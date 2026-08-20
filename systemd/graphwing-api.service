@@ -1,13 +1,15 @@
 [Unit]
-Description=graphwing OpenAPI server (git nodes for Rewst Graph)
+Description=graphwing OpenAPI server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/tim/.graphwing
-Environment=GRAPHWING_HOME=/home/tim/.graphwing
-ExecStart=/usr/bin/python3 /home/tim/.graphwing/server.py
+WorkingDirectory=@GRAPHWING_HOME@
+Environment=GRAPHWING_HOME=@GRAPHWING_HOME@
+Environment=HOME=@HOME@
+Environment=PATH=@PATH@
+ExecStart=@PYTHON@ @GRAPHWING_HOME@/server.py
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal
