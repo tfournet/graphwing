@@ -224,9 +224,9 @@ def main():
     install["custom_integration_id"] = integration
     install["pr_drive"] = published.get("pr-drive") or install.get("pr_drive")
     if "verify-stack" in published:
-        install["verify_stack"] = {**install.get("verify_stack") or {}, **published["verify-stack"]}
+        install["verify_stack"] = {**(install.get("verify_stack") or {}), **published["verify-stack"]}
     if "implement-slice" in published:
-        install["implement_slice"] = {**install.get("implement_slice") or {}, **published["implement-slice"]}
+        install["implement_slice"] = {**(install.get("implement_slice") or {}), **published["implement-slice"]}
     save_install(install)
     print("=== DONE ===")
     print(json.dumps(published, indent=2))

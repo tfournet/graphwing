@@ -42,13 +42,23 @@
         }
       },
       {
-        "id": "if_green",
-        "type": "logic.filter",
-        "label": "all_green?",
+        "id": "switch_checks",
+        "type": "logic.switch",
+        "label": "checks green/red/pending",
         "position": { "x": 880, "y": 240 },
         "config": {
-          "group": "AND",
-          "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "green",
+              "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+            },
+            {
+              "label": "red",
+              "rules": [{ "path": "data.any_red", "op": "equals", "value": true }]
+            }
+          ],
+          "default": { "label": "pending" }
         }
       },
       {
@@ -57,7 +67,7 @@
         "label": "Done (checks green)",
         "position": { "x": 1100, "y": 80 },
         "config": {
-          "alias": "done",
+          "alias": "done_green",
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
@@ -65,16 +75,6 @@
             { "id": "m3", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
             { "id": "m4", "output": "pr", "expression": { "kind": "getField", "path": "CTX.INPUT.pr" } }
           ]
-        }
-      },
-      {
-        "id": "if_red",
-        "type": "logic.filter",
-        "label": "any_red?",
-        "position": { "x": 1100, "y": 240 },
-        "config": {
-          "group": "AND",
-          "rules": [{ "path": "data.any_red", "op": "equals", "value": true }]
         }
       },
       {
@@ -179,21 +179,24 @@
         "label": "Done after one fix",
         "position": { "x": 2860, "y": 80 },
         "config": {
-          "alias": "done",
+          "alias": "done_after_fix",
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
             { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "checks_green_after_fix" } },
-            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.receipt.job_id" } }
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "CTX.receipt.job_id" } }
           ]
         }
       },
       { "id": "herdr_no_pr", "type": "action.noop", "label": "Herdr: missing PR", "position": { "x": 660, "y": 480 }, "config": {} },
       { "id": "herdr_git", "type": "action.noop", "label": "Herdr: gitStatus failed", "position": { "x": 440, "y": 480 }, "config": {} },
-      { "id": "herdr_checks", "type": "action.noop", "label": "Herdr: checks HTTP failed", "position": { "x": 880, "y": 480 }, "config": {} },
+      { "id": "herdr_checks1", "type": "action.noop", "label": "Herdr: checks HTTP failed", "position": { "x": 880, "y": 480 }, "config": {} },
+      { "id": "herdr_checks2", "type": "action.noop", "label": "Herdr: recheck HTTP failed", "position": { "x": 2420, "y": 480 }, "config": {} },
       { "id": "herdr_pending", "type": "action.noop", "label": "Herdr: checks pending", "position": { "x": 1320, "y": 480 }, "config": {} },
-      { "id": "herdr_test", "type": "action.noop", "label": "Herdr: testRun failed", "position": { "x": 1540, "y": 480 }, "config": {} },
-      { "id": "herdr_wait", "type": "action.noop", "label": "Herdr: agent wait timeout/fail", "position": { "x": 1980, "y": 40 }, "config": {} },
+      { "id": "herdr_test_http", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1320, "y": 620 }, "config": {} },
+      { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok", "position": { "x": 1540, "y": 480 }, "config": {} },
+      { "id": "herdr_wait_timeout", "type": "action.noop", "label": "Herdr: agent wait timeout", "position": { "x": 1760, "y": 40 }, "config": {} },
+      { "id": "herdr_wait_fail", "type": "action.noop", "label": "Herdr: agent wait failure", "position": { "x": 1980, "y": 40 }, "config": {} },
       { "id": "herdr_receipt", "type": "action.noop", "label": "Herdr: receipt not ok", "position": { "x": 2200, "y": 480 }, "config": {} },
       { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 2860, "y": 240 }, "config": {} }
     ],
@@ -203,25 +206,24 @@
       { "id": "e2f", "source": "git", "sourceHandle": "failure", "target": "herdr_git", "targetHandle": "in" },
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
       { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
-      { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "if_green", "targetHandle": "in" },
-      { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks", "targetHandle": "in" },
-      { "id": "e5", "source": "if_green", "sourceHandle": "pass", "target": "done_green", "targetHandle": "in" },
-      { "id": "e6", "source": "if_green", "sourceHandle": "fail", "target": "if_red", "targetHandle": "in" },
-      { "id": "e7", "source": "if_red", "sourceHandle": "pass", "target": "test", "targetHandle": "in" },
-      { "id": "e8", "source": "if_red", "sourceHandle": "fail", "target": "herdr_pending", "targetHandle": "in" },
+      { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
+      { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
+      { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "done_green", "targetHandle": "in" },
+      { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "test", "targetHandle": "in" },
+      { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
       { "id": "e9", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
-      { "id": "e9f", "source": "test", "sourceHandle": "failure", "target": "herdr_test", "targetHandle": "in" },
+      { "id": "e9f", "source": "test", "sourceHandle": "failure", "target": "herdr_test_http", "targetHandle": "in" },
       { "id": "e10", "source": "if_test_ok", "sourceHandle": "pass", "target": "wait", "targetHandle": "in" },
-      { "id": "e11", "source": "if_test_ok", "sourceHandle": "fail", "target": "herdr_test", "targetHandle": "in" },
+      { "id": "e11", "source": "if_test_ok", "sourceHandle": "fail", "target": "herdr_test_fail", "targetHandle": "in" },
       { "id": "e12", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
       { "id": "e13", "source": "wait", "sourceHandle": "out", "target": "receipt", "targetHandle": "in" },
-      { "id": "e14", "source": "wait", "sourceHandle": "timeout", "target": "herdr_wait", "targetHandle": "in" },
-      { "id": "e15", "source": "wait", "sourceHandle": "failure", "target": "herdr_wait", "targetHandle": "in" },
+      { "id": "e14", "source": "wait", "sourceHandle": "timeout", "target": "herdr_wait_timeout", "targetHandle": "in" },
+      { "id": "e15", "source": "wait", "sourceHandle": "failure", "target": "herdr_wait_fail", "targetHandle": "in" },
       { "id": "e16", "source": "receipt", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
       { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "checks2", "targetHandle": "in" },
       { "id": "e18", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "herdr_receipt", "targetHandle": "in" },
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
-      { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks", "targetHandle": "in" },
+      { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
       { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "done_after_fix", "targetHandle": "in" },
       { "id": "e21", "source": "if_green2", "sourceHandle": "fail", "target": "herdr_budget", "targetHandle": "in" }
     ]
