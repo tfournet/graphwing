@@ -757,6 +757,47 @@ class DispatchTests(unittest.TestCase):
             __import__("time").sleep(0.15)
         log.assert_not_called()
 
+    def test_herdr_job_done_closes_tab(self):
+        os.environ["GRAPHWING_HERDR"] = "1"
+        self.addCleanup(lambda: os.environ.__setitem__("GRAPHWING_HERDR", "0"))
+        calls: list[list[str]] = []
+
+        def fake_cli(args: list[str], timeout: int = 10):
+            calls.append(list(args))
+            return {}
+
+        job = {
+            "job_id": "ab" * 16,
+            "status": "completed",
+            "herdr_tab_id": "w1:t9",
+            "receipt": {"summary": "ok"},
+        }
+        with mock.patch.object(server, "herdr_cli", fake_cli):
+            with mock.patch.object(server, "herdr_log"):
+                server.herdr_job_done(job)
+        self.assertIn(["tab", "close", "w1:t9"], calls)
+
+    def test_herdr_prune_closes_done_tabs(self):
+        calls: list[list[str]] = []
+
+        def fake_cli(args: list[str], timeout: int = 10):
+            calls.append(list(args))
+            if args[:2] == ["tab", "list"]:
+                return {
+                    "tabs": [
+                        {"label": "gw-a-deadbeef", "tab_id": "w1:t5", "agent_status": "done"},
+                        {"label": "graph", "tab_id": "w1:t3", "agent_status": "idle"},
+                        {"label": "gw-a-working1", "tab_id": "w1:t6", "agent_status": "working"},
+                    ]
+                }
+            return {}
+
+        with mock.patch.object(server, "herdr_cli", fake_cli):
+            server.herdr_prune_job_tabs()
+        self.assertIn(["tab", "close", "w1:t5"], calls)
+        self.assertNotIn(["tab", "close", "w1:t3"], calls)
+        self.assertNotIn(["tab", "close", "w1:t6"], calls)
+
     def test_stack_status_default(self):
         status, payload, _ = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
         self.assertEqual(status, 200, payload)

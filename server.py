@@ -880,16 +880,32 @@ def herdr_log(line: str) -> None:
         herdr_report(pane_id, HERDR_GRAPH_LABEL, "idle", line[:120])
 
 
+def herdr_job_tab_label(job: dict[str, Any]) -> str:
+    job_id = str(job.get("job_id") or "")
+    tag = {"script": "s", "test": "t", "rr": "r"}.get(str(job.get("kind") or ""), "s" if job.get("script") else "a")
+    return f"gw-{tag}-{job_id[:8]}"
+
+
+def herdr_close_tab(tab_id: str) -> None:
+    if tab_id:
+        herdr_cli(["tab", "close", tab_id])
+
+
 def herdr_prune_job_tabs() -> None:
     listed = herdr_cli(["tab", "list"]) or {}
     tabs = [t for t in (listed.get("tabs") or []) if isinstance(t, dict) and str(t.get("label") or "").startswith("gw-")]
-    extra = len(tabs) - HERDR_JOB_TAB_MAX
+    live: list[dict[str, Any]] = []
+    for tab in tabs:
+        tid = str(tab.get("tab_id") or "")
+        if str(tab.get("agent_status") or "") == "done":
+            herdr_close_tab(tid)
+            continue
+        live.append(tab)
+    extra = len(live) - HERDR_JOB_TAB_MAX
     if extra <= 0:
         return
-    for tab in tabs[:extra]:
-        tid = tab.get("tab_id")
-        if tid:
-            herdr_cli(["tab", "close", str(tid)])
+    for tab in live[:extra]:
+        herdr_close_tab(str(tab.get("tab_id") or ""))
 
 
 def herdr_follow_job(job: dict[str, Any]) -> None:
@@ -898,8 +914,7 @@ def herdr_follow_job(job: dict[str, Any]) -> None:
     job_id = str(job.get("job_id") or "")
     if not JOB_ID_RE.fullmatch(job_id):
         return
-    kind = {"script": "s", "test": "t", "rr": "r"}.get(str(job.get("kind") or ""), "s" if job.get("script") else "a")
-    label = f"gw-{kind}-{job_id[:8]}"
+    label = herdr_job_tab_label(job)
     log_path = Path(job.get("log_ref") or (job_dir(job_id) / "stdout.log"))
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -932,11 +947,15 @@ def herdr_job_done(job: dict[str, Any]) -> None:
     summary = str(receipt.get("summary") or job.get("status") or "done")[:80]
     kind = job.get("kind") or job.get("script") or "agent"
     herdr_log(f"done {kind} {str(job.get('job_id') or '')[:8]} {job.get('status')} {summary}")
-    pane_id = job.get("herdr_pane_id")
-    if pane_id:
-        tag = {"script": "s", "test": "t", "rr": "r"}.get(str(job.get("kind") or ""), "s" if job.get("script") else "a")
-        label = f"gw-{tag}-{str(job.get('job_id') or '')[:8]}"
-        herdr_report(str(pane_id), label, "idle", summary)
+    tab_id = str(job.get("herdr_tab_id") or "")
+    label = herdr_job_tab_label(job)
+    if not tab_id:
+        listed = herdr_cli(["tab", "list"]) or {}
+        for tab in listed.get("tabs") or []:
+            if isinstance(tab, dict) and str(tab.get("label") or "") == label:
+                tab_id = str(tab.get("tab_id") or "")
+                break
+    herdr_close_tab(tab_id)
 
 
 def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str:
