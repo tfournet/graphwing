@@ -48,7 +48,7 @@ Runtime on zbook is `~/.graphwing`. Org wiring below is this laptop's Rewst seat
 - Org: https://app.rewst.ai/orgs/tim-graphwing
 - Public API: https://graphwing.tfour.net
 - Human: `herdr --session graphwing`
-- Graph activity: Herdr tab `graph` (one line per op). Long jobs (`agentRun`, async `scriptRun`) also get a `gw-*` tab that tails the log. Does not type into the Hermes chat pane.
+- Graph activity: Herdr tab `graph` (one line per op). Long jobs (`agentRun`, async `scriptRun`) get a `gw-*` tab that tails the log and **closes when the job finishes**. Does not type into the Hermes chat pane. Does not stop the `graphwing` Herdr session.
 - CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`, zbook example: `/home/tim/.graphwing`)
 
 Graph uses named OpenAPI actions, not a mega-agent. Prefer a new deterministic op over an agent loop.
