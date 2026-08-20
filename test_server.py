@@ -796,6 +796,7 @@ class InstallTests(unittest.TestCase):
         for rel in (
             "server.py",
             "install.py",
+            "start.sh",
             "setup_tunnel.py",
             "bin/graphwing",
             "systemd/graphwing-api.service",
@@ -844,6 +845,44 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn("@GRAPHWING_HOME@", api_unit)
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertNotIn("copied secrets", proc.stdout.lower())
+
+    def test_start_sh_yes_no_start_tmpdir(self):
+        root = Path(__file__).resolve().parent
+        script = root / "start.sh"
+        subprocess.run(["bash", "-n", str(script)], check=True)
+        text = script.read_text()
+        self.assertNotIn("/home/tim", text)
+        self.assertIn("hermes-agent.nousresearch.com/install.sh", text)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "gw"
+            units = Path(td) / "units"
+            proc = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--yes",
+                    "--no-hermes",
+                    "--no-herdr",
+                    "--tunnel",
+                    "none",
+                    "--home",
+                    str(home),
+                    "--unit-dir",
+                    str(units),
+                    "--no-cli",
+                    "--no-start",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue((home / "server.py").is_file())
+            self.assertTrue((home / "api.key").read_text().strip())
+            self.assertFalse((home / "rr.json").exists())
+            self.assertFalse((units / "graphwing-tunnel.service").exists())
+            self.assertIn("not starting", proc.stdout)
+            self.assertNotIn("installing Hermes", proc.stdout)
+            self.assertNotIn("installing herdr", proc.stdout)
 
 
 if __name__ == "__main__":

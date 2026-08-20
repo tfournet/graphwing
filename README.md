@@ -6,21 +6,29 @@ Source of truth: [`tfournet/graphwing`](https://github.com/tfournet/graphwing). 
 
 ## Install
 
-On a machine that is not this laptop:
+Clean machine, getting started:
 
 ```bash
 git clone https://github.com/tfournet/graphwing.git
 cd graphwing
-python3 install.py
+./start.sh
 ```
 
-`install.py` copies catalog files into `$GRAPHWING_HOME`, writes user systemd units, and generates an API key. It does not copy secrets from another home.
+`start.sh` optionally installs Hermes Agent (`agentRun`), herdr, and cloudflared, writes `$GRAPHWING_HOME`, and starts the API in this terminal. It does not copy secrets from another home. `rr` is not installed.
 
-Non-interactive (no TTY, tests, or first-cut):
+One-liner (non-interactive, loopback only, no extras):
 
 ```bash
-python3 install.py --non-interactive --tunnel none
+curl -fsSL https://raw.githubusercontent.com/tfournet/graphwing/main/start.sh | bash -s -- --yes
 ```
+
+```bash
+./start.sh --yes --with-hermes          # also grab Hermes Agent
+./start.sh --yes --no-start             # catalog + key + units only
+./start.sh --daemon                     # systemd --user instead of foreground
+```
+
+`install.py` is the catalog renderer `start.sh` calls. You can still run it directly.
 
 - **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Send header `X-Graphwing-Key`.
 - **Named-tunnel credentials:** `$GRAPHWING_HOME/cloudflared.token`, or `$GRAPHWING_HOME/tunnel.env` / `GRAPHWING_CF_API_KEY` for `setup_tunnel.py`. See `examples/tunnel.env.example`.
