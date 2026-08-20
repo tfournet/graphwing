@@ -13,13 +13,6 @@
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false
-    },
-    {
-      "name": "catalog-compile",
-      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py", "install.py", "setup_tunnel.py"],
-      "cwd": "/home/tim/work/graphwing",
-      "timeout_seconds": 15,
-      "async": false
     }
   ]
 }

@@ -18,7 +18,7 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | Hermes seat text | `SOUL.md` (copied to `$GRAPHWING_HOME` on install) |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
 
-Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is the **target repo** (usually riftwing); that repo's `AGENTS.md` applies there.
+Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.
 
 ## Git (tfournet/graphwing)
 

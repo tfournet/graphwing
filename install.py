@@ -105,27 +105,53 @@ def ensure_key(home: Path) -> Path:
     return path
 
 
-def ensure_repos(home: Path, repo_root: Path, non_interactive: bool) -> dict[str, str]:
+def parse_repo_flag(item: str) -> tuple[str, str]:
+    if "=" not in item:
+        raise SystemExit(f"--repo must be NAME=PATH, got {item!r}")
+    name, raw = item.split("=", 1)
+    name = name.strip()
+    path = Path(raw.strip()).expanduser()
+    if not name or not str(path):
+        raise SystemExit(f"--repo must be NAME=PATH, got {item!r}")
+    if not path.is_dir() or not (path / ".git").exists():
+        raise SystemExit(f"--repo path is not a git checkout: {path}")
+    return name, str(path.resolve())
+
+
+def ensure_repos(
+    home: Path,
+    repo_root: Path,
+    non_interactive: bool,
+    extra: list[str] | None = None,
+) -> dict[str, str]:
+    del repo_root  # wizard / --repo only; catalog does not ship Tim's clones
     path = home / "repos.json"
     repos: dict[str, str] = {}
     if path.is_file():
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text() or "{}")
         if isinstance(data, dict):
-            repos = {str(k): str(v) for k, v in data.items() if k and v}
-    dirty = False
-    if "graphwing" not in repos:
-        repos["graphwing"] = str(repo_root)
+            repos = {str(k).strip(): str(v).strip() for k, v in data.items() if str(k).strip() and str(v).strip()}
+    dirty = not path.is_file()
+    for item in extra or []:
+        name, resolved = parse_repo_flag(item)
+        repos[name] = resolved
         dirty = True
-    if not non_interactive and yes("Add another allowlisted git repo?", False, False):
+    if not non_interactive:
+        print("Allowlisted git repos (Graph short names). Empty name to finish.")
         while True:
-            name = ask("short name (empty to finish)", "", False)
+            name = ask("short name", "", False)
             if not name:
                 break
             raw = ask(f"path for {name}", "", False)
-            if raw:
-                repos[name] = raw
-                dirty = True
-    if dirty or not path.is_file():
+            if not raw:
+                continue
+            dest = Path(raw).expanduser()
+            if not dest.is_dir() or not (dest / ".git").exists():
+                print(f"  skip: not a git checkout: {dest}")
+                continue
+            repos[name] = str(dest.resolve())
+            dirty = True
+    if dirty:
         write_json(path, repos)
     return repos
 
@@ -214,6 +240,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tunnel", choices=("none", "demo", "named"), default=None)
     p.add_argument("--start", action="store_true", help="enable --now units after writing them")
     p.add_argument("--port", type=int, default=int(os.environ.get("GRAPHWING_PORT", "8645")))
+    p.add_argument(
+        "--repo",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="allowlist a git checkout (repeatable). Non-interactive installs stay empty unless this is set.",
+    )
     return p.parse_args()
 
 
@@ -233,9 +266,10 @@ def main() -> None:
     copy_file(REPO / "setup_tunnel.py", home / "setup_tunnel.py")
     copy_file(REPO / "examples" / "tunnel.env.example", home / "tunnel.env.example")
     copy_file(REPO / "examples" / "rr.example.json", home / "rr.example.json")
+    copy_file(REPO / "examples" / "repos.example.json", home / "repos.example.json")
 
     key_path = ensure_key(home)
-    ensure_repos(home, REPO, ni)
+    ensure_repos(home, REPO, ni, extra=args.repo)
     ensure_stacks(home, args.port)
 
     if not args.no_cli:

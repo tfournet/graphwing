@@ -40,6 +40,7 @@ Options:
   --foreground          run the API in this terminal (default)
   --daemon              enable systemd --user units instead
   --no-start            install only
+  --repo NAME=PATH      allowlist a git checkout (repeatable)
   -h, --help
 EOF
 }
@@ -82,6 +83,7 @@ UNIT_DIR=""
 NO_UNITS=0
 NO_CLI=0
 PORT="${GRAPHWING_PORT:-8645}"
+REPOS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -115,6 +117,11 @@ while [[ $# -gt 0 ]]; do
     --foreground) START=foreground ;;
     --daemon) START=daemon ;;
     --no-start) START=no ;;
+    --repo)
+      shift
+      [[ -n "${1:-}" ]] || die "--repo needs NAME=PATH"
+      REPOS+=("$1")
+      ;;
     -h|--help)
       usage
       exit 0
@@ -173,6 +180,9 @@ else
     [[ "$START" == foreground ]] && relaunch+=(--foreground)
     [[ "$START" == daemon ]] && relaunch+=(--daemon)
     [[ "$START" == no ]] && relaunch+=(--no-start)
+    for spec in "${REPOS[@]+"${REPOS[@]}"}"; do
+      relaunch+=(--repo "$spec")
+    done
     exec "${relaunch[@]}"
   fi
 fi
@@ -271,24 +281,6 @@ install_cloudflared() {
   chmod +x "$dest"
 }
 
-add_repo() {
-  local json="$1" name="$2" path="$3"
-  [[ -d "$path/.git" ]] || return 0
-  python3 - "$json" "$name" "$path" <<'PY'
-import json, sys
-from pathlib import Path
-p, name, path = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-data = {}
-if p.is_file():
-    data = json.loads(p.read_text())
-if not isinstance(data, dict):
-    data = {}
-if name not in data:
-    data[name] = path
-    p.write_text(json.dumps(data, indent=2) + "\n")
-PY
-}
-
 [[ "$WITH_HERMES" == yes ]] && install_hermes
 [[ "$WITH_HERDR" == yes ]] && install_herdr
 [[ "$WITH_CLOUDFLARED" == yes ]] && install_cloudflared
@@ -297,7 +289,11 @@ HOME_DIR="$(python3 -c 'import os,sys; from pathlib import Path; print(Path(sys.
 export GRAPHWING_HOME="$HOME_DIR"
 export GRAPHWING_PORT="$PORT"
 
-install_args=(--home "$HOME_DIR" --tunnel "$TUNNEL" --port "$PORT" --non-interactive)
+install_args=(--home "$HOME_DIR" --tunnel "$TUNNEL" --port "$PORT")
+[[ "$YES" == 1 ]] && install_args+=(--non-interactive)
+for spec in "${REPOS[@]+"${REPOS[@]}"}"; do
+  install_args+=(--repo "$spec")
+done
 [[ -n "$UNIT_DIR" ]] && install_args+=(--unit-dir "$UNIT_DIR")
 [[ "$NO_UNITS" == 1 ]] && install_args+=(--no-units)
 [[ "$NO_CLI" == 1 ]] && install_args+=(--no-cli)
@@ -305,10 +301,6 @@ install_args=(--home "$HOME_DIR" --tunnel "$TUNNEL" --port "$PORT" --non-interac
 
 log "installing catalog into $HOME_DIR"
 python3 "$REPO/install.py" "${install_args[@]}"
-
-if [[ -d "$HOME/.hermes/hermes-agent/.git" ]]; then
-  add_repo "$HOME_DIR/repos.json" hermes-agent "$HOME/.hermes/hermes-agent"
-fi
 
 key_file="$HOME_DIR/api.key"
 log "API http://127.0.0.1:${PORT}"
