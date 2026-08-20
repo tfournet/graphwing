@@ -191,6 +191,20 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "not_implemented")
 
+    def test_wrap_prompt_locks_cwd(self):
+        text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
+        self.assertIn("/home/tim/work/gw-real-slice", text)
+        self.assertIn("only inside that directory", text)
+
+    def test_hermes_job_env_overrides_terminal_cwd(self):
+        with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
+            env = server.hermes_job_env(
+                {"job_id": "ab" * 16, "cwd": "/home/tim/work/gw-real-slice"}
+            )
+        self.assertEqual(env["TERMINAL_CWD"], "/home/tim/work/gw-real-slice")
+        self.assertEqual(env["PWD"], "/home/tim/work/gw-real-slice")
+        self.assertNotEqual(env.get("TERMINAL_CWD"), "/home/tim/rewst/riftwing")
+
     def test_run_agent_completes_receipt(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"

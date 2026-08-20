@@ -1092,11 +1092,14 @@ def parse_webhook_fields(data: dict[str, Any]) -> tuple[str | None, str | None, 
     return url, token, None
 
 
-def wrap_prompt(job_id: str, prompt: str) -> str:
+def wrap_prompt(job_id: str, prompt: str, cwd: str) -> str:
+    root = str(Path(cwd).resolve())
     return (
         f"GRAPHWING_JOB {job_id}\n"
         "You are a Graph node on this laptop, not the story owner. One job only. "
         "Do not research+write+review+ship.\n"
+        f"Working directory is {root}. Create and edit files only inside that directory. "
+        "Do not write to any other path.\n"
         "Finish with a single JSON object and nothing after it:\n"
         '{"status":"ok"|"error","sha":null,"pr_url":null,"summary":"<one line>"}\n\n'
         f"Task:\n{prompt}\n"
@@ -1183,6 +1186,23 @@ def deliver_webhook(job: dict[str, Any], receipt: dict[str, Any]) -> dict[str, A
     return post_receipt(str(url), receipt, token=job.get("response_webhook_token"))
 
 
+def hermes_job_env(job: dict[str, Any]) -> dict[str, str]:
+    """Graph cwd wins over Hermes config.yaml terminal.cwd and inherited TERMINAL_CWD."""
+    cwd = str(Path(job["cwd"]).resolve())
+    env = {k: v for k, v in os.environ.items() if k not in ("TERMINAL_CWD", "PWD")}
+    env.update(
+        {
+            "HERMES_HOME": str(HOME),
+            "GRAPHWING_JOB_ID": str(job["job_id"]),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GH_PROMPT_DISABLED": "1",
+            "TERMINAL_CWD": cwd,
+            "PWD": cwd,
+        }
+    )
+    return env
+
+
 def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
     if not HERMES_BIN.is_file():
         return None, {"error": f"missing hermes binary: {HERMES_BIN}", "code": "missing_binary"}
@@ -1191,13 +1211,8 @@ def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     stderr_path = job_dir(job["job_id"]) / "stderr.log"
     stdout_f = stdout_path.open("wb")
     stderr_f = stderr_path.open("wb")
-    env = {
-        **os.environ,
-        "HERMES_HOME": str(HOME),
-        "GRAPHWING_JOB_ID": job["job_id"],
-        "GIT_TERMINAL_PROMPT": "0",
-        "GH_PROMPT_DISABLED": "1",
-    }
+    cwd = str(Path(job["cwd"]).resolve())
+    env = hermes_job_env(job)
     cmd = [
         str(HERMES_BIN),
         "chat",
@@ -1205,7 +1220,8 @@ def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
         "--query-file",
         str(prompt_path),
         "--in",
-        job["cwd"],
+        cwd,
+        "--no-restore-cwd",
         "--max-turns",
         str(job["max_turns"]),
         "--run-budget",
@@ -1217,7 +1233,7 @@ def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
             cmd,
             stdout=stdout_f,
             stderr=stderr_f,
-            cwd=job["cwd"],
+            cwd=cwd,
             env=env,
             start_new_session=True,
         )
@@ -1529,7 +1545,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "webhook": None,
         }
         job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        (job_dir(job_id) / "prompt.txt").write_text(wrap_prompt(job_id, prompt))
+        (job_dir(job_id) / "prompt.txt").write_text(wrap_prompt(job_id, prompt, str(resolved)))
         write_job(job)
     enqueue_agent(job)
     return 202, {
