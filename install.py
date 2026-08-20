@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Install graphwing catalog into GRAPHWING_HOME and user systemd units.
 
-Does not copy secrets from another home. rr and a named Cloudflare tunnel
-are optional; non-interactive default is neither.
+Does not copy secrets from another home. rr is a drop-in plugin (rr.json),
+never installed. Named Cloudflare tunnel is optional.
 """
 
 from __future__ import annotations
@@ -145,29 +145,6 @@ def ensure_stacks(home: Path, port: int) -> None:
     )
 
 
-def maybe_rr(home: Path, repos: dict[str, str], non_interactive: bool) -> None:
-    path = home / "rr.json"
-    if path.is_file() or non_interactive:
-        return
-    if not yes("Configure optional rr recipes?", False, False):
-        return
-    cwd = next(iter(repos.values()))
-    write_json(
-        path,
-        {
-            "recipes": [
-                {
-                    "name": "status",
-                    "argv": ["rr", "status"],
-                    "cwd": cwd,
-                    "timeout_seconds": 20,
-                    "async": False,
-                }
-            ]
-        },
-    )
-
-
 def render_unit(name: str, mapping: dict[str, str]) -> str:
     src = REPO / "systemd" / name
     text = src.read_text()
@@ -249,11 +226,11 @@ def main() -> None:
     copy_file(REPO / "bin" / "graphwing", home / "bin" / "graphwing")
     copy_file(REPO / "setup_tunnel.py", home / "setup_tunnel.py")
     copy_file(REPO / "examples" / "tunnel.env.example", home / "tunnel.env.example")
+    copy_file(REPO / "examples" / "rr.example.json", home / "rr.example.json")
 
     key_path = ensure_key(home)
-    repos = ensure_repos(home, REPO, ni)
+    ensure_repos(home, REPO, ni)
     ensure_stacks(home, args.port)
-    maybe_rr(home, repos, ni)
 
     if not args.no_cli:
         cli = install_cli(home)

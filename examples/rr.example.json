@@ -1,0 +1,11 @@
+{
+  "recipes": [
+    {
+      "name": "status",
+      "argv": ["rr", "status"],
+      "cwd": "/path/to/an/allowlisted/repo",
+      "timeout_seconds": 20,
+      "async": false
+    }
+  ]
+}
