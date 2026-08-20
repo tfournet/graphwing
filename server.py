@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -34,22 +35,28 @@ CMD_TIMEOUT = 30
 CMD_MAX_BYTES = 256 * 1024
 FILE_MAX_BYTES = 32 * 1024
 PROMPT_MAX_CHARS = 64 * 1024
-DEFAULT_REPO = "riftwing"
 UNITS = ("graphwing-api", "graphwing-tunnel", "graphwing-herdr")
-HERDR_SESSION = "graphwing"
-HERDR_AGENT = "graphwing"
+HERDR_SESSION = os.environ.get("GRAPHWING_HERDR_SESSION", "graphwing") or "graphwing"
+HERDR_AGENT = os.environ.get("GRAPHWING_HERDR_AGENT", "graphwing") or "graphwing"
 HERDR_GRAPH_LABEL = "graph"
 HERDR_SOURCE = "graphwing"
 HERDR_JOB_TAB_MAX = 8
 HERDR_LOCK = threading.Lock()
 HOME_PROFILE = "graphwing"
-HERMES_BIN = Path.home() / ".local" / "bin" / "hermes"
-RR_BIN = Path.home() / "go" / "bin" / "rr"
-PODMAN_ENV = {
-    "HOME": "/home/tim",
-    "XDG_RUNTIME_DIR": "/run/user/1000",
-    "DOCKER_HOST": "unix:///run/user/1000/podman/podman.sock",
-}
+
+
+def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
+    raw = os.environ.get(env_var, "").strip()
+    if raw:
+        return Path(raw)
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    return fallback
+
+
+HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
+RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
 HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
 AGENT_MAX_TURNS = 30
 AGENT_RUN_BUDGET = 300
@@ -69,6 +76,11 @@ def resolve_under_home(raw: str | Path | None) -> Path:
 
 
 def load_key() -> bytes:
+    env = os.environ.get("GRAPHWING_KEY", "").encode()
+    if env.strip():
+        return env.strip()
+    if not KEY_PATH.is_file():
+        raise RuntimeError(f"missing API key: set GRAPHWING_KEY or write {KEY_PATH}")
     raw = KEY_PATH.read_bytes().strip()
     if not raw:
         raise RuntimeError(f"empty API key at {KEY_PATH}")
@@ -169,10 +181,19 @@ def load_tests(repos: dict[str, str] | None = None) -> dict[str, dict[str, Any]]
 
 
 def load_rr(repos: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
+    if not RR_PATH.is_file():
+        return {}
+    data = json.loads(RR_PATH.read_text())
+    if isinstance(data, dict) and not data.get("recipes"):
+        return {}
+    if isinstance(data, list) and not data:
+        return {}
     return load_recipes(RR_PATH, "recipes", repos)
 
 
 def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
+    if not STACKS_PATH.is_file():
+        return {}, set()
     data = json.loads(STACKS_PATH.read_text())
     if not isinstance(data, dict):
         raise RuntimeError(f"stacks.json must be an object: {STACKS_PATH}")
@@ -189,7 +210,7 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        cwd = Path(str(item.get("cwd") or "")).resolve()
+        cwd = resolve_under_home(item.get("cwd") or ".")
         if not name or not cwd.is_dir():
             continue
         health = []
@@ -212,10 +233,8 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
             "health": health,
             "ports": sport,
         }
-    if not stacks:
-        raise RuntimeError(f"stacks.json has no stacks: {STACKS_PATH}")
-    if not ports:
-        raise RuntimeError(f"stacks.json has no ports: {STACKS_PATH}")
+    if not stacks and not ports:
+        raise RuntimeError(f"stacks.json has no stacks or ports: {STACKS_PATH}")
     return stacks, ports
 
 
@@ -227,8 +246,17 @@ def first_query(qs: dict[str, list[str]], name: str) -> str | None:
     return v or None
 
 
+def default_repo_name(repos: dict[str, str]) -> str:
+    preferred = os.environ.get("GRAPHWING_DEFAULT_REPO", "").strip()
+    if preferred and preferred in repos:
+        return preferred
+    if "riftwing" in repos:
+        return "riftwing"
+    return next(iter(repos))
+
+
 def resolve_repo(name: str | None, repos: dict[str, str]) -> tuple[str, Path] | tuple[None, dict[str, Any]]:
-    key = (name or DEFAULT_REPO).strip()
+    key = (name or default_repo_name(repos)).strip()
     if key not in repos:
         return None, {
             "error": f"unknown repo '{key}'",
@@ -632,7 +660,16 @@ def units_status() -> dict[str, Any]:
 
 
 def podman_env() -> dict[str, str]:
-    return {**os.environ, **PODMAN_ENV, "GIT_TERMINAL_PROMPT": "0"}
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    docker_host = os.environ.get("DOCKER_HOST") or f"unix://{runtime}/podman/podman.sock"
+    return {
+        **os.environ,
+        "HOME": str(Path.home()),
+        "XDG_RUNTIME_DIR": runtime,
+        "DOCKER_HOST": docker_host,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
 
 
 def probe_loopback(url: str) -> dict[str, Any]:
@@ -681,7 +718,11 @@ def parse_compose_ps(raw: str) -> list[dict[str, Any]]:
 
 def stack_status(name: str | None) -> dict[str, Any]:
     stacks, _ports = load_stacks()
-    key = (name or "riftwing").strip() or "riftwing"
+    if not stacks:
+        return {"ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501}
+    key = (name or "").strip()
+    if not key:
+        key = "riftwing" if "riftwing" in stacks else next(iter(stacks))
     if key not in stacks:
         return {"ok": False, "error": f"unknown stack '{key}'", "code": "unknown_stack", "allowed": sorted(stacks), "status": 400}
     spec = stacks[key]
@@ -717,6 +758,8 @@ def port_listening(port: int) -> bool:
 
 def port_check(raw: str | None) -> dict[str, Any]:
     _stacks, allowed = load_stacks()
+    if not allowed:
+        return {"ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501}
     if not raw or not raw.strip():
         return {"ok": False, "error": "port or ports is required", "code": "missing_port", "status": 400}
     parts = [p.strip() for p in raw.split(",") if p.strip()]
@@ -998,9 +1041,9 @@ def active_job_count() -> int:
 
 
 def resolve_run_cwd(raw: str | None, repos: dict[str, str]) -> tuple[str, Path] | tuple[None, dict[str, Any]]:
-    key = (raw or DEFAULT_REPO).strip()
+    key = (raw or default_repo_name(repos)).strip()
     if not key:
-        key = DEFAULT_REPO
+        key = default_repo_name(repos)
     if "/" in key or key.startswith("."):
         return None, {
             "error": "cwd must be an allowlisted repo short name, not a filesystem path",
@@ -1052,7 +1095,7 @@ def parse_webhook_fields(data: dict[str, Any]) -> tuple[str | None, str | None, 
 def wrap_prompt(job_id: str, prompt: str) -> str:
     return (
         f"GRAPHWING_JOB {job_id}\n"
-        "You are a Graph node on Tim's laptop, not the story owner. One job only. "
+        "You are a Graph node on this laptop, not the story owner. One job only. "
         "Do not research+write+review+ship.\n"
         "Finish with a single JSON object and nothing after it:\n"
         '{"status":"ok"|"error","sha":null,"pr_url":null,"summary":"<one line>"}\n\n'
@@ -1411,7 +1454,10 @@ def test_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
 
 
 def rr_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    return named_cmd_run("rr", load_rr(repos), body, "rr.json", "unknown_rr")
+    catalog = load_rr(repos)
+    if not catalog:
+        return 501, {"error": "rr is not configured", "code": "not_configured"}
+    return named_cmd_run("rr", catalog, body, "rr.json", "unknown_rr")
 
 
 def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -1671,13 +1717,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    load_key()
+    try:
+        load_key()
+    except Exception as exc:
+        raise SystemExit(f"API key missing: set GRAPHWING_KEY or write {KEY_PATH}") from exc
     load_repos()
     load_profiles()
     load_scripts()
     load_tests()
-    load_rr()
-    load_stacks()
+    if RR_PATH.is_file():
+        load_rr()
+    if STACKS_PATH.is_file():
+        load_stacks()
     if not OPENAPI_PATH.is_file():
         raise SystemExit(f"missing {OPENAPI_PATH}")
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)

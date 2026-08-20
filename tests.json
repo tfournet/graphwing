@@ -9,7 +9,7 @@
     },
     {
       "name": "graphwing-compile",
-      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py"],
+      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py", "install.py", "setup_tunnel.py"],
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false

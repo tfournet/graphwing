@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,7 +101,7 @@ class DispatchTests(unittest.TestCase):
             "/v1/agent/run",
             {},
             True,
-            b'{"prompt":"x","cwd":"/home/tim/rewst/riftwing"}',
+            b'{"prompt":"x","cwd":"/tmp/graphwing-not-a-repo"}',
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_cwd")
@@ -423,7 +424,7 @@ class DispatchTests(unittest.TestCase):
             {
                 "id": "graphwing",
                 "kind": "home",
-                "hermes_home": "/home/tim/.graphwing",
+                "hermes_home": "/tmp/graphwing",
                 "herdr_session": "graphwing",
                 "herdr_agent": "graphwing",
                 "runnable": True,
@@ -431,7 +432,7 @@ class DispatchTests(unittest.TestCase):
             {
                 "id": "executor",
                 "kind": "seat",
-                "hermes_home": "/home/tim/.hermes/profiles/executor",
+                "hermes_home": "/tmp/hermes-executor",
                 "herdr_session": "executor",
                 "herdr_agent": "executor",
                 "runnable": False,
@@ -590,7 +591,7 @@ class DispatchTests(unittest.TestCase):
                     "/v1/git/commit",
                     {},
                     True,
-                    json.dumps({"repo": "/home/tim/rewst/riftwing", "message": "x"}).encode(),
+                    json.dumps({"repo": "/tmp/graphwing-not-a-repo", "message": "x"}).encode(),
                 )
                 self.assertEqual(status, 400)
                 self.assertEqual(payload["code"], "bad_repo")
@@ -768,6 +769,81 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "unknown_rr")
+
+    def test_rr_not_configured(self):
+        with mock.patch.object(server, "RR_PATH", Path("/nope/rr.json")):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/rr/run", {}, True, b'{"name":"status"}'
+            )
+        self.assertEqual(status, 501)
+        self.assertEqual(payload["code"], "not_configured")
+
+    def test_stack_not_configured(self):
+        with mock.patch.object(server, "STACKS_PATH", Path("/nope/stacks.json")):
+            status, payload, _ = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
+        self.assertEqual(status, 501)
+        self.assertEqual(payload["code"], "not_configured")
+
+    def test_load_key_from_env(self):
+        with mock.patch.dict(os.environ, {"GRAPHWING_KEY": "env-secret-key"}):
+            with mock.patch.object(server, "KEY_PATH", Path("/nope/api.key")):
+                self.assertEqual(server.load_key(), b"env-secret-key")
+
+
+class InstallTests(unittest.TestCase):
+    def test_runtime_and_templates_have_no_hardcoded_home(self):
+        root = Path(__file__).resolve().parent
+        for rel in (
+            "server.py",
+            "install.py",
+            "setup_tunnel.py",
+            "bin/graphwing",
+            "systemd/graphwing-api.service",
+            "systemd/graphwing-herdr.service",
+            "systemd/graphwing-tunnel.service",
+            "systemd/graphwing-tunnel-demo.service",
+        ):
+            text = (root / rel).read_text()
+            self.assertNotIn("/home/tim", text, rel)
+
+    def test_install_noninteractive_tmpdir(self):
+        root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "gw"
+            units = Path(td) / "units"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(root / "install.py"),
+                    "--home",
+                    str(home),
+                    "--unit-dir",
+                    str(units),
+                    "--non-interactive",
+                    "--no-cli",
+                    "--tunnel",
+                    "none",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue((home / "server.py").is_file())
+            self.assertTrue((home / "openapi.json").is_file())
+            key = (home / "api.key").read_text().strip()
+            self.assertTrue(key)
+            self.assertEqual((home / "api.key").stat().st_mode & 0o777, 0o600)
+            repos = json.loads((home / "repos.json").read_text())
+            self.assertIn("graphwing", repos)
+            self.assertTrue(Path(repos["graphwing"]).is_dir())
+            self.assertFalse((home / "rr.json").exists())
+            stacks = json.loads((home / "stacks.json").read_text())
+            self.assertEqual(stacks["stacks"][0]["name"], "graphwing")
+            api_unit = (units / "graphwing-api.service").read_text()
+            self.assertIn(str(home), api_unit)
+            self.assertNotIn("@GRAPHWING_HOME@", api_unit)
+            self.assertFalse((units / "graphwing-tunnel.service").exists())
+            self.assertNotIn("copied secrets", proc.stdout.lower())
 
 
 if __name__ == "__main__":

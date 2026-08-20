@@ -1,5 +1,5 @@
 [Unit]
-Description=graphwing Cloudflare named tunnel
+Description=graphwing Cloudflare quick tunnel (ephemeral trycloudflare.com)
 After=network-online.target graphwing-api.service
 Wants=network-online.target
 Requires=graphwing-api.service
@@ -9,7 +9,7 @@ Type=simple
 WorkingDirectory=@GRAPHWING_HOME@
 Environment=HOME=@HOME@
 Environment=PATH=@PATH@
-ExecStart=@CLOUDFLARED@ tunnel run --token-file @GRAPHWING_HOME@/cloudflared.token
+ExecStart=@CLOUDFLARED@ tunnel --no-autoupdate --url http://127.0.0.1:@PORT@
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
