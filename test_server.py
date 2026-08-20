@@ -381,6 +381,36 @@ class DispatchTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertIsInstance(payload["data"], list)
 
+    def test_annotate_pr_checks_all_green(self):
+        out = server.annotate_pr_checks(
+            {"ok": True, "data": [{"name": "ci", "bucket": "pass"}, {"name": "lint", "bucket": "skipping"}]}
+        )
+        self.assertTrue(out["all_green"])
+        self.assertFalse(out["any_red"])
+        self.assertEqual(out["failing"], [])
+        self.assertEqual(out["pending"], [])
+
+    def test_annotate_pr_checks_red(self):
+        out = server.annotate_pr_checks(
+            {"ok": True, "data": [{"name": "ci", "bucket": "fail"}, {"name": "lint", "bucket": "pass"}]}
+        )
+        self.assertFalse(out["all_green"])
+        self.assertTrue(out["any_red"])
+        self.assertEqual(out["failing"], ["ci"])
+
+    def test_annotate_pr_checks_pending(self):
+        out = server.annotate_pr_checks(
+            {"ok": True, "data": [{"name": "ci", "bucket": "pending"}]}
+        )
+        self.assertFalse(out["all_green"])
+        self.assertFalse(out["any_red"])
+        self.assertEqual(out["pending"], ["ci"])
+
+    def test_gh_pr_checks_requires_number(self):
+        status, payload, _ = server.dispatch("GET", "/v1/gh/pr/checks", {}, True, b"")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "missing_number")
+
     def test_agent_run_executor_unknown(self):
         status, payload, _ = server.dispatch(
             "POST", "/v1/agent/run", {}, True, b'{"profile":"executor","prompt":"x"}'

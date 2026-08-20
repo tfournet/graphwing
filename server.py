@@ -590,6 +590,35 @@ def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
     return {"ok": True, "data": parsed, "truncated": r["truncated"]}
 
 
+GH_CHECK_PASS = frozenset({"pass", "skipping", "skip", "success"})
+GH_CHECK_FAIL = frozenset({"fail", "failure", "cancel", "cancelled", "cancelling", "error"})
+
+
+def annotate_pr_checks(out: dict[str, Any]) -> dict[str, Any]:
+    """HTTP 200 means gh ran. Graph gates on all_green / any_red, not the agent."""
+    if not out.get("ok"):
+        return out
+    rows = out.get("data")
+    if not isinstance(rows, list):
+        rows = []
+    failing: list[str] = []
+    pending: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        bucket = str(row.get("bucket") or row.get("state") or "").strip().lower()
+        name = str(row.get("name") or "")
+        if bucket in GH_CHECK_FAIL:
+            failing.append(name)
+        elif bucket not in GH_CHECK_PASS:
+            pending.append(name)
+    out["failing"] = failing
+    out["pending"] = pending
+    out["any_red"] = bool(failing)
+    out["all_green"] = not failing and not pending
+    return out
+
+
 def units_status() -> dict[str, Any]:
     units = {}
     all_ok = True
@@ -1570,7 +1599,9 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
             number = first_query(qs, "number")
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
-            out = gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
+            out = annotate_pr_checks(
+                gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
+            )
         else:
             out = None
         if out is not None:

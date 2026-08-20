@@ -801,7 +801,11 @@
         "properties": {
           "ok": { "type": "boolean" },
           "repo": { "type": "string" },
-          "data": {}
+          "data": {},
+          "all_green": { "type": "boolean", "description": "ghPrChecks: no fail and no pending" },
+          "any_red": { "type": "boolean", "description": "ghPrChecks: at least one fail/cancel" },
+          "failing": { "type": "array", "items": { "type": "string" } },
+          "pending": { "type": "array", "items": { "type": "string" } }
         }
       },
       "UnitsStatus": {
