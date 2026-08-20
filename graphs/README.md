@@ -11,5 +11,5 @@ python3 scripts/publish_graphs.py --only pr-drive
 | Slug | Input | Shape |
 |---|---|---|
 | `graphwing-verify-stack` | `stack`, `ports` | stackStatus → portCheck |
-| `graphwing-implement-slice` | `repo`, `prompt` | gitStatus → wait-webhook → agentRun |
+| `graphwing-implement-slice` | `repo`, `branch`, `prompt`, `commit_message` | gitStatus → gitCheckout → wait-webhook agentRun → gitCommit → gitPush |
 | `graphwing-pr-drive` | `repo`, `pr`, `test`, `prompt` | checks green → done; red → testRun → one agent slice → checks again |

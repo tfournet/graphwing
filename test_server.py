@@ -231,6 +231,9 @@ class DispatchTests(unittest.TestCase):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
         self.assertIn("/home/tim/work/gw-real-slice", text)
         self.assertIn("only inside that directory", text)
+        self.assertIn("git add --", text)
+        self.assertIn("relative paths only", text)
+        self.assertIn("Do not git commit, git push", text)
 
     def test_hermes_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
