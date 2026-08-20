@@ -20,6 +20,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertIn("riftwing", payload["repos"])
+        self.assertIn("graphwing", payload["repos"])
 
     def test_git_requires_key(self):
         status, payload, _ = server.dispatch("GET", "/v1/git/status", {}, False, b"")
@@ -40,6 +41,15 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["repo"], "riftwing")
+        self.assertIn("branch", payload)
+
+    def test_status_graphwing_clone(self):
+        status, payload, _ = server.dispatch(
+            "GET", "/v1/git/status", {"repo": ["graphwing"]}, True, b""
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["repo"], "graphwing")
         self.assertIn("branch", payload)
 
     def test_log_riftwing(self):
@@ -875,6 +885,20 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn("@GRAPHWING_HOME@", api_unit)
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertNotIn("copied secrets", proc.stdout.lower())
+
+    def test_ensure_repos_merges_graphwing(self):
+        import install
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            clone = Path(td) / "clone"
+            clone.mkdir()
+            (home / "repos.json").write_text(json.dumps({"riftwing": "/tmp/rw"}) + "\n")
+            repos = install.ensure_repos(home, clone, True)
+            self.assertEqual(repos["graphwing"], str(clone))
+            self.assertEqual(repos["riftwing"], "/tmp/rw")
+            saved = json.loads((home / "repos.json").read_text())
+            self.assertEqual(saved["riftwing"], "/tmp/rw")
 
     def test_start_sh_yes_no_start_tmpdir(self):
         root = Path(__file__).resolve().parent
