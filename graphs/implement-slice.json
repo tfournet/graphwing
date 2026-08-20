@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Hard-coded: gitStatus then wait-webhook agentRun. Payload: repo, prompt.",
+  "description": "Hard-coded: gitStatus → gitCheckout → wait-webhook agentRun → gitCommit → gitPush. Payload: repo, branch, prompt, commit_message.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -75,6 +75,48 @@
           ]
         }
       },
+      {
+        "id": "commit",
+        "type": "action.graphwing.POST:/v1/git/commit",
+        "label": "gitCommit",
+        "position": { "x": 1120, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "message": "{{ CTX.INPUT.commit_message }}"
+        }
+      },
+      {
+        "id": "push",
+        "type": "action.graphwing.POST:/v1/git/push",
+        "label": "gitPush",
+        "position": { "x": 1400, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "remote": "origin",
+          "ref": "{{ CTX.INPUT.branch }}"
+        }
+      },
+      { "id": "commit_fail", "type": "action.noop", "label": "Herdr: commit failed", "position": { "x": 1120, "y": -160 }, "config": {} },
+      { "id": "push_fail", "type": "action.noop", "label": "Herdr: push failed", "position": { "x": 1400, "y": -160 }, "config": {} },
+      {
+        "id": "done",
+        "type": "transforms.objectBuilder",
+        "label": "Done",
+        "position": { "x": 1680, "y": 80 },
+        "config": {
+          "alias": "done",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
+            { "id": "m3", "output": "branch", "expression": { "kind": "getField", "path": "CTX.INPUT.branch" } }
+          ]
+        }
+      },
       { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} }
@@ -87,7 +129,12 @@
       { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
       { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
       { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
-      { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" }
+      { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" },
+      { "id": "e9", "source": "record", "sourceHandle": "out", "target": "commit", "targetHandle": "in" },
+      { "id": "e10", "source": "commit", "sourceHandle": "success", "target": "push", "targetHandle": "in" },
+      { "id": "e11", "source": "commit", "sourceHandle": "failure", "target": "commit_fail", "targetHandle": "in" },
+      { "id": "e12", "source": "push", "sourceHandle": "success", "target": "done", "targetHandle": "in" },
+      { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" }
     ]
   }
 }
