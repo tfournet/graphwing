@@ -44,6 +44,8 @@ GRAPHWING_HOME=. python3 test_server.py
 
 Runtime on zbook is `~/.graphwing`. Org wiring below is this laptop's Rewst seat, not part of install.
 
+Allowlisted clone short name `graphwing` is `/home/tim/work/graphwing` (the git repo). Do not point that name at `$GRAPHWING_HOME`. `testRun` `graphwing-compile` uses the runtime home; `catalog-compile` uses the clone.
+
 - Org: https://app.rewst.ai/orgs/tim-graphwing
 - Public API: https://graphwing.tfour.net
 - Human: `herdr --session graphwing`

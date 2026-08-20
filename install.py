@@ -107,11 +107,15 @@ def ensure_key(home: Path) -> Path:
 
 def ensure_repos(home: Path, repo_root: Path, non_interactive: bool) -> dict[str, str]:
     path = home / "repos.json"
+    repos: dict[str, str] = {}
     if path.is_file():
         data = json.loads(path.read_text())
-        if isinstance(data, dict) and data:
-            return {str(k): str(v) for k, v in data.items()}
-    repos = {"graphwing": str(repo_root)}
+        if isinstance(data, dict):
+            repos = {str(k): str(v) for k, v in data.items() if k and v}
+    dirty = False
+    if "graphwing" not in repos:
+        repos["graphwing"] = str(repo_root)
+        dirty = True
     if not non_interactive and yes("Add another allowlisted git repo?", False, False):
         while True:
             name = ask("short name (empty to finish)", "", False)
@@ -120,7 +124,9 @@ def ensure_repos(home: Path, repo_root: Path, non_interactive: bool) -> dict[str
             raw = ask(f"path for {name}", "", False)
             if raw:
                 repos[name] = raw
-    write_json(path, repos)
+                dirty = True
+    if dirty or not path.is_file():
+        write_json(path, repos)
     return repos
 
 
