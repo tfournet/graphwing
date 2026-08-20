@@ -20,6 +20,10 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is the **target repo** (usually riftwing); that repo's `AGENTS.md` applies there.
 
+## Git (tfournet/graphwing)
+
+Work on a branch. Open a PR. Rebase onto current `main` before merge. Merge the PR as part of finishing the task (`gh pr merge --rebase --delete-branch`). Do not wait for Tim to merge. Do not push commits straight to `main`.
+
 ## Tests
 
 ```bash
