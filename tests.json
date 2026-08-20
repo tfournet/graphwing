@@ -1,0 +1,18 @@
+{
+  "tests": [
+    {
+      "name": "graphwing-unit",
+      "argv": ["python3", "test_server.py"],
+      "cwd": ".",
+      "timeout_seconds": 60,
+      "async": true
+    },
+    {
+      "name": "graphwing-compile",
+      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py"],
+      "cwd": ".",
+      "timeout_seconds": 15,
+      "async": false
+    }
+  ]
+}

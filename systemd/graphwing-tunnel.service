@@ -1,0 +1,18 @@
+[Unit]
+Description=graphwing Cloudflare tunnel (graphwing.tfour.net)
+After=network-online.target graphwing-api.service
+Wants=network-online.target
+Requires=graphwing-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tim/.graphwing
+Environment=HOME=/home/tim
+ExecStart=/home/tim/.local/bin/cloudflared tunnel run --token-file /home/tim/.graphwing/cloudflared.token
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

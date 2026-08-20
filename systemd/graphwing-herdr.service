@@ -1,0 +1,14 @@
+[Unit]
+Description=Herdr named session graphwing
+After=graphwing-api.service
+
+[Service]
+Type=simple
+ExecStart=/home/tim/.local/bin/herdr --session graphwing server
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

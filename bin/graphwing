@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export HERMES_HOME="${HERMES_HOME:-/home/tim/.graphwing}"
+exec /home/tim/.local/bin/hermes "$@"

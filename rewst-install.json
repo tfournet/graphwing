@@ -1,0 +1,39 @@
+{
+  "org_id": "485bb4f1-4f83-4f81-8079-618e1139e22b",
+  "org_slug": "tim-graphwing",
+  "custom_integration_id": "9ffd3543-c444-4973-8af3-fdeb81d129e5",
+  "custom_integration_version": 5,
+  "custom_integration_version_id": "26d5b2f2-9868-4463-b0e3-f17d6384ce71",
+  "custom_integration_spec_version": "0.5.0",
+  "credential_id": "5cfdc475-114b-4347-8f5b-3ca92e4d16f1",
+  "instance_id": "5ecad4ee-9353-465e-a488-017ba6815ab2",
+  "workflow_id": "11c0052b-19c0-4876-abd1-00c76abca886",
+  "workflow_version_id": "cecd13e6-7ac7-4c7d-ae47-c60b47f7fc3d",
+  "run_id": "dd429495-5c04-4c7a-a160-a9575539bfd3",
+  "run_id_temporal": "827e23a3-e62d-4139-9a67-d364fc9ec446",
+  "wrong_endpoint_run": "dd429495-5c04-4c7a-a160-a9575539bfd3",
+  "agentrun_canary": {
+    "workflow_id": "ff52cd06-a3c1-4cbd-91fe-f834d00a2dc2",
+    "workflow_slug": "graphwing-agentrun-canary",
+    "workflow_version_id": "3815abb9-3c54-470e-94c9-34909956f538",
+    "workflow_version_number": 3,
+    "run_id": "db85e37d-2dee-43e7-9b3b-a6a984ffcf61",
+    "temporal_workflow_id": "run_db85e37d-2dee-43e7-9b3b-a6a984ffcf61",
+    "status": "completed",
+    "receipt_summary": "graph-pong"
+  },
+  "verify_stack": {
+    "workflow_id": "35493277-9d08-42f5-932c-b242364496fc",
+    "workflow_version_id": "fa5bf3fc-5365-4287-a0f1-a6f7a0c5376c",
+    "slug": "graphwing-verify-stack",
+    "run_id": "b0094cb1-75b7-4c69-8b04-ad29960442a5",
+    "status": "completed"
+  },
+  "implement_slice": {
+    "workflow_id": "5c07590a-15c7-4721-a9fa-4adb0f8ab720",
+    "workflow_version_id": "5684f3fd-ff93-48c9-9c9f-d32da6394417",
+    "slug": "graphwing-implement-slice",
+    "run_id": "9f84e50b-b205-47f5-8871-41fb998d84b7",
+    "status": "completed"
+  }
+}

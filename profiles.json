@@ -1,0 +1,12 @@
+{
+  "profiles": [
+    {
+      "id": "graphwing",
+      "kind": "home",
+      "hermes_home": ".",
+      "herdr_session": "graphwing",
+      "herdr_agent": "graphwing",
+      "runnable": true
+    }
+  ]
+}

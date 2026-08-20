@@ -1,0 +1,16 @@
+{
+  "ports": [8645, 3000, 5173, 3337, 3338, 5432, 7233],
+  "stacks": [
+    {
+      "name": "riftwing",
+      "cwd": "/home/tim/rewst/riftwing",
+      "compose_file": "docker-compose.yml",
+      "ports": [3000, 5173, 3337, 3338, 5432, 7233],
+      "health": [
+        {"name": "api", "url": "http://127.0.0.1:3000/healthz"},
+        {"name": "frontend", "url": "http://127.0.0.1:5173/"},
+        {"name": "mcp", "url": "http://127.0.0.1:3337/health"}
+      ]
+    }
+  ]
+}

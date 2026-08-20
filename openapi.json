@@ -1,0 +1,938 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "graphwing",
+
+    "description": "Local node catalog for Rewst Graph on Tim's laptop. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts, tests, and rr recipes. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Org: https://app.rewst.ai/orgs/tim-graphwing",
+    "version": "0.5.0"
+  },
+  "servers": [
+    {
+      "url": "https://graphwing.tfour.net"
+    }
+  ],
+  "tags": [
+    { "name": "health" },
+    { "name": "git" },
+    { "name": "file" },
+    { "name": "gh" },
+    { "name": "units" },
+    { "name": "herdr" },
+    { "name": "agent" },
+    { "name": "script" },
+    { "name": "stack" },
+    { "name": "port" },
+    { "name": "test" },
+    { "name": "rr" }
+  ],
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "operationId": "health",
+        "tags": ["health"],
+        "summary": "Liveness",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "tags": ["health"],
+        "summary": "This spec",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI document"
+          }
+        }
+      }
+    },
+    "/v1/git/status": {
+      "get": {
+        "operationId": "gitStatus",
+        "tags": ["git"],
+        "summary": "git status on an allowlisted repo",
+        "parameters": [{ "$ref": "#/components/parameters/repo" }],
+        "responses": {
+          "200": {
+            "description": "status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitStatus" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/diff": {
+      "get": {
+        "operationId": "gitDiff",
+        "tags": ["git"],
+        "summary": "git diff",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          {
+            "name": "ref",
+            "in": "query",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "diff",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitDiff" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/log": {
+      "get": {
+        "operationId": "gitLog",
+        "tags": ["git"],
+        "summary": "git log",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          {
+            "name": "n",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "commits",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitLog" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/branch": {
+      "get": {
+        "operationId": "gitBranch",
+        "tags": ["git"],
+        "summary": "local branches",
+        "parameters": [{ "$ref": "#/components/parameters/repo" }],
+        "responses": {
+          "200": {
+            "description": "branches",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitBranch" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/show": {
+      "get": {
+        "operationId": "gitShow",
+        "tags": ["git"],
+        "summary": "git show one object",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          {
+            "name": "rev",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "object",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitShow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/rev-parse": {
+      "get": {
+        "operationId": "gitRevParse",
+        "tags": ["git"],
+        "summary": "Resolve a rev to a sha",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "rev", "in": "query", "schema": { "type": "string", "default": "HEAD" } }
+        ],
+        "responses": {
+          "200": { "description": "sha", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GitRev" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/worktrees": {
+      "get": {
+        "operationId": "gitWorktreeList",
+        "tags": ["git"],
+        "summary": "Local git worktrees",
+        "parameters": [{ "$ref": "#/components/parameters/repo" }],
+        "responses": {
+          "200": { "description": "worktrees", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GitWorktrees" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/checkout": {
+      "post": {
+        "operationId": "gitCheckout",
+        "tags": ["git"],
+        "summary": "git checkout a named branch in an allowlisted repo. create=true runs git checkout -b. No force, no filesystem paths.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GitCheckoutRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "checked out",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitWrite" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/commit": {
+      "post": {
+        "operationId": "gitCommit",
+        "tags": ["git"],
+        "summary": "Commit in an allowlisted repo. Optional add is relative paths only. Default does not git add -A; omitted add commits already-staged files.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GitCommitRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "committed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitWrite" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/git/push": {
+      "post": {
+        "operationId": "gitPush",
+        "tags": ["git"],
+        "summary": "git push to a named remote (default origin) of current HEAD or a named ref. No --force, no delete refs, no refspecs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GitPushRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "pushed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GitWrite" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/file/head": {
+      "get": {
+        "operationId": "fileHead",
+        "tags": ["file"],
+        "summary": "Read the start of an allowlisted-repo relative file. No ..",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "text", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FileHead" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/gh/pr/list": {
+      "get": {
+        "operationId": "ghPrList",
+        "tags": ["gh"],
+        "summary": "Local gh pr list for the allowlisted repo (Tim's GitHub auth)",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "n", "in": "query", "schema": { "type": "integer", "default": 10 } },
+          { "name": "state", "in": "query", "schema": { "type": "string", "default": "open" } }
+        ],
+        "responses": {
+          "200": { "description": "prs", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/gh/pr/view": {
+      "get": {
+        "operationId": "ghPrView",
+        "tags": ["gh"],
+        "summary": "Local gh pr view --json",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "number", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "pr", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/gh/pr/checks": {
+      "get": {
+        "operationId": "ghPrChecks",
+        "tags": ["gh"],
+        "summary": "Local gh pr checks --json",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "number", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "checks", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/units/status": {
+      "get": {
+        "operationId": "unitsStatus",
+        "tags": ["units"],
+        "summary": "graphwing systemd user units",
+        "responses": {
+          "200": { "description": "units", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UnitsStatus" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/herdr/agents": {
+      "get": {
+        "operationId": "herdrAgents",
+        "tags": ["herdr"],
+        "summary": "Agents in Herdr session graphwing",
+        "responses": {
+          "200": { "description": "agents", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HerdrAgents" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/agent/profiles": {
+      "get": {
+        "operationId": "agentProfiles",
+        "tags": ["agent"],
+        "summary": "Allowlisted seats from profiles.json. ~/.hermes/profiles is not dumped.",
+        "responses": {
+          "200": {
+            "description": "profiles",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentProfiles" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/agent/run": {
+      "post": {
+        "operationId": "agentRun",
+        "tags": ["agent"],
+        "summary": "Queue one bounded Hermes loop. Returns 202 + job_id; does not block.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AgentRunRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "queued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentRunAccepted" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "501": {
+            "description": "spawn failed closed (hermes binary missing)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/jobs/{job_id}": {
+      "get": {
+        "operationId": "agentJob",
+        "tags": ["agent"],
+        "summary": "Poll one agent job. Receipt is artifacts, not a transcript.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "job",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentJob" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/script/run": {
+      "post": {
+        "operationId": "scriptRun",
+        "tags": ["script"],
+        "summary": "Run one scripts.json entry by name. No free-form argv. async or timeout_seconds>25 returns 202 + job_id and POSTs an artifact receipt to response_webhook_url.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ScriptRunRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "sync result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ScriptRunResult" }
+              }
+            }
+          },
+          "202": {
+            "description": "queued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ScriptRunAccepted" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "501": {
+            "description": "spawn failed closed (binary missing)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/stack/status": {
+      "get": {
+        "operationId": "stackStatus",
+        "tags": ["stack"],
+        "summary": "Podman compose snapshot + loopback health probes for an allowlisted stack. No secrets.",
+        "parameters": [
+          { "name": "stack", "in": "query", "schema": { "type": "string", "default": "riftwing" } }
+        ],
+        "responses": {
+          "200": { "description": "snapshot", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StackStatus" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/port/check": {
+      "get": {
+        "operationId": "portCheck",
+        "tags": ["port"],
+        "summary": "Whether allowlisted host ports are listening (ss). No arbitrary port scan.",
+        "parameters": [
+          { "name": "port", "in": "query", "schema": { "type": "string" }, "description": "One port or comma-separated list from stacks.json allowlist." },
+          { "name": "ports", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "listen state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortCheck" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/test/run": {
+      "post": {
+        "operationId": "testRun",
+        "tags": ["test"],
+        "summary": "Run one tests.json recipe by name. No free-form argv. Long recipes return 202 + job_id.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "sync result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunResult" } } } },
+          "202": { "description": "queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunAccepted" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/rr/run": {
+      "post": {
+        "operationId": "rrRun",
+        "tags": ["rr"],
+        "summary": "Run one rr.json recipe (status/doctor). No free-form rr run command.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "sync result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunResult" } } } },
+          "202": { "description": "queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunAccepted" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Graphwing-Key"
+      }
+    },
+    "parameters": {
+      "repo": {
+        "name": "repo",
+        "in": "query",
+        "description": "Allowlisted short name, not a filesystem path. Default riftwing.",
+        "schema": { "type": "string", "default": "riftwing" }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "service": { "type": "string" },
+          "repos": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "StackStatus": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "stack": { "type": "string" },
+          "cwd": { "type": "string" },
+          "healthy": { "type": "boolean" },
+          "containers": { "type": "array", "items": { "type": "object" } },
+          "health": { "type": "array", "items": { "type": "object" } },
+          "compose_ok": { "type": "boolean" }
+        }
+      },
+      "PortCheck": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "port": { "type": "integer" },
+                "listening": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      },
+      "GitStatus": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "dirty": { "type": "boolean" },
+          "entries": { "type": "array", "items": { "type": "string" } },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "GitDiff": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "diff": { "type": "string" },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "GitLog": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "commits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sha": { "type": "string" },
+                "author": { "type": "string" },
+                "date": { "type": "string" },
+                "subject": { "type": "string" }
+              }
+            }
+          },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "GitBranch": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "current": { "type": "string" },
+          "branches": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "GitShow": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "rev": { "type": "string" },
+          "show": { "type": "string" },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "GitRev": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "rev": { "type": "string" },
+          "sha": { "type": "string" }
+        }
+      },
+      "GitWorktrees": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "worktrees": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "GitCheckoutRequest": {
+        "type": "object",
+        "required": ["repo", "branch"],
+        "properties": {
+          "repo": { "type": "string", "description": "Allowlisted short name, not a filesystem path." },
+          "branch": { "type": "string", "description": "Branch name. Rejected if it looks like a path." },
+          "create": { "type": "boolean", "default": false, "description": "If true, git checkout -b. Not git checkout -B." }
+        }
+      },
+      "GitCommitRequest": {
+        "type": "object",
+        "required": ["repo", "message"],
+        "properties": {
+          "repo": { "type": "string", "description": "Allowlisted short name, not a filesystem path." },
+          "message": { "type": "string", "description": "Commit message. Empty refused." },
+          "add": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional relative paths to git add. Omitted: commit already-staged files only. No .. or absolute paths. Default does not add -A."
+          }
+        }
+      },
+      "GitPushRequest": {
+        "type": "object",
+        "required": ["repo"],
+        "properties": {
+          "repo": { "type": "string", "description": "Allowlisted short name, not a filesystem path." },
+          "remote": { "type": "string", "default": "origin", "description": "Named remote already on the repo. Not a URL. Not --force." },
+          "ref": { "type": "string", "description": "HEAD if omitted. No +, no :, no delete, no force." }
+        }
+      },
+      "GitWrite": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "stdout": { "type": "string" },
+          "stderr": { "type": "string" },
+          "truncated": { "type": "boolean" },
+          "returncode": { "type": "integer" }
+        }
+      },
+      "ScriptRunRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "description": "scripts.json name only. No client argv." },
+          "response_webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "https URL from action.wait.webhook pending.resumeUrl. Used when the script is async."
+          },
+          "response_webhook_token": {
+            "type": "string",
+            "description": "From action.wait.webhook pending.resumeToken. Sent as X-Rewst-Token on the callback."
+          }
+        }
+      },
+      "ScriptRunResult": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "name": { "type": "string" },
+          "returncode": { "type": "integer" },
+          "stdout": { "type": "string" },
+          "stderr": { "type": "string" },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "ScriptRunAccepted": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "job_id": { "type": "string" },
+          "status": { "type": "string" },
+          "name": { "type": "string" },
+          "poll": { "type": "string" }
+        }
+      },
+      "FileHead": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "path": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "truncated": { "type": "boolean" },
+          "text": { "type": "string" }
+        }
+      },
+      "GhData": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "data": {}
+        }
+      },
+      "UnitsStatus": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "healthy": { "type": "boolean" },
+          "units": { "type": "object" }
+        }
+      },
+      "HerdrAgents": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "session": { "type": "string" },
+          "agents": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "AgentRunRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+          "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
+          "prompt": { "type": "string", "description": "One job. Graph owns topology." },
+          "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
+          "response_webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "https URL from action.wait.webhook pending.resumeUrl. POSTed the bounded receipt when the job finishes."
+          },
+          "response_webhook_token": {
+            "type": "string",
+            "description": "From action.wait.webhook pending.resumeToken. Sent as X-Rewst-Token on the callback. Default wait-webhook auth is token."
+          },
+          "resume_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Deprecated alias for response_webhook_url."
+          }
+        }
+      },
+      "AgentRunAccepted": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "job_id": { "type": "string" },
+          "status": { "type": "string" },
+          "profile": { "type": "string" },
+          "repo": { "type": "string" },
+          "poll": { "type": "string" }
+        }
+      },
+      "AgentProfiles": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "kind": { "type": "string" },
+                "hermes_home": { "type": "string" },
+                "herdr_session": { "type": "string" },
+                "herdr_agent": { "type": "string" },
+                "runnable": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      },
+      "AgentReceipt": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
+          "job_id": { "type": "string" },
+          "profile": { "type": "string" },
+          "sha": { "type": ["string", "null"] },
+          "pr_url": { "type": ["string", "null"] },
+          "log_ref": { "type": "string" },
+          "summary": { "type": ["string", "null"] }
+        }
+      },
+      "AgentJob": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "job_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
+          "profile": { "type": "string" },
+          "repo": { "type": "string" },
+          "cwd": { "type": "string" },
+          "prompt": { "type": "string" },
+          "created_at": { "type": "string" },
+          "started_at": { "type": ["string", "null"] },
+          "finished_at": { "type": ["string", "null"] },
+          "receipt": { "oneOf": [ { "$ref": "#/components/schemas/AgentReceipt" }, { "type": "null" } ] },
+          "log_ref": { "type": "string" },
+          "error": { "type": ["string", "null"] },
+          "webhook": { "type": ["object", "null"] }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "client error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "missing or invalid API key",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    { "apiKeyHeader": [] }
+  ]
+}
