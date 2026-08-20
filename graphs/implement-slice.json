@@ -18,6 +18,19 @@
         }
       },
       {
+        "id": "checkout",
+        "type": "action.graphwing.POST:/v1/git/checkout",
+        "label": "gitCheckout",
+        "position": { "x": 420, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "branch": "{{ CTX.INPUT.branch }}",
+          "create": false
+        }
+      },
+      {
         "id": "wait",
         "type": "action.wait.webhook",
         "label": "Wait for agent receipt",
@@ -63,15 +76,18 @@
         }
       },
       { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
-      { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} }
+      { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
+      { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} }
     ],
     "edges": [
       { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
-      { "id": "e2", "source": "git", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e2", "source": "git", "sourceHandle": "success", "target": "checkout", "targetHandle": "in" },
       { "id": "e3", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
       { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
       { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
-      { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" }
+      { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
+      { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" }
     ]
   }
 }
