@@ -6,7 +6,7 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 - Graph in org **tim-graphwing** owns topology. graphwing exposes named OpenAPI ops. `agentRun` is one bounded job.
 - Prefer a new deterministic op over an agent loop. New workflow JSON only when **edges** change; loop iterations are run `input`.
 - Laptop-only: git, local `gh`, file head, units, Herdr, allowlisted scripts/tests. Cloud GitHub/Shortcut stay Rewst integrations.
-- Clean machine: `./start.sh`. Optionally grabs Hermes Agent / herdr / cloudflared. `rr` and a named tunnel are not assumed.
+- Clean machine: `./start.sh`. Optionally grabs Hermes Agent / herdr / cloudflared. `rr` is a drop-in `rr.json` plugin if you already have the binary; tests stay local (`testRun` / `test_server.py`).
 - Do not install this on Rewst Internal. Do not ship as a platform package.
 
 ## Where to edit

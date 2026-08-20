@@ -754,22 +754,6 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "argv_forbidden")
 
-    def test_rr_run_status(self):
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/rr/run", {}, True, b'{"name":"status"}'
-        )
-        self.assertIn(status, (200, 400, 501), payload)
-        if status == 200:
-            self.assertEqual(payload["kind"], "rr")
-            self.assertIn("zafedora", payload.get("stdout") or "")
-
-    def test_rr_run_unknown(self):
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/rr/run", {}, True, b'{"name":"make-test"}'
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_rr")
-
     def test_rr_not_configured(self):
         with mock.patch.object(server, "RR_PATH", Path("/nope/rr.json")):
             status, payload, _ = server.dispatch(
@@ -777,6 +761,37 @@ class DispatchTests(unittest.TestCase):
             )
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "not_configured")
+
+    def test_rr_plugin_local_recipe(self):
+        with tempfile.TemporaryDirectory() as td:
+            recipes = Path(td) / "rr.json"
+            recipes.write_text(
+                json.dumps(
+                    {
+                        "recipes": [
+                            {
+                                "name": "echo",
+                                "argv": ["python3", "-c", "print('plugin-ok')"],
+                                "cwd": ".",
+                                "timeout_seconds": 10,
+                                "async": False,
+                            }
+                        ]
+                    }
+                )
+            )
+            with mock.patch.object(server, "RR_PATH", recipes):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/rr/run", {}, True, b'{"name":"echo"}'
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(payload["kind"], "rr")
+                self.assertIn("plugin-ok", payload.get("stdout") or "")
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/rr/run", {}, True, b'{"name":"make-test"}'
+                )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["code"], "unknown_rr")
 
     def test_stack_not_configured(self):
         with mock.patch.object(server, "STACKS_PATH", Path("/nope/stacks.json")):
@@ -838,6 +853,7 @@ class InstallTests(unittest.TestCase):
             self.assertIn("graphwing", repos)
             self.assertTrue(Path(repos["graphwing"]).is_dir())
             self.assertFalse((home / "rr.json").exists())
+            self.assertTrue((home / "rr.example.json").is_file())
             stacks = json.loads((home / "stacks.json").read_text())
             self.assertEqual(stacks["stacks"][0]["name"], "graphwing")
             api_unit = (units / "graphwing-api.service").read_text()
@@ -879,6 +895,7 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((home / "server.py").is_file())
             self.assertTrue((home / "api.key").read_text().strip())
             self.assertFalse((home / "rr.json").exists())
+            self.assertTrue((home / "rr.example.json").is_file())
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertIn("not starting", proc.stdout)
             self.assertNotIn("installing Hermes", proc.stdout)

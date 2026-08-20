@@ -3,7 +3,7 @@
   "info": {
     "title": "graphwing",
 
-    "description": "Local node catalog for Rewst Graph on Tim's laptop. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts, tests, and rr recipes. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Org: https://app.rewst.ai/orgs/tim-graphwing",
+    "description": "Local node catalog for Rewst Graph on Tim's laptop. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Org: https://app.rewst.ai/orgs/tim-graphwing",
     "version": "0.5.0"
   },
   "servers": [
@@ -563,7 +563,7 @@
       "post": {
         "operationId": "rrRun",
         "tags": ["rr"],
-        "summary": "Run one rr.json recipe (status/doctor). No free-form rr run command.",
+        "summary": "Optional plugin: run one rr.json recipe if present. 501 not_configured otherwise. No free-form rr run.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunRequest" } } }

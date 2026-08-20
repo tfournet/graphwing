@@ -14,7 +14,7 @@ cd graphwing
 ./start.sh
 ```
 
-`start.sh` optionally installs Hermes Agent (`agentRun`), herdr, and cloudflared, writes `$GRAPHWING_HOME`, and starts the API in this terminal. It does not copy secrets from another home. `rr` is not installed.
+`start.sh` optionally installs Hermes Agent (`agentRun`), herdr, and cloudflared, writes `$GRAPHWING_HOME`, and starts the API in this terminal. It does not copy secrets from another home. It does not install `rr`.
 
 One-liner (non-interactive, loopback only, no extras):
 
@@ -32,8 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/tfournet/graphwing/main/start.sh | 
 
 - **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Send header `X-Graphwing-Key`.
 - **Named-tunnel credentials:** `$GRAPHWING_HOME/cloudflared.token`, or `$GRAPHWING_HOME/tunnel.env` / `GRAPHWING_CF_API_KEY` for `setup_tunnel.py`. See `examples/tunnel.env.example`.
-- **`repos.json` / `stacks.json` / `rr.json`:** local config under `$GRAPHWING_HOME`, not compiled into `server.py`. The copies in this repo are the zbook test checkout; install writes machine-local files instead of copying them.
-- **`rr`:** optional. Skip the wizard step or omit `rr.json`. `POST /v1/rr/run` is `501 not_configured` when unset.
+- **`repos.json` / `stacks.json`:** local config under `$GRAPHWING_HOME`, not compiled into `server.py`.
+- **`rr`:** plugin, not an install. If you already have `rr`, copy `examples/rr.example.json` to `$GRAPHWING_HOME/rr.json` and point `cwd` at an allowlisted repo. Graphwing never installs the binary. No `rr.json` → `POST /v1/rr/run` is `501 not_configured`. Default tests are local (`tests.json` / `python3 test_server.py`), not `rrRun`.
 - **Tunnel:** default is none (loopback `127.0.0.1:8645`). `demo` is a Cloudflare quick tunnel (`*.trycloudflare.com`, hostname rotates — fine for a short Rewst demo, not a saved integration). `named` is opt-in. Rewst Graph SSRF-blocks loopback, RFC1918, and Tailscale, so a stable public hostname is still required for a saved cloud Graph integration.
 
 ```bash
@@ -54,7 +54,7 @@ Graph uses named OpenAPI actions, not a mega-agent. Prefer a new deterministic o
 
 `POST /v1/agent/run` queues one bounded Hermes loop (`HERMES_HOME=$GRAPHWING_HOME`, max 30 turns / 300s) and returns 202 + `job_id`. Graph join: `action.wait.webhook` pending → pass `response_webhook_url` (`resumeUrl`) and `response_webhook_token` (`resumeToken`); graphwing POSTs the receipt with `X-Rewst-Token`. Poll `GET /v1/agent/jobs/{job_id}` is optional. v0.4 seat is `graphwing` home only (`profiles.json` allowlist; `~/.hermes/profiles` is not dumped).
 
-Git writes are opt-in Graph ops on allowlisted repo short names: `gitCheckout`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless staged/add paths are explicit. `POST /v1/script/run` runs `scripts.json` names only. Deterministic stack ops: `stackStatus`, `portCheck`, `testRun` (`tests.json`), `rrRun` (`rr.json` recipes only — no free-form `rr run`). A Rewst PR-driver is a Graph sub-workflow of these nodes (`gitStatus` → `ghPrChecks` → `testRun` / `rrRun` → optional `agentRun` + wait-webhook), not one agent loop.
+Git writes are opt-in Graph ops on allowlisted repo short names: `gitCheckout`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless staged/add paths are explicit. `POST /v1/script/run` runs `scripts.json` names only. Deterministic stack ops: `stackStatus`, `portCheck`, `testRun` (`tests.json`). `rrRun` is an optional plugin when `rr.json` is present. A Rewst PR-driver is a Graph sub-workflow of these nodes (`gitStatus` → `ghPrChecks` → `testRun` → optional `agentRun` + wait-webhook), not one agent loop.
 
 Laptop-only here: git, local `gh`, file head, units, Herdr, allowlisted scripts, one-job agent loops. Cloud GitHub/Shortcut stay Rewst integrations — do not duplicate them on this host.
 
