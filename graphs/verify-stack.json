@@ -1,0 +1,54 @@
+{
+  "slug": "graphwing-verify-stack",
+  "name": "graphwing-verify-stack",
+  "description": "Hard-coded: stackStatus then portCheck. Payload: stack, ports.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 80 }, "config": {} },
+      {
+        "id": "stack",
+        "type": "action.graphwing.GET:/v1/stack/status",
+        "label": "stackStatus",
+        "position": { "x": 280, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "stack": "{{ CTX.INPUT.stack }}"
+        }
+      },
+      {
+        "id": "ports",
+        "type": "action.graphwing.GET:/v1/port/check",
+        "label": "portCheck",
+        "position": { "x": 560, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 15,
+          "port": "{{ CTX.INPUT.ports }}",
+          "ports": "{{ CTX.INPUT.ports }}"
+        }
+      },
+      {
+        "id": "record",
+        "type": "transforms.objectBuilder",
+        "label": "Snapshot",
+        "position": { "x": 840, "y": 80 },
+        "config": {
+          "alias": "snapshot",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "stack", "expression": { "kind": "getField", "path": "TASKS.stack.stack" } },
+            { "id": "m2", "output": "healthy", "expression": { "kind": "getField", "path": "TASKS.stack.healthy" } },
+            { "id": "m3", "output": "ports", "expression": { "kind": "getField", "path": "TASKS.ports.ports" } }
+          ]
+        }
+      }
+    ],
+    "edges": [
+      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "stack", "targetHandle": "in" },
+      { "id": "e2", "source": "stack", "sourceHandle": "success", "target": "ports", "targetHandle": "in" },
+      { "id": "e3", "source": "ports", "sourceHandle": "success", "target": "record", "targetHandle": "in" }
+    ]
+  }
+}

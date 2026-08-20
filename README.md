@@ -35,6 +35,8 @@ API key: `~/.graphwing/api.key` (header `X-Graphwing-Key`). Health and `/openapi
 - Agent canary: `graphwing-agentrun-canary` (manual → wait.webhook pending → agentRun → resume receipt)
 - `graphwing-verify-stack` — payload `{input:{stack,ports}}` → stackStatus → portCheck
 - `graphwing-implement-slice` — payload `{input:{repo,prompt}}` → gitStatus → wait.webhook → agentRun → receipt
+- `graphwing-pr-drive` — payload `{input:{repo,pr,test,prompt}}`. `gitStatus` → `ghPrView` → `ghPrChecks`. Green → done. Red → named `testRun` (sync recipe) → one implement-slice (`wait` + `agentRun`) → checks again. Missing PR / pending / test fail / still red → Herdr noop. Specs in `graphs/`.
 - Start a run: `POST /api/workflows/{slug}/run` with `{ "input": { ... } }` (that JSON is the start webhook body). Resume is a different POST to `response_webhook_url`.
+- `ghPrChecks` HTTP 200 means `gh` ran. Graph gates on `data.all_green` / `data.any_red`, not an agent reading the transcript.
 
 Do not install this on Rewst Internal. Do not ship as a platform package.

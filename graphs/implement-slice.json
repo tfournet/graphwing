@@ -1,0 +1,77 @@
+{
+  "slug": "graphwing-implement-slice",
+  "name": "graphwing-implement-slice",
+  "description": "Hard-coded: gitStatus then wait-webhook agentRun. Payload: repo, prompt.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 80 }, "config": {} },
+      {
+        "id": "git",
+        "type": "action.graphwing.GET:/v1/git/status",
+        "label": "gitStatus before",
+        "position": { "x": 280, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}"
+        }
+      },
+      {
+        "id": "wait",
+        "type": "action.wait.webhook",
+        "label": "Wait for agent receipt",
+        "position": { "x": 560, "y": 80 },
+        "config": {
+          "alias": "wait",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 300
+        }
+      },
+      {
+        "id": "agent",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "agentRun",
+        "position": { "x": 840, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "prompt": "{{ CTX.INPUT.prompt }}",
+          "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "record",
+        "type": "transforms.objectBuilder",
+        "label": "Receipt",
+        "position": { "x": 840, "y": 80 },
+        "config": {
+          "alias": "receipt",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "summary", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.summary" } },
+            { "id": "m2", "output": "status", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.status" } },
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
+            { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
+            { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
+            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } }
+          ]
+        }
+      },
+      { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
+      { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} }
+    ],
+    "edges": [
+      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e2", "source": "git", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e3", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
+      { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
+      { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
+      { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" }
+    ]
+  }
+}

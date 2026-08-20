@@ -1,0 +1,229 @@
+{
+  "slug": "graphwing-pr-drive",
+  "name": "graphwing-pr-drive",
+  "description": "Hard-coded PR driver: gitStatus → ghPrChecks. Green is done. Red → named testRun → one implement-slice (wait+agentRun) → checks again. Pending / missing PR / still red → Herdr noop. One retry is an edge, not a loop. Payload: repo, pr, test, prompt.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 240 }, "config": {} },
+      {
+        "id": "git",
+        "type": "action.graphwing.GET:/v1/git/status",
+        "label": "gitStatus",
+        "position": { "x": 220, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}"
+        }
+      },
+      {
+        "id": "view",
+        "type": "action.graphwing.GET:/v1/gh/pr/view",
+        "label": "ghPrView",
+        "position": { "x": 440, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "number": "{{ CTX.INPUT.pr }}"
+        }
+      },
+      {
+        "id": "checks",
+        "type": "action.graphwing.GET:/v1/gh/pr/checks",
+        "label": "ghPrChecks",
+        "position": { "x": 660, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "number": "{{ CTX.INPUT.pr }}"
+        }
+      },
+      {
+        "id": "if_green",
+        "type": "logic.filter",
+        "label": "all_green?",
+        "position": { "x": 880, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "done_green",
+        "type": "transforms.objectBuilder",
+        "label": "Done (checks green)",
+        "position": { "x": 1100, "y": 80 },
+        "config": {
+          "alias": "done",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "checks_green" } },
+            { "id": "m3", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
+            { "id": "m4", "output": "pr", "expression": { "kind": "getField", "path": "CTX.INPUT.pr" } }
+          ]
+        }
+      },
+      {
+        "id": "if_red",
+        "type": "logic.filter",
+        "label": "any_red?",
+        "position": { "x": 1100, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.any_red", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "test",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "testRun",
+        "position": { "x": 1320, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_test_ok",
+        "type": "logic.filter",
+        "label": "test ok?",
+        "position": { "x": 1540, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "wait",
+        "type": "action.wait.webhook",
+        "label": "Wait for agent receipt",
+        "position": { "x": 1760, "y": 240 },
+        "config": {
+          "alias": "wait",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 300
+        }
+      },
+      {
+        "id": "agent",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "implement-slice agentRun",
+        "position": { "x": 1980, "y": 400 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "prompt": "{{ CTX.INPUT.prompt }}",
+          "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "receipt",
+        "type": "transforms.objectBuilder",
+        "label": "Receipt",
+        "position": { "x": 1980, "y": 240 },
+        "config": {
+          "alias": "receipt",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.status" } },
+            { "id": "m2", "output": "summary", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.summary" } },
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
+            { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } }
+          ]
+        }
+      },
+      {
+        "id": "if_receipt_ok",
+        "type": "logic.filter",
+        "label": "receipt ok?",
+        "position": { "x": 2200, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "status", "op": "equals", "value": "ok" }]
+        }
+      },
+      {
+        "id": "checks2",
+        "type": "action.graphwing.GET:/v1/gh/pr/checks",
+        "label": "ghPrChecks after fix",
+        "position": { "x": 2420, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "number": "{{ CTX.INPUT.pr }}"
+        }
+      },
+      {
+        "id": "if_green2",
+        "type": "logic.filter",
+        "label": "all_green after fix?",
+        "position": { "x": 2640, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "done_after_fix",
+        "type": "transforms.objectBuilder",
+        "label": "Done after one fix",
+        "position": { "x": 2860, "y": 80 },
+        "config": {
+          "alias": "done",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "checks_green_after_fix" } },
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.receipt.job_id" } }
+          ]
+        }
+      },
+      { "id": "herdr_no_pr", "type": "action.noop", "label": "Herdr: missing PR", "position": { "x": 660, "y": 480 }, "config": {} },
+      { "id": "herdr_git", "type": "action.noop", "label": "Herdr: gitStatus failed", "position": { "x": 440, "y": 480 }, "config": {} },
+      { "id": "herdr_checks", "type": "action.noop", "label": "Herdr: checks HTTP failed", "position": { "x": 880, "y": 480 }, "config": {} },
+      { "id": "herdr_pending", "type": "action.noop", "label": "Herdr: checks pending", "position": { "x": 1320, "y": 480 }, "config": {} },
+      { "id": "herdr_test", "type": "action.noop", "label": "Herdr: testRun failed", "position": { "x": 1540, "y": 480 }, "config": {} },
+      { "id": "herdr_wait", "type": "action.noop", "label": "Herdr: agent wait timeout/fail", "position": { "x": 1980, "y": 40 }, "config": {} },
+      { "id": "herdr_receipt", "type": "action.noop", "label": "Herdr: receipt not ok", "position": { "x": 2200, "y": 480 }, "config": {} },
+      { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 2860, "y": 240 }, "config": {} }
+    ],
+    "edges": [
+      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e2", "source": "git", "sourceHandle": "success", "target": "view", "targetHandle": "in" },
+      { "id": "e2f", "source": "git", "sourceHandle": "failure", "target": "herdr_git", "targetHandle": "in" },
+      { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
+      { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
+      { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "if_green", "targetHandle": "in" },
+      { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks", "targetHandle": "in" },
+      { "id": "e5", "source": "if_green", "sourceHandle": "pass", "target": "done_green", "targetHandle": "in" },
+      { "id": "e6", "source": "if_green", "sourceHandle": "fail", "target": "if_red", "targetHandle": "in" },
+      { "id": "e7", "source": "if_red", "sourceHandle": "pass", "target": "test", "targetHandle": "in" },
+      { "id": "e8", "source": "if_red", "sourceHandle": "fail", "target": "herdr_pending", "targetHandle": "in" },
+      { "id": "e9", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
+      { "id": "e9f", "source": "test", "sourceHandle": "failure", "target": "herdr_test", "targetHandle": "in" },
+      { "id": "e10", "source": "if_test_ok", "sourceHandle": "pass", "target": "wait", "targetHandle": "in" },
+      { "id": "e11", "source": "if_test_ok", "sourceHandle": "fail", "target": "herdr_test", "targetHandle": "in" },
+      { "id": "e12", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
+      { "id": "e13", "source": "wait", "sourceHandle": "out", "target": "receipt", "targetHandle": "in" },
+      { "id": "e14", "source": "wait", "sourceHandle": "timeout", "target": "herdr_wait", "targetHandle": "in" },
+      { "id": "e15", "source": "wait", "sourceHandle": "failure", "target": "herdr_wait", "targetHandle": "in" },
+      { "id": "e16", "source": "receipt", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
+      { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "checks2", "targetHandle": "in" },
+      { "id": "e18", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "herdr_receipt", "targetHandle": "in" },
+      { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
+      { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks", "targetHandle": "in" },
+      { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "done_after_fix", "targetHandle": "in" },
+      { "id": "e21", "source": "if_green2", "sourceHandle": "fail", "target": "herdr_budget", "targetHandle": "in" }
+    ]
+  }
+}
