@@ -32,7 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/tfournet/graphwing/main/start.sh | 
 
 - **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Send header `X-Graphwing-Key`.
 - **Named-tunnel credentials:** `$GRAPHWING_HOME/cloudflared.token`, or `$GRAPHWING_HOME/tunnel.env` / `GRAPHWING_CF_API_KEY` for `setup_tunnel.py`. See `examples/tunnel.env.example`.
-- **`repos.json` / `stacks.json`:** local config under `$GRAPHWING_HOME`, not compiled into `server.py`.
+- **`repos.json`:** empty in git. The wizard (or `install.py --repo name=/path`) writes short names on the machine. Example shape: `examples/repos.example.json`. Never commit laptop clones.
+- **`stacks.json`:** local stack list; install writes a graphwing loopback stack if missing.
 - **`rr`:** plugin, not an install. If you already have `rr`, copy `examples/rr.example.json` to `$GRAPHWING_HOME/rr.json` and point `cwd` at an allowlisted repo. Graphwing never installs the binary. No `rr.json` → `POST /v1/rr/run` is `501 not_configured`. Default tests are local (`tests.json` / `python3 test_server.py`), not `rrRun`.
 - **Tunnel:** default is none (loopback `127.0.0.1:8645`). `demo` is a Cloudflare quick tunnel (`*.trycloudflare.com`, hostname rotates — fine for a short Rewst demo, not a saved integration). `named` is opt-in. Rewst Graph SSRF-blocks loopback, RFC1918, and Tailscale, so a stable public hostname is still required for a saved cloud Graph integration.
 
@@ -43,8 +44,6 @@ GRAPHWING_HOME=. python3 test_server.py
 ## zbook seat (example)
 
 Runtime on zbook is `~/.graphwing`. Org wiring below is this laptop's Rewst seat, not part of install.
-
-Allowlisted clone short name `graphwing` is `/home/tim/work/graphwing` (the git repo). Do not point that name at `$GRAPHWING_HOME`. `testRun` `graphwing-compile` uses the runtime home; `catalog-compile` uses the clone.
 
 - Org: https://app.rewst.ai/orgs/tim-graphwing
 - Public API: https://graphwing.tfour.net

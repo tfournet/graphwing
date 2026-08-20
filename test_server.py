@@ -15,12 +15,35 @@ import server  # noqa: E402
 
 
 class DispatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._scratch_td = tempfile.TemporaryDirectory()
+        root = Path(cls._scratch_td.name)
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "gw@test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "graphwing-test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, capture_output=True)
+        (repo / "README").write_text("hi\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+        cls.scratch = repo
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._scratch_td.cleanup()
+
+    def setUp(self):
+        p = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.scratch)})
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_health_no_auth(self):
         status, payload, _ = server.dispatch("GET", "/v1/health", {}, False, b"")
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
-        self.assertIn("riftwing", payload["repos"])
-        self.assertIn("graphwing", payload["repos"])
+        self.assertIsInstance(payload["repos"], list)
 
     def test_git_requires_key(self):
         status, payload, _ = server.dispatch("GET", "/v1/git/status", {}, False, b"")
@@ -32,38 +55,36 @@ class DispatchTests(unittest.TestCase):
             "GET", "/v1/git/status", {"repo": ["nope"]}, True, b""
         )
         self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_repo")
+        self.assertIn(payload["code"], ("unknown_repo", "no_repos"))
 
-    def test_status_riftwing(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/git/status", {"repo": ["riftwing"]}, True, b""
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["repo"], "riftwing")
-        self.assertIn("branch", payload)
+    def test_status_scratch_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/git/status", {"repo": ["scratch"]}, True, b""
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["repo"], "scratch")
+            self.assertIn("branch", payload)
 
-    def test_status_graphwing_clone(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/git/status", {"repo": ["graphwing"]}, True, b""
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["repo"], "graphwing")
-        self.assertIn("branch", payload)
+    def test_log_scratch_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/git/log", {"repo": ["scratch"], "n": ["2"]}, True, b""
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["commits"])
+            self.assertIn("sha", payload["commits"][0])
 
-    def test_log_riftwing(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/git/log", {"repo": ["riftwing"], "n": ["2"]}, True, b""
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["commits"])
-        self.assertIn("sha", payload["commits"][0])
-
-    def test_branch_riftwing(self):
-        status, payload, _ = server.dispatch("GET", "/v1/git/branch", {}, True, b"")
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["current"])
+    def test_branch_default_no_repos(self):
+        with mock.patch.object(server, "load_repos", return_value={}):
+            status, payload, _ = server.dispatch("GET", "/v1/git/branch", {}, True, b"")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "no_repos")
 
     def test_show_requires_rev(self):
         status, payload, _ = server.dispatch("GET", "/v1/git/show", {}, True, b"")
@@ -71,11 +92,14 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(payload["code"], "missing_rev")
 
     def test_show_head(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/git/show", {"rev": ["HEAD"]}, True, b""
-        )
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["show"])
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/git/show", {"repo": ["scratch"], "rev": ["HEAD"]}, True, b""
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["show"])
 
     def test_agent_profiles(self):
         status, payload, _ = server.dispatch("GET", "/v1/agent/profiles", {}, True, b"")
@@ -140,21 +164,23 @@ class DispatchTests(unittest.TestCase):
 
     def test_agent_run_accepted(self):
         with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
-            with mock.patch.object(server, "JOBS_DIR", jobs):
-                with mock.patch.object(server, "enqueue_agent", lambda job: None):
-                    status, payload, _ = server.dispatch(
-                        "POST",
-                        "/v1/agent/run",
-                        {},
-                        True,
-                        b'{"prompt":"ping","cwd":"riftwing"}',
-                    )
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "JOBS_DIR", jobs):
+                    with mock.patch.object(server, "enqueue_agent", lambda job: None):
+                        status, payload, _ = server.dispatch(
+                            "POST",
+                            "/v1/agent/run",
+                            {},
+                            True,
+                            b'{"prompt":"ping","cwd":"scratch"}',
+                        )
             self.assertEqual(status, 202, payload)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["status"], "queued")
             self.assertEqual(payload["profile"], "graphwing")
-            self.assertEqual(payload["repo"], "riftwing")
+            self.assertEqual(payload["repo"], "scratch")
             job_id = payload["job_id"]
             self.assertRegex(job_id, r"^[0-9a-f]{32}$")
             self.assertEqual(payload["poll"], f"/v1/agent/jobs/{job_id}")
@@ -370,7 +396,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_file_head(self):
         status, payload, _ = server.dispatch(
-            "GET", "/v1/file/head", {"path": ["README.md"]}, True, b""
+            "GET", "/v1/file/head", {"path": ["README"]}, True, b""
         )
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["text"])
@@ -705,20 +731,23 @@ class DispatchTests(unittest.TestCase):
 
     def test_herdr_disabled_skips_log(self):
         with mock.patch.object(server, "herdr_log") as log:
-            server.dispatch("GET", "/v1/git/status", {"repo": ["riftwing"]}, True, b"")
+            server.dispatch("GET", "/v1/git/status", {"repo": ["nope"]}, True, b"")
         log.assert_not_called()
 
     def test_herdr_announce_git_status(self):
         os.environ["GRAPHWING_HERDR"] = "1"
         self.addCleanup(lambda: os.environ.__setitem__("GRAPHWING_HERDR", "0"))
-        with mock.patch.object(server, "herdr_log") as log:
-            server.dispatch("GET", "/v1/git/status", {"repo": ["riftwing"]}, True, b"")
-            for _ in range(40):
-                if log.called:
-                    break
-                __import__("time").sleep(0.05)
-        self.assertTrue(log.called)
-        self.assertIn("/v1/git/status", log.call_args[0][0])
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "herdr_log") as log:
+                    server.dispatch("GET", "/v1/git/status", {"repo": ["scratch"]}, True, b"")
+                    for _ in range(40):
+                        if log.called:
+                            break
+                        __import__("time").sleep(0.05)
+                    self.assertTrue(log.called)
+                    self.assertIn("/v1/git/status", log.call_args[0][0])
 
     def test_herdr_skips_health(self):
         os.environ["GRAPHWING_HERDR"] = "1"
@@ -728,11 +757,11 @@ class DispatchTests(unittest.TestCase):
             __import__("time").sleep(0.15)
         log.assert_not_called()
 
-    def test_stack_status_riftwing(self):
+    def test_stack_status_default(self):
         status, payload, _ = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["stack"], "riftwing")
+        self.assertEqual(payload["stack"], "graphwing")
         self.assertIn("containers", payload)
         self.assertIn("health", payload)
 
@@ -874,8 +903,8 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(key)
             self.assertEqual((home / "api.key").stat().st_mode & 0o777, 0o600)
             repos = json.loads((home / "repos.json").read_text())
-            self.assertIn("graphwing", repos)
-            self.assertTrue(Path(repos["graphwing"]).is_dir())
+            self.assertEqual(repos, {})
+            self.assertTrue((home / "repos.example.json").is_file())
             self.assertFalse((home / "rr.json").exists())
             self.assertTrue((home / "rr.example.json").is_file())
             stacks = json.loads((home / "stacks.json").read_text())
@@ -886,19 +915,27 @@ class InstallTests(unittest.TestCase):
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertNotIn("copied secrets", proc.stdout.lower())
 
-    def test_ensure_repos_merges_graphwing(self):
+    def test_ensure_repos_noninteractive_empty(self):
+        import install
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            repos = install.ensure_repos(home, Path(td) / "clone", True, extra=[])
+            self.assertEqual(repos, {})
+            self.assertEqual(json.loads((home / "repos.json").read_text()), {})
+
+    def test_ensure_repos_flag(self):
         import install
 
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             clone = Path(td) / "clone"
             clone.mkdir()
-            (home / "repos.json").write_text(json.dumps({"riftwing": "/tmp/rw"}) + "\n")
-            repos = install.ensure_repos(home, clone, True)
-            self.assertEqual(repos["graphwing"], str(clone))
-            self.assertEqual(repos["riftwing"], "/tmp/rw")
-            saved = json.loads((home / "repos.json").read_text())
-            self.assertEqual(saved["riftwing"], "/tmp/rw")
+            (clone / ".git").mkdir()
+            repos = install.ensure_repos(
+                home, Path("/unused"), True, extra=[f"app={clone}"]
+            )
+            self.assertEqual(repos, {"app": str(clone.resolve())})
 
     def test_start_sh_yes_no_start_tmpdir(self):
         root = Path(__file__).resolve().parent

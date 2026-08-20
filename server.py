@@ -88,10 +88,13 @@ def load_key() -> bytes:
 
 
 def load_repos() -> dict[str, str]:
-    data = json.loads(REPOS_PATH.read_text())
-    if not isinstance(data, dict) or not data:
-        raise RuntimeError(f"repos.json must be a non-empty object: {REPOS_PATH}")
-    return {str(k): str(v) for k, v in data.items()}
+    if not REPOS_PATH.is_file():
+        return {}
+    raw = REPOS_PATH.read_text().strip() or "{}"
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"repos.json must be an object: {REPOS_PATH}")
+    return {str(k).strip(): str(v).strip() for k, v in data.items() if str(k).strip() and str(v).strip()}
 
 
 def load_profiles() -> list[dict[str, Any]]:
@@ -250,12 +253,16 @@ def default_repo_name(repos: dict[str, str]) -> str:
     preferred = os.environ.get("GRAPHWING_DEFAULT_REPO", "").strip()
     if preferred and preferred in repos:
         return preferred
-    if "riftwing" in repos:
-        return "riftwing"
-    return next(iter(repos))
+    return next(iter(repos), "")
 
 
 def resolve_repo(name: str | None, repos: dict[str, str]) -> tuple[str, Path] | tuple[None, dict[str, Any]]:
+    if not repos:
+        return None, {
+            "error": "no allowlisted repos; add short names in repos.json",
+            "code": "no_repos",
+            "allowed": [],
+        }
     key = (name or default_repo_name(repos)).strip()
     if key not in repos:
         return None, {
