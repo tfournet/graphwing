@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver: gitStatus → ghPrChecks. Green is done. Red → checkout PR head → one implement-slice (wait+agentRun) → testRun → gitCommit/gitPush or gitRestore → checks again. Pending / missing PR / still red → Herdr noop. One retry is an edge, not a loop. Payload: repo, pr, test, prompt, commit_message.",
+  "description": "Hard-coded PR driver: gitStatus → ghPrView → ghPrChecks. Green + reviews_ok is mergeable; red drives one fix slice; pending or blocking reviews stop at a unique Herdr noop. Doorbell is the authenticated webhook. Payload: repo, pr, test, prompt, commit_message.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -31,6 +31,8 @@
         "config": {
           "enabled": true,
           "requireAuthHeader": true,
+          "headerKey": "x-rewst-secret",
+          "headerValue": "$GRAPHWING_HOOK_SECRET",
           "allowedMethods": ["POST"]
         }
       },
@@ -97,16 +99,50 @@
         }
       },
       {
-        "id": "done_green",
+        "id": "review_snap",
         "type": "transforms.objectBuilder",
-        "label": "Done (checks green)",
+        "label": "Review snapshot",
         "position": { "x": 1100, "y": 80 },
         "config": {
-          "alias": "done_green",
+          "alias": "review_snap",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "review_decision", "expression": { "kind": "getField", "path": "TASKS.view.data.review_decision" } },
+            { "id": "m2", "output": "reviews_blocking", "expression": { "kind": "getField", "path": "TASKS.view.data.reviews_blocking" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_review",
+        "type": "logic.switch",
+        "label": "reviews blocking?",
+        "position": { "x": 1320, "y": 80 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "changes",
+              "rules": [{ "path": "review_decision", "op": "equals", "value": "CHANGES_REQUESTED" }]
+            },
+            {
+              "label": "need_review",
+              "rules": [{ "path": "review_decision", "op": "equals", "value": "REVIEW_REQUIRED" }]
+            }
+          ],
+          "default": { "label": "mergeable" }
+        }
+      },
+      {
+        "id": "done_mergeable",
+        "type": "transforms.objectBuilder",
+        "label": "Done (mergeable)",
+        "position": { "x": 1540, "y": 80 },
+        "config": {
+          "alias": "done_mergeable",
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
-            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "checks_green" } },
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "mergeable" } },
             { "id": "m3", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
             { "id": "m4", "output": "pr", "expression": { "kind": "getField", "path": "CTX.INPUT.pr" } }
           ]
@@ -278,6 +314,8 @@
       { "id": "herdr_checks1", "type": "action.noop", "label": "Herdr: checks HTTP failed", "position": { "x": 880, "y": 480 }, "config": {} },
       { "id": "herdr_checks2", "type": "action.noop", "label": "Herdr: recheck HTTP failed", "position": { "x": 3300, "y": 400 }, "config": {} },
       { "id": "herdr_pending", "type": "action.noop", "label": "Herdr: checks pending", "position": { "x": 1320, "y": 480 }, "config": {} },
+      { "id": "herdr_changes_requested", "type": "action.noop", "label": "Herdr: changes requested", "position": { "x": 1540, "y": 320 }, "config": {} },
+      { "id": "herdr_review_required", "type": "action.noop", "label": "Herdr: review required", "position": { "x": 1540, "y": 440 }, "config": {} },
       { "id": "herdr_pr_checkout", "type": "action.noop", "label": "Herdr: PR checkout failed", "position": { "x": 1540, "y": 620 }, "config": {} },
       { "id": "herdr_test_http", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 2640, "y": 520 }, "config": {} },
       { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok; worktree discarded", "position": { "x": 3080, "y": 400 }, "config": {} },
@@ -300,7 +338,11 @@
       { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
       { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
       { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
-      { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "done_green", "targetHandle": "in" },
+      { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "review_snap", "targetHandle": "in" },
+      { "id": "e5a", "source": "review_snap", "sourceHandle": "out", "target": "switch_review", "targetHandle": "in" },
+      { "id": "e5b", "source": "switch_review", "sourceHandle": "case-0", "target": "herdr_changes_requested", "targetHandle": "in" },
+      { "id": "e5c", "source": "switch_review", "sourceHandle": "case-1", "target": "herdr_review_required", "targetHandle": "in" },
+      { "id": "e5d", "source": "switch_review", "sourceHandle": "default", "target": "done_mergeable", "targetHandle": "in" },
       { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "pr_checkout", "targetHandle": "in" },
       { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
       { "id": "e9", "source": "pr_checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },

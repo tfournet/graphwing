@@ -1,0 +1,37 @@
+name: pr-drive-doorbell
+
+on:
+  workflow_run:
+    workflows: ["*"]
+    types: [completed]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ring:
+    if: >-
+      (github.event_name != 'workflow_run' || github.event.workflow_run.name != 'pr-drive-doorbell') &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure') &&
+      (github.event.pull_request.user.login == 'tfournet' || github.event.workflow_run.actor.login == 'tfournet' || github.actor == 'tfournet')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR and ring Rewst
+        env:
+          HOOK_URL: ${{ secrets.REWST_PR_DRIVE_HOOK_URL }}
+          HOOK_SECRET: ${{ secrets.REWST_PR_DRIVE_HOOK_SECRET }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            exit 0
+          fi
+          printf -v body '%s' '{"repo":"graphwing","pr":"'"$PR_NUMBER"'","test":"catalog-compile","prompt":"Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge.","commit_message":"pr-drive doorbell"}'
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --header "x-rewst-secret: $HOOK_SECRET" \
+            --data "$body" \
+            "$HOOK_URL"

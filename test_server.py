@@ -441,6 +441,32 @@ class DispatchTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertIsInstance(payload["data"], list)
 
+    def test_annotate_pr_view_approved(self):
+        out = server.annotate_pr_view({"ok": True, "data": {"reviewDecision": "APPROVED", "mergeStateStatus": "CLEAN"}})
+        self.assertEqual(out["review_decision"], "APPROVED")
+        self.assertEqual(out["merge_state"], "CLEAN")
+        self.assertFalse(out["reviews_blocking"])
+        self.assertTrue(out["reviews_ok"])
+
+    def test_annotate_pr_view_changes_requested(self):
+        out = server.annotate_pr_view({"ok": True, "data": {"reviewDecision": "CHANGES_REQUESTED"}})
+        self.assertEqual(out["review_decision"], "CHANGES_REQUESTED")
+        self.assertTrue(out["reviews_blocking"])
+        self.assertFalse(out["reviews_ok"])
+
+    def test_annotate_pr_view_review_required(self):
+        out = server.annotate_pr_view({"ok": True, "data": {"reviewDecision": "REVIEW_REQUIRED"}})
+        self.assertEqual(out["review_decision"], "REVIEW_REQUIRED")
+        self.assertTrue(out["reviews_blocking"])
+        self.assertFalse(out["reviews_ok"])
+
+    def test_annotate_pr_view_empty(self):
+        out = server.annotate_pr_view({"ok": True, "data": {}})
+        self.assertEqual(out["review_decision"], "")
+        self.assertEqual(out["merge_state"], "")
+        self.assertFalse(out["reviews_blocking"])
+        self.assertTrue(out["reviews_ok"])
+
     def test_annotate_pr_checks_all_green(self):
         out = server.annotate_pr_checks(
             {"ok": True, "data": [{"name": "ci", "bucket": "pass"}, {"name": "lint", "bucket": "skipping"}]}
