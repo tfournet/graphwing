@@ -591,6 +591,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(spec["paths"]["/v1/slice/continue"]["post"]["operationId"], "sliceContinue")
         self.assertEqual(spec["paths"]["/v1/slice/route"]["post"]["operationId"], "sliceRoute")
         self.assertEqual(spec["paths"]["/v1/review/run"]["post"]["operationId"], "reviewRun")
+        self.assertEqual(spec["paths"]["/v1/slice/e2e"]["post"]["operationId"], "sliceE2e")
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
         doorbell = spec["paths"]["/v1/doorbell/pr-drive"]["post"]
@@ -809,6 +810,130 @@ class DispatchTests(unittest.TestCase):
                 )
             self.assertEqual(status, 400)
             self.assertEqual(payload["code"], "bad_kick_url")
+
+    def test_slice_e2e_skip_without_test_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "done",
+                    }
+                ],
+            )
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/slice/e2e",
+                    {},
+                    True,
+                    json.dumps({"repo": "scratch", "index": rel}).encode(),
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["kind"], "skip")
+
+    def test_slice_e2e_auto_ticket_from_fail_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "done",
+                    }
+                ],
+            )
+            fake = {
+                "ok": False,
+                "returncode": 1,
+                "stdout": "FAIL: test_checkout_valid_card\nAssertionError: no\n",
+                "stderr": "",
+            }
+            orig = server.run_cmd
+
+            def run_cmd(args, **kwargs):
+                if args and args[0] == "git":
+                    return orig(args, **kwargs)
+                return fake
+
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "run_cmd", side_effect=run_cmd):
+                    status, payload, _ = server.dispatch(
+                        "POST",
+                        "/v1/slice/e2e",
+                        {},
+                        True,
+                        json.dumps({"repo": "scratch", "index": rel, "test": "always-fail"}).encode(),
+                    )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["kind"], "auto")
+            self.assertTrue((repo / payload["path"]).is_file())
+            idx = json.loads((repo / rel).read_text())
+            self.assertEqual(idx["e2e_reds"], 1)
+            self.assertEqual(idx["tickets"][-1]["id"], payload["id"])
+
+    def test_slice_e2e_parks_on_third_red(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "done",
+                    }
+                ],
+            )
+            (repo / rel).write_text(
+                json.dumps(
+                    {
+                        "e2e_reds": 2,
+                        "tickets": [
+                            {
+                                "id": "01-login",
+                                "path": "slices/demo/01-login.md",
+                                "blocked_by": [],
+                                "kind": "build",
+                                "status": "done",
+                            }
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            fake = {"ok": False, "returncode": 1, "stdout": "boom", "stderr": ""}
+            orig = server.run_cmd
+
+            def run_cmd(args, **kwargs):
+                if args and args[0] == "git":
+                    return orig(args, **kwargs)
+                return fake
+
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "run_cmd", side_effect=run_cmd):
+                    status, payload, _ = server.dispatch(
+                        "POST",
+                        "/v1/slice/e2e",
+                        {},
+                        True,
+                        json.dumps({"repo": "scratch", "index": rel, "test": "always-fail"}).encode(),
+                    )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["kind"], "park")
+            self.assertEqual(payload["e2e_reds"], 3)
 
     def test_git_commit_add_accepts_string_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1525,6 +1650,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
         self.assertEqual(edges["e12"]["target"], "walk")
+        self.assertEqual(edges["e7h"]["target"], "e2e")
+        self.assertEqual(edges["e12d"]["target"], "e2e")
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")

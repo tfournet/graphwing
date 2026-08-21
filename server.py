@@ -864,17 +864,34 @@ def load_slice_index(repo: Path, rel: str) -> tuple[list[dict[str, Any]] | None,
     return parse_slice_index(data)
 
 
-def write_slice_index(repo: Path, rel: str, tickets: list[dict[str, Any]]) -> dict[str, Any] | None:
+def write_slice_index(
+    repo: Path, rel: str, tickets: list[dict[str, Any]], extra: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     target, err = safe_relpath(repo, rel)
     if err:
         err["ok"] = False
         err["status"] = 400
         return err
     target.parent.mkdir(parents=True, exist_ok=True)
+    doc: dict[str, Any] = dict(extra or {})
+    doc["tickets"] = tickets
     tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps({"tickets": tickets}, indent=2) + "\n")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n")
     tmp.replace(target)
     return None
+
+
+def index_extra(repo: Path, rel: str) -> dict[str, Any]:
+    target, err = safe_file(repo, rel)
+    if err or target is None:
+        return {}
+    try:
+        data = json.loads(target.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if k != "tickets"}
 
 
 def slice_ready(ticket: dict[str, Any], done: set[str]) -> bool:
@@ -940,7 +957,7 @@ def slice_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
     if found is None:
         return 400, {"error": f"unknown ticket id '{tid}'", "code": "unknown_ticket"}
     found["status"] = "done"
-    write_err = write_slice_index(resolved, index.strip(), tickets)
+    write_err = write_slice_index(resolved, index.strip(), tickets, extra=index_extra(resolved, index.strip()))
     if write_err:
         return int(write_err.get("status", 400)), write_err
     return 200, {"ok": True, "repo": name, "index": index.strip(), "id": found["id"], "path": found["path"]}
@@ -1004,6 +1021,90 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
     if not out["kicked"]:
         return 502, {**out, "ok": False, "error": "kick failed", "code": "kick_failed"}
     return 200, out
+
+
+def slice_e2e(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    test_name = data.get("test")
+    if test_name in ("", None):
+        return 200, {"ok": True, "kind": "skip"}
+    if not isinstance(test_name, str):
+        return 400, {"error": "test must be a string", "code": "bad_test"}
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    index = data.get("index")
+    if not isinstance(index, str) or not index.strip():
+        return 400, {"error": "index is required", "code": "missing_index"}
+    index = index.strip()
+    tickets, load_err = load_slice_index(resolved, index)
+    if load_err:
+        return int(load_err.get("status", 400)), load_err
+    assert tickets is not None
+    extra = index_extra(resolved, index)
+    catalog = load_tests(repos)
+    spec = catalog.get(test_name.strip())
+    if spec is None:
+        return 400, {"error": f"unknown test '{test_name}'", "code": "unknown_test", "allowed": sorted(catalog)}
+    result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=int(spec["timeout_seconds"]))
+    compact = compact_cmd_signal(result)
+    if result.get("ok"):
+        return 200, {"ok": True, "kind": "green", "repo": name, "compact": "ok"}
+    reds = int(extra.get("e2e_reds") or 0) + 1
+    extra["e2e_reds"] = reds
+    if reds >= 3:
+        write_err = write_slice_index(resolved, index, tickets, extra=extra)
+        if write_err:
+            return int(write_err.get("status", 400)), write_err
+        return 200, {"ok": True, "kind": "park", "repo": name, "e2e_reds": reds, "compact": compact}
+    hits = [ln.split("FAIL:", 1)[-1].strip() for ln in compact.splitlines() if "FAIL:" in ln]
+    rel_dir = str(Path(index).parent)
+    if hits:
+        tid = f"e2e-{reds}"
+        rel_md = f"{rel_dir}/{tid}.md"
+        md_target, perr = safe_relpath(resolved, rel_md)
+        if perr:
+            return 400, perr
+        assert md_target is not None
+        md_target.parent.mkdir(parents=True, exist_ok=True)
+        body_md = "E2E failed. Ticket from failing names.\n\n" + "\n".join(f"- {h}" for h in hits[:8]) + "\n"
+        md_target.write_text(body_md)
+        tickets.append(
+            {"id": tid, "path": rel_md, "blocked_by": [], "kind": "build", "status": "open"}
+        )
+        write_err = write_slice_index(resolved, index, tickets, extra=extra)
+        if write_err:
+            return int(write_err.get("status", 400)), write_err
+        return 200, {
+            "ok": True,
+            "kind": "auto",
+            "repo": name,
+            "id": tid,
+            "path": rel_md,
+            "e2e_reds": reds,
+            "compact": compact,
+        }
+    draft = f"{rel_dir}/e2e-draft-{reds}.md"
+    draft_path, perr = safe_relpath(resolved, draft)
+    if perr:
+        return 400, perr
+    assert draft_path is not None
+    draft_path.parent.mkdir(parents=True, exist_ok=True)
+    draft_path.write_text("E2E failed. Draft — ACK before it becomes a ticket.\n\n" + compact + "\n")
+    write_err = write_slice_index(resolved, index, tickets, extra=extra)
+    if write_err:
+        return int(write_err.get("status", 400)), write_err
+    return 200, {
+        "ok": True,
+        "kind": "draft",
+        "repo": name,
+        "path": draft,
+        "e2e_reds": reds,
+        "compact": compact,
+    }
 
 
 def parse_optional_int(data: dict[str, Any], key: str, lo: int, hi: int) -> tuple[int | None, dict[str, Any] | None]:
@@ -2470,6 +2571,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/review/run":
         status, payload = review_run(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/e2e":
+        status, payload = slice_e2e(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":

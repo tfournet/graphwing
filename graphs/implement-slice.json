@@ -27,7 +27,8 @@
             "ac_count": { "type": "string", "required": false },
             "seams": { "type": "string", "required": false },
             "kick_url": { "type": "string", "required": false, "description": "https Rewst webhook for the next slice" },
-            "kick_token": { "type": "string", "required": false }
+            "kick_token": { "type": "string", "required": false },
+            "e2e": { "type": "string", "required": false, "description": "Optional tests.json name run after the map is empty, before CI" }
           }
         }
       },
@@ -492,6 +493,35 @@
       { "id": "slices_complete", "type": "action.noop", "label": "Herdr: slices complete", "position": { "x": 1680, "y": 200 }, "config": {} },
       { "id": "route_fail", "type": "action.noop", "label": "Herdr: sliceRoute failed", "position": { "x": 480, "y": -160 }, "config": {} },
       { "id": "review_fail", "type": "action.noop", "label": "Herdr: specReview HTTP failed", "position": { "x": 1180, "y": -160 }, "config": {} },
+      {
+        "id": "e2e",
+        "type": "action.graphwing.POST:/v1/slice/e2e",
+        "label": "sliceE2e",
+        "position": { "x": 1720, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 120,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "index": "{{ CTX.INPUT.index }}",
+          "test": "{{ CTX.INPUT.e2e }}"
+        }
+      },
+      {
+        "id": "switch_e2e",
+        "type": "logic.switch",
+        "label": "e2e kind?",
+        "position": { "x": 1780, "y": 200 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "green", "rules": [{ "path": "data.kind", "op": "equals", "value": "green" }] },
+            { "label": "skip", "rules": [{ "path": "data.kind", "op": "equals", "value": "skip" }] },
+            { "label": "auto", "rules": [{ "path": "data.kind", "op": "equals", "value": "auto" }] }
+          ],
+          "default": { "label": "park" }
+        }
+      },
+      { "id": "e2e_fail", "type": "action.noop", "label": "Herdr: sliceE2e HTTP failed", "position": { "x": 1720, "y": -40 }, "config": {} },
       { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
 
       { "id": "wait2_timeout", "type": "action.noop", "label": "Herdr: retry wait timeout", "position": { "x": 1840, "y": 200 }, "config": {} },
@@ -513,7 +543,7 @@
       { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "frontier", "targetHandle": "in" },
       { "id": "e7f", "source": "frontier", "sourceHandle": "success", "target": "switch_kind", "targetHandle": "in" },
       { "id": "e7g", "source": "frontier", "sourceHandle": "failure", "target": "frontier_fail", "targetHandle": "in" },
-      { "id": "e7h", "source": "switch_kind", "sourceHandle": "case-0", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e7h", "source": "switch_kind", "sourceHandle": "case-0", "target": "e2e", "targetHandle": "in" },
       { "id": "e7i", "source": "switch_kind", "sourceHandle": "case-1", "target": "wait_human", "targetHandle": "in" },
       { "id": "e7j", "source": "switch_kind", "sourceHandle": "default", "target": "route", "targetHandle": "in" },
       { "id": "e7k", "source": "route", "sourceHandle": "success", "target": "ticket_head", "targetHandle": "in" },
@@ -526,7 +556,13 @@
       { "id": "e12", "source": "push", "sourceHandle": "success", "target": "walk", "targetHandle": "in" },
       { "id": "e12b", "source": "walk", "sourceHandle": "success", "target": "switch_walk", "targetHandle": "in" },
       { "id": "e12c", "source": "walk", "sourceHandle": "failure", "target": "walk_fail", "targetHandle": "in" },
-      { "id": "e12d", "source": "switch_walk", "sourceHandle": "case-0", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e12d", "source": "switch_walk", "sourceHandle": "case-0", "target": "e2e", "targetHandle": "in" },
+      { "id": "e_e2e_ok", "source": "e2e", "sourceHandle": "success", "target": "switch_e2e", "targetHandle": "in" },
+      { "id": "e_e2e_http", "source": "e2e", "sourceHandle": "failure", "target": "e2e_fail", "targetHandle": "in" },
+      { "id": "e_e2e_green", "source": "switch_e2e", "sourceHandle": "case-0", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e_e2e_skip", "source": "switch_e2e", "sourceHandle": "case-1", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e_e2e_auto", "source": "switch_e2e", "sourceHandle": "case-2", "target": "walk", "targetHandle": "in" },
+      { "id": "e_e2e_park", "source": "switch_e2e", "sourceHandle": "default", "target": "wait_human", "targetHandle": "in" },
       { "id": "e12e", "source": "switch_walk", "sourceHandle": "case-1", "target": "wait_human", "targetHandle": "in" },
       { "id": "e12f", "source": "switch_walk", "sourceHandle": "default", "target": "done", "targetHandle": "in" },
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
