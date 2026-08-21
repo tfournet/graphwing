@@ -27,7 +27,7 @@
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
           "branch": "{{ CTX.INPUT.branch }}",
-          "create": false
+          "create": true
         }
       },
       {
