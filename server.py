@@ -1342,7 +1342,7 @@ def doorbell_pr_drive(body: bytes, headers: Any) -> tuple[int, dict[str, Any]]:
     except Exception:
         install = {}
     hook_url = str(install.get("pr_drive_hook_url") or "").strip()
-    hook_secret = str(install.get("pr_drive_hook_secret") or "").strip()
+    hook_secret = str(install.get("hook_secret") or install.get("pr_drive_hook_secret") or "").strip()
     if not hook_url or not hook_secret:
         return 503, {"error": "pr-drive hook is not configured", "code": "hook_unconfigured"}
 
