@@ -1163,6 +1163,20 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(any("gh/pr/view" in node_type for node_type in node_types))
         self.assertTrue(any("gh/pr/checks" in node_type for node_type in node_types))
 
+    def test_implement_slice_keeps_files_on_red(self):
+        graph_path = Path(__file__).resolve().parent / "graphs" / "implement-slice.json"
+        graph = json.loads(graph_path.read_text())
+        node_types = [node["type"].lower() for node in graph["spec"]["nodes"]]
+        self.assertFalse(any("git/restore" in node_type for node_type in node_types))
+        edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
+        self.assertEqual(edges["e18"]["source"], "if_test_ok")
+        self.assertEqual(edges["e18"]["sourceHandle"], "fail")
+        self.assertEqual(edges["e18"]["target"], "switch_retry")
+        self.assertEqual(edges["e31"]["source"], "if_test_ok2")
+        self.assertEqual(edges["e31"]["sourceHandle"], "fail")
+        self.assertEqual(edges["e31"]["target"], "wait_human")
+        self.assertEqual(edges["e22"]["target"], "wait_human")
+
 
 class InstallTests(unittest.TestCase):
     def test_runtime_and_templates_have_no_hardcoded_home(self):
