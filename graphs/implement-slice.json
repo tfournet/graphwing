@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → fileHead ticket → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay. Writer prompt is the ticket file, not a pasted spec. Set iters_left=2 to resume the same Hermes session with a compact test signal; otherwise wait for human. Payload: repo, branch, ticket, commit_message, test, iters_left.",
+  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, iters_left, optional kick_url.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -17,10 +17,13 @@
           "inputs": {
             "repo": { "type": "string", "required": true },
             "branch": { "type": "string", "required": true },
-            "ticket": { "type": "string", "required": true, "description": "Repo-relative path to the slice ticket markdown" },
+            "index": { "type": "string", "required": true, "description": "Repo-relative path to slices index JSON" },
+            "ticket": { "type": "string", "required": false, "description": "Optional ticket path; must already be on the frontier. Omit to take the next build." },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
-            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" }
+            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" },
+            "kick_url": { "type": "string", "required": false, "description": "https Rewst webhook for the next slice" },
+            "kick_token": { "type": "string", "required": false }
           }
         }
       },
@@ -67,6 +70,33 @@
         }
       },
       {
+        "id": "frontier",
+        "type": "action.graphwing.GET:/v1/slice/frontier",
+        "label": "sliceFrontier",
+        "position": { "x": 455, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "index": "{{ CTX.INPUT.index }}",
+          "ticket": "{{ CTX.INPUT.ticket }}"
+        }
+      },
+      {
+        "id": "switch_kind",
+        "type": "logic.switch",
+        "label": "frontier kind?",
+        "position": { "x": 470, "y": 200 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "empty", "rules": [{ "path": "data.kind", "op": "equals", "value": "empty" }] },
+            { "label": "decision", "rules": [{ "path": "data.kind", "op": "equals", "value": "decision" }] }
+          ],
+          "default": { "label": "build" }
+        }
+      },
+      {
         "id": "ticket_head",
         "type": "action.graphwing.GET:/v1/file/head",
         "label": "fileHead ticket",
@@ -75,7 +105,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "path": "{{ CTX.INPUT.ticket }}"
+          "path": "{{ TASKS.frontier.data.path }}"
         }
       },
       {
@@ -264,7 +294,53 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "message": "{{ CTX.INPUT.commit_message }}"
+          "message": "{{ CTX.INPUT.commit_message }}",
+          "add": "{{ CTX.INPUT.index }}"
+        }
+      },
+      {
+        "id": "complete",
+        "type": "action.graphwing.POST:/v1/slice/complete",
+        "label": "sliceComplete",
+        "position": { "x": 1080, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "index": "{{ CTX.INPUT.index }}",
+          "id": "{{ TASKS.frontier.data.id }}"
+        }
+      },
+      {
+        "id": "walk",
+        "type": "action.graphwing.POST:/v1/slice/continue",
+        "label": "sliceContinue",
+        "position": { "x": 1540, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "index": "{{ CTX.INPUT.index }}",
+          "branch": "{{ CTX.INPUT.branch }}",
+          "test": "{{ CTX.INPUT.test }}",
+          "commit_message": "{{ CTX.INPUT.commit_message }}",
+          "iters_left": "{{ CTX.INPUT.iters_left }}",
+          "kick_url": "{{ CTX.INPUT.kick_url }}",
+          "kick_token": "{{ CTX.INPUT.kick_token }}"
+        }
+      },
+      {
+        "id": "switch_walk",
+        "type": "logic.switch",
+        "label": "next kind?",
+        "position": { "x": 1610, "y": 80 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "empty", "rules": [{ "path": "data.kind", "op": "equals", "value": "empty" }] },
+            { "label": "decision", "rules": [{ "path": "data.kind", "op": "equals", "value": "decision" }] }
+          ],
+          "default": { "label": "build" }
         }
       },
       {
@@ -308,6 +384,10 @@
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
       { "id": "ticket_fail", "type": "action.noop", "label": "Herdr: ticket fileHead failed", "position": { "x": 490, "y": -160 }, "config": {} },
+      { "id": "frontier_fail", "type": "action.noop", "label": "Herdr: sliceFrontier failed", "position": { "x": 455, "y": -160 }, "config": {} },
+      { "id": "complete_fail", "type": "action.noop", "label": "Herdr: sliceComplete failed", "position": { "x": 1080, "y": -160 }, "config": {} },
+      { "id": "walk_fail", "type": "action.noop", "label": "Herdr: sliceContinue failed", "position": { "x": 1540, "y": -160 }, "config": {} },
+      { "id": "slices_complete", "type": "action.noop", "label": "Herdr: slices complete", "position": { "x": 1680, "y": 200 }, "config": {} },
       { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
 
       { "id": "wait2_timeout", "type": "action.noop", "label": "Herdr: retry wait timeout", "position": { "x": 1840, "y": 200 }, "config": {} },
@@ -326,13 +406,23 @@
       { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
       { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
       { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
-      { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "ticket_head", "targetHandle": "in" },
+      { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "frontier", "targetHandle": "in" },
+      { "id": "e7f", "source": "frontier", "sourceHandle": "success", "target": "switch_kind", "targetHandle": "in" },
+      { "id": "e7g", "source": "frontier", "sourceHandle": "failure", "target": "frontier_fail", "targetHandle": "in" },
+      { "id": "e7h", "source": "switch_kind", "sourceHandle": "case-0", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e7i", "source": "switch_kind", "sourceHandle": "case-1", "target": "wait_human", "targetHandle": "in" },
+      { "id": "e7j", "source": "switch_kind", "sourceHandle": "default", "target": "ticket_head", "targetHandle": "in" },
       { "id": "e7b", "source": "ticket_head", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
       { "id": "e7c", "source": "ticket_head", "sourceHandle": "failure", "target": "ticket_fail", "targetHandle": "in" },
       { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" },
       { "id": "e10", "source": "commit", "sourceHandle": "success", "target": "push", "targetHandle": "in" },
       { "id": "e11", "source": "commit", "sourceHandle": "failure", "target": "commit_fail", "targetHandle": "in" },
-      { "id": "e12", "source": "push", "sourceHandle": "success", "target": "done", "targetHandle": "in" },
+      { "id": "e12", "source": "push", "sourceHandle": "success", "target": "walk", "targetHandle": "in" },
+      { "id": "e12b", "source": "walk", "sourceHandle": "success", "target": "switch_walk", "targetHandle": "in" },
+      { "id": "e12c", "source": "walk", "sourceHandle": "failure", "target": "walk_fail", "targetHandle": "in" },
+      { "id": "e12d", "source": "switch_walk", "sourceHandle": "case-0", "target": "slices_complete", "targetHandle": "in" },
+      { "id": "e12e", "source": "switch_walk", "sourceHandle": "case-1", "target": "wait_human", "targetHandle": "in" },
+      { "id": "e12f", "source": "switch_walk", "sourceHandle": "default", "target": "done", "targetHandle": "in" },
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
       { "id": "e14", "source": "record", "sourceHandle": "out", "target": "test", "targetHandle": "in" },
       { "id": "e15", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
@@ -349,7 +439,9 @@
       { "id": "e28", "source": "test2", "sourceHandle": "success", "target": "if_test_ok2", "targetHandle": "in" },
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "test2_http_fail", "targetHandle": "in" },
       { "id": "e_commit_retry", "source": "if_test_ok2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
-      { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "commit", "targetHandle": "in" },
+      { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "complete", "targetHandle": "in" },
+      { "id": "e_complete_ok", "source": "complete", "sourceHandle": "success", "target": "commit", "targetHandle": "in" },
+      { "id": "e_complete_fail", "source": "complete", "sourceHandle": "failure", "target": "complete_fail", "targetHandle": "in" },
       { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
       { "id": "e34", "source": "wait_human", "sourceHandle": "pending", "target": "herdr_waiting", "targetHandle": "in" },
       { "id": "e35", "source": "wait_human", "sourceHandle": "timeout", "target": "nack_timeout", "targetHandle": "in" },

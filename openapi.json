@@ -371,6 +371,55 @@
         }
       }
     },
+    "/v1/slice/frontier": {
+      "get": {
+        "operationId": "sliceFrontier",
+        "tags": ["slice"],
+        "summary": "Next open slice whose blockers are done. Serial: first matching ticket in index order. kind is build, decision, or empty.",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "index", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Repo-relative path to slices index JSON." },
+          { "name": "ticket", "in": "query", "schema": { "type": "string" }, "description": "Optional ticket path; must already be on the frontier." }
+        ],
+        "responses": {
+          "200": { "description": "frontier", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceFrontier" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/slice/complete": {
+      "post": {
+        "operationId": "sliceComplete",
+        "tags": ["slice"],
+        "summary": "Mark a ticket done in the index file. Does not commit.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceCompleteRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceComplete" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/slice/continue": {
+      "post": {
+        "operationId": "sliceContinue",
+        "tags": ["slice"],
+        "summary": "After a slice push: if the next frontier ticket is build and kick_url is set, POST that webhook with the next ticket path. Serial walker. https kick_url only.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceContinueRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "next", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceContinue" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/gh/pr/list": {
       "get": {
         "operationId": "ghPrList",
@@ -786,9 +835,11 @@
           "repo": { "type": "string", "description": "Allowlisted short name, not a filesystem path." },
           "message": { "type": "string", "description": "Commit message. Empty refused." },
           "add": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Optional relative paths to git add. Omitted: commit already-staged files only. No .. or absolute paths. Default does not add -A."
+            "description": "Relative paths to git add before commit, or a single path string. Omitted: commit already-staged files only. No .. or absolute paths. Default does not add -A.",
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
           }
         }
       },
@@ -862,6 +913,62 @@
           "bytes": { "type": "integer" },
           "truncated": { "type": "boolean" },
           "text": { "type": "string" }
+        }
+      },
+      "SliceFrontier": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "kind": { "type": "string", "enum": ["build", "decision", "empty"] },
+          "id": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      },
+      "SliceCompleteRequest": {
+        "type": "object",
+        "required": ["repo", "index", "id"],
+        "properties": {
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      },
+      "SliceComplete": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "id": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      },
+      "SliceContinueRequest": {
+        "type": "object",
+        "required": ["repo", "index"],
+        "properties": {
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "branch": { "type": "string" },
+          "test": { "type": "string" },
+          "commit_message": { "type": "string" },
+          "iters_left": { "type": "string" },
+          "kick_url": { "type": "string", "format": "uri", "description": "https Rewst webhook to start the next slice. Omitted: return frontier only." },
+          "kick_token": { "type": "string" }
+        }
+      },
+      "SliceContinue": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "kind": { "type": "string" },
+          "id": { "type": "string" },
+          "path": { "type": "string" },
+          "kicked": { "type": "boolean" }
         }
       },
       "GhData": {

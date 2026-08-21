@@ -70,6 +70,9 @@ AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
+SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SLICE_KINDS = frozenset({"build", "decision"})
+SLICE_STATUSES = frozenset({"open", "done"})
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
@@ -724,9 +727,11 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     if data.get("add_all") is True:
         return 400, {"error": "add_all is not enabled; pass add as relative paths or commit staged files", "code": "add_all_disabled"}
     add = data.get("add")
+    if isinstance(add, str):
+        add = [add]
     if add is not None:
         if not isinstance(add, list) or not all(isinstance(x, str) for x in add):
-            return 400, {"error": "add must be a list of relative paths", "code": "bad_add"}
+            return 400, {"error": "add must be a list of relative paths or one path string", "code": "bad_add"}
         rels: list[str] = []
         for rel in add:
             _target, perr = safe_relpath(resolved, rel)
@@ -785,6 +790,202 @@ def file_head(repo: Path, rel: str) -> dict[str, Any]:
         "truncated": truncated,
         "text": data.decode("utf-8", "replace"),
     }
+
+
+def parse_slice_index(data: Any) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    if not isinstance(data, dict):
+        return None, {"ok": False, "error": "index must be an object", "code": "bad_index", "status": 400}
+    raw = data.get("tickets")
+    if not isinstance(raw, list) or not raw:
+        return None, {"ok": False, "error": "index.tickets must be a non-empty list", "code": "bad_index", "status": 400}
+    tickets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, {"ok": False, "error": "ticket must be an object", "code": "bad_ticket", "status": 400}
+        tid = item.get("id")
+        path = item.get("path")
+        if not isinstance(tid, str) or not SLICE_ID_RE.fullmatch(tid):
+            return None, {"ok": False, "error": "ticket id is invalid", "code": "bad_ticket_id", "status": 400}
+        if tid in seen:
+            return None, {"ok": False, "error": f"duplicate ticket id '{tid}'", "code": "dup_ticket_id", "status": 400}
+        if not isinstance(path, str) or not path.strip() or ".." in path or path.startswith("/"):
+            return None, {"ok": False, "error": "ticket path is invalid", "code": "bad_ticket_path", "status": 400}
+        kind = item.get("kind") or "build"
+        status = item.get("status") or "open"
+        blocked = item.get("blocked_by") or []
+        if kind not in SLICE_KINDS:
+            return None, {"ok": False, "error": f"unknown kind '{kind}'", "code": "bad_ticket_kind", "status": 400}
+        if status not in SLICE_STATUSES:
+            return None, {"ok": False, "error": f"unknown status '{status}'", "code": "bad_ticket_status", "status": 400}
+        if not isinstance(blocked, list) or not all(isinstance(x, str) for x in blocked):
+            return None, {"ok": False, "error": "blocked_by must be a list of ids", "code": "bad_blocked_by", "status": 400}
+        seen.add(tid)
+        tickets.append(
+            {"id": tid, "path": path.strip(), "kind": kind, "status": status, "blocked_by": list(blocked)}
+        )
+    ids = {t["id"] for t in tickets}
+    for t in tickets:
+        for b in t["blocked_by"]:
+            if b not in ids:
+                return None, {
+                    "ok": False,
+                    "error": f"blocked_by unknown id '{b}'",
+                    "code": "bad_blocked_by",
+                    "status": 400,
+                }
+    return tickets, None
+
+
+def load_slice_index(repo: Path, rel: str) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    target, err = safe_file(repo, rel)
+    if err:
+        err["ok"] = False
+        err["status"] = 400
+        return None, err
+    try:
+        data = json.loads(target.read_text())
+    except json.JSONDecodeError:
+        return None, {"ok": False, "error": "index is not JSON", "code": "bad_index", "status": 400}
+    return parse_slice_index(data)
+
+
+def write_slice_index(repo: Path, rel: str, tickets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    target, err = safe_relpath(repo, rel)
+    if err:
+        err["ok"] = False
+        err["status"] = 400
+        return err
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps({"tickets": tickets}, indent=2) + "\n")
+    tmp.replace(target)
+    return None
+
+
+def slice_ready(ticket: dict[str, Any], done: set[str]) -> bool:
+    return ticket["status"] == "open" and all(b in done for b in ticket["blocked_by"])
+
+
+def slice_frontier(tickets: list[dict[str, Any]], ticket_path: str | None = None) -> dict[str, Any]:
+    done = {t["id"] for t in tickets if t["status"] == "done"}
+    if ticket_path:
+        matches = [t for t in tickets if t["path"] == ticket_path]
+        if not matches:
+            return {"ok": False, "error": f"unknown ticket path '{ticket_path}'", "code": "unknown_ticket", "status": 400}
+        t = matches[0]
+        if not slice_ready(t, done):
+            return {"ok": False, "error": "ticket is not on the frontier", "code": "ticket_blocked", "status": 409}
+        return {"ok": True, "kind": t["kind"], "id": t["id"], "path": t["path"]}
+    for t in tickets:
+        if slice_ready(t, done):
+            return {"ok": True, "kind": t["kind"], "id": t["id"], "path": t["path"]}
+    return {"ok": True, "kind": "empty"}
+
+
+def slice_frontier_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    name, resolved = resolve_repo(first_query(qs, "repo"), repos)
+    if name is None:
+        return 400, resolved
+    index = first_query(qs, "index")
+    if not index:
+        return 400, {"error": "index is required", "code": "missing_index"}
+    tickets, err = load_slice_index(resolved, index)
+    if err:
+        return int(err.get("status", 400)), err
+    assert tickets is not None
+    out = slice_frontier(tickets, first_query(qs, "ticket") or None)
+    out["repo"] = name
+    out["index"] = index
+    return (200 if out.get("ok") else int(out.get("status", 400))), out
+
+
+def slice_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    index = data.get("index")
+    if not isinstance(index, str) or not index.strip():
+        return 400, {"error": "index is required", "code": "missing_index"}
+    tid = data.get("id")
+    if not isinstance(tid, str) or not tid.strip():
+        return 400, {"error": "id is required", "code": "missing_ticket_id"}
+    tickets, load_err = load_slice_index(resolved, index.strip())
+    if load_err:
+        return int(load_err.get("status", 400)), load_err
+    assert tickets is not None
+    found = None
+    for t in tickets:
+        if t["id"] == tid.strip():
+            found = t
+            break
+    if found is None:
+        return 400, {"error": f"unknown ticket id '{tid}'", "code": "unknown_ticket"}
+    found["status"] = "done"
+    write_err = write_slice_index(resolved, index.strip(), tickets)
+    if write_err:
+        return int(write_err.get("status", 400)), write_err
+    return 200, {"ok": True, "repo": name, "index": index.strip(), "id": found["id"], "path": found["path"]}
+
+
+def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    index = data.get("index")
+    if not isinstance(index, str) or not index.strip():
+        return 400, {"error": "index is required", "code": "missing_index"}
+    tickets, load_err = load_slice_index(resolved, index.strip())
+    if load_err:
+        return int(load_err.get("status", 400)), load_err
+    assert tickets is not None
+    nxt = slice_frontier(tickets)
+    out = {
+        "ok": True,
+        "repo": name,
+        "index": index.strip(),
+        "kind": nxt.get("kind"),
+        "id": nxt.get("id"),
+        "path": nxt.get("path"),
+        "kicked": False,
+    }
+    if nxt.get("kind") != "build":
+        return 200, out
+    kick_url = data.get("kick_url")
+    if kick_url in ("", None):
+        return 200, out
+    if not isinstance(kick_url, str) or not valid_webhook_url(kick_url):
+        return 400, {"error": "kick_url must be https", "code": "bad_kick_url"}
+    token = data.get("kick_token")
+    if token in ("", None):
+        token = None
+    elif not isinstance(token, str):
+        return 400, {"error": "kick_token must be a string", "code": "bad_kick_token"}
+    payload = {
+        "repo": name,
+        "branch": data.get("branch"),
+        "index": index.strip(),
+        "ticket": nxt["path"],
+        "test": data.get("test"),
+        "commit_message": data.get("commit_message"),
+        "iters_left": data.get("iters_left"),
+        "kick_url": kick_url,
+        "kick_token": token,
+    }
+    hook = post_receipt(kick_url, payload, token=token)
+    out["kicked"] = bool(hook.get("ok"))
+    out["kick"] = hook
+    if not out["kicked"]:
+        return 502, {**out, "ok": False, "error": "kick failed", "code": "kick_failed"}
+    return 200, out
 
 
 def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
@@ -1986,6 +2187,15 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/script/run":
         status, payload = script_run(body, repos)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/slice/frontier":
+        status, payload = slice_frontier_op(qs, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/complete":
+        status, payload = slice_complete(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/continue":
+        status, payload = slice_continue(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":

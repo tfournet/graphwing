@@ -130,7 +130,7 @@ Do not resume the last feature session to “fix e2e.”
 
 ## Not wired yet (do these next, do not re-litigate)
 
-1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Walker: same topology, next `input` = next `ticket` path (graph already fileHeads that path). No bash `go`.
+1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Index JSON is `tickets[]` with `id`, `path`, `blocked_by`, `kind` (`build`|`decision`), `status` (`open`|`done`). `implement-slice` walks serially: frontier → write → complete → commit index → continue kicks `kick_url` with the next build ticket. No bash `go`.
 2. Three-strikes park (third suite-red); spec-review nack → resume; wipe only on explicit discard.
 3. Seat default writer `grok-4.6`; class×size table on `agentRun`; opposing-vendor spec-review **before** commit.
 4. E2E node after empty map; auto-ticket / draft-ACK; three e2e-reds → park.
