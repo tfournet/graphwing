@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver: gitStatus → ghPrChecks. Green is done. Red → named testRun → one implement-slice (wait+agentRun) → checks again. Pending / missing PR / still red → Herdr noop. One retry is an edge, not a loop. Payload: repo, pr, test, prompt.",
+  "description": "Hard-coded PR driver: gitStatus → ghPrChecks. Green is done. Red → checkout PR head → one implement-slice (wait+agentRun) → testRun → gitCommit/gitPush or gitRestore → checks again. Pending / missing PR / still red → Herdr noop. One retry is an edge, not a loop. Payload: repo, pr, test, prompt, commit_message.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -78,24 +78,16 @@
         }
       },
       {
-        "id": "test",
-        "type": "action.graphwing.POST:/v1/test/run",
-        "label": "testRun",
+        "id": "pr_checkout",
+        "type": "action.graphwing.POST:/v1/git/checkout",
+        "label": "Checkout PR head",
         "position": { "x": 1320, "y": 240 },
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "name": "{{ CTX.INPUT.test }}"
-        }
-      },
-      {
-        "id": "if_test_ok",
-        "type": "logic.filter",
-        "label": "test ok?",
-        "position": { "x": 1540, "y": 240 },
-        "config": {
-          "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "repo": "{{ CTX.INPUT.repo }}",
+          "branch": "{{ TASKS.view.data.headRefName }}",
+          "create": false
         }
       },
       {
@@ -152,10 +144,68 @@
         }
       },
       {
+        "id": "fix_test",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "testRun after fix",
+        "position": { "x": 2420, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_fix_test",
+        "type": "logic.filter",
+        "label": "fix test ok?",
+        "position": { "x": 2640, "y": 240 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "fix_commit",
+        "type": "action.graphwing.POST:/v1/git/commit",
+        "label": "Commit fix",
+        "position": { "x": 2860, "y": 160 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "message": "{{ CTX.INPUT.commit_message }}"
+        }
+      },
+      {
+        "id": "fix_push",
+        "type": "action.graphwing.POST:/v1/git/push",
+        "label": "Push fix",
+        "position": { "x": 3080, "y": 160 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "remote": "origin",
+          "ref": "{{ TASKS.view.data.headRefName }}"
+        }
+      },
+      {
+        "id": "fix_restore",
+        "type": "action.graphwing.POST:/v1/git/restore",
+        "label": "Restore failed fix",
+        "position": { "x": 2860, "y": 400 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "clean_untracked": true
+        }
+      },
+      {
         "id": "checks2",
         "type": "action.graphwing.GET:/v1/gh/pr/checks",
         "label": "ghPrChecks after fix",
-        "position": { "x": 2420, "y": 240 },
+        "position": { "x": 3300, "y": 160 },
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
@@ -167,7 +217,7 @@
         "id": "if_green2",
         "type": "logic.filter",
         "label": "all_green after fix?",
-        "position": { "x": 2640, "y": 240 },
+        "position": { "x": 3520, "y": 160 },
         "config": {
           "group": "AND",
           "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
@@ -177,7 +227,7 @@
         "id": "done_after_fix",
         "type": "transforms.objectBuilder",
         "label": "Done after one fix",
-        "position": { "x": 2860, "y": 80 },
+        "position": { "x": 3740, "y": 80 },
         "config": {
           "alias": "done_after_fix",
           "version": 1,
@@ -191,14 +241,18 @@
       { "id": "herdr_no_pr", "type": "action.noop", "label": "Herdr: missing PR", "position": { "x": 660, "y": 480 }, "config": {} },
       { "id": "herdr_git", "type": "action.noop", "label": "Herdr: gitStatus failed", "position": { "x": 440, "y": 480 }, "config": {} },
       { "id": "herdr_checks1", "type": "action.noop", "label": "Herdr: checks HTTP failed", "position": { "x": 880, "y": 480 }, "config": {} },
-      { "id": "herdr_checks2", "type": "action.noop", "label": "Herdr: recheck HTTP failed", "position": { "x": 2420, "y": 480 }, "config": {} },
+      { "id": "herdr_checks2", "type": "action.noop", "label": "Herdr: recheck HTTP failed", "position": { "x": 3300, "y": 400 }, "config": {} },
       { "id": "herdr_pending", "type": "action.noop", "label": "Herdr: checks pending", "position": { "x": 1320, "y": 480 }, "config": {} },
-      { "id": "herdr_test_http", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1320, "y": 620 }, "config": {} },
-      { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok", "position": { "x": 1540, "y": 480 }, "config": {} },
+      { "id": "herdr_pr_checkout", "type": "action.noop", "label": "Herdr: PR checkout failed", "position": { "x": 1540, "y": 620 }, "config": {} },
+      { "id": "herdr_test_http", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 2640, "y": 520 }, "config": {} },
+      { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok; worktree discarded", "position": { "x": 3080, "y": 400 }, "config": {} },
       { "id": "herdr_wait_timeout", "type": "action.noop", "label": "Herdr: agent wait timeout", "position": { "x": 1760, "y": 40 }, "config": {} },
       { "id": "herdr_wait_fail", "type": "action.noop", "label": "Herdr: agent wait failure", "position": { "x": 1980, "y": 40 }, "config": {} },
       { "id": "herdr_receipt", "type": "action.noop", "label": "Herdr: receipt not ok", "position": { "x": 2200, "y": 480 }, "config": {} },
-      { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 2860, "y": 240 }, "config": {} }
+      { "id": "herdr_commit", "type": "action.noop", "label": "Herdr: commit failed", "position": { "x": 3080, "y": 40 }, "config": {} },
+      { "id": "herdr_push", "type": "action.noop", "label": "Herdr: push failed", "position": { "x": 3300, "y": 40 }, "config": {} },
+      { "id": "herdr_restore", "type": "action.noop", "label": "Herdr: restore failed", "position": { "x": 3080, "y": 520 }, "config": {} },
+      { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 3740, "y": 240 }, "config": {} }
     ],
     "edges": [
       { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
@@ -209,19 +263,27 @@
       { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
       { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
       { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "done_green", "targetHandle": "in" },
-      { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "test", "targetHandle": "in" },
+      { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "pr_checkout", "targetHandle": "in" },
       { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
-      { "id": "e9", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
-      { "id": "e9f", "source": "test", "sourceHandle": "failure", "target": "herdr_test_http", "targetHandle": "in" },
-      { "id": "e10", "source": "if_test_ok", "sourceHandle": "pass", "target": "wait", "targetHandle": "in" },
-      { "id": "e11", "source": "if_test_ok", "sourceHandle": "fail", "target": "herdr_test_fail", "targetHandle": "in" },
+      { "id": "e9", "source": "pr_checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e9f", "source": "pr_checkout", "sourceHandle": "failure", "target": "herdr_pr_checkout", "targetHandle": "in" },
       { "id": "e12", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
       { "id": "e13", "source": "wait", "sourceHandle": "out", "target": "receipt", "targetHandle": "in" },
       { "id": "e14", "source": "wait", "sourceHandle": "timeout", "target": "herdr_wait_timeout", "targetHandle": "in" },
       { "id": "e15", "source": "wait", "sourceHandle": "failure", "target": "herdr_wait_fail", "targetHandle": "in" },
       { "id": "e16", "source": "receipt", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
-      { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "checks2", "targetHandle": "in" },
+      { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "fix_test", "targetHandle": "in" },
       { "id": "e18", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "herdr_receipt", "targetHandle": "in" },
+      { "id": "e18a", "source": "fix_test", "sourceHandle": "success", "target": "if_fix_test", "targetHandle": "in" },
+      { "id": "e18b", "source": "fix_test", "sourceHandle": "failure", "target": "herdr_test_http", "targetHandle": "in" },
+      { "id": "e18c", "source": "if_fix_test", "sourceHandle": "pass", "target": "fix_commit", "targetHandle": "in" },
+      { "id": "e18d", "source": "if_fix_test", "sourceHandle": "fail", "target": "fix_restore", "targetHandle": "in" },
+      { "id": "e18e", "source": "fix_commit", "sourceHandle": "success", "target": "fix_push", "targetHandle": "in" },
+      { "id": "e18f", "source": "fix_commit", "sourceHandle": "failure", "target": "herdr_commit", "targetHandle": "in" },
+      { "id": "e18g", "source": "fix_push", "sourceHandle": "success", "target": "checks2", "targetHandle": "in" },
+      { "id": "e18h", "source": "fix_push", "sourceHandle": "failure", "target": "herdr_push", "targetHandle": "in" },
+      { "id": "e18i", "source": "fix_restore", "sourceHandle": "success", "target": "herdr_test_fail", "targetHandle": "in" },
+      { "id": "e18j", "source": "fix_restore", "sourceHandle": "failure", "target": "herdr_restore", "targetHandle": "in" },
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
       { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
       { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "done_after_fix", "targetHandle": "in" },

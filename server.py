@@ -1181,6 +1181,7 @@ def wrap_prompt(job_id: str, prompt: str, cwd: str) -> str:
         "Do not write to any other path.\n"
         "Stage the files you changed with `git add --` and relative paths only. No `git add -A`.\n"
         "Do not git commit, git push, or open a PR. Graph owns those ops.\n"
+        "Do not `git checkout` another branch. Graph already checked out the job branch.\n"
         "Finish with a single JSON object and nothing after it:\n"
         '{"status":"ok"|"error","sha":null,"pr_url":null,"summary":"<one line>"}\n\n'
         f"Task:\n{prompt}\n"
