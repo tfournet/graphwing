@@ -156,6 +156,48 @@ for t in (d.get("result", d).get("tabs") or []):
 ' <<<"$raw"
 }
 
+pane_has_agent() {
+  local pane="$1"
+  herdr_s agent list | PANE="$pane" python3 -c '
+import json, os, sys
+raw = sys.stdin.read()
+i = raw.find("{")
+if i < 0:
+    sys.exit(1)
+d = json.loads(raw[i:])
+want = os.environ["PANE"]
+for a in (d.get("result", d).get("agents") or []):
+    if a.get("pane_id") == want:
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+start_claude() {
+  local pane="$1" agent="$2"
+  if pane_has_agent "$pane"; then
+    return 0
+  fi
+  # New tabs are not a shell prompt yet; agent start fails if we race it.
+  herdr_s pane wait-output --source recent-unwrapped --regex '.' --timeout 15000 "$pane" >/dev/null 2>&1 || true
+  local i err
+  err="$(mktemp)"
+  for i in 1 2 3 4 5 6 7 8; do
+    if herdr_s agent start "$agent" --kind claude --pane "$pane" --timeout 60000 >/dev/null 2>"$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if pane_has_agent "$pane"; then
+      rm -f "$err"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "note: Claude did not start. Click space $LABEL, tab claude, type: claude" >&2
+  cat "$err" >&2 || true
+  rm -f "$err"
+}
+
 cmd_list() {
   command -v "$HERDR" >/dev/null || die "herdr not on PATH"
   herdr_s workspace list >/dev/null || die "herdr session $SESSION not reachable (start: herdr --session $SESSION)"
@@ -273,11 +315,7 @@ for p in (d.get("result", d).get("panes") or []):
   agent="$(echo "$agent" | cut -c1-32)"
 
   if [[ "$START_CLAUDE" -eq 1 ]]; then
-    if herdr_s agent start "$agent" --kind claude --pane "$pane_id" --timeout 60000 >/dev/null; then
-      :
-    else
-      echo "note: space is ready; start Claude in tab claude: claude" >&2
-    fi
+    start_claude "$pane_id" "$agent"
   fi
 
   python3 -c '
