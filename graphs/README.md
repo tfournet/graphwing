@@ -4,6 +4,7 @@ Hard-coded topology. Payload is the iteration. New file only when **edges** chan
 
 `$GRAPHWING_INSTANCE` and the webhook secret placeholder are replaced at publish from environment/install configuration.
 Public OpenAPI URL comes from named-tunnel meta (`cloudflared-meta.json`) or `GRAPHWING_PUBLIC_URL`.
+riftwing rings graphwing OIDC, no Rewst secrets.
 
 ```bash
 GRAPHWING_REWST_MCP_TOKEN=... python3 scripts/publish_graphs.py --only pr-drive

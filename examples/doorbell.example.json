@@ -1,0 +1,20 @@
+{
+  "audience": "https://graphwing.tfour.net",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "jwks_url": "https://token.actions.githubusercontent.com/.well-known/jwks",
+  "allow_repos": {
+    "RewstApp/riftwing": {
+      "repo": "riftwing-drive",
+      "test": "go-fmt",
+      "prompt": "Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge.",
+      "commit_message": "pr-drive doorbell"
+    },
+    "tfournet/graphwing": {
+      "repo": "graphwing",
+      "test": "catalog-compile",
+      "prompt": "Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge.",
+      "commit_message": "pr-drive doorbell"
+    }
+  },
+  "allow_actors": ["tfournet"]
+}

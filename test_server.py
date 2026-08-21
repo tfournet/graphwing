@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("GRAPHWING_HOME", str(Path(__file__).resolve().parent))
+os.environ["GRAPHWING_HOME"] = str(Path(__file__).resolve().parent)
 os.environ["GRAPHWING_HERDR"] = "0"
 
 import server  # noqa: E402
@@ -38,6 +38,118 @@ class DispatchTests(unittest.TestCase):
         p = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.scratch)})
         p.start()
         self.addCleanup(p.stop)
+
+    def _doorbell(self, claims=None, body=None, headers=None, authed=False, install=None):
+        claims = claims or {"repository": "RewstApp/riftwing", "actor": "tfournet"}
+        body = {"pr": 42} if body is None else body
+        headers = {"Authorization": "Bearer oidc-token"} if headers is None else headers
+        install = install or {
+            "pr_drive_hook_url": "https://rewst.example/hooks/pr-drive",
+            "pr_drive_hook_secret": "rewst-secret",
+        }
+        with (
+            mock.patch.object(server, "verify_github_oidc", return_value=claims),
+            mock.patch.object(server, "load_rewst_install", return_value=install),
+        ):
+            return server.dispatch(
+                "POST",
+                "/v1/doorbell/pr-drive",
+                {},
+                authed,
+                json.dumps(body).encode(),
+                headers,
+            )
+
+    def test_doorbell_requires_bearer_even_with_api_key_auth(self):
+        with mock.patch.object(server, "verify_github_oidc") as verify:
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/doorbell/pr-drive", {}, True, b'{"pr":42}', {}
+            )
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["code"], "missing_oidc")
+        verify.assert_not_called()
+
+    def test_doorbell_riftwing_maps_and_rings_rewst(self):
+        captured = {}
+
+        class FakeResp:
+            status = 202
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=20):
+            captured["request"] = req
+            captured["timeout"] = timeout
+            return FakeResp()
+
+        with mock.patch.object(server, "urlopen", fake_urlopen):
+            status, payload, _ = self._doorbell()
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["mapped_repo"], "riftwing-drive")
+        self.assertEqual(payload["rewst_status"], 202)
+        self.assertEqual(captured["timeout"], 20)
+        headers = {k.lower(): v for k, v in captured["request"].header_items()}
+        self.assertEqual(headers["x-rewst-secret"], "rewst-secret")
+        sent = json.loads(captured["request"].data)
+        self.assertEqual(
+            sent,
+            {
+                "repo": "riftwing-drive",
+                "pr": 42,
+                "test": "go-fmt",
+                "prompt": "Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge.",
+                "commit_message": "pr-drive doorbell",
+            },
+        )
+
+    def test_doorbell_graphwing_maps_to_graphwing(self):
+        claims = {"repository": "tfournet/graphwing", "actor": "tfournet"}
+        with mock.patch.object(server, "urlopen", return_value=mock.MagicMock(status=200)):
+            status, payload, _ = self._doorbell(claims=claims)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["mapped_repo"], "graphwing")
+
+    def test_doorbell_rejects_bad_actor_without_post(self):
+        claims = {"repository": "RewstApp/riftwing", "actor": "mallory"}
+        with mock.patch.object(server, "urlopen") as post:
+            status, payload, _ = self._doorbell(claims=claims)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["code"], "actor_not_allowed")
+        post.assert_not_called()
+
+    def test_doorbell_rejects_unknown_repo(self):
+        claims = {"repository": "tfournet/other", "actor": "tfournet"}
+        with mock.patch.object(server, "urlopen") as post:
+            status, payload, _ = self._doorbell(claims=claims)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["code"], "repo_not_allowed")
+        post.assert_not_called()
+
+    def test_doorbell_missing_pr_is_skipped(self):
+        with mock.patch.object(server, "urlopen") as post:
+            status, payload, _ = self._doorbell(body={})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "skipped": True, "reason": "missing_pr"})
+        post.assert_not_called()
+
+    def test_doorbell_body_repo_cannot_override_oidc_repo(self):
+        with mock.patch.object(server, "urlopen", return_value=mock.MagicMock(status=204)) as post:
+            status, payload, _ = self._doorbell(body={"pr": 7, "repo": "tfournet/graphwing"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["mapped_repo"], "riftwing-drive")
+        sent = json.loads(post.call_args.args[0].data)
+        self.assertEqual(sent["repo"], "riftwing-drive")
+
+    def test_doorbell_missing_hook_is_unavailable(self):
+        with mock.patch.object(server, "urlopen") as post:
+            status, payload, _ = self._doorbell(install={"org_id": "unused"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["code"], "hook_unconfigured")
+        post.assert_not_called()
 
     def test_health_no_auth(self):
         status, payload, _ = server.dispatch("GET", "/v1/health", {}, False, b"")
@@ -356,7 +468,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.1")
+        self.assertEqual(spec["info"]["version"], "0.5.2")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -381,6 +493,9 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("/v1/file/head", spec["paths"])
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
+        doorbell = spec["paths"]["/v1/doorbell/pr-drive"]["post"]
+        self.assertEqual(doorbell["operationId"], "doorbellPrDrive")
+        self.assertEqual(doorbell["security"], [])
         self.assertEqual(spec["paths"]["/v1/git/checkout"]["post"]["operationId"], "gitCheckout")
         self.assertEqual(spec["paths"]["/v1/git/restore"]["post"]["operationId"], "gitRestore")
         self.assertEqual(spec["paths"]["/v1/git/commit"]["post"]["operationId"], "gitCommit")
@@ -1087,6 +1202,7 @@ class InstallTests(unittest.TestCase):
             self.assertFalse((home / "cloudflared-meta.json").exists())
             self.assertFalse((home / "rewst-install.json").exists())
             self.assertTrue((home / "rewst-install.example.json").is_file())
+            self.assertTrue((home / "doorbell.example.json").is_file())
             soul = (home / "SOUL.md").read_text()
             self.assertIn(str(home), soul)
             self.assertNotIn("$GRAPHWING_HOME", soul)

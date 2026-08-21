@@ -41,6 +41,8 @@ GRAPHWING_HOME=. python3 test_server.py
 
 Graph uses named OpenAPI actions, not a mega-agent. Prefer a new deterministic op over an agent loop.
 
+`POST /v1/doorbell/pr-drive` accepts a GitHub Actions OIDC bearer token, maps the verified repository and actor through `$GRAPHWING_HOME/doorbell.json` (see `examples/doorbell.example.json`), and rings the secret Rewst pr-drive hook configured in `$GRAPHWING_HOME/rewst-install.json`; it does not accept `X-Graphwing-Key` as authorization.
+
 `POST /v1/agent/run` queues one bounded Hermes loop (`HERMES_HOME=$GRAPHWING_HOME`, max 30 turns / 300s) and returns 202 + `job_id`. Spawn sets `TERMINAL_CWD` / `--in` to the allowlisted repo cwd. Graph join: `action.wait.webhook` pending → `response_webhook_url` / `response_webhook_token`; graphwing POSTs the receipt with `X-Rewst-Token`.
 
 Git writes are opt-in on allowlisted short names: `gitCheckout`, `gitRestore`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless paths are explicit. `scriptRun` / `testRun` are allowlisted names only.
