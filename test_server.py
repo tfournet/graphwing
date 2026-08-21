@@ -45,7 +45,7 @@ class DispatchTests(unittest.TestCase):
         headers = {"Authorization": "Bearer oidc-token"} if headers is None else headers
         install = install or {
             "pr_drive_hook_url": "https://rewst.example/hooks/pr-drive",
-            "pr_drive_hook_secret": "rewst-secret",
+            "hook_secret": "rewst-secret",
         }
         with (
             mock.patch.object(server, "verify_github_oidc", return_value=claims),
@@ -150,6 +150,18 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(payload["code"], "hook_unconfigured")
         post.assert_not_called()
+
+    def test_doorbell_legacy_pr_drive_hook_secret_key(self):
+        with mock.patch.object(server, "urlopen", return_value=mock.MagicMock(status=200)) as post:
+            status, payload, _ = self._doorbell(
+                install={
+                    "pr_drive_hook_url": "https://rewst.example/hooks/pr-drive",
+                    "pr_drive_hook_secret": "legacy-secret",
+                }
+            )
+        self.assertEqual(status, 200, payload)
+        headers = {k.lower(): v for k, v in post.call_args.args[0].header_items()}
+        self.assertEqual(headers["x-rewst-secret"], "legacy-secret")
 
     def test_health_no_auth(self):
         status, payload, _ = server.dispatch("GET", "/v1/health", {}, False, b"")
