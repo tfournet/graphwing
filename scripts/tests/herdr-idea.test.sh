@@ -78,6 +78,12 @@ JSON
   "agent start")
     echo '{"id":"cli:agent:start","result":{"agent":"grill-x"}}'
     ;;
+  "agent list")
+    echo '{"id":"cli:agent:list","result":{"agents":[]}}'
+    ;;
+  "pane wait-output")
+    echo '{"id":"cli:pane:wait-output","result":{}}'
+    ;;
   *)
     echo "unhandled: $*" >&2
     exit 1
@@ -142,5 +148,12 @@ if ! "$SCRIPT" open --label from-repo --repo scratch --no-claude --no-worktree >
   fail "repo short name failed: $(cat "$FAKE/from-repo.err") $(cat "$FAKE/from-repo.out")"
 fi
 pass "resolves repos.json short name"
+
+# 6. Claude start waits for the shell, then agent start
+: >"$log"
+"$SCRIPT" open --label wait-shell --no-worktree --cwd "$FAKE/repo" >/dev/null
+grep -q 'pane wait-output' "$log" || fail "expected pane wait-output before agent start"
+grep -q 'agent start' "$log" || fail "expected agent start"
+pass "waits for shell then starts claude"
 
 echo "all herdr-idea tests passed"
