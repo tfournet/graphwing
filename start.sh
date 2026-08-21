@@ -35,7 +35,7 @@ Options:
   --home DIR            GRAPHWING_HOME (default ~/.graphwing)
   --unit-dir DIR        systemd user unit dir
   --no-units            do not write systemd units
-  --no-cli              do not install ~/.local/bin/graphwing
+  --no-cli              do not install ~/.local/bin/graphwing or graphwing-idea
   --port N              listen port (default 8645)
   --foreground          run the API in this terminal (default)
   --daemon              enable systemd --user units instead

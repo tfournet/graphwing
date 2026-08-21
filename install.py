@@ -250,11 +250,14 @@ def bin_ok(path: Path) -> bool:
 
 
 def install_cli(home: Path) -> Path:
-    src = REPO / "bin" / "graphwing"
-    dest = Path.home() / ".local/bin/graphwing"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    copy_file(src, dest)
+    dest_dir = Path.home() / ".local/bin"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "graphwing"
+    copy_file(REPO / "bin" / "graphwing", dest)
     dest.chmod(0o755)
+    idea = dest_dir / "graphwing-idea"
+    copy_file(REPO / "scripts" / "herdr-idea.sh", idea)
+    idea.chmod(0o755)
     return dest
 
 

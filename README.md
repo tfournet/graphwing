@@ -35,7 +35,8 @@ GRAPHWING_HOME=. python3 test_server.py
 ## Runtime
 
 - API: `127.0.0.1:8645` (health and `/openapi.json` unauthenticated)
-- Human: `herdr --session graphwing`, tab `graph`
+- Human: `herdr --session graphwing`. Tab `graph` is the dashboard (Graph ops / `gw-*` job logs). Do not grill there.
+- Ideas: one Herdr **space** per idea (`graphwing-idea open --repo riftwing --story SC-N` or `--label name`). Claude is tab `claude` in that space. `graphwing-idea list` shows idea spaces and hides the dashboard.
 - CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`)
 - Units: `graphwing-api` always; `graphwing-tunnel` / `graphwing-herdr` only if you opted in
 

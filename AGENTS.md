@@ -34,4 +34,4 @@ Start a Graph run with `{ "input": { ... } }`. `response_webhook_url` is resume 
 
 ## Human surface
 
-Herdr session `graphwing`, tab `graph`. Do not type into the Hermes chat pane.
+Herdr session `graphwing`. Tab `graph` is the dashboard. One idea = one space via `scripts/herdr-idea.sh` (`graphwing-idea` after install). Do not type into the Hermes chat pane or tab `graph`.
