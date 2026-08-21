@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import os
@@ -11,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -66,6 +69,11 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
+JWKS_LOCK = threading.Lock()
+JWKS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+GITHUB_OIDC_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks"
+DOORBELL_PROMPT = "Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge."
 
 
 def public_base_url() -> str | None:
@@ -126,6 +134,114 @@ def load_repos() -> dict[str, str]:
     if not isinstance(data, dict):
         raise RuntimeError(f"repos.json must be an object: {REPOS_PATH}")
     return {str(k).strip(): str(v).strip() for k, v in data.items() if str(k).strip() and str(v).strip()}
+
+
+def load_doorbell() -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "audience": public_base_url() or "https://graphwing.tfour.net",
+        "issuer": GITHUB_OIDC_ISSUER,
+        "jwks_url": GITHUB_OIDC_JWKS_URL,
+        "allow_repos": {
+            "RewstApp/riftwing": {
+                "repo": "riftwing-drive",
+                "test": "go-fmt",
+                "prompt": DOORBELL_PROMPT,
+                "commit_message": "pr-drive doorbell",
+            },
+            "tfournet/graphwing": {
+                "repo": "graphwing",
+                "test": "catalog-compile",
+                "prompt": DOORBELL_PROMPT,
+                "commit_message": "pr-drive doorbell",
+            },
+        },
+        "allow_actors": ["tfournet"],
+    }
+    path = HOME / "doorbell.json"
+    if not path.is_file():
+        return config
+    overlay = json.loads(path.read_text())
+    if not isinstance(overlay, dict):
+        raise RuntimeError(f"doorbell.json must be an object: {path}")
+    config.update(overlay)
+    return config
+
+
+def load_rewst_install() -> dict[str, Any]:
+    path = HOME / "rewst-install.json"
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise RuntimeError(f"rewst-install.json must be an object: {path}")
+    return data
+
+
+def _base64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _load_jwks(url: str) -> dict[str, Any]:
+    now = time.time()
+    with JWKS_LOCK:
+        cached = JWKS_CACHE.get(url)
+        if cached and cached[0] > now:
+            return cached[1]
+        req = Request(url, method="GET")
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
+            raise ValueError("invalid JWKS")
+        JWKS_CACHE[url] = (now + 3600, data)
+        return data
+
+
+def verify_github_oidc(token: str, config: dict[str, Any]) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("invalid JWT")
+    header = json.loads(_base64url_decode(parts[0]))
+    claims = json.loads(_base64url_decode(parts[1]))
+    if not isinstance(header, dict) or not isinstance(claims, dict) or header.get("alg") != "RS256":
+        raise ValueError("invalid JWT")
+    kid = header.get("kid")
+    jwks = _load_jwks(str(config["jwks_url"]))
+    jwk = next(
+        (
+            item
+            for item in jwks["keys"]
+            if isinstance(item, dict) and item.get("kid") == kid and item.get("kty") == "RSA"
+        ),
+        None,
+    )
+    if jwk is None:
+        raise ValueError("unknown signing key")
+    n = int.from_bytes(_base64url_decode(str(jwk["n"])), "big")
+    e = int.from_bytes(_base64url_decode(str(jwk["e"])), "big")
+    signature = _base64url_decode(parts[2])
+    size = (n.bit_length() + 7) // 8
+    if len(signature) != size:
+        raise ValueError("invalid signature")
+    signing_input = f"{parts[0]}.{parts[1]}".encode()
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(signing_input).digest()
+    padding_length = size - len(digest_info) - 3
+    if padding_length < 8:
+        raise ValueError("invalid signing key")
+    expected = b"\x00\x01" + b"\xff" * padding_length + b"\x00" + digest_info
+    actual = pow(int.from_bytes(signature, "big"), e, n).to_bytes(size, "big")
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError("invalid signature")
+    if claims.get("iss") != config.get("issuer"):
+        raise ValueError("invalid issuer")
+    audience = config.get("audience")
+    claim_audience = claims.get("aud")
+    audiences = claim_audience if isinstance(claim_audience, list) else [claim_audience]
+    if audience not in audiences:
+        raise ValueError("invalid audience")
+    expires = claims.get("exp")
+    if not isinstance(expires, (int, float)) or expires <= time.time():
+        raise ValueError("expired JWT")
+    return claims
 
 
 def load_profiles() -> list[dict[str, Any]]:
@@ -1162,6 +1278,98 @@ def parse_json_object(body: bytes) -> tuple[dict[str, Any] | None, dict[str, Any
     return data, None
 
 
+def _request_header(headers: Any, name: str) -> str:
+    if headers is None:
+        return ""
+    direct = headers.get(name) if hasattr(headers, "get") else None
+    if direct is not None:
+        return str(direct)
+    lowered = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
+
+
+def doorbell_pr_drive(body: bytes, headers: Any) -> tuple[int, dict[str, Any]]:
+    authorization = _request_header(headers, "Authorization").strip()
+    if not authorization.lower().startswith("bearer ") or not authorization[7:].strip():
+        return 401, {"error": "GitHub Actions OIDC bearer token required", "code": "missing_oidc"}
+    token = authorization[7:].strip()
+    try:
+        config = load_doorbell()
+        claims = verify_github_oidc(token, config)
+    except Exception:
+        return 401, {"error": "invalid GitHub Actions OIDC token", "code": "invalid_oidc"}
+
+    repository = str(claims.get("repository") or "")
+    actor = str(claims.get("actor") or "")
+    allow_repos = config.get("allow_repos")
+    if not isinstance(allow_repos, dict) or repository not in allow_repos:
+        return 403, {"error": "repository is not allowed", "code": "repo_not_allowed"}
+    allow_actors = config.get("allow_actors")
+    if not isinstance(allow_actors, list) or actor not in allow_actors:
+        return 403, {"error": "actor is not allowed", "code": "actor_not_allowed"}
+
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    pr = data.get("pr")
+    if pr in (None, ""):
+        return 200, {"ok": True, "skipped": True, "reason": "missing_pr"}
+
+    mapping = allow_repos[repository]
+    if isinstance(mapping, str):
+        mapping = {"repo": mapping}
+    if not isinstance(mapping, dict) or not str(mapping.get("repo") or "").strip():
+        return 403, {"error": "repository is not allowed", "code": "repo_not_allowed"}
+    mapped_repo = str(mapping["repo"]).strip()
+    defaults = {
+        "riftwing-drive": {"test": "go-fmt"},
+        "graphwing": {"test": "catalog-compile"},
+    }
+    settings = defaults.get(mapped_repo, {})
+    hook_payload = {
+        "repo": mapped_repo,
+        "pr": pr,
+        "test": str(mapping.get("test") or settings.get("test") or ""),
+        "prompt": str(mapping.get("prompt") or DOORBELL_PROMPT),
+        "commit_message": str(mapping.get("commit_message") or "pr-drive doorbell"),
+    }
+    try:
+        install = load_rewst_install()
+    except Exception:
+        install = {}
+    hook_url = str(install.get("pr_drive_hook_url") or "").strip()
+    hook_secret = str(install.get("pr_drive_hook_secret") or "").strip()
+    if not hook_url or not hook_secret:
+        return 503, {"error": "pr-drive hook is not configured", "code": "hook_unconfigured"}
+
+    request = Request(
+        hook_url,
+        data=json.dumps(hook_payload).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "x-rewst-secret": hook_secret},
+    )
+    try:
+        response = urlopen(request, timeout=20)
+        rewst_status = int(getattr(response, "status", 200))
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        return 502, {"error": "pr-drive hook failed", "code": "hook_failed"}
+    if not 200 <= rewst_status < 300:
+        return 502, {"error": "pr-drive hook failed", "code": "hook_failed"}
+    return 200, {
+        "ok": True,
+        "mapped_repo": mapped_repo,
+        "pr": pr,
+        "rewst_status": rewst_status,
+    }
+
+
 def valid_webhook_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme == "https" and bool(parsed.netloc) and not parsed.netloc.startswith(".")
@@ -1667,7 +1875,18 @@ def repo_or_error(qs: dict[str, list[str]], repos: dict[str, str]):
     return (name, resolved), None
 
 
-def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: bool, body: bytes) -> tuple[int, dict[str, Any] | bytes, str]:
+def dispatch_inner(
+    method: str,
+    path: str,
+    qs: dict[str, list[str]],
+    authed: bool,
+    body: bytes,
+    headers: Any = None,
+) -> tuple[int, dict[str, Any] | bytes, str]:
+    if method == "POST" and path == "/v1/doorbell/pr-drive":
+        status, payload = doorbell_pr_drive(body, headers)
+        return json_out(status, payload)
+
     repos = load_repos()
     if method == "GET" and path in ("/v1/health", "/health"):
         return json_out(200, {"ok": True, "service": "graphwing", "repos": sorted(repos)})
@@ -1799,8 +2018,15 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
     return json_out(404, {"error": "not found", "code": "not_found"})
 
 
-def dispatch(method: str, path: str, qs: dict[str, list[str]], authed: bool, body: bytes) -> tuple[int, dict[str, Any] | bytes, str]:
-    status, payload, ctype = dispatch_inner(method, path, qs, authed, body)
+def dispatch(
+    method: str,
+    path: str,
+    qs: dict[str, list[str]],
+    authed: bool,
+    body: bytes,
+    headers: Any = None,
+) -> tuple[int, dict[str, Any] | bytes, str]:
+    status, payload, ctype = dispatch_inner(method, path, qs, authed, body, headers)
     herdr_announce(method, path, status, payload)
     return status, payload, ctype
 
@@ -1830,7 +2056,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        status, payload, ctype = dispatch("GET", parsed.path, parse_qs(parsed.query), self._authed(), b"")
+        status, payload, ctype = dispatch(
+            "GET", parsed.path, parse_qs(parsed.query), self._authed(), b"", self.headers
+        )
         self._send(status, payload, ctype)
 
     def do_POST(self) -> None:
@@ -1840,7 +2068,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(413, {"error": "body too large", "code": "too_large"}, "application/json")
             return
         body = self.rfile.read(length) if length else b""
-        status, payload, ctype = dispatch("POST", parsed.path, parse_qs(parsed.query), self._authed(), body)
+        status, payload, ctype = dispatch(
+            "POST", parsed.path, parse_qs(parsed.query), self._authed(), body, self.headers
+        )
         self._send(status, payload, ctype)
 
 

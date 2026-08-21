@@ -308,6 +308,7 @@ def main() -> None:
     copy_file(REPO / "examples" / "rr.example.json", home / "rr.example.json")
     copy_file(REPO / "examples" / "repos.example.json", home / "repos.example.json")
     copy_file(REPO / "examples" / "rewst-install.example.json", home / "rewst-install.example.json")
+    copy_file(REPO / "examples" / "doorbell.example.json", home / "doorbell.example.json")
 
     key_path = ensure_key(home)
     ensure_repos(home, REPO, ni, extra=args.repo)
