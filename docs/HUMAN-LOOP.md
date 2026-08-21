@@ -132,7 +132,7 @@ Do not resume the last feature session to “fix e2e.”
 
 1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Index JSON is `tickets[]` with `id`, `path`, `blocked_by`, `kind` (`build`|`decision`), `status` (`open`|`done`). `implement-slice` walks serially: frontier → write → complete → commit index → continue kicks `kick_url` with the next build ticket. No bash `go`.
 2. Three-strikes park (third suite-red); spec-review nack → resume; wipe only on explicit discard.
-3. Seat default writer `grok-4.6`; class×size table on `agentRun`; opposing-vendor spec-review **before** commit.
+3. Seat default writer is still whatever Hermes `config.yaml` says (intended `grok-4.6`). `sliceRoute` sets launcher/turns/reviewers; visual/sensitive spawn `claude -p`. Spec-review nack parks (resume-on-nack still not wired).
 4. E2E node after empty map; auto-ticket / draft-ACK; three e2e-reds → park.
 5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
 

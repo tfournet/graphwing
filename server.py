@@ -62,6 +62,7 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
 
 
 HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
+CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
 HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
 AGENT_MAX_TURNS = 30
@@ -73,6 +74,19 @@ HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
+SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
+SLICE_SIZES = ("S", "M", "L")
+SLICE_BUDGET = {
+    ("mechanical", "S"): (10, 120),
+    ("mechanical", "M"): (30, 300),
+    ("mechanical", "L"): (50, 600),
+    ("visual", "S"): (10, 180),
+    ("visual", "M"): (30, 600),
+    ("visual", "L"): (50, 900),
+    ("sensitive", "S"): (10, 180),
+    ("sensitive", "M"): (30, 600),
+    ("sensitive", "L"): (50, 900),
+}
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
@@ -977,6 +991,10 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "test": data.get("test"),
         "commit_message": data.get("commit_message"),
         "iters_left": data.get("iters_left"),
+        "class": data.get("class"),
+        "size": data.get("size"),
+        "ac_count": data.get("ac_count"),
+        "seams": data.get("seams"),
         "kick_url": kick_url,
         "kick_token": token,
     }
@@ -986,6 +1004,181 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
     if not out["kicked"]:
         return 502, {**out, "ok": False, "error": "kick failed", "code": "kick_failed"}
     return 200, out
+
+
+def parse_optional_int(data: dict[str, Any], key: str, lo: int, hi: int) -> tuple[int | None, dict[str, Any] | None]:
+    raw = data.get(key)
+    if raw in ("", None):
+        return None, None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None, {"error": f"{key} must be an integer", "code": f"bad_{key}"}
+    if n < lo or n > hi:
+        return None, {"error": f"{key} out of range", "code": f"bad_{key}"}
+    return n, None
+
+
+def bump_slice_size(size: str, class_name: str, ac_count: int | None, seams: int | None) -> str:
+    i = SLICE_SIZES.index(size)
+    bump = 0
+    if ac_count is not None and ac_count >= 6:
+        bump = 1
+    if class_name == "visual" and (seams is None or seams == 1):
+        bump = max(bump, 1)
+    return SLICE_SIZES[min(i + bump, len(SLICE_SIZES) - 1)]
+
+
+def slice_route_lookup(
+    class_name: str, size_floor: str, ac_count: int | None = None, seams: int | None = None
+) -> dict[str, Any]:
+    sized = bump_slice_size(size_floor, class_name, ac_count, seams)
+    turns, wait = SLICE_BUDGET[(class_name, sized)]
+    if class_name == "mechanical":
+        launcher, model = "hermes", "grok-4.6"
+        reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
+    elif class_name == "visual":
+        launcher, model = "claude", "claude-opus-5"
+        reviewer1, reviewer2 = "sol", "none"
+    else:
+        launcher, model = "claude", "claude-opus-5"
+        reviewer1, reviewer2 = "sol", "opus"
+    return {
+        "ok": True,
+        "class": class_name,
+        "size_floor": size_floor,
+        "size": sized,
+        "launcher": launcher,
+        "model": model,
+        "max_turns": turns,
+        "run_budget_seconds": wait,
+        "reviewer1": reviewer1,
+        "reviewer2": reviewer2,
+        "review": "none" if reviewer1 == "none" else ("sol_opus" if reviewer2 == "opus" else reviewer1),
+    }
+
+
+def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    class_name = str(data.get("class") or "mechanical").strip()
+    size_floor = str(data.get("size") or "M").strip()
+    if class_name not in SLICE_CLASSES:
+        return 400, {"error": "class must be mechanical, visual, or sensitive", "code": "bad_class"}
+    if size_floor not in SLICE_SIZES:
+        return 400, {"error": "size must be S, M, or L", "code": "bad_size"}
+    ac_count, ac_err = parse_optional_int(data, "ac_count", 0, 99)
+    if ac_err:
+        return 400, ac_err
+    seams, seams_err = parse_optional_int(data, "seams", 0, 20)
+    if seams_err:
+        return 400, seams_err
+    return 200, slice_route_lookup(class_name, size_floor, ac_count, seams)
+
+
+def parse_review_verdict(text: str) -> tuple[str, str]:
+    raw = text or ""
+    upper = raw.upper()
+    if "VERDICT: PASS" in upper or '"VERDICT": "PASS"' in upper or "VERDICT:PASS" in upper:
+        verdict = "PASS"
+    elif "VERDICT: NACK" in upper or "VERDICT: REQUEST_CHANGES" in upper or "VERDICT: FAIL" in upper:
+        verdict = "NACK"
+    else:
+        parsed = parse_receipt_text(raw)
+        if parsed and str(parsed.get("verdict") or parsed.get("status") or "").upper() in {"PASS", "OK"}:
+            verdict = "PASS"
+        elif parsed:
+            verdict = "NACK"
+        else:
+            verdict = "NACK"
+    summary = raw.strip().splitlines()
+    line = next((ln.strip() for ln in summary if ln.strip()), "no review output")
+    return verdict, line[:500]
+
+
+def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    reviewer = str(data.get("reviewer") or "").strip()
+    if reviewer not in {"sonnet", "opus", "sol"}:
+        return 400, {"error": "reviewer must be sonnet, opus, or sol", "code": "bad_reviewer"}
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return 400, {"error": "prompt is required", "code": "missing_prompt"}
+    prompt = prompt.strip()
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    diff = git_diff(resolved, "HEAD", None)
+    diff_text = str(diff.get("diff") or "")[:12000]
+    body_prompt = (
+        "Spec-review only. Do not edit files, commit, or push.\n"
+        "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
+        f"Ticket:\n{prompt[:8000]}\n\nDiff:\n{diff_text}\n"
+    )
+    if reviewer in {"sonnet", "opus"}:
+        if not CLAUDE_BIN.is_file():
+            return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
+        model = "sonnet" if reviewer == "sonnet" else "opus"
+        cmd = [
+            str(CLAUDE_BIN),
+            "-p",
+            "--output-format",
+            "text",
+            "--permission-mode",
+            "plan",
+            "--max-turns",
+            "1",
+            "--model",
+            model,
+            body_prompt,
+        ]
+        env = {k: v for k, v in os.environ.items()}
+    else:
+        if not HERMES_BIN.is_file():
+            return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
+        cmd = [
+            str(HERMES_BIN),
+            "chat",
+            "-Q",
+            "--query",
+            body_prompt,
+            "--in",
+            str(resolved),
+            "--no-restore-cwd",
+            "--max-turns",
+            "8",
+            "--run-budget",
+            "180",
+            "--yolo",
+            "--source",
+            "tool",
+        ]
+        env = hermes_job_env({"job_id": "review", "cwd": str(resolved)})
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(resolved),
+            env=env,
+            capture_output=True,
+            timeout=200,
+        )
+    except subprocess.TimeoutExpired:
+        return 504, {"ok": False, "verdict": "NACK", "error": "review timed out", "code": "timeout"}
+    text = (proc.stdout or b"").decode("utf-8", "replace")
+    verdict, summary = parse_review_verdict(text)
+    return 200, {
+        "ok": verdict == "PASS",
+        "verdict": verdict,
+        "reviewer": reviewer,
+        "summary": summary,
+        "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
+        "returncode": proc.returncode,
+    }
 
 
 def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
@@ -1800,6 +1993,60 @@ def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     return proc, None
 
 
+def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    if not CLAUDE_BIN.is_file():
+        return None, {"error": f"missing claude binary: {CLAUDE_BIN}", "code": "missing_binary"}
+    prompt_path = job_dir(job["job_id"]) / "prompt.txt"
+    stdout_path = job_dir(job["job_id"]) / "stdout.log"
+    stderr_path = job_dir(job["job_id"]) / "stderr.log"
+    try:
+        prompt = prompt_path.read_text()
+    except OSError as exc:
+        return None, {"error": f"missing prompt: {exc}", "code": "missing_prompt"}
+    stdout_f = stdout_path.open("wb")
+    stderr_f = stderr_path.open("wb")
+    cwd = str(Path(job["cwd"]).resolve())
+    env = {k: v for k, v in os.environ.items()}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "PWD": cwd})
+    cmd = [
+        str(CLAUDE_BIN),
+        "-p",
+        "--output-format",
+        "text",
+        "--permission-mode",
+        "acceptEdits",
+        "--max-turns",
+        str(job["max_turns"]),
+        "--add-dir",
+        cwd,
+        "--model",
+        str(job.get("model") or "claude-opus-5"),
+        prompt,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        stdout_f.close()
+        stderr_f.close()
+        return None, {"error": f"spawn failed: {exc}", "code": "spawn_failed"}
+    stdout_f.close()
+    stderr_f.close()
+    return proc, None
+
+
+def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    if job.get("launcher") == "claude":
+        return spawn_claude(job)
+    return spawn_hermes(job)
+
+
 def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -1822,7 +2069,7 @@ def run_agent_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    proc, err = spawn_hermes(job)
+    proc, err = spawn_writer(job)
     if err:
         job["status"] = "failed"
         job["finished_at"] = utcnow()
@@ -2076,8 +2323,26 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     session, session_err = parse_hermes_session(data)
     if session_err:
         return 400, session_err
-    if not HERMES_BIN.is_file():
+    launcher = str(data.get("launcher") or "hermes").strip()
+    if launcher not in {"hermes", "claude"}:
+        return 400, {"error": "launcher must be hermes or claude", "code": "bad_launcher"}
+    turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
+    if turns_err:
+        return 400, turns_err
+    budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
+    if budget_err:
+        return 400, budget_err
+    model = data.get("model")
+    if model in ("", None):
+        model = None
+    elif not isinstance(model, str) or not model.strip() or len(model) > 80:
+        return 400, {"error": "model is invalid", "code": "bad_model"}
+    else:
+        model = model.strip()
+    if launcher == "hermes" and not HERMES_BIN.is_file():
         return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
+    if launcher == "claude" and not CLAUDE_BIN.is_file():
+        return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
@@ -2092,14 +2357,16 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "cwd": str(resolved),
             "prompt": prompt,
             "hermes_session": hermes_session,
+            "launcher": launcher,
+            "model": model,
+            "max_turns": turns or AGENT_MAX_TURNS,
+            "run_budget_seconds": budget or AGENT_RUN_BUDGET,
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
             "resume_url": webhook_url,
             "created_at": utcnow(),
             "started_at": None,
             "finished_at": None,
-            "max_turns": AGENT_MAX_TURNS,
-            "run_budget_seconds": AGENT_RUN_BUDGET,
             "receipt": None,
             "log_ref": log_ref,
             "error": None,
@@ -2116,6 +2383,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "profile": profile,
         "repo": repo_name,
         "hermes_session": hermes_session,
+        "launcher": launcher,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
 
@@ -2196,6 +2464,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/continue":
         status, payload = slice_continue(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/route":
+        status, payload = slice_route(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/review/run":
+        status, payload = review_run(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":
