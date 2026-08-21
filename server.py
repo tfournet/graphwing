@@ -1741,7 +1741,7 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
             number = first_query(qs, "number")
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
-            out = gh_json(repo_path, ["pr", "view", number, "--json", "number,title,state,url,headRefName,baseRefName,mergeable,isDraft,body"])
+            out = gh_json(repo_path, ["pr", "view", number, "--json", "number,title,state,url,headRefName,baseRefName,mergeable,isDraft"])
         elif method == "GET" and path == "/v1/gh/pr/checks":
             number = first_query(qs, "number")
             if not number:
