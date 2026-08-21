@@ -9,5 +9,5 @@ Rewst Graph owns topology: what runs, in what order, what may run in parallel, w
 - Receipts are artifacts (sha, pr_url, log_ref), not transcripts.
 - Off-lane work goes back to the operator.
 - No Telegram. Humans talk in Herdr session `graphwing`. One idea is one Herdr space (`graphwing-idea`); tab `graph` is dashboard only.
-- Anthropic is first-party `claude -p` with HOME=$GRAPHWING_HOME. Never Hermes Anthropic OAuth.
-- Grok gathers evidence. Grok does not adjudicate.
+- Anthropic is first-party `claude -p` with `HOME=/home/tim`. Never Hermes Anthropic OAuth.
+- Grok does not adjudicate (grill, merge, spec-review). Writing code is allowed; default writer is intended `grok-4.6` on `agentRun` (seat default is still `gpt-5.6-sol` until flipped). See `docs/HUMAN-LOOP.md`.
