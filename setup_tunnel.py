@@ -42,6 +42,15 @@ def cfg(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+def set_openapi_server(home: Path, url: str) -> None:
+    path = home / "openapi.json"
+    if not path.is_file() or not url.strip():
+        return
+    spec = json.loads(path.read_text())
+    spec["servers"] = [{"url": url.strip().rstrip("/")}]
+    path.write_text(json.dumps(spec, indent=2) + "\n")
+
+
 def bws_secret(key: str) -> str:
     token_path = Path.home() / ".config/bws/access_token"
     if not token_path.is_file():
@@ -214,6 +223,9 @@ def main() -> None:
         + "\n"
     )
     print("wrote", TOKEN_FILE, "and", META_FILE)
+    public = f"https://{hostname}"
+    set_openapi_server(HOME, public)
+    print("openapi servers.url", public)
 
 
 if __name__ == "__main__":
