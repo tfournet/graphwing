@@ -13,6 +13,20 @@
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false
+    },
+    {
+      "name": "always-fail",
+      "argv": ["python3", "-c", "raise SystemExit(1)"],
+      "cwd": ".",
+      "timeout_seconds": 5,
+      "async": false
+    },
+    {
+      "name": "catalog-compile",
+      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py", "install.py", "setup_tunnel.py"],
+      "cwd": ".",
+      "timeout_seconds": 15,
+      "async": false
     }
   ]
 }
