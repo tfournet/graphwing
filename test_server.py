@@ -355,7 +355,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.0")
+        self.assertEqual(spec["info"]["version"], "0.5.1")
         self.assertIn("/v1/stack/status", spec["paths"])
         self.assertIn("/v1/port/check", spec["paths"])
         self.assertIn("/v1/test/run", spec["paths"])
@@ -369,6 +369,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("response_webhook_token", props)
         self.assertIn("/v1/git/status", spec["paths"])
         self.assertIn("/v1/git/checkout", spec["paths"])
+        self.assertIn("/v1/git/restore", spec["paths"])
         self.assertIn("/v1/git/commit", spec["paths"])
         self.assertIn("/v1/git/push", spec["paths"])
         self.assertIn("/v1/script/run", spec["paths"])
@@ -377,6 +378,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
         self.assertEqual(spec["paths"]["/v1/git/checkout"]["post"]["operationId"], "gitCheckout")
+        self.assertEqual(spec["paths"]["/v1/git/restore"]["post"]["operationId"], "gitRestore")
         self.assertEqual(spec["paths"]["/v1/git/commit"]["post"]["operationId"], "gitCommit")
         self.assertEqual(spec["paths"]["/v1/git/push"]["post"]["operationId"], "gitPush")
         self.assertEqual(spec["paths"]["/v1/script/run"]["post"]["operationId"], "scriptRun")
@@ -556,6 +558,80 @@ class DispatchTests(unittest.TestCase):
                     )
                     self.assertEqual(status, 400, payload)
                     self.assertEqual(payload["code"], "bad_branch")
+
+    def test_git_restore_keeps_untracked_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "README").write_text("failed experiment\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README"], check=True, capture_output=True)
+            (repo / "untracked.txt").write_text("keep me\n")
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/git/restore", {}, True, json.dumps({"repo": "scratch"}).encode()
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
+            self.assertEqual((repo / "README").read_text(), "hi\n")
+            self.assertEqual((repo / "untracked.txt").read_text(), "keep me\n")
+
+    def test_git_restore_cleans_untracked_when_requested(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / ".gitignore").write_text("ignored.txt\n")
+            subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "ignore fixture"], check=True, capture_output=True)
+            (repo / "README").write_text("failed experiment\n")
+            (repo / "untracked.txt").write_text("remove me\n")
+            (repo / "ignored.txt").write_text("keep ignored\n")
+            untracked_dir = repo / "untracked-dir"
+            untracked_dir.mkdir()
+            (untracked_dir / "file.txt").write_text("remove me too\n")
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/git/restore",
+                    {},
+                    True,
+                    json.dumps({"repo": "scratch", "clean_untracked": True}).encode(),
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
+            self.assertEqual((repo / "README").read_text(), "hi\n")
+            self.assertFalse((repo / "untracked.txt").exists())
+            self.assertFalse(untracked_dir.exists())
+            self.assertEqual((repo / "ignored.txt").read_text(), "keep ignored\n")
+
+    def test_git_restore_rejects_missing_and_path_repo(self):
+        with mock.patch.object(server, "load_repos", return_value={"scratch": "/tmp/scratch"}):
+            for request, code in (({}, "missing_repo"), ({"repo": "/tmp/scratch"}, "bad_repo")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/git/restore", {}, True, json.dumps(request).encode()
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], code)
+
+    def test_git_restore_rejects_force(self):
+        with mock.patch.object(server, "load_repos", return_value={"scratch": "/tmp/scratch"}):
+            for field in ("force", "force_with_lease"):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/git/restore",
+                    {},
+                    True,
+                    json.dumps({"repo": "scratch", field: True}).encode(),
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "force_rejected")
+            for field in ("remote", "ref", "delete"):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/git/restore",
+                    {},
+                    True,
+                    json.dumps({"repo": "scratch", field: "rejected"}).encode(),
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "extra_field")
 
     def test_git_commit_add_and_staged_only(self):
         with tempfile.TemporaryDirectory() as td:
