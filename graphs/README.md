@@ -16,3 +16,4 @@ Copy `examples/rewst-install.example.json` to `$GRAPHWING_HOME/rewst-install.jso
 | `graphwing-verify-stack` | `stack`, `ports` | stackStatus → portCheck |
 | `graphwing-implement-slice` | `repo`, `branch`, `prompt`, `commit_message`, `test` | gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush or gitRestore |
 | `graphwing-pr-drive` | `repo`, `pr`, `test`, `prompt` | checks green → done; red → testRun → one agent slice → checks again |
+<!-- keep-revert pass smoke -->
