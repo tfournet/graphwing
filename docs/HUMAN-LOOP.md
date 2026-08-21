@@ -9,7 +9,7 @@ Read this at the start of a **new** Herdr/Claude session. Do not reconstruct it 
 - Session: `herdr --session graphwing` (only session).
 - Dashboard: space `graphwing`, tab `graph`. Job logs `gw-*`. Do not chat there.
 - One idea = one **space** (`graphwing-idea open --label NAME --repo riftwing`). Claude is tab `claude`.
-- Pre-platform notes: Obsidian `Epics/`, `Notes/`, `projects/riftwing/`. **Not** Mission Control.
+- Pre-platform notes: Obsidian `Epics/`, `Notes/`, `projects/riftwing/`. Mission Control is **retired** (archive: `/home/tim/archive/riftwing-mission-control-20260821`). Do not recreate it.
 - Tracker: Shortcut. In-repo truth after cement: ADR / `ARCHITECTURE.md` / story.
 
 ## Flow
