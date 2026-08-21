@@ -260,18 +260,7 @@
           "ref": "{{ TASKS.view.data.data.headRefName }}"
         }
       },
-      {
-        "id": "fix_restore",
-        "type": "action.graphwing.POST:/v1/git/restore",
-        "label": "Restore failed fix",
-        "position": { "x": 2860, "y": 400 },
-        "config": {
-          "integrationInstanceId": "$GRAPHWING_INSTANCE",
-          "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "clean_untracked": true
-        }
-      },
+
       {
         "id": "checks2",
         "type": "action.graphwing.GET:/v1/gh/pr/checks",
@@ -318,13 +307,13 @@
       { "id": "herdr_review_required", "type": "action.noop", "label": "Herdr: review required", "position": { "x": 1540, "y": 440 }, "config": {} },
       { "id": "herdr_pr_checkout", "type": "action.noop", "label": "Herdr: PR checkout failed", "position": { "x": 1540, "y": 620 }, "config": {} },
       { "id": "herdr_test_http", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 2640, "y": 520 }, "config": {} },
-      { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok; worktree discarded", "position": { "x": 3080, "y": 400 }, "config": {} },
+      { "id": "herdr_test_fail", "type": "action.noop", "label": "Herdr: testRun not ok; files kept", "position": { "x": 3080, "y": 400 }, "config": {} },
       { "id": "herdr_wait_timeout", "type": "action.noop", "label": "Herdr: agent wait timeout", "position": { "x": 1760, "y": 40 }, "config": {} },
       { "id": "herdr_wait_fail", "type": "action.noop", "label": "Herdr: agent wait failure", "position": { "x": 1980, "y": 40 }, "config": {} },
       { "id": "herdr_receipt", "type": "action.noop", "label": "Herdr: receipt not ok", "position": { "x": 2200, "y": 480 }, "config": {} },
       { "id": "herdr_commit", "type": "action.noop", "label": "Herdr: commit failed", "position": { "x": 3080, "y": 40 }, "config": {} },
       { "id": "herdr_push", "type": "action.noop", "label": "Herdr: push failed", "position": { "x": 3300, "y": 40 }, "config": {} },
-      { "id": "herdr_restore", "type": "action.noop", "label": "Herdr: restore failed", "position": { "x": 3080, "y": 520 }, "config": {} },
+
       { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 3740, "y": 240 }, "config": {} }
     ],
     "edges": [
@@ -357,13 +346,12 @@
       { "id": "e18a", "source": "fix_test", "sourceHandle": "success", "target": "if_fix_test", "targetHandle": "in" },
       { "id": "e18b", "source": "fix_test", "sourceHandle": "failure", "target": "herdr_test_http", "targetHandle": "in" },
       { "id": "e18c", "source": "if_fix_test", "sourceHandle": "pass", "target": "fix_commit", "targetHandle": "in" },
-      { "id": "e18d", "source": "if_fix_test", "sourceHandle": "fail", "target": "fix_restore", "targetHandle": "in" },
+      { "id": "e18d", "source": "if_fix_test", "sourceHandle": "fail", "target": "herdr_test_fail", "targetHandle": "in" },
       { "id": "e18e", "source": "fix_commit", "sourceHandle": "success", "target": "fix_push", "targetHandle": "in" },
       { "id": "e18f", "source": "fix_commit", "sourceHandle": "failure", "target": "herdr_commit", "targetHandle": "in" },
       { "id": "e18g", "source": "fix_push", "sourceHandle": "success", "target": "checks2", "targetHandle": "in" },
       { "id": "e18h", "source": "fix_push", "sourceHandle": "failure", "target": "herdr_push", "targetHandle": "in" },
-      { "id": "e18i", "source": "fix_restore", "sourceHandle": "success", "target": "herdr_test_fail", "targetHandle": "in" },
-      { "id": "e18j", "source": "fix_restore", "sourceHandle": "failure", "target": "herdr_restore", "targetHandle": "in" },
+
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
       { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
       { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "done_after_fix", "targetHandle": "in" },

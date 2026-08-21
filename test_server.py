@@ -1619,6 +1619,12 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e31"]["sourceHandle"], "fail")
         self.assertEqual(edges["e31"]["target"], "wait3")
         self.assertEqual(edges["e31i"]["target"], "wait_human")
+        self.assertEqual(edges["e_rev1_nack"]["target"], "wait_rn1")
+        self.assertEqual(edges["e_rev2_nack"]["target"], "wait_rn2")
+        self.assertEqual(edges["e_r1b_nack"]["target"], "wait_human")
+        self.assertEqual(edges["e_r2b_nack"]["target"], "wait_human")
+        rn1 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent_rn1")
+        self.assertIn("TASKS.review1.data.compact", rn1["config"]["prompt"])
         self.assertEqual(edges["e22"]["target"], "wait_human")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
         self.assertIn("hermes_session", agent2["config"])
@@ -1627,6 +1633,16 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
         self.assertNotIn("CTX.INPUT.prompt", agent2["config"]["prompt"])
+
+    def test_pr_drive_keeps_files_on_red(self):
+        graph_path = Path(__file__).resolve().parent / "graphs" / "pr-drive.json"
+        graph = json.loads(graph_path.read_text())
+        node_types = [node["type"].lower() for node in graph["spec"]["nodes"]]
+        self.assertFalse(any("git/restore" in node_type for node_type in node_types))
+        edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
+        self.assertEqual(edges["e18d"]["target"], "herdr_test_fail")
+        fail = next(node for node in graph["spec"]["nodes"] if node["id"] == "herdr_test_fail")
+        self.assertIn("files kept", fail["label"])
 
     def test_implement_slice_writer_sees_ticket_file(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "implement-slice.json"

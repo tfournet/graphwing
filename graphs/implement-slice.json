@@ -188,6 +188,158 @@
         }
       },
       {
+        "id": "wait_rn1",
+        "type": "action.wait.webhook",
+        "label": "Wait review1 nack resume",
+        "position": { "x": 1240, "y": 200 },
+        "config": {
+          "alias": "wait_rn1",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "agent_rn1",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "resume after review1 nack",
+        "position": { "x": 1300, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "launcher": "{{ TASKS.route.data.launcher }}",
+          "model": "{{ TASKS.route.data.model }}",
+          "max_turns": "{{ TASKS.route.data.max_turns }}",
+          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.review1.data.compact }}\nFiles are on disk. Continue this slice. Do not start over.",
+          "response_webhook_url": "{{ TASKS.wait_rn1.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_rn1.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "test_rn1",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "test after review1 nack",
+        "position": { "x": 1360, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_test_rn1",
+        "type": "logic.filter",
+        "label": "test after nack1 ok?",
+        "position": { "x": 1420, "y": 200 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "review1b",
+        "type": "action.graphwing.POST:/v1/review/run",
+        "label": "specReview 1 again",
+        "position": { "x": 1480, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 200,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "reviewer": "{{ TASKS.route.data.reviewer1 }}",
+          "prompt": "{{ TASKS.ticket_head.data.text }}"
+        }
+      },
+      {
+        "id": "if_review1b",
+        "type": "logic.filter",
+        "label": "review1b pass?",
+        "position": { "x": 1540, "y": 200 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "wait_rn2",
+        "type": "action.wait.webhook",
+        "label": "Wait review2 nack resume",
+        "position": { "x": 1360, "y": 280 },
+        "config": {
+          "alias": "wait_rn2",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "agent_rn2",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "resume after review2 nack",
+        "position": { "x": 1420, "y": 280 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "launcher": "{{ TASKS.route.data.launcher }}",
+          "model": "{{ TASKS.route.data.model }}",
+          "max_turns": "{{ TASKS.route.data.max_turns }}",
+          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.review2.data.compact }}\nFiles are on disk. Continue this slice. Do not start over.",
+          "response_webhook_url": "{{ TASKS.wait_rn2.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_rn2.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "test_rn2",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "test after review2 nack",
+        "position": { "x": 1480, "y": 280 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_test_rn2",
+        "type": "logic.filter",
+        "label": "test after nack2 ok?",
+        "position": { "x": 1540, "y": 280 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "review2b",
+        "type": "action.graphwing.POST:/v1/review/run",
+        "label": "specReview 2 again",
+        "position": { "x": 1600, "y": 280 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 200,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "reviewer": "opus",
+          "prompt": "{{ TASKS.ticket_head.data.text }}"
+        }
+      },
+      {
+        "id": "if_review2b",
+        "type": "logic.filter",
+        "label": "review2b pass?",
+        "position": { "x": 1660, "y": 280 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
         "id": "ticket_head",
         "type": "action.graphwing.GET:/v1/file/head",
         "label": "fileHead ticket",
@@ -628,13 +780,37 @@
       { "id": "e_rev1_ok", "source": "review1", "sourceHandle": "success", "target": "if_review1", "targetHandle": "in" },
       { "id": "e_rev1_http", "source": "review1", "sourceHandle": "failure", "target": "review_fail", "targetHandle": "in" },
       { "id": "e_rev1_pass", "source": "if_review1", "sourceHandle": "pass", "target": "switch_rev2", "targetHandle": "in" },
-      { "id": "e_rev1_nack", "source": "if_review1", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
+      { "id": "e_rev1_nack", "source": "if_review1", "sourceHandle": "fail", "target": "wait_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_pend", "source": "wait_rn1", "sourceHandle": "pending", "target": "agent_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_to", "source": "wait_rn1", "sourceHandle": "timeout", "target": "wait2_timeout", "targetHandle": "in" },
+      { "id": "e_rn1_fail", "source": "wait_rn1", "sourceHandle": "failure", "target": "wait2_fail", "targetHandle": "in" },
+      { "id": "e_rn1_th", "source": "test_rn1", "sourceHandle": "success", "target": "if_test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_tf", "source": "test_rn1", "sourceHandle": "failure", "target": "test_http_fail", "targetHandle": "in" },
+      { "id": "e_rn1_tok", "source": "if_test_rn1", "sourceHandle": "pass", "target": "review1b", "targetHandle": "in" },
+      { "id": "e_rn1_tbad", "source": "if_test_rn1", "sourceHandle": "fail", "target": "wait2", "targetHandle": "in" },
+      { "id": "e_r1b_ok", "source": "review1b", "sourceHandle": "success", "target": "if_review1b", "targetHandle": "in" },
+      { "id": "e_r1b_http", "source": "review1b", "sourceHandle": "failure", "target": "review_fail", "targetHandle": "in" },
+      { "id": "e_r1b_pass", "source": "if_review1b", "sourceHandle": "pass", "target": "switch_rev2", "targetHandle": "in" },
+      { "id": "e_r1b_nack", "source": "if_review1b", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
       { "id": "e_rev2_need", "source": "switch_rev2", "sourceHandle": "case-0", "target": "review2", "targetHandle": "in" },
       { "id": "e_rev2_skip", "source": "switch_rev2", "sourceHandle": "default", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_rev2_ok", "source": "review2", "sourceHandle": "success", "target": "if_review2", "targetHandle": "in" },
       { "id": "e_rev2_http", "source": "review2", "sourceHandle": "failure", "target": "review_fail", "targetHandle": "in" },
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
-      { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
+      { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_pend", "source": "wait_rn2", "sourceHandle": "pending", "target": "agent_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_to", "source": "wait_rn2", "sourceHandle": "timeout", "target": "wait2_timeout", "targetHandle": "in" },
+      { "id": "e_rn2_fail", "source": "wait_rn2", "sourceHandle": "failure", "target": "wait2_fail", "targetHandle": "in" },
+      { "id": "e_rn2_th", "source": "test_rn2", "sourceHandle": "success", "target": "if_test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_tf", "source": "test_rn2", "sourceHandle": "failure", "target": "test_http_fail", "targetHandle": "in" },
+      { "id": "e_rn2_tok", "source": "if_test_rn2", "sourceHandle": "pass", "target": "review2b", "targetHandle": "in" },
+      { "id": "e_rn2_tbad", "source": "if_test_rn2", "sourceHandle": "fail", "target": "wait2", "targetHandle": "in" },
+      { "id": "e_r2b_ok", "source": "review2b", "sourceHandle": "success", "target": "if_review2b", "targetHandle": "in" },
+      { "id": "e_r2b_http", "source": "review2b", "sourceHandle": "failure", "target": "review_fail", "targetHandle": "in" },
+      { "id": "e_r2b_pass", "source": "if_review2b", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
+      { "id": "e_r2b_nack", "source": "if_review2b", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
       { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "wait2", "targetHandle": "in" },
       { "id": "e21", "source": "switch_retry", "sourceHandle": "case-0", "target": "wait2", "targetHandle": "in" },
       { "id": "e22", "source": "switch_retry", "sourceHandle": "default", "target": "wait_human", "targetHandle": "in" },
