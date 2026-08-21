@@ -583,6 +583,12 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("/v1/script/run", spec["paths"])
         self.assertIn("/v1/gh/pr/list", spec["paths"])
         self.assertIn("/v1/file/head", spec["paths"])
+        self.assertIn("/v1/slice/frontier", spec["paths"])
+        self.assertIn("/v1/slice/complete", spec["paths"])
+        self.assertIn("/v1/slice/continue", spec["paths"])
+        self.assertEqual(spec["paths"]["/v1/slice/frontier"]["get"]["operationId"], "sliceFrontier")
+        self.assertEqual(spec["paths"]["/v1/slice/complete"]["post"]["operationId"], "sliceComplete")
+        self.assertEqual(spec["paths"]["/v1/slice/continue"]["post"]["operationId"], "sliceContinue")
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
         doorbell = spec["paths"]["/v1/doorbell/pr-drive"]["post"]
@@ -616,6 +622,208 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["text"])
+
+    def _write_slice_index(self, repo: Path, tickets: list) -> str:
+        rel = "slices/demo/index.json"
+        dest = repo / "slices" / "demo"
+        dest.mkdir(parents=True)
+        (dest / "index.json").write_text(json.dumps({"tickets": tickets}, indent=2) + "\n")
+        return rel
+
+    def test_slice_frontier_serial_and_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "open",
+                    },
+                    {
+                        "id": "02-checkout",
+                        "path": "slices/demo/02-checkout.md",
+                        "blocked_by": ["01-login"],
+                        "kind": "build",
+                        "status": "open",
+                    },
+                ],
+            )
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET",
+                    "/v1/slice/frontier",
+                    {"repo": ["scratch"], "index": [rel]},
+                    True,
+                    b"",
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(payload["kind"], "build")
+                self.assertEqual(payload["id"], "01-login")
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/slice/complete",
+                    {},
+                    True,
+                    json.dumps({"repo": "scratch", "index": rel, "id": "01-login"}).encode(),
+                )
+                self.assertEqual(status, 200, payload)
+                status, payload, _ = server.dispatch(
+                    "GET",
+                    "/v1/slice/frontier",
+                    {"repo": ["scratch"], "index": [rel]},
+                    True,
+                    b"",
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["id"], "02-checkout")
+
+    def test_slice_frontier_decision_stops(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-ask",
+                        "path": "slices/demo/01-ask.md",
+                        "blocked_by": [],
+                        "kind": "decision",
+                        "status": "open",
+                    },
+                    {
+                        "id": "02-build",
+                        "path": "slices/demo/02-build.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "open",
+                    },
+                ],
+            )
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET",
+                    "/v1/slice/frontier",
+                    {"repo": ["scratch"], "index": [rel]},
+                    True,
+                    b"",
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["kind"], "decision")
+            self.assertEqual(payload["id"], "01-ask")
+
+    def test_slice_continue_kicks_https_webhook(self):
+        captured = {}
+
+        class FakeResp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=15):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "done",
+                    },
+                    {
+                        "id": "02-checkout",
+                        "path": "slices/demo/02-checkout.md",
+                        "blocked_by": ["01-login"],
+                        "kind": "build",
+                        "status": "open",
+                    },
+                ],
+            )
+            body = json.dumps(
+                {
+                    "repo": "scratch",
+                    "index": rel,
+                    "branch": "feature/x",
+                    "test": "graphwing-unit",
+                    "commit_message": "slice",
+                    "kick_url": "https://example.com/hook",
+                    "kick_token": "tok",
+                }
+            ).encode()
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "urlopen", fake_urlopen):
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/slice/continue", {}, True, body
+                    )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["kicked"])
+            self.assertEqual(payload["id"], "02-checkout")
+            self.assertEqual(captured["url"], "https://example.com/hook")
+            self.assertEqual(captured["body"]["ticket"], "slices/demo/02-checkout.md")
+            self.assertEqual(captured["body"]["kick_url"], "https://example.com/hook")
+
+    def test_slice_continue_rejects_http_kick_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {
+                        "id": "01-login",
+                        "path": "slices/demo/01-login.md",
+                        "blocked_by": [],
+                        "kind": "build",
+                        "status": "open",
+                    }
+                ],
+            )
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/slice/continue",
+                    {},
+                    True,
+                    json.dumps(
+                        {
+                            "repo": "scratch",
+                            "index": rel,
+                            "kick_url": "http://127.0.0.1/x",
+                        }
+                    ).encode(),
+                )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["code"], "bad_kick_url")
+
+    def test_git_commit_add_accepts_string_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "extra.txt").write_text("x\n")
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "POST",
+                    "/v1/git/commit",
+                    {},
+                    True,
+                    json.dumps(
+                        {"repo": "scratch", "message": "add extra", "add": "extra.txt"}
+                    ).encode(),
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
 
     def test_file_head_nested_relative_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1297,19 +1505,25 @@ class DispatchTests(unittest.TestCase):
         graph = json.loads(graph_path.read_text())
         form = next(node for node in graph["spec"]["nodes"] if node["id"] == "form")
         inputs = form["config"]["inputs"]
-        self.assertTrue(inputs["ticket"]["required"])
+        self.assertTrue(inputs["index"]["required"])
+        self.assertFalse(inputs["ticket"].get("required"))
         self.assertNotIn("prompt", inputs)
         head = next(node for node in graph["spec"]["nodes"] if node["id"] == "ticket_head")
         self.assertIn("file/head", head["type"])
-        self.assertEqual(head["config"]["path"], "{{ CTX.INPUT.ticket }}")
+        self.assertEqual(head["config"]["path"], "{{ TASKS.frontier.data.path }}")
         agent = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent")
         self.assertEqual(agent["config"]["prompt"], "{{ TASKS.ticket_head.data.text }}")
         self.assertNotIn("CTX.INPUT.prompt", agent["config"]["prompt"])
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
-        self.assertEqual(edges["e7"]["target"], "ticket_head")
+        self.assertEqual(edges["e7"]["target"], "frontier")
+        self.assertEqual(edges["e7j"]["target"], "ticket_head")
         self.assertEqual(edges["e7b"]["source"], "ticket_head")
         self.assertEqual(edges["e7b"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
+        self.assertEqual(edges["e_commit_out"]["target"], "complete")
+        self.assertEqual(edges["e12"]["target"], "walk")
+        commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
+        self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
 
 
 class InstallTests(unittest.TestCase):

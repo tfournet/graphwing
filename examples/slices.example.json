@@ -1,0 +1,18 @@
+{
+  "tickets": [
+    {
+      "id": "01-login",
+      "path": "slices/demo/01-login.md",
+      "blocked_by": [],
+      "kind": "build",
+      "status": "open"
+    },
+    {
+      "id": "02-checkout",
+      "path": "slices/demo/02-checkout.md",
+      "blocked_by": ["01-login"],
+      "kind": "build",
+      "status": "open"
+    }
+  ]
+}
