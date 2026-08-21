@@ -121,7 +121,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "branch": "{{ TASKS.view.data.headRefName }}",
+          "branch": "{{ TASKS.view.data.data.headRefName }}",
           "create": false
         }
       },
@@ -221,7 +221,7 @@
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
           "remote": "origin",
-          "ref": "{{ TASKS.view.data.headRefName }}"
+          "ref": "{{ TASKS.view.data.data.headRefName }}"
         }
       },
       {
