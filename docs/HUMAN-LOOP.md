@@ -122,16 +122,18 @@ Not per slice. After frontier empty:
 
 Do not resume the last feature session to “fix e2e.”
 
-## Tests fail (pre-PR, today)
+## Tests fail (pre-PR)
 
-Codex/Hermes wrote files; Graph ran `test`. Red → `git restore` + `git clean -fd` (uncommitted work deleted). Optional one more write from the spec (`iters_left=2`), not from the failure log. Second red → wipe again → wait for a human on an empty tree.
+`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. `iters_left=2` is one more `agentRun` from the same prompt on the dirty tree. Then wait for human. Hermes **session resume** and compact test log are still **not wired** (retry is a new `-Q` on the kept files).
 
-**Intended:** the retry section above. **Not wired.**
+`graphwing-pr-drive` still restores on red (out of scope here).
+
+**Intended retry:** one session per slice; compact signal; three-strikes park; wipe only on explicit discard.
 
 ## Not wired yet (do these next, do not re-litigate)
 
 1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Frontier path → `POST graphwing-implement-slice` (no bash `go`). Walker: same topology, next `input` = next path.
-2. Keep files on red; Hermes **session resume**; three-strikes park; no wipe except discard.
+2. Hermes **session resume**; compact test/review signal; three-strikes park; wipe only on explicit discard.
 3. Seat default writer `grok-4.6`; class×size table on `agentRun`; opposing-vendor spec-review **before** commit.
 4. E2E node after empty map; auto-ticket / draft-ACK; three e2e-reds → park.
 5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.

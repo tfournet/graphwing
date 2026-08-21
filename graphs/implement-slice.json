@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush or gitRestore. Set iters_left=2 for one unrolled retry after restore; otherwise wait for human acknowledgement. Payload: repo, branch, prompt, commit_message, test, iters_left.",
+  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay (no gitRestore). Set iters_left=2 for one unrolled retry on the dirty tree; otherwise wait for human. Payload: repo, branch, prompt, commit_message, test, iters_left.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -20,7 +20,7 @@
             "prompt": { "type": "string", "required": true },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
-            "iters_left": { "type": "string", "required": false, "description": "Set to 2 for one retry after restore" }
+            "iters_left": { "type": "string", "required": false, "description": "Set to 2 for one retry on the dirty tree (files kept on red)" }
           }
         }
       },
@@ -133,18 +133,6 @@
         }
       },
       {
-        "id": "restore",
-        "type": "action.graphwing.POST:/v1/git/restore",
-        "label": "gitRestore",
-        "position": { "x": 1260, "y": 320 },
-        "config": {
-          "integrationInstanceId": "$GRAPHWING_INSTANCE",
-          "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "clean_untracked": true
-        }
-      },
-      {
         "id": "switch_retry",
         "type": "logic.switch",
         "label": "retry once?",
@@ -227,21 +215,9 @@
         }
       },
       {
-        "id": "restore2",
-        "type": "action.graphwing.POST:/v1/git/restore",
-        "label": "gitRestore after retry",
-        "position": { "x": 2500, "y": 440 },
-        "config": {
-          "integrationInstanceId": "$GRAPHWING_INSTANCE",
-          "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "clean_untracked": true
-        }
-      },
-      {
         "id": "wait_human",
         "type": "action.wait.webhook",
-        "label": "Wait for human acknowledgement",
+        "label": "Wait for human (files kept)",
         "position": { "x": 1620, "y": 560 },
         "config": {
           "alias": "human",
@@ -318,13 +294,11 @@
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
       { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
-      { "id": "restore_fail", "type": "action.noop", "label": "Herdr: restore failed", "position": { "x": 1400, "y": 440 }, "config": {} },
+
       { "id": "wait2_timeout", "type": "action.noop", "label": "Herdr: retry wait timeout", "position": { "x": 1840, "y": 200 }, "config": {} },
       { "id": "wait2_fail", "type": "action.noop", "label": "Herdr: retry wait failure", "position": { "x": 1840, "y": 80 }, "config": {} },
       { "id": "test2_http_fail", "type": "action.noop", "label": "Herdr: retry testRun HTTP failed", "position": { "x": 2280, "y": 200 }, "config": {} },
-      { "id": "discarded2", "type": "action.noop", "label": "Herdr: retry test failed, worktree restored", "position": { "x": 2720, "y": 440 }, "config": {} },
-      { "id": "restore2_fail", "type": "action.noop", "label": "Herdr: retry restore failed", "position": { "x": 2720, "y": 560 }, "config": {} },
-      { "id": "herdr_waiting", "type": "action.noop", "label": "Herdr: waiting for human", "position": { "x": 1840, "y": 680 }, "config": {} },
+      { "id": "herdr_waiting", "type": "action.noop", "label": "Herdr: waiting for human; files kept", "position": { "x": 1840, "y": 680 }, "config": {} },
       { "id": "nack_timeout", "type": "action.noop", "label": "Herdr: human timeout", "position": { "x": 1840, "y": 800 }, "config": {} }
     ],
     "edges": [
@@ -347,9 +321,7 @@
       { "id": "e15", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
-      { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "restore", "targetHandle": "in" },
-      { "id": "e19", "source": "restore", "sourceHandle": "success", "target": "switch_retry", "targetHandle": "in" },
-      { "id": "e20", "source": "restore", "sourceHandle": "failure", "target": "restore_fail", "targetHandle": "in" },
+      { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "switch_retry", "targetHandle": "in" },
       { "id": "e21", "source": "switch_retry", "sourceHandle": "case-0", "target": "wait2", "targetHandle": "in" },
       { "id": "e22", "source": "switch_retry", "sourceHandle": "default", "target": "wait_human", "targetHandle": "in" },
       { "id": "e23", "source": "wait2", "sourceHandle": "pending", "target": "agent2", "targetHandle": "in" },
@@ -361,9 +333,7 @@
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "test2_http_fail", "targetHandle": "in" },
       { "id": "e_commit_retry", "source": "if_test_ok2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "commit", "targetHandle": "in" },
-      { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "restore2", "targetHandle": "in" },
-      { "id": "e32", "source": "restore2", "sourceHandle": "success", "target": "discarded2", "targetHandle": "in" },
-      { "id": "e33", "source": "restore2", "sourceHandle": "failure", "target": "restore2_fail", "targetHandle": "in" },
+      { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
       { "id": "e34", "source": "wait_human", "sourceHandle": "pending", "target": "herdr_waiting", "targetHandle": "in" },
       { "id": "e35", "source": "wait_human", "sourceHandle": "timeout", "target": "nack_timeout", "targetHandle": "in" },
       { "id": "e36", "source": "wait_human", "sourceHandle": "out", "target": "human_ack", "targetHandle": "in" }
