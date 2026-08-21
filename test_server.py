@@ -589,6 +589,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(spec["paths"]["/v1/slice/frontier"]["get"]["operationId"], "sliceFrontier")
         self.assertEqual(spec["paths"]["/v1/slice/complete"]["post"]["operationId"], "sliceComplete")
         self.assertEqual(spec["paths"]["/v1/slice/continue"]["post"]["operationId"], "sliceContinue")
+        self.assertEqual(spec["paths"]["/v1/slice/route"]["post"]["operationId"], "sliceRoute")
+        self.assertEqual(spec["paths"]["/v1/review/run"]["post"]["operationId"], "reviewRun")
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
         doorbell = spec["paths"]["/v1/doorbell/pr-drive"]["post"]
@@ -1516,7 +1518,8 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("CTX.INPUT.prompt", agent["config"]["prompt"])
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
         self.assertEqual(edges["e7"]["target"], "frontier")
-        self.assertEqual(edges["e7j"]["target"], "ticket_head")
+        self.assertEqual(edges["e7j"]["target"], "route")
+        self.assertEqual(edges["e7k"]["target"], "ticket_head")
         self.assertEqual(edges["e7b"]["source"], "ticket_head")
         self.assertEqual(edges["e7b"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
@@ -1524,6 +1527,74 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e12"]["target"], "walk")
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
+        agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
+        self.assertEqual(agent["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
+        agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
+        self.assertEqual(agent2["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
+        self.assertEqual(edges["e7j"]["target"], "route")
+        self.assertEqual(edges["e_commit_first"]["target"], "switch_rev")
+        review1 = next(n for n in graph["spec"]["nodes"] if n["id"] == "review1")
+        self.assertIn("review/run", review1["type"])
+
+    def test_slice_route_table(self):
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"mechanical","size":"S"}'
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["launcher"], "hermes")
+        self.assertEqual(payload["reviewer1"], "none")
+        self.assertEqual(payload["max_turns"], 10)
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"mechanical","size":"M"}'
+        )
+        self.assertEqual(payload["reviewer1"], "sonnet")
+        self.assertEqual(payload["max_turns"], 30)
+        status, payload, _ = server.dispatch(
+            "POST",
+            "/v1/slice/route",
+            {},
+            True,
+            b'{"class":"mechanical","size":"S","ac_count":6}',
+        )
+        self.assertEqual(payload["size"], "M")
+        self.assertEqual(payload["size_floor"], "S")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"S"}'
+        )
+        self.assertEqual(payload["launcher"], "claude")
+        self.assertEqual(payload["size"], "M")
+        self.assertEqual(payload["reviewer1"], "sol")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"M"}'
+        )
+        self.assertEqual(payload["launcher"], "claude")
+        self.assertEqual(payload["reviewer1"], "sol")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"sensitive","size":"M"}'
+        )
+        self.assertEqual(payload["reviewer1"], "sol")
+        self.assertEqual(payload["reviewer2"], "opus")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True, b'{"class":"nope","size":"M"}'
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_class")
+
+    def test_parse_review_verdict(self):
+        self.assertEqual(server.parse_review_verdict("noise\nVERDICT: PASS\n")[0], "PASS")
+        self.assertEqual(server.parse_review_verdict("VERDICT: NACK\nbad seam")[0], "NACK")
+        self.assertEqual(server.parse_review_verdict("nope")[0], "NACK")
+
+    def test_agent_run_rejects_bad_launcher(self):
+        status, payload, _ = server.dispatch(
+            "POST",
+            "/v1/agent/run",
+            {},
+            True,
+            b'{"prompt":"x","launcher":"codex"}',
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_launcher")
 
 
 class InstallTests(unittest.TestCase):

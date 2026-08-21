@@ -404,6 +404,38 @@
         }
       }
     },
+    "/v1/slice/route": {
+      "post": {
+        "operationId": "sliceRoute",
+        "tags": ["slice"],
+        "summary": "Deterministic class×size lookup: launcher, model, turns, budget, opposing reviewers. Never picks a vendor because tests were red.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRouteRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "row", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRoute" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/review/run": {
+      "post": {
+        "operationId": "reviewRun",
+        "tags": ["review"],
+        "summary": "Opposing-vendor spec-review of git diff HEAD. Plan-mode Claude for sonnet/opus; Hermes for sol. Does not commit.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "verdict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunResult" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/slice/continue": {
       "post": {
         "operationId": "sliceContinue",
@@ -959,6 +991,50 @@
           "kick_token": { "type": "string" }
         }
       },
+      "SliceRouteRequest": {
+        "type": "object",
+        "properties": {
+          "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "size": { "type": "string", "enum": ["S", "M", "L"] },
+          "ac_count": { "type": "integer" },
+          "seams": { "type": "integer" }
+        }
+      },
+      "SliceRoute": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "class": { "type": "string" },
+          "size": { "type": "string" },
+          "size_floor": { "type": "string" },
+          "launcher": { "type": "string" },
+          "model": { "type": "string" },
+          "max_turns": { "type": "integer" },
+          "run_budget_seconds": { "type": "integer" },
+          "reviewer1": { "type": "string" },
+          "reviewer2": { "type": "string" },
+          "review": { "type": "string" }
+        }
+      },
+      "ReviewRunRequest": {
+        "type": "object",
+        "required": ["repo", "reviewer", "prompt"],
+        "properties": {
+          "repo": { "type": "string" },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "sol"] },
+          "prompt": { "type": "string" }
+        }
+      },
+      "ReviewRunResult": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "verdict": { "type": "string" },
+          "reviewer": { "type": "string" },
+          "summary": { "type": "string" },
+          "compact": { "type": "string" }
+        }
+      },
       "SliceContinue": {
         "type": "object",
         "properties": {
@@ -1005,6 +1081,10 @@
         "properties": {
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
+          "launcher": { "type": "string", "enum": ["hermes", "claude"], "default": "hermes" },
+          "model": { "type": "string" },
+          "max_turns": { "type": "integer" },
+          "run_budget_seconds": { "type": "integer" },
           "hermes_session": {
             "type": "string",
             "description": "Named Hermes session gwslice-<32 hex>. Omit to mint one. Retry passes the receipt value to resume the same session."

@@ -19,6 +19,6 @@ Copy `examples/rewst-install.example.json` to `$GRAPHWING_HOME/rewst-install.jso
 | Slug | Input | Shape |
 |---|---|---|
 | `graphwing-verify-stack` | `stack`, `ports` | stackStatus → portCheck |
-| `graphwing-implement-slice` | `repo`, `branch`, `index`, optional `ticket`, `commit_message`, `test`, optional `iters_left`, optional `kick_url` | frontier → fileHead → agentRun → test → complete → commit (adds index) → push → continue (kicks next build) |
+| `graphwing-implement-slice` | `repo`, `branch`, `index`, optional `ticket`, `commit_message`, `test`, `class`, `size`, optional `kick_url` | frontier → route → fileHead → agentRun → test → opposing spec-review → complete → commit → push → continue |
 | `graphwing-pr-drive` | Manual, form, or authenticated webhook: `repo`, `pr`, `test`, `prompt`, `commit_message` | mergeable = all_green and not blocking reviews; red → checkout PR head → agent → testRun → commit/push or restore → checks again; webhook doorbell on CI completed + review submitted |
 | `graphwing-pr-status` | Manual or unauthenticated webhook: `pr` | ghPrView → ghPrChecks → mergeable, red, pending, or blocking reviews; no writes |
