@@ -1614,10 +1614,11 @@ class DispatchTests(unittest.TestCase):
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
         self.assertEqual(edges["e18"]["source"], "if_test_ok")
         self.assertEqual(edges["e18"]["sourceHandle"], "fail")
-        self.assertEqual(edges["e18"]["target"], "switch_retry")
+        self.assertEqual(edges["e18"]["target"], "wait2")
         self.assertEqual(edges["e31"]["source"], "if_test_ok2")
         self.assertEqual(edges["e31"]["sourceHandle"], "fail")
-        self.assertEqual(edges["e31"]["target"], "wait_human")
+        self.assertEqual(edges["e31"]["target"], "wait3")
+        self.assertEqual(edges["e31i"]["target"], "wait_human")
         self.assertEqual(edges["e22"]["target"], "wait_human")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
         self.assertIn("hermes_session", agent2["config"])

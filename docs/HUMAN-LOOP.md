@@ -124,14 +124,14 @@ Do not resume the last feature session to “fix e2e.”
 
 ## Tests fail (pre-PR)
 
-`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. `iters_left=2` **resumes** the same Hermes session (`hermes_session` on the receipt) with `testRun.compact` in the prompt. Then wait for human. Topology is still one unrolled retry (two suite-reds then park), not three-strikes. Spec-review nack resume is **not** wired.
+`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. Two compact resumes of the same Hermes session, then park (three suite-reds). Spec-review nack parks (resume-on-nack still not wired).
 
 `graphwing-pr-drive` still restores on red (out of scope here).
 
 ## Not wired yet (do these next, do not re-litigate)
 
 1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Index JSON is `tickets[]` with `id`, `path`, `blocked_by`, `kind` (`build`|`decision`), `status` (`open`|`done`). `implement-slice` walks serially: frontier → write → complete → commit index → continue kicks `kick_url` with the next build ticket. No bash `go`.
-2. Three-strikes park (third suite-red); spec-review nack → resume; wipe only on explicit discard.
+2. Spec-review nack → resume (today nack parks). Wipe only on explicit discard.
 3. Seat default writer is still whatever Hermes `config.yaml` says (intended `grok-4.6`). `sliceRoute` sets launcher/turns/reviewers; visual/sensitive spawn `claude -p`. Spec-review nack parks (resume-on-nack still not wired).
 4. Shortcut comments (lossy sha + ticket id) still not posted from Graph.
 5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
