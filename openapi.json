@@ -836,7 +836,11 @@
           "returncode": { "type": "integer" },
           "stdout": { "type": "string" },
           "stderr": { "type": "string" },
-          "truncated": { "type": "boolean" }
+          "truncated": { "type": "boolean" },
+          "compact": {
+            "type": "string",
+            "description": "Short test/script failure signal for a resume prompt. 'ok' when the recipe passed. Never the full log."
+          }
         }
       },
       "ScriptRunAccepted": {
@@ -894,6 +898,10 @@
         "properties": {
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
+          "hermes_session": {
+            "type": "string",
+            "description": "Named Hermes session gwslice-<32 hex>. Omit to mint one. Retry passes the receipt value to resume the same session."
+          },
           "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
           "response_webhook_url": {
             "type": "string",
@@ -919,6 +927,7 @@
           "status": { "type": "string" },
           "profile": { "type": "string" },
           "repo": { "type": "string" },
+          "hermes_session": { "type": "string" },
           "poll": { "type": "string" }
         }
       },

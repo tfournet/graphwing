@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay (no gitRestore). Set iters_left=2 for one unrolled retry on the dirty tree; otherwise wait for human. Payload: repo, branch, prompt, commit_message, test, iters_left.",
+  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay. Set iters_left=2 for one resume of the same Hermes session with a compact test signal; otherwise wait for human. Payload: repo, branch, prompt, commit_message, test, iters_left.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -20,7 +20,7 @@
             "prompt": { "type": "string", "required": true },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
-            "iters_left": { "type": "string", "required": false, "description": "Set to 2 for one retry on the dirty tree (files kept on red)" }
+            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" }
           }
         }
       },
@@ -107,7 +107,8 @@
             { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
-            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } }
+            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
+            { "id": "m7", "output": "hermes_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.hermes_session" } }
           ]
         }
       },
@@ -170,7 +171,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "prompt": "{{ CTX.INPUT.prompt }}",
+          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "prompt": "{{ CTX.INPUT.prompt }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"
         }

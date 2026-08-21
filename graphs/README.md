@@ -2,7 +2,7 @@
 
 Hard-coded topology. Payload is the iteration. New file only when **edges** change.
 
-How a human gets to a run: `docs/HUMAN-LOOP.md` (Shortcut = idea in; slice map in the worktree; walker input = ticket path). `implement-slice` keeps files on red (no gitRestore). Session resume is still not wired. `pr-drive` still restores on red.
+How a human gets to a run: `docs/HUMAN-LOOP.md` (Shortcut = idea in; slice map in the worktree; walker input = ticket path). `implement-slice` keeps files on red and resumes the Hermes session with a compact test signal when `iters_left=2`. `pr-drive` still restores on red.
 
 `$GRAPHWING_INSTANCE`, `$GRAPHWING_STATUS_REPO`, and the webhook secret placeholder are replaced at publish from environment/install configuration.
 Public OpenAPI URL comes from named-tunnel meta (`cloudflared-meta.json`) or `GRAPHWING_PUBLIC_URL`.
@@ -19,6 +19,6 @@ Copy `examples/rewst-install.example.json` to `$GRAPHWING_HOME/rewst-install.jso
 | Slug | Input | Shape |
 |---|---|---|
 | `graphwing-verify-stack` | `stack`, `ports` | stackStatus → portCheck |
-| `graphwing-implement-slice` | Manual, form, or authenticated webhook: `repo`, `branch`, `prompt`, `commit_message`, `test`, optional `iters_left=2` | gitStatus → gitCheckout → wait-webhook agentRun → testRun → commit/push on green; on red files stay; `iters_left=2` is one retry on the dirty tree, otherwise wait for human |
+| `graphwing-implement-slice` | Manual, form, or authenticated webhook: `repo`, `branch`, `prompt`, `commit_message`, `test`, optional `iters_left=2` | gitStatus → gitCheckout → wait-webhook agentRun → testRun → commit/push on green; on red files stay; `iters_left=2` resumes the same Hermes session with compact test signal, otherwise wait for human |
 | `graphwing-pr-drive` | Manual, form, or authenticated webhook: `repo`, `pr`, `test`, `prompt`, `commit_message` | mergeable = all_green and not blocking reviews; red → checkout PR head → agent → testRun → commit/push or restore → checks again; webhook doorbell on CI completed + review submitted |
 | `graphwing-pr-status` | Manual or unauthenticated webhook: `pr` | ghPrView → ghPrChecks → mergeable, red, pending, or blocking reviews; no writes |
