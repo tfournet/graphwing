@@ -617,6 +617,24 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["text"])
 
+    def test_file_head_nested_relative_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            dest = repo / "slices" / "sc-1"
+            dest.mkdir(parents=True)
+            (dest / "02-checkout.md").write_text("AC: pay with a valid card\n")
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                status, payload, _ = server.dispatch(
+                    "GET",
+                    "/v1/file/head",
+                    {"repo": ["scratch"], "path": ["slices/sc-1/02-checkout.md"]},
+                    True,
+                    b"",
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertIn("valid card", payload["text"])
+            self.assertFalse(payload["truncated"])
+
     def test_file_head_traversal(self):
         status, payload, _ = server.dispatch(
             "GET", "/v1/file/head", {"path": ["../.graphwing/api.key"]}, True, b""
@@ -1271,6 +1289,27 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("TASKS.wait.request.body.hermes_session", agent2["config"]["hermes_session"])
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
+        self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
+        self.assertNotIn("CTX.INPUT.prompt", agent2["config"]["prompt"])
+
+    def test_implement_slice_writer_sees_ticket_file(self):
+        graph_path = Path(__file__).resolve().parent / "graphs" / "implement-slice.json"
+        graph = json.loads(graph_path.read_text())
+        form = next(node for node in graph["spec"]["nodes"] if node["id"] == "form")
+        inputs = form["config"]["inputs"]
+        self.assertTrue(inputs["ticket"]["required"])
+        self.assertNotIn("prompt", inputs)
+        head = next(node for node in graph["spec"]["nodes"] if node["id"] == "ticket_head")
+        self.assertIn("file/head", head["type"])
+        self.assertEqual(head["config"]["path"], "{{ CTX.INPUT.ticket }}")
+        agent = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent")
+        self.assertEqual(agent["config"]["prompt"], "{{ TASKS.ticket_head.data.text }}")
+        self.assertNotIn("CTX.INPUT.prompt", agent["config"]["prompt"])
+        edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
+        self.assertEqual(edges["e7"]["target"], "ticket_head")
+        self.assertEqual(edges["e7b"]["source"], "ticket_head")
+        self.assertEqual(edges["e7b"]["target"], "wait")
+        self.assertEqual(edges["e7c"]["target"], "ticket_fail")
 
 
 class InstallTests(unittest.TestCase):
