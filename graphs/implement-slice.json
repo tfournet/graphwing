@@ -358,6 +358,59 @@
         }
       },
       {
+        "id": "wait3",
+        "type": "action.wait.webhook",
+        "label": "Wait for second retry receipt",
+        "position": { "x": 2400, "y": 440 },
+        "config": {
+          "alias": "wait3",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "agent3",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "second retry agentRun",
+        "position": { "x": 2520, "y": 440 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "launcher": "{{ TASKS.route.data.launcher }}",
+          "model": "{{ TASKS.route.data.model }}",
+          "max_turns": "{{ TASKS.route.data.max_turns }}",
+          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "test3",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "second retry testRun",
+        "position": { "x": 2640, "y": 320 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_test_ok3",
+        "type": "logic.filter",
+        "label": "second retry test ok?",
+        "position": { "x": 2760, "y": 320 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
         "id": "wait_human",
         "type": "action.wait.webhook",
         "label": "Wait for human (files kept)",
@@ -582,7 +635,7 @@
       { "id": "e_rev2_http", "source": "review2", "sourceHandle": "failure", "target": "review_fail", "targetHandle": "in" },
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
-      { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "switch_retry", "targetHandle": "in" },
+      { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "wait2", "targetHandle": "in" },
       { "id": "e21", "source": "switch_retry", "sourceHandle": "case-0", "target": "wait2", "targetHandle": "in" },
       { "id": "e22", "source": "switch_retry", "sourceHandle": "default", "target": "wait_human", "targetHandle": "in" },
       { "id": "e23", "source": "wait2", "sourceHandle": "pending", "target": "agent2", "targetHandle": "in" },
@@ -596,7 +649,15 @@
       { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "complete", "targetHandle": "in" },
       { "id": "e_complete_ok", "source": "complete", "sourceHandle": "success", "target": "commit", "targetHandle": "in" },
       { "id": "e_complete_fail", "source": "complete", "sourceHandle": "failure", "target": "complete_fail", "targetHandle": "in" },
-      { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
+      { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait3", "targetHandle": "in" },
+      { "id": "e31b", "source": "wait3", "sourceHandle": "pending", "target": "agent3", "targetHandle": "in" },
+      { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "test3", "targetHandle": "in" },
+      { "id": "e31d", "source": "wait3", "sourceHandle": "timeout", "target": "wait2_timeout", "targetHandle": "in" },
+      { "id": "e31e", "source": "wait3", "sourceHandle": "failure", "target": "wait2_fail", "targetHandle": "in" },
+      { "id": "e31f", "source": "test3", "sourceHandle": "success", "target": "if_test_ok3", "targetHandle": "in" },
+      { "id": "e31g", "source": "test3", "sourceHandle": "failure", "target": "test2_http_fail", "targetHandle": "in" },
+      { "id": "e31h", "source": "if_test_ok3", "sourceHandle": "pass", "target": "switch_rev", "targetHandle": "in" },
+      { "id": "e31i", "source": "if_test_ok3", "sourceHandle": "fail", "target": "wait_human", "targetHandle": "in" },
       { "id": "e34", "source": "wait_human", "sourceHandle": "pending", "target": "herdr_waiting", "targetHandle": "in" },
       { "id": "e35", "source": "wait_human", "sourceHandle": "timeout", "target": "nack_timeout", "targetHandle": "in" },
       { "id": "e36", "source": "wait_human", "sourceHandle": "out", "target": "human_ack", "targetHandle": "in" }
