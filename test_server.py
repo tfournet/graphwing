@@ -307,6 +307,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(payload["repo"], "scratch")
             job_id = payload["job_id"]
             self.assertRegex(job_id, r"^[0-9a-f]{32}$")
+            self.assertEqual(payload["hermes_session"], f"gwslice-{job_id}")
             self.assertEqual(payload["poll"], f"/v1/agent/jobs/{job_id}")
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 gstatus, gp, _ = server.dispatch(
@@ -315,8 +316,47 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(gstatus, 200, gp)
             self.assertEqual(gp["status"], "queued")
             self.assertEqual(gp["prompt"], "ping")
+            self.assertEqual(gp["hermes_session"], f"gwslice-{job_id}")
             self.assertNotIn("response_webhook_token", gp)
             self.assertNotIn("resume_url", gp)
+
+    def test_agent_run_rejects_bad_hermes_session(self):
+        status, payload, _ = server.dispatch(
+            "POST",
+            "/v1/agent/run",
+            {},
+            True,
+            b'{"prompt":"x","hermes_session":"../evil"}',
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_hermes_session")
+
+    def test_agent_run_accepts_hermes_session(self):
+        session = "gwslice-" + ("ab" * 16)
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            jobs = Path(td) / "jobs"
+            body = json.dumps({"prompt": "ping", "cwd": "scratch", "hermes_session": session}).encode()
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                with mock.patch.object(server, "JOBS_DIR", jobs):
+                    with mock.patch.object(server, "enqueue_agent", lambda job: None):
+                        status, payload, _ = server.dispatch(
+                            "POST", "/v1/agent/run", {}, True, body
+                        )
+            self.assertEqual(status, 202, payload)
+            self.assertEqual(payload["hermes_session"], session)
+
+    def test_compact_cmd_signal_shortens_failure(self):
+        noise = "\n".join(f"ok line {i}" for i in range(80))
+        result = {
+            "ok": False,
+            "stdout": noise + "\nFAIL: test_foo\nAssertionError: no\n" + noise,
+            "stderr": "",
+        }
+        compact = server.compact_cmd_signal(result)
+        self.assertIn("FAIL: test_foo", compact)
+        self.assertLessEqual(len(compact), server.COMPACT_MAX_CHARS)
+        self.assertEqual(server.compact_cmd_signal({"ok": True, "stdout": "lots"}), "ok")
 
     def test_agent_job_not_found(self):
         with tempfile.TemporaryDirectory() as td:
@@ -360,6 +400,44 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("Do not git commit, git push", text)
         self.assertIn("Do not `git checkout`", text)
 
+    def test_spawn_hermes_continues_named_session(self):
+        captured: dict = {}
+
+        class FakePopen:
+            pid = 7
+
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = list(cmd)
+
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            job_id = "ab" * 16
+            session = "gwslice-" + job_id
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            (jdir / "prompt.txt").write_text("x")
+            hermes = Path(td) / "hermes"
+            hermes.write_text("#!/bin/sh\n")
+            job = {
+                "job_id": job_id,
+                "cwd": td,
+                "max_turns": 1,
+                "run_budget_seconds": 5,
+                "hermes_session": session,
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                with mock.patch.object(server, "HERMES_BIN", hermes):
+                    with mock.patch.object(server.subprocess, "Popen", FakePopen):
+                        proc, err = server.spawn_hermes(job)
+            self.assertIsNone(err)
+            self.assertIsNotNone(proc)
+            cmd = captured["cmd"]
+            self.assertIn("--continue", cmd)
+            self.assertEqual(cmd[cmd.index("--continue") + 1], session)
+            self.assertIn("--create-if-missing", cmd)
+            self.assertIn("--source", cmd)
+            self.assertEqual(cmd[cmd.index("--source") + 1], "tool")
+
     def test_hermes_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
             env = server.hermes_job_env(
@@ -382,6 +460,7 @@ class DispatchTests(unittest.TestCase):
                 "repo": "riftwing",
                 "cwd": str(td),
                 "prompt": "ping",
+                "hermes_session": "gwslice-" + ("ab" * 16),
                 "response_webhook_url": "https://example.com/resume",
                 "response_webhook_token": "tok_secret",
                 "created_at": "t",
@@ -417,6 +496,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(saved["status"], "completed")
             self.assertEqual(saved["receipt"]["summary"], "pong")
             self.assertEqual(saved["receipt"]["job_id"], job_id)
+            self.assertEqual(saved["receipt"]["hermes_session"], "gwslice-" + ("ab" * 16))
             posted.assert_called_once()
             _args, kwargs = posted.call_args
             self.assertEqual(_args[0], "https://example.com/resume")
@@ -1071,6 +1151,16 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["kind"], "test")
+        self.assertEqual(payload.get("compact"), "ok")
+
+    def test_test_run_always_fail_has_compact_not_only_stdout(self):
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/test/run", {}, True, b'{"name":"always-fail"}'
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload.get("compact"))
+        self.assertLessEqual(len(payload["compact"]), server.COMPACT_MAX_CHARS)
 
     def test_test_run_unknown_and_argv(self):
         status, payload, _ = server.dispatch(
@@ -1176,6 +1266,11 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e31"]["sourceHandle"], "fail")
         self.assertEqual(edges["e31"]["target"], "wait_human")
         self.assertEqual(edges["e22"]["target"], "wait_human")
+        agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
+        self.assertIn("hermes_session", agent2["config"])
+        self.assertIn("TASKS.wait.request.body.hermes_session", agent2["config"]["hermes_session"])
+        self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
+        self.assertIn("Continue this slice", agent2["config"]["prompt"])
 
 
 class InstallTests(unittest.TestCase):

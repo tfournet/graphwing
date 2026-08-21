@@ -38,6 +38,9 @@ CMD_TIMEOUT = 30
 CMD_MAX_BYTES = 256 * 1024
 FILE_MAX_BYTES = 32 * 1024
 PROMPT_MAX_CHARS = 64 * 1024
+COMPACT_MAX_CHARS = 2000
+COMPACT_TAIL_LINES = 40
+COMPACT_FAIL_RE = re.compile(r"FAIL:|ERROR:|Error:|AssertionError|FAILED")
 UNITS = ("graphwing-api", "graphwing-tunnel", "graphwing-herdr")
 HERDR_SESSION = os.environ.get("GRAPHWING_HERDR_SESSION", "graphwing") or "graphwing"
 HERDR_AGENT = os.environ.get("GRAPHWING_HERDR_AGENT", "graphwing") or "graphwing"
@@ -66,6 +69,7 @@ AGENT_RUN_BUDGET = 300
 AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
@@ -1220,6 +1224,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "repo",
         "cwd",
         "prompt",
+        "hermes_session",
         "created_at",
         "started_at",
         "finished_at",
@@ -1395,6 +1400,42 @@ def parse_webhook_fields(data: dict[str, Any]) -> tuple[str | None, str | None, 
     return url, token, None
 
 
+def parse_hermes_session(data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    raw = data.get("hermes_session")
+    if raw in ("", None):
+        return None, None
+    if not isinstance(raw, str):
+        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
+    name = raw.strip()
+    if not HERMES_SESSION_RE.fullmatch(name):
+        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
+    return name, None
+
+
+def compact_cmd_signal(result: dict[str, Any]) -> str:
+    if result.get("ok"):
+        return "ok"
+    blob = "\n".join(
+        [
+            str(result.get("error") or ""),
+            str(result.get("stdout") or ""),
+            str(result.get("stderr") or ""),
+        ]
+    )
+    lines = [ln.rstrip() for ln in blob.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if COMPACT_FAIL_RE.search(ln)]
+    tail = lines[-COMPACT_TAIL_LINES:]
+    seen: set[str] = set()
+    out: list[str] = []
+    for ln in hits + tail:
+        if ln in seen:
+            continue
+        seen.add(ln)
+        out.append(ln)
+    text = "\n".join(out).strip() or "failed (no compact lines)"
+    return text[:COMPACT_MAX_CHARS]
+
+
 def wrap_prompt(job_id: str, prompt: str, cwd: str) -> str:
     root = str(Path(cwd).resolve())
     return (
@@ -1454,6 +1495,7 @@ def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, return
         "status": status,
         "job_id": job["job_id"],
         "profile": job["profile"],
+        "hermes_session": job.get("hermes_session"),
         "sha": None,
         "pr_url": None,
         "log_ref": job["log_ref"],
@@ -1533,7 +1575,12 @@ def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
         "--run-budget",
         str(job["run_budget_seconds"]),
         "--yolo",
+        "--source",
+        "tool",
     ]
+    session = job.get("hermes_session")
+    if isinstance(session, str) and HERMES_SESSION_RE.fullmatch(session):
+        cmd.extend(["--continue", session, "--create-if-missing"])
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1720,6 +1767,7 @@ def named_cmd_run(
                 "stdout": result.get("stdout") or "",
                 "stderr": result.get("stderr") or "",
                 "truncated": bool(result.get("truncated")),
+                "compact": compact_cmd_signal(result),
             }
         return 200, {
             "ok": bool(result.get("ok")),
@@ -1729,6 +1777,7 @@ def named_cmd_run(
             "stdout": result.get("stdout") or "",
             "stderr": result.get("stderr") or "",
             "truncated": bool(result.get("truncated")),
+            "compact": compact_cmd_signal(result),
         }
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
@@ -1823,6 +1872,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    session, session_err = parse_hermes_session(data)
+    if session_err:
+        return 400, session_err
     if not HERMES_BIN.is_file():
         return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
     with JOB_LOCK:
@@ -1830,6 +1882,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
         log_ref = str(job_dir(job_id) / "stdout.log")
+        hermes_session = session or f"gwslice-{job_id}"
         job = {
             "job_id": job_id,
             "status": "queued",
@@ -1837,6 +1890,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "repo": repo_name,
             "cwd": str(resolved),
             "prompt": prompt,
+            "hermes_session": hermes_session,
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
             "resume_url": webhook_url,
@@ -1860,6 +1914,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "status": "queued",
         "profile": profile,
         "repo": repo_name,
+        "hermes_session": hermes_session,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
 

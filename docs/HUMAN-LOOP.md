@@ -124,16 +124,14 @@ Do not resume the last feature session to “fix e2e.”
 
 ## Tests fail (pre-PR)
 
-`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. `iters_left=2` is one more `agentRun` from the same prompt on the dirty tree. Then wait for human. Hermes **session resume** and compact test log are still **not wired** (retry is a new `-Q` on the kept files).
+`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. `iters_left=2` **resumes** the same Hermes session (`hermes_session` on the receipt) with `testRun.compact` in the prompt. Then wait for human. Topology is still one unrolled retry (two suite-reds then park), not three-strikes. Spec-review nack resume is **not** wired.
 
 `graphwing-pr-drive` still restores on red (out of scope here).
-
-**Intended retry:** one session per slice; compact signal; three-strikes park; wipe only on explicit discard.
 
 ## Not wired yet (do these next, do not re-litigate)
 
 1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Frontier path → `POST graphwing-implement-slice` (no bash `go`). Walker: same topology, next `input` = next path.
-2. Hermes **session resume**; compact test/review signal; three-strikes park; wipe only on explicit discard.
+2. Three-strikes park (third suite-red); spec-review nack → resume; wipe only on explicit discard.
 3. Seat default writer `grok-4.6`; class×size table on `agentRun`; opposing-vendor spec-review **before** commit.
 4. E2E node after empty map; auto-ticket / draft-ACK; three e2e-reds → park.
 5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
