@@ -2,6 +2,8 @@
 
 Hard-coded topology. Payload is the iteration. New file only when **edges** change.
 
+How a human gets to a run: `docs/HUMAN-LOOP.md`. `implement-slice` still restores the worktree on red tests; that wipe is a known defect (keep files and feed the log). Do not “fix” it in this README.
+
 `$GRAPHWING_INSTANCE`, `$GRAPHWING_STATUS_REPO`, and the webhook secret placeholder are replaced at publish from environment/install configuration.
 Public OpenAPI URL comes from named-tunnel meta (`cloudflared-meta.json`) or `GRAPHWING_PUBLIC_URL`.
 riftwing rings graphwing OIDC, no Rewst secrets.
