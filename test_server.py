@@ -1150,6 +1150,19 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("/home/tim", text)
         self.assertNotIn("tim-graphwing", text)
 
+    def test_pr_status_graph_is_read_only_and_unauthenticated(self):
+        graph_path = Path(__file__).resolve().parent / "graphs" / "pr-status.json"
+        graph = json.loads(graph_path.read_text())
+        nodes = graph["spec"]["nodes"]
+        webhook = next(node for node in nodes if node["id"] == "hook")
+        self.assertFalse(webhook["config"]["requireAuthHeader"])
+        banned = ("agent", "git/commit", "git/push", "git/checkout", "git/restore")
+        node_types = [node["type"].lower() for node in nodes]
+        for term in banned:
+            self.assertFalse(any(term in node_type for node_type in node_types), term)
+        self.assertTrue(any("gh/pr/view" in node_type for node_type in node_types))
+        self.assertTrue(any("gh/pr/checks" in node_type for node_type in node_types))
+
 
 class InstallTests(unittest.TestCase):
     def test_runtime_and_templates_have_no_hardcoded_home(self):

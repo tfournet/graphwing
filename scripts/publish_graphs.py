@@ -132,19 +132,23 @@ def must(st, body, ok=(200, 201, 202), label=""):
     return body
 
 
-def subst_instance(obj, instance: str, hook_secret: str = ""):
+def subst_instance(obj, instance: str, hook_secret: str = "", status_repo: str = ""):
     if isinstance(obj, str):
-        return obj.replace("$GRAPHWING_INSTANCE", instance).replace("$GRAPHWING_HOOK_SECRET", hook_secret)
+        return (
+            obj.replace("$GRAPHWING_INSTANCE", instance)
+            .replace("$GRAPHWING_HOOK_SECRET", hook_secret)
+            .replace("$GRAPHWING_STATUS_REPO", status_repo)
+        )
     if isinstance(obj, list):
-        return [subst_instance(x, instance, hook_secret) for x in obj]
+        return [subst_instance(x, instance, hook_secret, status_repo) for x in obj]
     if isinstance(obj, dict):
-        return {k: subst_instance(v, instance, hook_secret) for k, v in obj.items()}
+        return {k: subst_instance(v, instance, hook_secret, status_repo) for k, v in obj.items()}
     return obj
 
 
-def load_graph(name: str, instance: str, hook_secret: str = "") -> dict:
+def load_graph(name: str, instance: str, hook_secret: str = "", status_repo: str = "") -> dict:
     raw = json.loads((GRAPHS / f"{name}.json").read_text())
-    return subst_instance(raw, instance, hook_secret)
+    return subst_instance(raw, instance, hook_secret, status_repo)
 
 
 def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict):
@@ -245,12 +249,22 @@ def main():
         raise SystemExit("rewst-install.json missing instance_id")
     hook_secret = os.environ.get("GRAPHWING_HOOK_SECRET") or install.get("hook_secret") or ""
     integration = install.get("custom_integration_id")
+    stems = ["verify-stack", "implement-slice", "pr-drive", "pr-status"] if args.only == "all" else [args.only]
+    status_repo = (
+        os.environ.get("GRAPHWING_STATUS_REPO")
+        or install.get("pr_status_repo")
+        or install.get("smoke_repo")
+        or ""
+    ).strip()
+    if "pr-status" in stems and not status_repo:
+        raise SystemExit(
+            "publishing pr-status requires GRAPHWING_STATUS_REPO, pr_status_repo, or smoke_repo"
+        )
     mcp = rewst_mcp(install)
     print("openapi", public_openapi_url())
-    stems = ["verify-stack", "implement-slice", "pr-drive"] if args.only == "all" else [args.only]
     published = {}
     for stem in stems:
-        g = load_graph(stem, instance, hook_secret)
+        g = load_graph(stem, instance, hook_secret, status_repo)
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
     if not args.no_run and "pr-drive" in published:
@@ -269,6 +283,8 @@ def main():
             published["pr-drive"]["smoke"] = "missing_pr"
     install["custom_integration_id"] = integration
     install["pr_drive"] = published.get("pr-drive") or install.get("pr_drive")
+    if "pr-status" in published:
+        install["pr_status"] = published["pr-status"]
     if "verify-stack" in published:
         install["verify_stack"] = {**(install.get("verify_stack") or {}), **published["verify-stack"]}
     if "implement-slice" in published:
