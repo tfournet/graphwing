@@ -36,6 +36,13 @@
         }
       },
       {
+        "id": "join_start",
+        "type": "logic.join.any",
+        "label": "Start from any trigger",
+        "position": { "x": 140, "y": 200 },
+        "config": { "stopOnFirst": true }
+      },
+      {
         "id": "git",
         "type": "action.graphwing.GET:/v1/git/status",
         "label": "gitStatus before",
@@ -271,6 +278,13 @@
         }
       },
       {
+        "id": "join_commit",
+        "type": "logic.join.any",
+        "label": "Commit after any test pass",
+        "position": { "x": 2500, "y": 80 },
+        "config": { "stopOnFirst": true }
+      },
+      {
         "id": "push",
         "type": "action.graphwing.POST:/v1/git/push",
         "label": "gitPush",
@@ -314,9 +328,10 @@
       { "id": "nack_timeout", "type": "action.noop", "label": "Herdr: human timeout", "position": { "x": 1840, "y": 800 }, "config": {} }
     ],
     "edges": [
-      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
-      { "id": "e1_form", "source": "form", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
-      { "id": "e1_hook", "source": "hook", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_form", "source": "form", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_hook", "source": "hook", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_git", "source": "join_start", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
       { "id": "e2", "source": "git", "sourceHandle": "success", "target": "checkout", "targetHandle": "in" },
       { "id": "e3", "source": "wait", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
       { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
@@ -331,7 +346,7 @@
       { "id": "e14", "source": "record", "sourceHandle": "out", "target": "test", "targetHandle": "in" },
       { "id": "e15", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "test_http_fail", "targetHandle": "in" },
-      { "id": "e17", "source": "if_test_ok", "sourceHandle": "pass", "target": "commit", "targetHandle": "in" },
+      { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "restore", "targetHandle": "in" },
       { "id": "e19", "source": "restore", "sourceHandle": "success", "target": "switch_retry", "targetHandle": "in" },
       { "id": "e20", "source": "restore", "sourceHandle": "failure", "target": "restore_fail", "targetHandle": "in" },
@@ -344,7 +359,8 @@
       { "id": "e27", "source": "record2", "sourceHandle": "out", "target": "test2", "targetHandle": "in" },
       { "id": "e28", "source": "test2", "sourceHandle": "success", "target": "if_test_ok2", "targetHandle": "in" },
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "test2_http_fail", "targetHandle": "in" },
-      { "id": "e30", "source": "if_test_ok2", "sourceHandle": "pass", "target": "commit", "targetHandle": "in" },
+      { "id": "e_commit_retry", "source": "if_test_ok2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
+      { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "commit", "targetHandle": "in" },
       { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "restore2", "targetHandle": "in" },
       { "id": "e32", "source": "restore2", "sourceHandle": "success", "target": "discarded2", "targetHandle": "in" },
       { "id": "e33", "source": "restore2", "sourceHandle": "failure", "target": "restore2_fail", "targetHandle": "in" },

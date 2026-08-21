@@ -35,6 +35,13 @@
         }
       },
       {
+        "id": "join_start",
+        "type": "logic.join.any",
+        "label": "Start from any trigger",
+        "position": { "x": 110, "y": 360 },
+        "config": { "stopOnFirst": true }
+      },
+      {
         "id": "git",
         "type": "action.graphwing.GET:/v1/git/status",
         "label": "gitStatus",
@@ -283,9 +290,10 @@
       { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 3740, "y": 240 }, "config": {} }
     ],
     "edges": [
-      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
-      { "id": "e1_form", "source": "form", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
-      { "id": "e1_hook", "source": "hook", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_form", "source": "form", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_hook", "source": "hook", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_git", "source": "join_start", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
       { "id": "e2", "source": "git", "sourceHandle": "success", "target": "view", "targetHandle": "in" },
       { "id": "e2f", "source": "git", "sourceHandle": "failure", "target": "herdr_git", "targetHandle": "in" },
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
