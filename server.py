@@ -682,6 +682,22 @@ GH_CHECK_PASS = frozenset({"pass", "skipping", "skip", "success"})
 GH_CHECK_FAIL = frozenset({"fail", "failure", "cancel", "cancelled", "cancelling", "error"})
 
 
+def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
+    """Expose review state at the action result level for Graph switches."""
+    if not out.get("ok"):
+        return out
+    data = out.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    review_decision = str(data.get("reviewDecision") or "")
+    reviews_blocking = review_decision in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+    out["review_decision"] = review_decision
+    out["merge_state"] = str(data.get("mergeStateStatus") or "")
+    out["reviews_blocking"] = reviews_blocking
+    out["reviews_ok"] = not reviews_blocking
+    return out
+
+
 def annotate_pr_checks(out: dict[str, Any]) -> dict[str, Any]:
     """HTTP 200 means gh ran. Graph gates on all_green / any_red, not the agent."""
     if not out.get("ok"):
@@ -1741,7 +1757,18 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
             number = first_query(qs, "number")
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
-            out = gh_json(repo_path, ["pr", "view", number, "--json", "number,title,state,url,headRefName,baseRefName,mergeable,isDraft"])
+            out = annotate_pr_view(
+                gh_json(
+                    repo_path,
+                    [
+                        "pr",
+                        "view",
+                        number,
+                        "--json",
+                        "number,title,state,url,headRefName,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus",
+                    ],
+                )
+            )
         elif method == "GET" and path == "/v1/gh/pr/checks":
             number = first_query(qs, "number")
             if not number:

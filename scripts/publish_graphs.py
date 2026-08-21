@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish catalog graphs to a Rewst org. Substitutes $GRAPHWING_INSTANCE.
+"""Publish catalog graphs to a Rewst org. Substitutes instance and hook placeholders.
 
 Seat config is $GRAPHWING_HOME/rewst-install.json (see examples/rewst-install.example.json).
 Public OpenAPI URL comes from named-tunnel meta or GRAPHWING_PUBLIC_URL.
@@ -132,19 +132,19 @@ def must(st, body, ok=(200, 201, 202), label=""):
     return body
 
 
-def subst_instance(obj, instance: str):
+def subst_instance(obj, instance: str, hook_secret: str = ""):
     if isinstance(obj, str):
-        return obj.replace("$GRAPHWING_INSTANCE", instance)
+        return obj.replace("$GRAPHWING_INSTANCE", instance).replace("$GRAPHWING_HOOK_SECRET", hook_secret)
     if isinstance(obj, list):
-        return [subst_instance(x, instance) for x in obj]
+        return [subst_instance(x, instance, hook_secret) for x in obj]
     if isinstance(obj, dict):
-        return {k: subst_instance(v, instance) for k, v in obj.items()}
+        return {k: subst_instance(v, instance, hook_secret) for k, v in obj.items()}
     return obj
 
 
-def load_graph(name: str, instance: str) -> dict:
+def load_graph(name: str, instance: str, hook_secret: str = "") -> dict:
     raw = json.loads((GRAPHS / f"{name}.json").read_text())
-    return subst_instance(raw, instance)
+    return subst_instance(raw, instance, hook_secret)
 
 
 def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict):
@@ -243,13 +243,14 @@ def main():
     instance = install.get("instance_id") or ""
     if not instance:
         raise SystemExit("rewst-install.json missing instance_id")
+    hook_secret = os.environ.get("GRAPHWING_HOOK_SECRET") or install.get("hook_secret") or ""
     integration = install.get("custom_integration_id")
     mcp = rewst_mcp(install)
     print("openapi", public_openapi_url())
     stems = ["verify-stack", "implement-slice", "pr-drive"] if args.only == "all" else [args.only]
     published = {}
     for stem in stems:
-        g = load_graph(stem, instance)
+        g = load_graph(stem, instance, hook_secret)
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
     if not args.no_run and "pr-drive" in published:
