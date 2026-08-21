@@ -420,6 +420,22 @@
         }
       }
     },
+    "/v1/slice/e2e": {
+      "post": {
+        "operationId": "sliceE2e",
+        "tags": ["slice"],
+        "summary": "After the map is empty: run a named tests.json recipe. Green or skip ends. Fail auto-adds a ticket from FAIL: lines, drafts if the log is a blob, parks after 3 reds.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceE2eRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "kind skip|green|auto|draft|park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceE2e" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/review/run": {
       "post": {
         "operationId": "reviewRun",
@@ -1014,6 +1030,26 @@
           "reviewer1": { "type": "string" },
           "reviewer2": { "type": "string" },
           "review": { "type": "string" }
+        }
+      },
+      "SliceE2eRequest": {
+        "type": "object",
+        "required": ["repo", "index"],
+        "properties": {
+          "repo": { "type": "string" },
+          "index": { "type": "string" },
+          "test": { "type": "string", "description": "tests.json name. Omitted or empty: skip." }
+        }
+      },
+      "SliceE2e": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "kind": { "type": "string" },
+          "id": { "type": "string" },
+          "path": { "type": "string" },
+          "e2e_reds": { "type": "integer" },
+          "compact": { "type": "string" }
         }
       },
       "ReviewRunRequest": {
