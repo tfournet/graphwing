@@ -92,6 +92,43 @@ def copy_file(src: Path, dest: Path) -> None:
     shutil.copy2(src, dest)
 
 
+def install_soul(home: Path) -> None:
+    src = REPO / "SOUL.md"
+    dest = home / "SOUL.md"
+    text = src.read_text().replace("$GRAPHWING_HOME", str(home))
+    if src.resolve() == dest.resolve():
+        return
+    dest.write_text(text)
+
+
+def apply_openapi_url(home: Path, port: int) -> str:
+    from setup_tunnel import set_openapi_server
+
+    meta = home / "cloudflared-meta.json"
+    if meta.is_file():
+        try:
+            host = str(json.loads(meta.read_text()).get("hostname") or "").strip()
+        except (OSError, json.JSONDecodeError):
+            host = ""
+        if host:
+            url = host if host.startswith("http") else f"https://{host}"
+            set_openapi_server(home, url)
+            return url
+    url = f"http://127.0.0.1:{port}"
+    set_openapi_server(home, url)
+    return url
+
+
+def run_named_tunnel_setup(home: Path) -> None:
+    if not (home / "tunnel.env").is_file() and not os.environ.get("GRAPHWING_CF_API_KEY"):
+        print("named tunnel: add tunnel.env or GRAPHWING_CF_API_KEY, then python3 setup_tunnel.py")
+        return
+    env = {**os.environ, "GRAPHWING_HOME": str(home)}
+    proc = subprocess.run([python_bin(), str(REPO / "setup_tunnel.py")], env=env, check=False)
+    if proc.returncode != 0:
+        print(f"setup_tunnel.py exited {proc.returncode}; OpenAPI stays loopback until it succeeds")
+
+
 def write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -261,12 +298,16 @@ def main() -> None:
     ni = args.non_interactive
 
     for name in CATALOG:
+        if name == "SOUL.md":
+            continue
         copy_file(REPO / name, home / name)
+    install_soul(home)
     copy_file(REPO / "bin" / "graphwing", home / "bin" / "graphwing")
     copy_file(REPO / "setup_tunnel.py", home / "setup_tunnel.py")
     copy_file(REPO / "examples" / "tunnel.env.example", home / "tunnel.env.example")
     copy_file(REPO / "examples" / "rr.example.json", home / "rr.example.json")
     copy_file(REPO / "examples" / "repos.example.json", home / "repos.example.json")
+    copy_file(REPO / "examples" / "rewst-install.example.json", home / "rewst-install.example.json")
 
     key_path = ensure_key(home)
     ensure_repos(home, REPO, ni, extra=args.repo)
@@ -305,6 +346,7 @@ def main() -> None:
             )
             print("demo tunnel: ephemeral trycloudflare.com hostname is in the unit journal")
             print("Rewst Graph SSRF-blocks loopback; demo URLs rotate and are for short-lived demos only")
+            print("set GRAPHWING_PUBLIC_URL to that hostname if Rewst must import OpenAPI")
         else:
             wrote_units.append(
                 write_unit(unit_dir, "graphwing-tunnel.service", render_unit("graphwing-tunnel.service", mapping))
@@ -318,6 +360,11 @@ def main() -> None:
             systemd_user("daemon-reload")
             names = [p.name for p in wrote_units]
             systemd_user("enable", "--now", *names)
+
+    if tunnel == "named":
+        run_named_tunnel_setup(home)
+    public = apply_openapi_url(home, args.port)
+    print("openapi servers.url", public)
 
     print("GRAPHWING_HOME", home)
     print("api key file", key_path, "(mode 600); header X-Graphwing-Key")

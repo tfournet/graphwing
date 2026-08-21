@@ -68,6 +68,37 @@ REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
 
 
+def public_base_url() -> str | None:
+    env = os.environ.get("GRAPHWING_PUBLIC_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    meta_path = HOME / "cloudflared-meta.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        data = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    host = str(data.get("hostname") or "").strip().rstrip("/")
+    if not host:
+        return None
+    if host.startswith("http://") or host.startswith("https://"):
+        return host
+    return f"https://{host}"
+
+
+def openapi_bytes() -> bytes:
+    raw = OPENAPI_PATH.read_bytes()
+    url = public_base_url()
+    if not url:
+        return raw
+    spec = json.loads(raw)
+    spec["servers"] = [{"url": url}]
+    return (json.dumps(spec, indent=2) + "\n").encode()
+
+
 def resolve_under_home(raw: str | Path | None) -> Path:
     path = Path("." if raw in (None, "") else raw)
     if not path.is_absolute():
@@ -1624,7 +1655,7 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
     if method == "GET" and path in ("/v1/health", "/health"):
         return json_out(200, {"ok": True, "service": "graphwing", "repos": sorted(repos)})
     if method == "GET" and path in ("/openapi.json", "/v1/openapi.json"):
-        return 200, OPENAPI_PATH.read_bytes(), "application/json"
+        return 200, openapi_bytes(), "application/json"
 
     if not authed:
         return json_out(401, {"error": "invalid or missing X-Graphwing-Key", "code": "unauthorized"})

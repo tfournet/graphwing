@@ -356,6 +356,9 @@ class DispatchTests(unittest.TestCase):
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
         self.assertEqual(spec["info"]["version"], "0.5.1")
+        self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
+        self.assertNotIn("tfour.net", spec["info"]["description"])
+        self.assertNotIn("tim-graphwing", spec["info"]["description"])
         self.assertIn("/v1/stack/status", spec["paths"])
         self.assertIn("/v1/port/check", spec["paths"])
         self.assertIn("/v1/test/run", spec["paths"])
@@ -977,6 +980,22 @@ class DispatchTests(unittest.TestCase):
             with mock.patch.object(server, "KEY_PATH", Path("/nope/api.key")):
                 self.assertEqual(server.load_key(), b"env-secret-key")
 
+    def test_openapi_url_from_tunnel_meta(self):
+        with tempfile.TemporaryDirectory() as td:
+            meta = Path(td) / "cloudflared-meta.json"
+            meta.write_text(json.dumps({"hostname": "gw.example.com"}) + "\n")
+            with mock.patch.object(server, "HOME", Path(td)):
+                os.environ.pop("GRAPHWING_PUBLIC_URL", None)
+                self.assertEqual(server.public_base_url(), "https://gw.example.com")
+        with mock.patch.dict(os.environ, {"GRAPHWING_PUBLIC_URL": "https://override.example"}):
+            self.assertEqual(server.public_base_url(), "https://override.example")
+
+    def test_catalog_soul_is_agnostic(self):
+        text = (Path(__file__).resolve().parent / "SOUL.md").read_text()
+        self.assertIn("$GRAPHWING_HOME", text)
+        self.assertNotIn("/home/tim", text)
+        self.assertNotIn("tim-graphwing", text)
+
 
 class InstallTests(unittest.TestCase):
     def test_runtime_and_templates_have_no_hardcoded_home(self):
@@ -986,6 +1005,8 @@ class InstallTests(unittest.TestCase):
             "install.py",
             "start.sh",
             "setup_tunnel.py",
+            "scripts/publish_graphs.py",
+            "SOUL.md",
             "bin/graphwing",
             "systemd/graphwing-api.service",
             "systemd/graphwing-herdr.service",
@@ -1034,6 +1055,15 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn("@GRAPHWING_HOME@", api_unit)
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertNotIn("copied secrets", proc.stdout.lower())
+            spec = json.loads((home / "openapi.json").read_text())
+            self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
+            self.assertFalse((home / "cloudflared-meta.json").exists())
+            self.assertFalse((home / "rewst-install.json").exists())
+            self.assertTrue((home / "rewst-install.example.json").is_file())
+            soul = (home / "SOUL.md").read_text()
+            self.assertIn(str(home), soul)
+            self.assertNotIn("$GRAPHWING_HOME", soul)
+            self.assertNotIn("tim-graphwing", soul)
 
     def test_ensure_repos_noninteractive_empty(self):
         import install

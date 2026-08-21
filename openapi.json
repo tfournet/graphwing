@@ -3,12 +3,12 @@
   "info": {
     "title": "graphwing",
 
-    "description": "Local node catalog for Rewst Graph on Tim's laptop. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Org: https://app.rewst.ai/orgs/tim-graphwing",
+    "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
     "version": "0.5.1"
   },
   "servers": [
     {
-      "url": "https://graphwing.tfour.net"
+      "url": "http://127.0.0.1:8645"
     }
   ],
   "tags": [

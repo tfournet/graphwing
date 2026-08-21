@@ -6,8 +6,6 @@ Source of truth: [`tfournet/graphwing`](https://github.com/tfournet/graphwing). 
 
 ## Install
 
-Clean machine, getting started:
-
 ```bash
 git clone https://github.com/tfournet/graphwing.git
 cd graphwing
@@ -16,72 +14,46 @@ cd graphwing
 
 `start.sh` optionally installs Hermes Agent (`agentRun`), herdr, and cloudflared, writes `$GRAPHWING_HOME`, and starts the API in this terminal. It does not copy secrets from another home. It does not install `rr`.
 
-One-liner (non-interactive, loopback only, no extras):
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tfournet/graphwing/main/start.sh | bash -s -- --yes
+./start.sh --yes --with-hermes
+./start.sh --yes --no-start
+./start.sh --daemon
 ```
 
-```bash
-./start.sh --yes --with-hermes          # also grab Hermes Agent
-./start.sh --yes --no-start             # catalog + key + units only
-./start.sh --daemon                     # systemd --user instead of foreground
-```
+`install.py` is the catalog renderer `start.sh` calls.
 
-`install.py` is the catalog renderer `start.sh` calls. You can still run it directly.
-
-- **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Send header `X-Graphwing-Key`.
-- **Named-tunnel credentials:** `$GRAPHWING_HOME/cloudflared.token`, or `$GRAPHWING_HOME/tunnel.env` / `GRAPHWING_CF_API_KEY` for `setup_tunnel.py`. See `examples/tunnel.env.example`.
-- **`repos.json`:** empty in git. The wizard (or `install.py --repo name=/path`) writes short names on the machine. Example shape: `examples/repos.example.json`. Never commit laptop clones.
-- **`stacks.json`:** local stack list; install writes a graphwing loopback stack if missing.
-- **`rr`:** plugin, not an install. If you already have `rr`, copy `examples/rr.example.json` to `$GRAPHWING_HOME/rr.json` and point `cwd` at an allowlisted repo. Graphwing never installs the binary. No `rr.json` → `POST /v1/rr/run` is `501 not_configured`. Default tests are local (`tests.json` / `python3 test_server.py`), not `rrRun`.
-- **Tunnel:** default is none (loopback `127.0.0.1:8645`). `demo` is a Cloudflare quick tunnel (`*.trycloudflare.com`, hostname rotates — fine for a short Rewst demo, not a saved integration). `named` is opt-in. Rewst Graph SSRF-blocks loopback, RFC1918, and Tailscale, so a stable public hostname is still required for a saved cloud Graph integration.
+- **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Header `X-Graphwing-Key`.
+- **`repos.json`:** empty until the wizard or `install.py --repo name=/path`. See `examples/repos.example.json`.
+- **`rr`:** drop-in plugin. Copy `examples/rr.example.json` to `$GRAPHWING_HOME/rr.json` if you already have `rr`. Otherwise `POST /v1/rr/run` is `501 not_configured`. Tests stay local (`python3 test_server.py`).
+- **Tunnel:** default none (loopback `127.0.0.1:8645`). `demo` is an ephemeral `*.trycloudflare.com` URL (journal). `named` runs `setup_tunnel.py` when `tunnel.env` or `GRAPHWING_CF_API_KEY` is present; that writes `$GRAPHWING_HOME/cloudflared-meta.json` and sets the OpenAPI `servers` URL to `https://<hostname>`. Rewst Graph SSRF-blocks loopback, so a stable public hostname is required for a saved cloud integration.
 
 ```bash
 GRAPHWING_HOME=. python3 test_server.py
 ```
 
-## zbook seat (example)
+## Runtime
 
-Runtime on zbook is `~/.graphwing`. Org wiring below is this laptop's Rewst seat, not part of install.
-
-- Org: https://app.rewst.ai/orgs/tim-graphwing
-- Public API: https://graphwing.tfour.net
-- Human: `herdr --session graphwing`
-- Graph activity: Herdr tab `graph` (one line per op). Long jobs (`agentRun`, async `scriptRun`) get a `gw-*` tab that tails the log and **closes when the job finishes**. Does not type into the Hermes chat pane. Does not stop the `graphwing` Herdr session.
-- CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`, zbook example: `/home/tim/.graphwing`)
+- API: `127.0.0.1:8645` (health and `/openapi.json` unauthenticated)
+- Human: `herdr --session graphwing`, tab `graph`
+- CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`)
+- Units: `graphwing-api` always; `graphwing-tunnel` / `graphwing-herdr` only if you opted in
 
 Graph uses named OpenAPI actions, not a mega-agent. Prefer a new deterministic op over an agent loop.
 
-`POST /v1/agent/run` queues one bounded Hermes loop (`HERMES_HOME=$GRAPHWING_HOME`, max 30 turns / 300s) and returns 202 + `job_id`. Spawn sets `TERMINAL_CWD` / `--in` to the allowlisted repo cwd so Hermes `config.yaml` `terminal.cwd` cannot retarget live riftwing. Graph join: `action.wait.webhook` pending → pass `response_webhook_url` (`resumeUrl`) and `response_webhook_token` (`resumeToken`); graphwing POSTs the receipt with `X-Rewst-Token`. Poll `GET /v1/agent/jobs/{job_id}` is optional. v0.4 seat is `graphwing` home only (`profiles.json` allowlist; `~/.hermes/profiles` is not dumped).
+`POST /v1/agent/run` queues one bounded Hermes loop (`HERMES_HOME=$GRAPHWING_HOME`, max 30 turns / 300s) and returns 202 + `job_id`. Spawn sets `TERMINAL_CWD` / `--in` to the allowlisted repo cwd. Graph join: `action.wait.webhook` pending → `response_webhook_url` / `response_webhook_token`; graphwing POSTs the receipt with `X-Rewst-Token`.
 
-Git writes are opt-in Graph ops on allowlisted repo short names: `gitCheckout`, `gitRestore`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless staged/add paths are explicit. `POST /v1/script/run` runs `scripts.json` names only. Deterministic stack ops: `stackStatus`, `portCheck`, `testRun` (`tests.json`). `rrRun` is an optional plugin when `rr.json` is present. A Rewst PR-driver is a Graph sub-workflow of these nodes (`gitStatus` → `ghPrChecks` → `testRun` → optional `agentRun` + wait-webhook), not one agent loop.
+Git writes are opt-in on allowlisted short names: `gitCheckout`, `gitRestore`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless paths are explicit. `scriptRun` / `testRun` are allowlisted names only.
 
-Laptop-only here: git, local `gh`, file head, units, Herdr, allowlisted scripts, one-job agent loops. Cloud GitHub/Shortcut stay Rewst integrations — do not duplicate them on this host.
+## Rewst
 
-## Units (user systemd)
+Import a custom integration from the seat OpenAPI URL (`GET /openapi.json` `servers[0].url`, or `GRAPHWING_PUBLIC_URL`). Named-tunnel setup is what fills that URL.
 
-Templates in `systemd/` have no hard-coded home. `install.py` renders them into `~/.config/systemd/user/`.
+Publish graphs from this repo:
 
-- `graphwing-api` — 127.0.0.1:8645 (always)
-- `graphwing-tunnel` — only if you picked demo or named
-- `graphwing-herdr` — only if `herdr` is on PATH
-
-zbook example: named tunnel `zbook-graphwing` → graphwing.tfour.net.
-
-API key: `$GRAPHWING_HOME/api.key` (header `X-Graphwing-Key`). Health and `/openapi.json` are unauthenticated.
-
-## Rewst (org tim-graphwing only)
-
-- Org: https://app.rewst.ai/orgs/tim-graphwing
-- MCP token BWS key: `app_rewst_ai__tim_graphwing_mcp_token`
-- Custom integration `graphwing` imported from `https://graphwing.tfour.net/openapi.json` (spec 0.5.0)
-- Canary workflow: `graphwing-canary` (manual → health → gitStatus)
-- Agent canary: `graphwing-agentrun-canary` (manual → wait.webhook pending → agentRun → resume receipt)
-- `graphwing-verify-stack` — payload `{input:{stack,ports}}` → stackStatus → portCheck
-- `graphwing-implement-slice` — payload `{input:{repo,prompt}}` → gitStatus → wait.webhook → agentRun → receipt
-- `graphwing-pr-drive` — payload `{input:{repo,pr,test,prompt}}`. `gitStatus` → `ghPrView` → `ghPrChecks`. Green → done. Red → named `testRun` (sync recipe) → one implement-slice (`wait` + `agentRun`) → checks again. Missing PR / pending / test fail / still red → Herdr noop. Specs in `graphs/`.
-- Start a run: `POST /api/workflows/{slug}/run` with `{ "input": { ... } }` (that JSON is the start webhook body). Resume is a different POST to `response_webhook_url`.
-- `ghPrChecks` HTTP 200 means `gh` ran. Graph gates on `data.all_green` / `data.any_red`, not an agent reading the transcript.
+```bash
+# $GRAPHWING_HOME/rewst-install.json from examples/rewst-install.example.json
+GRAPHWING_REWST_MCP_TOKEN=... python3 scripts/publish_graphs.py --only pr-drive
+```
 
 Do not install this on Rewst Internal. Do not ship as a platform package.

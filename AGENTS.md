@@ -2,8 +2,8 @@
 
 This git repo is the **node catalog** source of truth. It is not a mega-agent and not the runtime.
 
-- Runtime is `$GRAPHWING_HOME` (zbook: `~/.graphwing`). Secrets, jobs, Hermes state stay there. Do not commit them.
-- Graph in org **tim-graphwing** owns topology. graphwing exposes named OpenAPI ops. `agentRun` is one bounded job.
+- Runtime is `$GRAPHWING_HOME` (default `~/.graphwing`). Secrets, jobs, Hermes state stay there. Do not commit them.
+- Rewst Graph owns topology. graphwing exposes named OpenAPI ops. `agentRun` is one bounded job.
 - Prefer a new deterministic op over an agent loop. New workflow JSON only when **edges** change; loop iterations are run `input`.
 - Laptop-only: git, local `gh`, file head, units, Herdr, allowlisted scripts/tests. Cloud GitHub/Shortcut stay Rewst integrations.
 - Clean machine: `./start.sh`. Optionally grabs Hermes Agent / herdr / cloudflared. `rr` is a drop-in `rr.json` plugin if you already have the binary; tests stay local (`testRun` / `test_server.py`).
@@ -14,8 +14,8 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | Thing | Path |
 |---|---|
 | HTTP ops | `server.py` + `openapi.json` + `test_server.py` |
-| Published graphs | `graphs/*.json` then `python3 scripts/publish_graphs.py` |
-| Hermes seat text | `SOUL.md` (copied to `$GRAPHWING_HOME` on install) |
+| Published graphs | `graphs/*.json` then `scripts/publish_graphs.py` (reads `$GRAPHWING_HOME/rewst-install.json` + public URL from tunnel meta) |
+| Hermes seat text | `SOUL.md` (copied to `$GRAPHWING_HOME` with `$GRAPHWING_HOME` substituted) |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.

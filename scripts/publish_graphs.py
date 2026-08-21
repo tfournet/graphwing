@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish catalog graphs in org tim-graphwing. Substitutes $GRAPHWING_INSTANCE."""
+"""Publish catalog graphs to a Rewst org. Substitutes $GRAPHWING_INSTANCE.
+
+Seat config is $GRAPHWING_HOME/rewst-install.json (see examples/rewst-install.example.json).
+Public OpenAPI URL comes from named-tunnel meta or GRAPHWING_PUBLIC_URL.
+MCP token: GRAPHWING_REWST_MCP_TOKEN, or GRAPHWING_REWST_MCP_BWS_KEY + BWS_ACCESS_TOKEN.
+"""
 
 from __future__ import annotations
 
@@ -15,51 +20,83 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GRAPHS = ROOT / "graphs"
-INSTALL_PATHS = [
-    ROOT / "rewst-install.json",
-    Path.home() / ".graphwing" / "rewst-install.json",
-]
-TENANT = "485bb4f1-4f83-4f81-8079-618e1139e22b"
-BASE = "https://app.rewst.ai/api"
-SOURCE = "https://graphwing.tfour.net/openapi.json"
+HOME = Path(os.environ.get("GRAPHWING_HOME", Path.home() / ".graphwing"))
+BASE = os.environ.get("GRAPHWING_REWST_API", "https://app.rewst.ai/api").rstrip("/")
+TENANT = ""
 
 
 def load_install() -> dict:
-    for p in INSTALL_PATHS:
-        if p.is_file():
-            return json.loads(p.read_text())
-    raise SystemExit("rewst-install.json missing")
+    path = HOME / "rewst-install.json"
+    if not path.is_file():
+        raise SystemExit(f"missing {path} (copy examples/rewst-install.example.json)")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must be a JSON object")
+    return data
 
 
-def bws_mcp() -> str:
-    token = None
-    for p in (
-        Path.home() / ".hermes/.env",
-        Path.home() / ".hermes/profiles/executor/.env",
-        Path.home() / ".hermes/profiles/executor-max/.env",
-        Path.home() / ".hermes/profiles/riftwing-planner/.env",
-    ):
-        if not p.is_file():
-            continue
-        for line in p.read_text().splitlines():
-            if line.startswith("BWS_ACCESS_TOKEN=") and len(line) > 20:
-                token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
-        if token:
-            break
+def tenant_id(install: dict) -> str:
+    tid = (os.environ.get("GRAPHWING_REWST_ORG_ID") or install.get("org_id") or "").strip()
+    if not tid:
+        raise SystemExit("set org_id in rewst-install.json or GRAPHWING_REWST_ORG_ID")
+    return tid
+
+
+def public_openapi_url() -> str:
+    env = os.environ.get("GRAPHWING_PUBLIC_URL", "").strip().rstrip("/")
+    if env:
+        return env if env.endswith("/openapi.json") else env + "/openapi.json"
+    meta = HOME / "cloudflared-meta.json"
+    if meta.is_file():
+        host = str(json.loads(meta.read_text()).get("hostname") or "").strip().rstrip("/")
+        if host:
+            if host.startswith("http://") or host.startswith("https://"):
+                return host.rstrip("/") + "/openapi.json"
+            return f"https://{host}/openapi.json"
+    spec_path = HOME / "openapi.json"
+    if spec_path.is_file():
+        spec = json.loads(spec_path.read_text())
+        servers = spec.get("servers") or []
+        if servers and isinstance(servers[0], dict) and servers[0].get("url"):
+            base = str(servers[0]["url"]).rstrip("/")
+            if "127.0.0.1" in base or "localhost" in base:
+                raise SystemExit("OpenAPI servers.url is loopback; run named tunnel setup or set GRAPHWING_PUBLIC_URL")
+            return base + "/openapi.json"
+    raise SystemExit("no public OpenAPI URL: named tunnel setup writes cloudflared-meta.json, or set GRAPHWING_PUBLIC_URL")
+
+
+def bws_secret(key: str) -> str:
+    token = os.environ.get("BWS_ACCESS_TOKEN", "").strip()
     if not token:
-        raise SystemExit("no BWS_ACCESS_TOKEN")
+        raise SystemExit("BWS_ACCESS_TOKEN required for GRAPHWING_REWST_MCP_BWS_KEY")
     env = {**os.environ, "BWS_ACCESS_TOKEN": token}
     secrets = json.loads(subprocess.check_output(["bws", "secret", "list", "-o", "json"], env=env, text=True))
-    sid = next(s["id"] for s in secrets if s.get("key") == "app_rewst_ai__tim_graphwing_mcp_token")
+    sid = next((s["id"] for s in secrets if s.get("key") == key), None)
+    if not sid:
+        raise SystemExit(f"BWS secret not found: {key}")
     got = json.loads(subprocess.check_output(["bws", "secret", "get", sid, "-o", "json"], env=env, text=True))
-    mcp = got["value"]
+    val = got.get("value") or ""
+    if not val:
+        raise SystemExit(f"BWS secret {key} empty")
+    return val
+
+
+def rewst_mcp(install: dict) -> str:
+    direct = os.environ.get("GRAPHWING_REWST_MCP_TOKEN", "").strip()
+    if direct:
+        mcp = direct
+    else:
+        bws_key = (os.environ.get("GRAPHWING_REWST_MCP_BWS_KEY") or install.get("mcp_bws_key") or "").strip()
+        if not bws_key:
+            raise SystemExit("set GRAPHWING_REWST_MCP_TOKEN or GRAPHWING_REWST_MCP_BWS_KEY")
+        mcp = bws_secret(bws_key)
     payload = mcp.split(".")[1]
     pad = "=" * (-len(payload) % 4)
     claims = json.loads(base64.urlsafe_b64decode(payload + pad))
     tid = claims.get("tenant_id") or claims.get("tid")
-    if tid != TENANT:
-        raise SystemExit(f"jwt tenant {tid} != {TENANT}")
+    expected = tenant_id(install)
+    if tid and tid != expected:
+        raise SystemExit(f"jwt tenant {tid} != {expected}")
     return mcp
 
 
@@ -190,21 +227,25 @@ def run_slug(mcp: str, slug: str, payload: dict, wait: int = 90):
 
 
 def save_install(install: dict) -> None:
-    text = json.dumps(install, indent=2) + "\n"
-    for p in INSTALL_PATHS:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+    path = HOME / "rewst-install.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(install, indent=2) + "\n")
 
 
 def main():
+    global TENANT
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="pr-drive", help="graph file stem, or 'all'")
     ap.add_argument("--no-run", action="store_true")
     args = ap.parse_args()
     install = load_install()
-    instance = install["instance_id"]
-    integration = install["custom_integration_id"]
-    mcp = bws_mcp()
+    TENANT = tenant_id(install)
+    instance = install.get("instance_id") or ""
+    if not instance:
+        raise SystemExit("rewst-install.json missing instance_id")
+    integration = install.get("custom_integration_id")
+    mcp = rewst_mcp(install)
+    print("openapi", public_openapi_url())
     stems = ["verify-stack", "implement-slice", "pr-drive"] if args.only == "all" else [args.only]
     published = {}
     for stem in stems:
@@ -212,15 +253,19 @@ def main():
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
     if not args.no_run and "pr-drive" in published:
-        rs, rid, _, _ = run_slug(
-            mcp,
-            "graphwing-pr-drive",
-            {"input": {"repo": "riftwing"}},
-            wait=60,
-        )
-        published["pr-drive"]["run_id"] = rid
-        published["pr-drive"]["status"] = rs
-        published["pr-drive"]["smoke"] = "missing_pr"
+        repo = (os.environ.get("GRAPHWING_SMOKE_REPO") or install.get("smoke_repo") or "").strip()
+        if not repo:
+            print("skip smoke run (set GRAPHWING_SMOKE_REPO or smoke_repo in rewst-install.json)")
+        else:
+            rs, rid, _, _ = run_slug(
+                mcp,
+                "graphwing-pr-drive",
+                {"input": {"repo": repo}},
+                wait=60,
+            )
+            published["pr-drive"]["run_id"] = rid
+            published["pr-drive"]["status"] = rs
+            published["pr-drive"]["smoke"] = "missing_pr"
     install["custom_integration_id"] = integration
     install["pr_drive"] = published.get("pr-drive") or install.get("pr_drive")
     if "verify-stack" in published:

@@ -3,6 +3,9 @@ api.key
 auth.json
 auth.lock
 cloudflared.token
+cloudflared-meta.json
+rewst-install.json
+tunnel.env
 .env
 state.db
 state.db-shm
