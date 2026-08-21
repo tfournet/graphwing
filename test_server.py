@@ -1593,6 +1593,44 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("/home/tim", text)
         self.assertNotIn("tim-graphwing", text)
 
+    def test_graphs_fan_in_targets_are_joins(self):
+        graphs = Path(__file__).resolve().parent / "graphs"
+        for graph_path in sorted(graphs.glob("*.json")):
+            graph = json.loads(graph_path.read_text())
+            nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+            incoming: dict[str, int] = {}
+            outgoing: dict[str, list[str]] = {}
+            for edge in graph["spec"]["edges"]:
+                incoming[edge["target"]] = incoming.get(edge["target"], 0) + 1
+                outgoing.setdefault(edge["source"], []).append(edge["target"])
+            for nid, count in incoming.items():
+                if count < 2:
+                    continue
+                ntype = nodes[nid]["type"]
+                self.assertTrue(
+                    ntype.startswith("logic.join"),
+                    f"{graph_path.name} node {nid} type={ntype} has {count} incoming edges",
+                )
+            color = {nid: 0 for nid in nodes}
+            stack: list[str] = []
+
+            def dfs(uid: str) -> None:
+                color[uid] = 1
+                stack.append(uid)
+                for vid in outgoing.get(uid, []):
+                    if color[vid] == 1:
+                        self.fail(
+                            f"{graph_path.name} unbounded cycle: {' -> '.join(stack + [vid])}"
+                        )
+                    if color[vid] == 0:
+                        dfs(vid)
+                stack.pop()
+                color[uid] = 2
+
+            for nid in nodes:
+                if color[nid] == 0:
+                    dfs(nid)
+
     def test_pr_status_graph_is_read_only_and_unauthenticated(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "pr-status.json"
         graph = json.loads(graph_path.read_text())
@@ -1618,14 +1656,19 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e31"]["source"], "if_test_ok2")
         self.assertEqual(edges["e31"]["sourceHandle"], "fail")
         self.assertEqual(edges["e31"]["target"], "wait3")
-        self.assertEqual(edges["e31i"]["target"], "wait_human")
+        self.assertEqual(edges["e31i"]["target"], "join_wait_human")
+        self.assertEqual(edges["e_join_wait_human"]["target"], "wait_human")
         self.assertEqual(edges["e_rev1_nack"]["target"], "wait_rn1")
         self.assertEqual(edges["e_rev2_nack"]["target"], "wait_rn2")
-        self.assertEqual(edges["e_r1b_nack"]["target"], "wait_human")
-        self.assertEqual(edges["e_r2b_nack"]["target"], "wait_human")
+        self.assertEqual(edges["e_r1b_nack"]["target"], "join_wait_human")
+        self.assertEqual(edges["e_r2b_nack"]["target"], "join_wait_human")
         rn1 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent_rn1")
         self.assertIn("TASKS.review1.data.compact", rn1["config"]["prompt"])
-        self.assertEqual(edges["e22"]["target"], "wait_human")
+        self.assertEqual(edges["e_rn1_tbad"]["target"], "join_wait_human")
+        self.assertEqual(edges["e_rn2_tbad"]["target"], "join_wait_human")
+        self.assertNotIn("switch_retry", {node["id"] for node in graph["spec"]["nodes"]})
+        self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
+        self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
         self.assertIn("hermes_session", agent2["config"])
         self.assertIn("TASKS.wait.request.body.hermes_session", agent2["config"]["hermes_session"])
@@ -1666,9 +1709,11 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e7b"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
-        self.assertEqual(edges["e12"]["target"], "walk")
-        self.assertEqual(edges["e7h"]["target"], "e2e")
-        self.assertEqual(edges["e12d"]["target"], "e2e")
+        self.assertEqual(edges["e12"]["target"], "join_walk")
+        self.assertEqual(edges["e_join_walk"]["target"], "walk")
+        self.assertEqual(edges["e7h"]["target"], "join_e2e")
+        self.assertEqual(edges["e12d"]["target"], "join_e2e")
+        self.assertEqual(edges["e_join_e2e"]["target"], "e2e")
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
@@ -1676,7 +1721,9 @@ class DispatchTests(unittest.TestCase):
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
         self.assertEqual(agent2["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
         self.assertEqual(edges["e7j"]["target"], "route")
-        self.assertEqual(edges["e_commit_first"]["target"], "switch_rev")
+        self.assertEqual(edges["e_commit_first"]["target"], "join_switch_rev")
+        self.assertEqual(edges["e_join_switch_rev"]["target"], "map_switch_rev")
+        self.assertEqual(edges["e_map_switch_rev"]["target"], "switch_rev")
         review1 = next(n for n in graph["spec"]["nodes"] if n["id"] == "review1")
         self.assertIn("review/run", review1["type"])
 
