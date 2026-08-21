@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Hard-coded: gitStatus → gitCheckout → wait-webhook agentRun → gitCommit → gitPush. Payload: repo, branch, prompt, commit_message.",
+  "description": "Hard-coded: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush or gitRestore. Payload: repo, branch, prompt, commit_message, test.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -76,6 +76,39 @@
         }
       },
       {
+        "id": "test",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "testRun",
+        "position": { "x": 980, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "name": "{{ CTX.INPUT.test }}"
+        }
+      },
+      {
+        "id": "if_test_ok",
+        "type": "logic.filter",
+        "label": "test ok?",
+        "position": { "x": 1120, "y": 200 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "restore",
+        "type": "action.graphwing.POST:/v1/git/restore",
+        "label": "gitRestore",
+        "position": { "x": 1260, "y": 320 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "clean_untracked": true
+        }
+      },
+      {
         "id": "commit",
         "type": "action.graphwing.POST:/v1/git/commit",
         "label": "gitCommit",
@@ -119,7 +152,10 @@
       },
       { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
-      { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} }
+      { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
+      { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
+      { "id": "discarded", "type": "action.noop", "label": "Herdr: test failed, worktree restored", "position": { "x": 1400, "y": 320 }, "config": {} },
+      { "id": "restore_fail", "type": "action.noop", "label": "Herdr: restore failed", "position": { "x": 1400, "y": 440 }, "config": {} }
     ],
     "edges": [
       { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
@@ -130,11 +166,17 @@
       { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
       { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
       { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" },
-      { "id": "e9", "source": "record", "sourceHandle": "out", "target": "commit", "targetHandle": "in" },
       { "id": "e10", "source": "commit", "sourceHandle": "success", "target": "push", "targetHandle": "in" },
       { "id": "e11", "source": "commit", "sourceHandle": "failure", "target": "commit_fail", "targetHandle": "in" },
       { "id": "e12", "source": "push", "sourceHandle": "success", "target": "done", "targetHandle": "in" },
-      { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" }
+      { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
+      { "id": "e14", "source": "record", "sourceHandle": "out", "target": "test", "targetHandle": "in" },
+      { "id": "e15", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
+      { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "test_http_fail", "targetHandle": "in" },
+      { "id": "e17", "source": "if_test_ok", "sourceHandle": "pass", "target": "commit", "targetHandle": "in" },
+      { "id": "e18", "source": "if_test_ok", "sourceHandle": "fail", "target": "restore", "targetHandle": "in" },
+      { "id": "e19", "source": "restore", "sourceHandle": "success", "target": "discarded", "targetHandle": "in" },
+      { "id": "e20", "source": "restore", "sourceHandle": "failure", "target": "restore_fail", "targetHandle": "in" }
     ]
   }
 }
