@@ -7,6 +7,34 @@
     "nodes": [
       { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 240 }, "config": {} },
       {
+        "id": "form",
+        "type": "trigger.form",
+        "label": "Form",
+        "position": { "x": 0, "y": 360 },
+        "config": {
+          "enabled": true,
+          "allowDrafts": false,
+          "inputs": {
+            "repo": { "type": "string", "required": true },
+            "pr": { "type": "string", "required": true },
+            "test": { "type": "string", "required": true },
+            "prompt": { "type": "string", "required": true },
+            "commit_message": { "type": "string", "required": true }
+          }
+        }
+      },
+      {
+        "id": "hook",
+        "type": "trigger.webhook",
+        "label": "Webhook",
+        "position": { "x": 0, "y": 480 },
+        "config": {
+          "enabled": true,
+          "requireAuthHeader": true,
+          "allowedMethods": ["POST"]
+        }
+      },
+      {
         "id": "git",
         "type": "action.graphwing.GET:/v1/git/status",
         "label": "gitStatus",
@@ -256,6 +284,8 @@
     ],
     "edges": [
       { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e1_form", "source": "form", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
+      { "id": "e1_hook", "source": "hook", "sourceHandle": "out", "target": "git", "targetHandle": "in" },
       { "id": "e2", "source": "git", "sourceHandle": "success", "target": "view", "targetHandle": "in" },
       { "id": "e2f", "source": "git", "sourceHandle": "failure", "target": "herdr_git", "targetHandle": "in" },
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
