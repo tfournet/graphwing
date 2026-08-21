@@ -537,6 +537,28 @@ def git_checkout(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
     return git_write_result(name, out)
 
 
+def git_restore(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if "force" in data or "force_with_lease" in data:
+        return 400, {"error": "force is not allowed", "code": "force_rejected"}
+    for field in ("remote", "ref", "delete"):
+        if field in data:
+            return 400, {"error": f"{field} is not accepted", "code": "extra_field"}
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    clean_untracked = data.get("clean_untracked", False)
+    if not isinstance(clean_untracked, bool):
+        return 400, {"error": "clean_untracked must be a boolean", "code": "bad_clean_untracked"}
+    out = run_git(resolved, ["reset", "--hard", "HEAD"])
+    if not out.get("ok") or not clean_untracked:
+        return git_write_result(name, out)
+    return git_write_result(name, run_git(resolved, ["clean", "-fd"]))
+
+
 def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1630,6 +1652,9 @@ def dispatch_inner(method: str, path: str, qs: dict[str, list[str]], authed: boo
 
     if method == "POST" and path == "/v1/git/checkout":
         status, payload = git_checkout(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/git/restore":
+        status, payload = git_restore(body, repos)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/git/commit":
         status, payload = git_commit(body, repos)
