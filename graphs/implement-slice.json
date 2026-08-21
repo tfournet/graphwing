@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay. Set iters_left=2 for one resume of the same Hermes session with a compact test signal; otherwise wait for human. Payload: repo, branch, prompt, commit_message, test, iters_left.",
+  "description": "Manual, form, or authenticated webhook: gitStatus → gitCheckout → fileHead ticket → wait-webhook agentRun → testRun → gitCommit/gitPush on green. On red, files stay. Writer prompt is the ticket file, not a pasted spec. Set iters_left=2 to resume the same Hermes session with a compact test signal; otherwise wait for human. Payload: repo, branch, ticket, commit_message, test, iters_left.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -17,7 +17,7 @@
           "inputs": {
             "repo": { "type": "string", "required": true },
             "branch": { "type": "string", "required": true },
-            "prompt": { "type": "string", "required": true },
+            "ticket": { "type": "string", "required": true, "description": "Repo-relative path to the slice ticket markdown" },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
             "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" }
@@ -67,6 +67,18 @@
         }
       },
       {
+        "id": "ticket_head",
+        "type": "action.graphwing.GET:/v1/file/head",
+        "label": "fileHead ticket",
+        "position": { "x": 490, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "path": "{{ CTX.INPUT.ticket }}"
+        }
+      },
+      {
         "id": "wait",
         "type": "action.wait.webhook",
         "label": "Wait for agent receipt",
@@ -88,7 +100,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "prompt": "{{ CTX.INPUT.prompt }}",
+          "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}"
         }
@@ -172,7 +184,7 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
-          "prompt": "{{ CTX.INPUT.prompt }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"
         }
@@ -295,6 +307,7 @@
       { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
+      { "id": "ticket_fail", "type": "action.noop", "label": "Herdr: ticket fileHead failed", "position": { "x": 490, "y": -160 }, "config": {} },
       { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
 
       { "id": "wait2_timeout", "type": "action.noop", "label": "Herdr: retry wait timeout", "position": { "x": 1840, "y": 200 }, "config": {} },
@@ -313,7 +326,9 @@
       { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
       { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
       { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
-      { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "ticket_head", "targetHandle": "in" },
+      { "id": "e7b", "source": "ticket_head", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
+      { "id": "e7c", "source": "ticket_head", "sourceHandle": "failure", "target": "ticket_fail", "targetHandle": "in" },
       { "id": "e8", "source": "checkout", "sourceHandle": "failure", "target": "checkout_fail", "targetHandle": "in" },
       { "id": "e10", "source": "commit", "sourceHandle": "success", "target": "push", "targetHandle": "in" },
       { "id": "e11", "source": "commit", "sourceHandle": "failure", "target": "commit_fail", "targetHandle": "in" },

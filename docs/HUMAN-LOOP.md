@@ -54,7 +54,7 @@ A ticket tagged **`decision`** (grill/prototype) is not a build. Graph **parks**
 
 ## One slice (`implement-slice`)
 
-Payload is the **ticket path**, not the whole spec. Same workflow JSON; next slice = next `input`.
+Payload is the **ticket path**, not the whole spec. Same workflow JSON; next slice = next `input`. `implement-slice` `fileHead`s that path after checkout; `agentRun.prompt` is the ticket text.
 
 1. `gitCheckout` the story branch (create if needed).
 2. One **Hermes session per slice** (`agentRun`). Inner TDD is this session.
@@ -130,7 +130,7 @@ Do not resume the last feature session to “fix e2e.”
 
 ## Not wired yet (do these next, do not re-litigate)
 
-1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Frontier path → `POST graphwing-implement-slice` (no bash `go`). Walker: same topology, next `input` = next path.
+1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Walker: same topology, next `input` = next `ticket` path (graph already fileHeads that path). No bash `go`.
 2. Three-strikes park (third suite-red); spec-review nack → resume; wipe only on explicit discard.
 3. Seat default writer `grok-4.6`; class×size table on `agentRun`; opposing-vendor spec-review **before** commit.
 4. E2E node after empty map; auto-ticket / draft-ACK; three e2e-reds → park.
