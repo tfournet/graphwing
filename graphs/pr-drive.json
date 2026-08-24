@@ -249,8 +249,8 @@
           "alias": "drive_snap",
           "version": 1,
           "mappings": [
-            { "id": "m1", "output": "all_green", "expression": { "kind": "getField", "path": "TASKS.checks.all_green" } },
-            { "id": "m2", "output": "any_red", "expression": { "kind": "getField", "path": "TASKS.checks.any_red" } },
+            { "id": "m1", "output": "all_green", "expression": { "kind": "getField", "path": "TASKS.findings.data.all_green" } },
+            { "id": "m2", "output": "any_red", "expression": { "kind": "getField", "path": "TASKS.findings.data.any_red" } },
             { "id": "m3", "output": "blocking", "expression": { "kind": "getField", "path": "TASKS.findings.data.blocking" } }
           ]
         }

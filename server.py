@@ -2176,7 +2176,15 @@ def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str
 
 
 _ANNOUNCE_SKIP_PREFIX = ("/v1/agent/jobs/",)
-_ANNOUNCE_SKIP = {"/v1/health", "/health", "/openapi.json", "/v1/openapi.json", "/v1/herdr/agents", "/v1/units/status"}
+_ANNOUNCE_SKIP = {
+    "/v1/health",
+    "/health",
+    "/openapi.json",
+    "/v1/openapi.json",
+    "/v1/herdr/agents",
+    "/v1/units/status",
+    "/v1/watch",
+}
 
 
 def herdr_announce(method: str, path: str, status: int, payload: dict[str, Any] | bytes) -> None:
@@ -2266,6 +2274,131 @@ def active_job_count() -> int:
         if isinstance(data, dict) and data.get("status") in ("queued", "running"):
             n += 1
     return n
+
+
+WATCH_RECENT = 8
+WATCH_TITLE_CHARS = 72
+WATCH_ERROR_CHARS = 120
+WATCH_ACTIVE = frozenset({"queued", "running"})
+WATCH_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$")
+WATCH_TICKET_SLUG_RE = re.compile(r"^\d{2,}[-_][A-Za-z0-9._-]+")
+WATCH_SLICE_PATH_RE = re.compile(r"(?:^|\s)((?:slices|tickets)/[A-Za-z0-9._/-]+\.md)\b")
+
+
+def clip_text(text: Any, n: int) -> str | None:
+    if text is None:
+        return None
+    first = str(text).strip().splitlines()[0].strip() if str(text).strip() else ""
+    if not first:
+        return None
+    if len(first) > n:
+        return first[: n - 1] + "…"
+    return first
+
+
+def prompt_title(prompt: Any) -> str | None:
+    text = str(prompt or "").strip()
+    if not text:
+        return None
+    path = WATCH_SLICE_PATH_RE.search(text)
+    if path:
+        return Path(path.group(1)).stem
+    first = text.splitlines()[0].strip()
+    heading = WATCH_HEADING_RE.match(first)
+    if heading:
+        rest = heading.group(1).strip()
+        if ":" in rest:
+            slug = rest.split(":", 1)[0].strip()
+            if WATCH_TICKET_SLUG_RE.match(slug) or "-" in slug:
+                return clip_text(slug, WATCH_TITLE_CHARS)
+        return clip_text(rest, WATCH_TITLE_CHARS)
+    return clip_text(first, WATCH_TITLE_CHARS)
+
+
+def job_title(job: dict[str, Any]) -> str:
+    kind = str(job.get("kind") or "agent")
+    if kind in ("script", "test", "rr"):
+        return str(job.get("script") or kind)
+    if kind == "review":
+        who = str(job.get("reviewer") or "").strip()
+        return f"review {who}".strip() if who else "review"
+    ticket = str(job.get("ticket") or "").strip()
+    if ticket:
+        name = Path(ticket).name
+        if name.endswith(".md"):
+            name = name[:-3]
+        return clip_text(name, WATCH_TITLE_CHARS) or kind
+    pr = job.get("pr")
+    if pr not in (None, ""):
+        return f"PR {pr}"
+    return prompt_title(job.get("prompt")) or kind
+
+
+def watch_job(job: dict[str, Any]) -> dict[str, Any]:
+    tab_id = job.get("herdr_tab_id")
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "status": str(job.get("status") or ""),
+        "kind": str(job.get("kind") or "agent"),
+        "title": job_title(job),
+        "repo": job.get("repo"),
+        "tab": herdr_job_tab_label(job),
+        "herdr_tab_id": str(tab_id) if tab_id else None,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "error": clip_text(job.get("error"), WATCH_ERROR_CHARS),
+        "summary": clip_text(
+            (job.get("receipt") or {}).get("summary") if isinstance(job.get("receipt"), dict) else None,
+            80,
+        ),
+    }
+
+
+def watch_snapshot() -> dict[str, Any]:
+    """Compact panel payload: units plus in-flight and recent jobs. No secrets."""
+    units = units_status()
+    active: list[dict[str, Any]] = []
+    finished: list[dict[str, Any]] = []
+    if JOBS_DIR.is_dir():
+        for path in JOBS_DIR.glob("*/job.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            job_id = str(data.get("job_id") or "")
+            if not JOB_ID_RE.fullmatch(job_id):
+                continue
+            row = watch_job(data)
+            if row["status"] in WATCH_ACTIVE:
+                active.append(row)
+            else:
+                finished.append(row)
+    active.sort(key=lambda j: str(j.get("created_at") or ""), reverse=True)
+    finished.sort(key=lambda j: str(j.get("finished_at") or j.get("created_at") or ""), reverse=True)
+    recent = finished[:WATCH_RECENT]
+    queued = sum(1 for j in active if j["status"] == "queued")
+    running = sum(1 for j in active if j["status"] == "running")
+    failed_recent = sum(1 for j in recent if j["status"] == "failed")
+    api = (units.get("units") or {}).get("graphwing-api") or {}
+    api_active = bool(api.get("active"))
+    return {
+        "ok": True,
+        "service": "graphwing",
+        "units": units.get("units") or {},
+        "units_healthy": api_active,
+        "api_active": api_active,
+        "counts": {
+            "queued": queued,
+            "running": running,
+            "active": len(active),
+            "failed_recent": failed_recent,
+        },
+        "active": active,
+        "recent": recent,
+    }
 
 
 def resolve_run_cwd(raw: str | None, repos: dict[str, str]) -> tuple[str, Path] | tuple[None, dict[str, Any]]:
@@ -3041,6 +3174,8 @@ def dispatch_inner(
     if method == "GET" and path == "/v1/units/status":
         out = units_status()
         return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
+    if method == "GET" and path == "/v1/watch":
+        return json_out(200, watch_snapshot())
 
     if method == "GET" and path == "/v1/herdr/agents":
         out = herdr_agents()
@@ -3164,7 +3299,22 @@ def dispatch_inner(
                     labels=[l.get("name", "") for l in (d.get("labels") or [])],
                     comment_bodies=[c.get("body", "") for c in (d.get("comments") or [])],
                 )
-                out = {"ok": out.get("ok"), "data": out, "status": 200 if out.get("ok") else 422}
+                # Fold the check state in here. The graph cannot read it from
+                # the checks node: that output is ~21KB and Rewst replaces it
+                # with an artifact stub, so TASKS.checks.all_green is null.
+                ck = annotate_pr_checks(
+                    gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
+                )
+                out["all_green"] = bool(ck.get("all_green"))
+                out["any_red"] = bool(ck.get("any_red"))
+                out["failing"] = (ck.get("failing") or [])[:20]
+                # Flat, not nested under "data": the connector already exposes
+                # this as TASKS.<node>.data.<field>, so nesting made every path
+                # a double .data.data and drive_snap read nulls.
+                out["status"] = 200 if out.get("ok") else 422
+                # The findings list is for humans reading the trace; the brief
+                # is what the writer consumes. Keep the payload small.
+                out["findings"] = out.get("findings", [])[:20]
         elif method == "GET" and path == "/v1/gh/pr/checks":
             number = first_query(qs, "number")
             if not number:
