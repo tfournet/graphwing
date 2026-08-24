@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="t d">
+  <title id="t">How Graphwing fits together</title>
+  <desc id="d">Engineer in Herdr, laptop Graphwing catalog, tunnel to Rewst Graph. Named HTTP ops go out. Agent receipts come back.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a2420"/>
+      <stop offset="1" stop-color="#121814"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="960" height="420" fill="url(#bg)"/>
+  <text x="32" y="36" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="0.18em">GRAPHWING · THREE MACHINES</text>
+
+  <!-- laptop -->
+  <rect x="40" y="64" width="280" height="300" rx="10" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
+  <text x="60" y="96" fill="#e8b86d" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="700">Laptop seat</text>
+  <text x="60" y="122" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Graphwing OpenAPI on :8645</text>
+  <text x="60" y="160" fill="#7dcea0" font-family="ui-monospace, Menlo, monospace" font-size="12">gitStatus  testRun  fileHead</text>
+  <text x="60" y="180" fill="#7dcea0" font-family="ui-monospace, Menlo, monospace" font-size="12">agentRun   gitCommit  …</text>
+  <text x="60" y="220" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Allowlisted git checkouts</text>
+  <text x="60" y="240" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Herdr session graphwing</text>
+  <text x="60" y="280" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Secrets stay in ~/.graphwing</text>
+  <text x="60" y="332" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">You grill here. Graph does not.</text>
+
+  <!-- tunnel -->
+  <path d="M320 214 H400" stroke="#e8b86d" stroke-width="3" fill="none"/>
+  <polygon points="400,208 416,214 400,220" fill="#e8b86d"/>
+  <text x="328" y="200" fill="#e8b86d" font-family="ui-monospace, Menlo, monospace" font-size="11">named tunnel</text>
+  <path d="M416 250 H336" stroke="#d97aa8" stroke-width="2" fill="none"/>
+  <polygon points="336,244 320,250 336,256" fill="#d97aa8"/>
+  <text x="328" y="276" fill="#d97aa8" font-family="ui-monospace, Menlo, monospace" font-size="11">agent receipt</text>
+
+  <!-- rewst -->
+  <rect x="430" y="64" width="280" height="300" rx="10" fill="#24352c" stroke="#e8b86d" stroke-width="2"/>
+  <text x="450" y="96" fill="#e8b86d" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="700">Rewst Graph</text>
+  <text x="450" y="122" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Published workflow JSON</text>
+  <!-- mini nodes -->
+  <circle cx="478" cy="180" r="10" fill="#7dcea0"/>
+  <circle cx="538" cy="180" r="10" fill="#7dcea0"/>
+  <circle cx="598" cy="180" r="10" fill="#c46b3a"/>
+  <circle cx="658" cy="180" r="10" fill="#7dcea0"/>
+  <line x1="488" y1="180" x2="528" y2="180" stroke="#7dcea0" stroke-width="2"/>
+  <line x1="548" y1="180" x2="588" y2="180" stroke="#c46b3a" stroke-width="2"/>
+  <line x1="608" y1="180" x2="648" y2="180" stroke="#7dcea0" stroke-width="2"/>
+  <text x="450" y="220" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Edges are the map. Rarely change.</text>
+  <text x="450" y="248" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">A run is { "input": { … } }.</text>
+  <text x="450" y="280" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Same map. New payload.</text>
+  <text x="450" y="332" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Cloud GitHub / Shortcut live here.</text>
+
+  <!-- human -->
+  <rect x="740" y="64" width="180" height="300" rx="10" fill="#24352c" stroke="#d97aa8" stroke-width="2"/>
+  <text x="760" y="96" fill="#d97aa8" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="700">You</text>
+  <text x="760" y="130" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Grill the idea</text>
+  <text x="760" y="154" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Cut the tickets</text>
+  <text x="760" y="178" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Start a Graph run</text>
+  <text x="760" y="202" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Prove the result</text>
+  <text x="760" y="226" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Merge the PR</text>
+  <text x="760" y="280" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Tab graph is logs.</text>
+  <text x="760" y="300" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Do not chat there.</text>
+</svg>

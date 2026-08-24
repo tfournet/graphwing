@@ -1,8 +1,86 @@
-# graphwing
+# Graphwing
 
-Local node catalog for Rewst Graph.
+<p align="center">
+  <img src="docs/images/hero.jpg" alt="Instrument panel: a person at a terminal, a laptop catalog of HTTP ports, and a Rewst node graph joined by patch cables" width="100%">
+</p>
 
-Source of truth: [`tfournet/graphwing`](https://github.com/tfournet/graphwing). Runtime lives in `$GRAPHWING_HOME` (default `~/.graphwing`): API key, `auth.json`, tunnel token, jobs, Hermes state. Those stay out of git.
+Graphwing is a **node catalog on your laptop** for [Rewst Graph](https://rewst.io). Rewst holds the workflow map. This repo is the list of named HTTP operations that map can call: git, tests, one bounded agent job. It is not a mega-agent and not Rewst Internal.
+
+You grill ideas in Herdr. Graph runs the map. You prove the result and merge the PR.
+
+<p align="center">
+  <img src="docs/images/architecture.svg" alt="Laptop seat, named tunnel, Rewst Graph, and you" width="100%">
+</p>
+
+| Piece | Job |
+|---|---|
+| This git repo | Source of truth for ops (`server.py`, `openapi.json`) and workflow JSON (`graphs/`) |
+| `~/.graphwing` | Runtime. API key, tunnel, jobs, Hermes state. Do not commit it. |
+| Rewst Graph | Published topology. A run is `{ "input": { … } }`. Same map, new payload. |
+| Named tunnel | Public URL so Rewst can reach the laptop. Loopback is blocked. |
+
+Cloud GitHub and Shortcut stay Rewst integrations. This seat does not hold those keys.
+
+## How a run works
+
+Most steps are a short HTTP call (`gitStatus`, `testRun`, `fileHead`, …) and a 200 with JSON. The Graph follows the next edge.
+
+`agentRun` is the long one. It returns 202. The Graph waits on a webhook. When the job finishes, Graphwing POSTs a receipt. That is how a coding loop joins without living inside Rewst.
+
+<p align="center">
+  <img src="docs/images/a-run.svg" alt="Start, named op, optional agent wait, next edge, done" width="100%">
+</p>
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "primaryColor": "#24352c",
+    "primaryTextColor": "#e8efe9",
+    "primaryBorderColor": "#7dcea0",
+    "lineColor": "#e8b86d",
+    "secondaryColor": "#1a2420",
+    "tertiaryColor": "#121814",
+    "background": "#121814",
+    "mainBkg": "#24352c",
+    "nodeBorder": "#7dcea0",
+    "clusterBkg": "#1a2420",
+    "titleColor": "#7dcea0",
+    "edgeLabelBackground": "#1a2420",
+    "fontFamily": "ui-sans-serif, system-ui, sans-serif"
+  }
+}}%%
+flowchart LR
+  A["Start<br/>form or webhook"] --> B["Named op<br/>200 + data"]
+  B --> C{"agentRun?"}
+  C -->|no| D["Next edge"]
+  C -->|yes| E["Wait webhook"]
+  E --> F["Laptop POSTs receipt"]
+  F --> D
+  D --> G["Commit, park, or kick next run"]
+  style A fill:#24352c,stroke:#e8b86d,color:#e8b86d
+  style B fill:#24352c,stroke:#7dcea0,color:#7dcea0
+  style C fill:#24352c,stroke:#c46b3a,color:#e8b86d
+  style E fill:#24352c,stroke:#c46b3a,color:#c46b3a
+  style F fill:#24352c,stroke:#d97aa8,color:#d97aa8
+  style D fill:#24352c,stroke:#7dcea0,color:#7dcea0
+  style G fill:#24352c,stroke:#d97aa8,color:#d97aa8
+```
+
+A long walk is **several runs**. One run does one slice, then POSTs this workflow’s webhook with the next ticket. Rewst rejects unbounded cycles inside a single run.
+
+Prefer a new deterministic op over stuffing more work into `agentRun`.
+
+## Published maps
+
+| Slug | Input | What it does |
+|---|---|---|
+| `graphwing-implement-slice` | repo, branch, index, ticket, test, … | One ticket: write, test, review, commit. Kick the next. |
+| `graphwing-verify-stack` | stack, ports | Is the stack up. |
+| `graphwing-pr-status` | pr | Read-only checks. |
+| `graphwing-pr-drive` | repo, pr, test, prompt | One fix slice when CI is red. |
+
+Human loop: [docs/HUMAN-LOOP.md](docs/HUMAN-LOOP.md). How to fire a run: [docs/USING.md](docs/USING.md). Graph JSON: [graphs/README.md](graphs/README.md).
 
 ## Install
 
@@ -12,50 +90,28 @@ cd graphwing
 ./start.sh
 ```
 
-`start.sh` optionally installs Hermes Agent (`agentRun`), herdr, and cloudflared, writes `$GRAPHWING_HOME`, and starts the API in this terminal. It does not copy secrets from another home. It does not install `rr`.
+`start.sh` can install Hermes Agent, herdr, and cloudflared, write `$GRAPHWING_HOME`, and start the API. It does not copy secrets from another machine. It does not install `rr`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tfournet/graphwing/main/start.sh | bash -s -- --yes
 ./start.sh --yes --with-hermes
 ./start.sh --yes --no-start
 ./start.sh --daemon
 ```
 
-`install.py` is the catalog renderer `start.sh` calls.
-
-- **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `export GRAPHWING_KEY=...`. Header `X-Graphwing-Key`.
-- **`repos.json`:** empty until the wizard or `install.py --repo name=/path`. See `examples/repos.example.json`.
-- **`rr`:** drop-in plugin. Copy `examples/rr.example.json` to `$GRAPHWING_HOME/rr.json` if you already have `rr`. Otherwise `POST /v1/rr/run` is `501 not_configured`. Tests stay local (`python3 test_server.py`).
-- **Tunnel:** default none (loopback `127.0.0.1:8645`). `demo` is an ephemeral `*.trycloudflare.com` URL (journal). `named` runs `setup_tunnel.py` when `tunnel.env` or `GRAPHWING_CF_API_KEY` is present; that writes `$GRAPHWING_HOME/cloudflared-meta.json` and sets the OpenAPI `servers` URL to `https://<hostname>`. Rewst Graph SSRF-blocks loopback, so a stable public hostname is required for a saved cloud integration.
+- **API key:** `$GRAPHWING_HOME/api.key` (mode 600) or `GRAPHWING_KEY`. Header `X-Graphwing-Key`. Health and `/openapi.json` are open.
+- **Repos:** `$GRAPHWING_HOME/repos.json`. Graph uses short names, not paths. See `examples/repos.example.json`.
+- **Tunnel:** default is loopback `127.0.0.1:8645`. `named` needs `tunnel.env` or `GRAPHWING_CF_API_KEY` and writes `cloudflared-meta.json`. Rewst cannot import a loopback OpenAPI URL.
+- **Human:** `herdr --session graphwing`. One idea = one space (`graphwing-idea open --label NAME --repo riftwing`). Tab `graph` is logs. Do not grill there.
 
 ```bash
 GRAPHWING_HOME=. python3 test_server.py
 ```
 
-## Runtime
-
-- API: `127.0.0.1:8645` (health and `/openapi.json` unauthenticated)
-- Human: `herdr --session graphwing`. Tab `graph` is the dashboard (Graph ops / `gw-*` job logs). Do not grill there.
-- Ideas: one Herdr **space** per idea (`graphwing-idea open --repo riftwing --story SC-N` or `--label name`). Claude is tab `claude` in that space. `graphwing-idea list` shows idea spaces and hides the dashboard.
-- Docs: [`docs/README.md`](docs/README.md). Operator lock [`docs/HUMAN-LOOP.md`](docs/HUMAN-LOOP.md). First run [`docs/USING.md`](docs/USING.md).
-- CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`)
-- Units: `graphwing-api` always; `graphwing-tunnel` / `graphwing-herdr` only if you opted in
-
-Graph uses named OpenAPI actions, not a mega-agent. Prefer a new deterministic op over an agent loop.
-
-`POST /v1/doorbell/pr-drive` accepts a GitHub Actions OIDC bearer token, maps the verified repository and actor through `$GRAPHWING_HOME/doorbell.json` (see `examples/doorbell.example.json`), and rings the secret Rewst pr-drive hook configured in `$GRAPHWING_HOME/rewst-install.json`; it does not accept `X-Graphwing-Key` as authorization.
-
-The GitHub Action reads `<!-- pr-drive-hook: URL -->` from the PR body and POSTs `{pr}` to that Rewst webhook, so no GitHub secret is required. The status graph webhook has no hook secret; the fix graph (`pr-drive`) remains authenticated with `x-rewst-secret`.
-
-`POST /v1/agent/run` queues one bounded Hermes loop (`HERMES_HOME=$GRAPHWING_HOME`, max 30 turns / 300s) and returns 202 + `job_id`. Spawn sets `TERMINAL_CWD` / `--in` to the allowlisted repo cwd. Graph join: `action.wait.webhook` pending → `response_webhook_url` / `response_webhook_token`; graphwing POSTs the receipt with `X-Rewst-Token`.
-
-Git writes are opt-in on allowlisted short names: `gitCheckout`, `gitRestore`, `gitCommit`, `gitPush`. No `--force`, no `git add -A` unless paths are explicit. `scriptRun` / `testRun` are allowlisted names only.
+Git writes are opt-in on allowlisted short names. No `--force`. No `git add -A` unless paths are explicit. `scriptRun` / `testRun` are allowlisted names only.
 
 ## Rewst
 
-Import a custom integration from the seat OpenAPI URL (`GET /openapi.json` `servers[0].url`, or `GRAPHWING_PUBLIC_URL`). Named-tunnel setup is what fills that URL.
-
-Publish graphs from this repo:
+Import the custom integration from the public OpenAPI URL (`servers[0].url` or `GRAPHWING_PUBLIC_URL`). Then publish maps:
 
 ```bash
 # $GRAPHWING_HOME/rewst-install.json from examples/rewst-install.example.json
@@ -63,6 +119,4 @@ Publish graphs from this repo:
 python3 scripts/publish_graphs.py --only all --no-run
 ```
 
-See [`docs/USING.md`](docs/USING.md).
-
-Do not install this on Rewst Internal. Do not ship as a platform package.
+Do not install this on Rewst Internal. Do not ship it as a platform package.
