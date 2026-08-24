@@ -2085,12 +2085,15 @@ def job_title(job: dict[str, Any]) -> str:
 
 
 def watch_job(job: dict[str, Any]) -> dict[str, Any]:
+    tab_id = job.get("herdr_tab_id")
     return {
         "job_id": str(job.get("job_id") or ""),
         "status": str(job.get("status") or ""),
         "kind": str(job.get("kind") or "agent"),
         "title": job_title(job),
         "repo": job.get("repo"),
+        "tab": herdr_job_tab_label(job),
+        "herdr_tab_id": str(tab_id) if tab_id else None,
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),

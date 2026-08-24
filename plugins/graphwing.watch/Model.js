@@ -30,6 +30,8 @@ function asJobs(value) {
       kind: String(row.kind || "agent"),
       title: String(row.title || row.kind || "job"),
       repo: row.repo ? String(row.repo) : "",
+      tab: String(row.tab || ""),
+      herdr_tab_id: row.herdr_tab_id ? String(row.herdr_tab_id) : "",
       created_at: String(row.created_at || ""),
       started_at: String(row.started_at || ""),
       finished_at: String(row.finished_at || ""),

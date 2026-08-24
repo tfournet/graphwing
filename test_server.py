@@ -1113,6 +1113,10 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(titles[queued_id], "review sonnet")
             self.assertEqual(titles[running_id], "implement the login tracer")
             self.assertEqual(titles[failed_id], "riftwing-local-gates")
+            running = next(j for j in payload["active"] if j["job_id"] == running_id)
+            self.assertEqual(running["tab"], "gw-a-" + running_id[:8])
+            failed = next(j for j in payload["recent"] if j["job_id"] == failed_id)
+            self.assertEqual(failed["tab"], "gw-t-" + failed_id[:8])
             dumped = json.dumps(payload)
             self.assertNotIn("do-not-leak", dumped)
             self.assertNotIn("https://example.invalid/resume", dumped)
@@ -1139,6 +1143,19 @@ class DispatchTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["code"], "no_key")
+
+    def test_watch_helper_focus_requires_label(self):
+        helper = Path(__file__).resolve().parent / "plugins" / "graphwing.watch" / "status.py"
+        proc = subprocess.run(
+            [sys.executable, str(helper), ".", "8645", "focus"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "missing_tab")
 
     def test_watch_empty_jobs(self):
         with tempfile.TemporaryDirectory() as td:

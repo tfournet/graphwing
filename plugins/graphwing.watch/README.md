@@ -35,8 +35,9 @@ The daemon must be the copy in `$GRAPHWING_HOME` that already serves `/v1/watch`
 ## Interactions
 
 - Bar icon: left = panel, right = refresh, middle = open herdr session `graphwing`.
-- Panel: `r` refresh, Enter on the hero opens herdr, arrows/`j`/`k` move the
-  job list, Esc closes.
+- Panel: `r` refresh, Enter on the hero opens herdr, Enter or click on a job
+  focuses its `gw-*` tab (or tab `graph` if that tab is gone), arrows/`j`/`k`
+  move the job list, Esc closes.
 - IPC: `omarchy-shell graphwing.watch <open|close|toggle|refresh|status|herdr|journal>`.
 
 ## Settings
