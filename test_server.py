@@ -1488,6 +1488,44 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("--max-turns", cmd)
         self.assertEqual(cmd[cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
 
+    def test_pr_drive_gates_wait_for_results_too(self):
+        # implement-slice got wait nodes for every async op; pr-drive did not.
+        # riftwing-local-gates is async (120s > the 25s sync cap), so
+        # if_fix_test read a queue receipt and pr-drive would commit and push
+        # a "fix" the instant the test job was accepted.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+
+        self.assertIn("wait_fix_test", nodes)
+        self.assertEqual(nodes["wait_fix_test"]["type"], "action.wait.webhook")
+        # The action must be reached from the wait node's pending handle, and
+        # the filter from its out handle. Anything else is the old shape.
+        self.assertTrue(any(e["source"] == "wait_fix_test" and e["sourceHandle"] == "pending"
+                            and e["target"] == "fix_test" for e in edges))
+        self.assertTrue(any(e["source"] == "wait_fix_test" and e["sourceHandle"] == "out"
+                            and e["target"] == "if_fix_test" for e in edges))
+        self.assertFalse(any(e["source"] == "fix_test" and e["target"] == "if_fix_test"
+                             for e in edges), "fix_test still feeds the gate directly")
+        cfg = nodes["fix_test"]["config"]
+        self.assertIn("wait_fix_test", cfg.get("response_webhook_url", ""))
+        rules = nodes["if_fix_test"]["config"]["rules"]
+        self.assertEqual(rules[0]["path"], "request.body.status")
+
+    def test_pr_drive_reads_findings_instead_of_a_human_prompt(self):
+        # The agent prompt came from CTX.INPUT.prompt, so driving a PR green
+        # started with a person reading the review and writing the brief.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        self.assertIn("findings", nodes)
+        self.assertTrue(nodes["findings"]["type"].endswith("/v1/gh/pr/findings"))
+        # It has to run before the switch that decides green vs red.
+        self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
+        self.assertTrue(any(e["source"] == "findings" and e["target"] == "switch_checks"
+                            for e in edges))
+        self.assertIn("findings", nodes["agent"]["config"]["prompt"])
+
     def test_async_gates_wait_for_the_result_not_the_ack(self):
         # testRun and reviewRun return a queue receipt ({"ok": true,
         # "status": "queued"}). The graph used to feed that straight into a

@@ -183,7 +183,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "prompt": "{{ CTX.INPUT.prompt }}",
+          "prompt": "{{ TASKS.findings.data.brief | default(CTX.INPUT.prompt) }}",
           "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}"
         }
@@ -222,7 +222,41 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_fix_test.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_fix_test.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "join_fix_test_fail",
+        "type": "logic.join.any",
+        "label": "Join fix_test failure",
+        "position": { "x": 2420, "y": 520 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "wait_fix_test",
+        "type": "action.wait.webhook",
+        "label": "Wait fix test",
+        "position": { "x": 2420, "y": 380 },
+        "config": {
+          "alias": "wait_fix_test",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "findings",
+        "type": "action.graphwing.GET:/v1/gh/pr/findings",
+        "label": "PR findings",
+        "position": { "x": 1180, "y": 380 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "number": "{{ CTX.INPUT.pr }}"
         }
       },
       {
@@ -232,7 +266,7 @@
         "position": { "x": 2640, "y": 240 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }]
         }
       },
       {
@@ -325,7 +359,8 @@
       { "id": "e2f", "source": "git", "sourceHandle": "failure", "target": "herdr_git", "targetHandle": "in" },
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
       { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
-      { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
+      { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "findings", "targetHandle": "in" },
+      { "id": "e4b", "source": "findings", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
       { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
       { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "review_snap", "targetHandle": "in" },
       { "id": "e5a", "source": "review_snap", "sourceHandle": "out", "target": "switch_review", "targetHandle": "in" },
@@ -341,10 +376,14 @@
       { "id": "e14", "source": "wait", "sourceHandle": "timeout", "target": "herdr_wait_timeout", "targetHandle": "in" },
       { "id": "e15", "source": "wait", "sourceHandle": "failure", "target": "herdr_wait_fail", "targetHandle": "in" },
       { "id": "e16", "source": "receipt", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
-      { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "fix_test", "targetHandle": "in" },
+      { "id": "e17", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "wait_fix_test", "targetHandle": "in" },
+      { "id": "e_wft_pending", "source": "wait_fix_test", "sourceHandle": "pending", "target": "fix_test", "targetHandle": "in" },
+      { "id": "e_wft_out", "source": "wait_fix_test", "sourceHandle": "out", "target": "if_fix_test", "targetHandle": "in" },
+      { "id": "e_wft_timeout", "source": "wait_fix_test", "sourceHandle": "timeout", "target": "join_fix_test_fail", "targetHandle": "in" },
+      { "id": "e_wft_fail", "source": "wait_fix_test", "sourceHandle": "failure", "target": "join_fix_test_fail", "targetHandle": "in" },
+      { "id": "e_jftf_out", "source": "join_fix_test_fail", "sourceHandle": "out", "target": "herdr_test_http", "targetHandle": "in" },
       { "id": "e18", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "herdr_receipt", "targetHandle": "in" },
-      { "id": "e18a", "source": "fix_test", "sourceHandle": "success", "target": "if_fix_test", "targetHandle": "in" },
-      { "id": "e18b", "source": "fix_test", "sourceHandle": "failure", "target": "herdr_test_http", "targetHandle": "in" },
+      { "id": "e18b", "source": "fix_test", "sourceHandle": "failure", "target": "join_fix_test_fail", "targetHandle": "in" },
       { "id": "e18c", "source": "if_fix_test", "sourceHandle": "pass", "target": "fix_commit", "targetHandle": "in" },
       { "id": "e18d", "source": "if_fix_test", "sourceHandle": "fail", "target": "herdr_test_fail", "targetHandle": "in" },
       { "id": "e18e", "source": "fix_commit", "sourceHandle": "success", "target": "fix_push", "targetHandle": "in" },
