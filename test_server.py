@@ -1566,11 +1566,34 @@ class DispatchTests(unittest.TestCase):
         edges = graph["spec"]["edges"]
         self.assertIn("findings", nodes)
         self.assertTrue(nodes["findings"]["type"].endswith("/v1/gh/pr/findings"))
-        # It has to run before the switch that decides green vs red.
         self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
-        self.assertTrue(any(e["source"] == "findings" and e["target"] == "switch_checks"
-                            for e in edges))
         self.assertIn("findings", nodes["agent"]["config"]["prompt"])
+
+    def test_pr_drive_switch_can_actually_match_its_input(self):
+        # Inserting findings in front of switch_checks left its rules reading
+        # data.all_green, which lives on the checks payload and not the findings
+        # one, so every case missed and every PR fell through to pending. The
+        # first version of the test above asserted only that the edge existed,
+        # which the broken graph satisfied. Assert the switch can match instead.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+
+        feeders = [e["source"] for e in edges if e["target"] == "switch_checks"]
+        self.assertEqual(len(feeders), 1, feeders)
+        feeder = nodes[feeders[0]]
+        self.assertEqual(feeder["type"], "transforms.objectBuilder",
+                         "a switch reads its immediate input; snapshot the tasks first")
+        produced = {m["output"] for m in feeder["config"]["mappings"]}
+        for case in nodes["switch_checks"]["config"]["cases"]:
+            for rule in case["rules"]:
+                self.assertIn(rule["path"], produced,
+                              f"case {case['label']} reads {rule['path']}, which "
+                              f"{feeders[0]} never produces")
+        # A green PR that is still graded down must reach the fix path, so the
+        # blocking case has to be tested before the green one.
+        labels = [c["label"] for c in nodes["switch_checks"]["config"]["cases"]]
+        self.assertLess(labels.index("blocked_by_findings"), labels.index("green"))
 
     def test_async_gates_wait_for_the_result_not_the_ack(self):
         # testRun and reviewRun return a queue receipt ({"ok": true,

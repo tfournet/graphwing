@@ -87,12 +87,16 @@
           "mode": "rules",
           "cases": [
             {
+              "label": "blocked_by_findings",
+              "rules": [{ "path": "blocking", "op": "equals", "value": true }]
+            },
+            {
               "label": "green",
-              "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+              "rules": [{ "path": "all_green", "op": "equals", "value": true }]
             },
             {
               "label": "red",
-              "rules": [{ "path": "data.any_red", "op": "equals", "value": true }]
+              "rules": [{ "path": "any_red", "op": "equals", "value": true }]
             }
           ],
           "default": { "label": "pending" }
@@ -221,6 +225,28 @@
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "auto_merge", "expression": { "kind": "getField", "path": "CTX.INPUT.auto_merge" } }
+          ]
+        }
+      },
+      {
+        "id": "join_fix_entry",
+        "type": "logic.join.any",
+        "label": "Join fix entry",
+        "position": { "x": 1500, "y": 420 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "drive_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Drive snapshot",
+        "position": { "x": 1320, "y": 300 },
+        "config": {
+          "alias": "drive_snap",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "all_green", "expression": { "kind": "getField", "path": "TASKS.checks.all_green" } },
+            { "id": "m2", "output": "any_red", "expression": { "kind": "getField", "path": "TASKS.checks.any_red" } },
+            { "id": "m3", "output": "blocking", "expression": { "kind": "getField", "path": "TASKS.findings.data.blocking" } }
           ]
         }
       },
@@ -424,14 +450,17 @@
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
       { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
       { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "findings", "targetHandle": "in" },
-      { "id": "e4b", "source": "findings", "sourceHandle": "success", "target": "switch_checks", "targetHandle": "in" },
+      { "id": "e4b", "source": "findings", "sourceHandle": "success", "target": "drive_snap", "targetHandle": "in" },
+      { "id": "e4c", "source": "drive_snap", "sourceHandle": "out", "target": "switch_checks", "targetHandle": "in" },
       { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
-      { "id": "e5", "source": "switch_checks", "sourceHandle": "case-0", "target": "review_snap", "targetHandle": "in" },
+      { "id": "e5", "source": "switch_checks", "sourceHandle": "case-1", "target": "review_snap", "targetHandle": "in" },
+      { "id": "e5f", "source": "switch_checks", "sourceHandle": "case-0", "target": "join_fix_entry", "targetHandle": "in" },
       { "id": "e5a", "source": "review_snap", "sourceHandle": "out", "target": "switch_review", "targetHandle": "in" },
       { "id": "e5b", "source": "switch_review", "sourceHandle": "case-0", "target": "herdr_changes_requested", "targetHandle": "in" },
       { "id": "e5c", "source": "switch_review", "sourceHandle": "case-1", "target": "herdr_review_required", "targetHandle": "in" },
       { "id": "e5d", "source": "switch_review", "sourceHandle": "default", "target": "join_mergeable", "targetHandle": "in" },
-      { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "pr_checkout", "targetHandle": "in" },
+      { "id": "e7", "source": "switch_checks", "sourceHandle": "case-2", "target": "join_fix_entry", "targetHandle": "in" },
+      { "id": "e_jfe_out", "source": "join_fix_entry", "sourceHandle": "out", "target": "pr_checkout", "targetHandle": "in" },
       { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
       { "id": "e9", "source": "pr_checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
       { "id": "e9f", "source": "pr_checkout", "sourceHandle": "failure", "target": "herdr_pr_checkout", "targetHandle": "in" },
