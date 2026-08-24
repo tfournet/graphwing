@@ -1245,6 +1245,64 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
 
+    def test_pr_findings_extracts_the_machine_verdict_not_the_prose(self):
+        # pr-drive took its fix instructions from CTX.INPUT.prompt, so a human
+        # had to read the review and write them. The reviewers already publish
+        # a machine-readable block; parse that instead.
+        body = (
+            "## Claude's Review\n> **Grade: B-** | Action: REQUEST_CHANGES\n"
+            "prose a model should not have to parse\n"
+            '<!-- engineering-findings-json\n'
+            '{"findings":[{"category":"tests","severity":"major",'
+            '"fingerprint":"shim-path","location":{"path":"a.sh","line":88},'
+            '"remedy":"prepend rather than replace"}]}\n-->\n'
+        )
+        second = (
+            '<!-- engineering-findings-json\n'
+            '{"findings":[{"category":"correctness","severity":"major",'
+            '"fingerprint":"mktemp-root","location":{"path":"a.sh","line":21},'
+            '"remedy":"abort if mktemp fails"},'
+            '{"category":"tests","severity":"major",'
+            '"fingerprint":"shim-path","location":{"path":"a.sh","line":88},'
+            '"remedy":"duplicate of the first reviewer"}]}\n-->\n'
+        )
+        out = server.pr_findings_from(
+            labels=["grade-B-", "hold:pm-review"],
+            comment_bodies=[body, "unrelated chatter", second],
+        )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["grade"], "B-")
+        self.assertEqual(out["holds"], ["hold:pm-review"])
+        self.assertTrue(out["blocking"])
+        # Two reviewers raised shim-path; it is one thing to fix, not two.
+        prints = [f["fingerprint"] for f in out["findings"]]
+        self.assertEqual(sorted(prints), ["mktemp-root", "shim-path"])
+        self.assertEqual(out["major"], 2)
+        # The brief is what the writer sees, so every finding must reach it.
+        for fp in ("shim-path", "mktemp-root"):
+            self.assertIn(fp, out["brief"])
+        self.assertNotIn("prose a model should not have to parse", out["brief"])
+
+    def test_pr_findings_says_clear_when_nothing_blocks(self):
+        # A green PR must not look like a PR whose findings failed to parse:
+        # both would otherwise be an empty list.
+        out = server.pr_findings_from(labels=["grade-A"], comment_bodies=["no markers here"])
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["blocking"])
+        self.assertEqual(out["findings"], [])
+        self.assertEqual(out["grade"], "A")
+
+    def test_pr_findings_survives_a_corrupt_marker(self):
+        # A truncated or malformed block must not read as "no findings", which
+        # would let the walker call a blocked PR clean.
+        out = server.pr_findings_from(
+            labels=["hold:codequality"],
+            comment_bodies=["<!-- engineering-findings-json\n{not json at all\n-->"],
+        )
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["blocking"])
+        self.assertEqual(out["code"], "unparsable_findings")
+
     def test_review_no_verdict_is_flagged_not_an_opinion(self):
         # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran
         # counted as a reviewer that said no. Both SC-110290 review passes died

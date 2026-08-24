@@ -1287,6 +1287,87 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     return 200, slice_route_lookup(class_name, size_floor, ac_count, seams)
 
 
+FINDINGS_MARKER = "<!-- engineering-findings-json"
+FINDINGS_SEVERITIES = ("blocker", "critical", "major", "minor")
+
+
+def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, Any]:
+    """Turn a PR's labels and review comments into a fix brief.
+
+    pr-drive used to take its instructions from CTX.INPUT.prompt, so getting a
+    PR green started with a human reading the review. Both reviewers already
+    publish a machine-readable block; parse that and skip the prose.
+
+    Two reviewers routinely raise the same defect, so findings are deduped by
+    fingerprint: that is one thing to fix, not two. A malformed block is an
+    error rather than an empty list, because "nothing found" and "could not
+    read what was found" must not look alike to the walker.
+    """
+    grade = next((l[len("grade-"):] for l in labels if l.startswith("grade-")), None)
+    holds = sorted(l for l in labels if l.startswith("hold:"))
+
+    findings: dict[str, dict[str, Any]] = {}
+    for body in comment_bodies:
+        start = 0
+        while True:
+            i = body.find(FINDINGS_MARKER, start)
+            if i < 0:
+                break
+            end = body.find("-->", i)
+            if end < 0:
+                return {"ok": False, "blocking": True, "code": "unparsable_findings",
+                        "error": "findings marker is not closed", "grade": grade, "holds": holds}
+            raw = body[i + len(FINDINGS_MARKER):end]
+            start = end + 3
+            try:
+                block = json.loads(raw)
+            except ValueError as exc:
+                return {"ok": False, "blocking": True, "code": "unparsable_findings",
+                        "error": f"findings block is not JSON: {exc}", "grade": grade, "holds": holds}
+            for f in block.get("findings") or []:
+                fp = str(f.get("fingerprint") or "")
+                if fp and fp not in findings:
+                    findings[fp] = f
+
+    ordered = sorted(
+        findings.values(),
+        key=lambda f: (
+            FINDINGS_SEVERITIES.index(f.get("severity"))
+            if f.get("severity") in FINDINGS_SEVERITIES
+            else len(FINDINGS_SEVERITIES),
+            str(f.get("fingerprint")),
+        ),
+    )
+    counts = {s: sum(1 for f in ordered if f.get("severity") == s) for s in FINDINGS_SEVERITIES}
+    return {
+        "ok": True,
+        "grade": grade,
+        "holds": holds,
+        "blocking": bool(ordered or holds),
+        "findings": ordered,
+        "brief": render_findings_brief(ordered),
+        **counts,
+    }
+
+
+def render_findings_brief(findings: list[dict[str, Any]]) -> str:
+    """The text the writer sees. Remedies only; reviewer reasoning stays out."""
+    if not findings:
+        return "No blocking findings."
+    lines = ["Fix every finding below. Do not restructure anything else.", ""]
+    for i, f in enumerate(findings, 1):
+        loc = f.get("location") or {}
+        where = str(loc.get("path") or "?")
+        if loc.get("line"):
+            where += ":%s" % loc["line"]
+        lines.append("%d. [%s/%s] %s" % (i, f.get("severity", "?"), f.get("category", "?"),
+                                         f.get("fingerprint", "?")))
+        lines.append("   where:  %s" % where)
+        lines.append("   remedy: %s" % (f.get("remedy") or "(none given)"))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def review_said_nothing(text: str) -> bool:
     """True when the reviewer never emitted a verdict.
 
@@ -2910,6 +2991,20 @@ def dispatch_inner(
                     ],
                 )
             )
+        elif method == "GET" and path == "/v1/gh/pr/findings":
+            number = first_query(qs, "number")
+            if not number:
+                return json_out(400, {"error": "number is required", "code": "missing_number"})
+            raw = gh_json(repo_path, ["pr", "view", number, "--json", "labels,comments"])
+            if not raw.get("ok"):
+                out = raw
+            else:
+                d = raw.get("data") or {}
+                out = pr_findings_from(
+                    labels=[l.get("name", "") for l in (d.get("labels") or [])],
+                    comment_bodies=[c.get("body", "") for c in (d.get("comments") or [])],
+                )
+                out = {"ok": out.get("ok"), "data": out, "status": 200 if out.get("ok") else 422}
         elif method == "GET" and path == "/v1/gh/pr/checks":
             number = first_query(qs, "number")
             if not number:
