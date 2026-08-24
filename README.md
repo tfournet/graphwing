@@ -37,7 +37,7 @@ GRAPHWING_HOME=. python3 test_server.py
 - API: `127.0.0.1:8645` (health and `/openapi.json` unauthenticated)
 - Human: `herdr --session graphwing`. Tab `graph` is the dashboard (Graph ops / `gw-*` job logs). Do not grill there.
 - Ideas: one Herdr **space** per idea (`graphwing-idea open --repo riftwing --story SC-N` or `--label name`). Claude is tab `claude` in that space. `graphwing-idea list` shows idea spaces and hides the dashboard.
-- Operator loop (grill → spec → Graph → proof → PR): [`docs/HUMAN-LOOP.md`](docs/HUMAN-LOOP.md)
+- Docs: [`docs/README.md`](docs/README.md). Operator lock [`docs/HUMAN-LOOP.md`](docs/HUMAN-LOOP.md). First run [`docs/USING.md`](docs/USING.md).
 - CLI: `graphwing` (`HERMES_HOME=$GRAPHWING_HOME`)
 - Units: `graphwing-api` always; `graphwing-tunnel` / `graphwing-herdr` only if you opted in
 
@@ -59,7 +59,10 @@ Publish graphs from this repo:
 
 ```bash
 # $GRAPHWING_HOME/rewst-install.json from examples/rewst-install.example.json
-GRAPHWING_REWST_MCP_TOKEN=... python3 scripts/publish_graphs.py --only pr-drive
+# MCP token: GRAPHWING_REWST_MCP_TOKEN, or mcp_bws_key + BWS_ACCESS_TOKEN
+python3 scripts/publish_graphs.py --only all --no-run
 ```
+
+See [`docs/USING.md`](docs/USING.md).
 
 Do not install this on Rewst Internal. Do not ship as a platform package.

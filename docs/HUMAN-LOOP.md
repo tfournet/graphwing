@@ -6,7 +6,7 @@ Read this at the start of a **new** Herdr/Claude session. Do not reconstruct it 
 
 **Human** = any engineer on their laptop seat (not Rewst Internal).
 
-Two different “graphs” — do not smash them:
+Two different "graphs". Do not smash them:
 
 | | Rewst workflow (topology) | Slice map (our files) |
 |---|---|---|
@@ -25,15 +25,15 @@ Two different “graphs” — do not smash them:
 
 ## Flow
 
-1. **Grill** — tab `claude`, `/grill-with-docs`. Skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`).
-2. **UI** — Storybook throwaways; the engineer picks. Then agents may build.
-3. **Spec** — `/to-spec` onto Shortcut. The Shortcut story is the external idea, not the slice list.
-4. **Ready** (Shortcut) — spec is good enough to **Structure**. Graph does **not** write yet.
-5. **Structure** — same tab `claude`, `/to-tickets`. Writes the slice map in the worktree. The engineer approves once. Graph never Structures.
-6. **Write** — a **frontier** ticket path fires `graphwing-implement-slice`. Graph **walks serially** until the map is empty, a slice **fails** the valve, or the next ticket is a **`decision`**. Watch tab `graph`; do not chat there.
-7. **E2E** — after the map is empty, **before** PR/CI: named smoke/e2e on the seat. Green → `slices complete` comment. Red → go back to slices (below).
-8. **Proof** — bug: the failing command is green. UI: drive a live stack. Minor UI: before/after on the story. You, not Graph.
-9. **PR** — then GitHub CI (deterministic) then Engineering grade (AI, same vendor table as spec-review). Merge is the engineer. Graph does not move Shortcut columns; you close the story after proof + merge. Doorbell can start one fix run if CI is red.
+1. **Grill.** Tab `claude`, `/grill-with-docs`. Skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`).
+2. **UI.** Storybook throwaways; the engineer picks. Then agents may build.
+3. **Spec.** `/to-spec` onto Shortcut. The Shortcut story is the external idea, not the slice list.
+4. **Ready** (Shortcut). Spec is good enough to **Structure**. Graph does **not** write yet.
+5. **Structure.** Same tab `claude`, `/to-tickets`. Writes the slice map in the worktree. The engineer approves once. Graph never Structures.
+6. **Write.** A **frontier** ticket path fires `graphwing-implement-slice`. Graph **walks serially** until the map is empty, a slice **fails** the valve, or the next ticket is a **`decision`**. Watch tab `graph`; do not chat there.
+7. **E2E.** After the map is empty, **before** PR/CI: named smoke/e2e on the seat. Green is supposed to comment `slices complete` (Graph does not post it yet). Red goes back to slices (below).
+8. **Proof.** Bug: the failing command is green. UI: drive a live stack. Minor UI: before/after on the story. You, not Graph.
+9. **PR.** Then GitHub CI (deterministic) then Engineering grade (AI, same vendor table as spec-review). Merge is the engineer. Graph does not move Shortcut columns; you close the story after proof + merge. Doorbell can start one fix run if CI is red.
 
 ## Slice map
 
@@ -61,7 +61,7 @@ Payload is the **ticket path**, not the whole spec. Same workflow JSON; next sli
 3. Graph `testRun` (allowlisted recipe): this ticket’s tests **plus** the story suite. Visual still needs a named recipe (smoke / tiny happy path counts). E2E is **not** this gate.
 4. **Spec-review** (opposing vendor, plan mode) **gates commit**. Mechanical **S skips**. Nack = keep files, no sha, no Shortcut comment.
 5. Then `gitCommit` + `gitPush`. Writer **stages**; Graph commits. No sha until green (+ review unless S).
-6. Lossy Shortcut comment: ticket id + `sha`. Not a shadow board.
+6. Lossy Shortcut comment is the intended sha receipt. Graph does not post it yet.
 
 `gitCommit` does not `git add -A`. Empty commit = failed slice (keep files, do not push).
 
@@ -90,7 +90,7 @@ Engineering grade on the PR uses this **same** mapping on the whole diff (majori
 
 The **writer’s vendor does not spec-review**. Grok does not grill or merge. Evidence may be Grok; it does not commit.
 
-Do not say “use Codex” — that is a wire (`openai-codex`), not a policy.
+Do not say "use Codex". That is a wire (`openai-codex`), not a policy.
 
 ## Retry (one session per slice)
 
@@ -114,7 +114,7 @@ Not per slice. After frontier empty:
 
 1. Stack down → `verify-stack` / park infra. Not a product slice.
 2. Named e2e/smoke from `tests.json`.
-3. **Green** → Shortcut comment `slices complete`. Then proof, then PR, then CI.
+3. **Green** → intended Shortcut comment `slices complete` (not posted yet). Then proof, then PR, then CI.
 4. **Red** → no `slices complete`, no PR. Compact e2e signal.
    - If failing names are already ACs: Graph **auto-adds** a build ticket and walks it (new session, writer sees only that ticket + compact fail). Then e2e **again**.
    - If the output is a blob: Graph **drafts** the ticket; you ACK; then it walks.
@@ -128,15 +128,19 @@ Do not resume the last feature session to “fix e2e.”
 
 `graphwing-pr-drive` keeps files on red (no restore).
 
-## Not wired yet (do these next, do not re-litigate)
+## Known gaps (do not re-litigate here)
 
-1. Shortcut Ready → Structure (human `/to-tickets` until a Structure job exists). Index JSON is `tickets[]` with `id`, `path`, `blocked_by`, `kind` (`build`|`decision`), `status` (`open`|`done`). `implement-slice` walks serially: frontier → write → complete → commit index → continue kicks `kick_url` with the next build ticket. No bash `go`.
-2. Wipe only on explicit discard. Spec-review nack resumes once then parks.
-3. Seat default writer is still whatever Hermes `config.yaml` says (intended `grok-4.6`). `sliceRoute` sets launcher/turns/reviewers; visual/sensitive spawn `claude -p`. Spec-review nack parks (resume-on-nack still not wired).
-4. Shortcut comments (lossy sha + ticket id) still not posted from Graph.
+Future work lives in Obsidian `Riftwing/Notes/Graphwing human loop.md`. This list is what an engineer hits today.
+
+1. Structure is human `/to-tickets`. Graph never cuts tickets.
+2. Hermes `config.yaml` default writer is still `gpt-5.6-sol` / `openai-codex` until the seat is flipped to `grok-4.6`. `sliceRoute` still picks launcher, turns, and reviewers. Visual and sensitive spawn `claude -p`.
+3. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
+4. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
 5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
 
-`POST /v1/slice/e2e` runs after the map is empty when `e2e` is set: green/skip complete, `FAIL:` lines auto-add a ticket, blob drafts, three reds park.
+`POST /v1/slice/e2e` runs after the map is empty when `e2e` is set: green/skip complete, `FAIL:` lines auto-add a ticket, blob drafts, three reds park. Next slice is `kick_url`, not a cycle inside one run.
+
+How to fire a run: [USING.md](USING.md).
 
 ## Do not
 
