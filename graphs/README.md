@@ -3,7 +3,7 @@
 Hard-coded topology. Payload is the iteration. New file only when **edges** change.
 Rewst publish requires fan-in on `logic.join.*` and no unbounded cycles (one Graph run per slice; `kick_url` starts the next).
 
-How a human gets to a run: `docs/HUMAN-LOOP.md`. Slice map is `index` JSON in the worktree. `implement-slice` walks it serially. `pr-drive` keeps files on red.
+How a human gets to a run: `docs/HUMAN-LOOP.md` and `docs/USING.md`. Slice map is `index` JSON in the worktree. `implement-slice` walks it serially. `pr-drive` keeps files on red.
 
 `$GRAPHWING_INSTANCE`, `$GRAPHWING_STATUS_REPO`, and the webhook secret placeholder are replaced at publish from environment/install configuration.
 Public OpenAPI URL comes from named-tunnel meta (`cloudflared-meta.json`) or `GRAPHWING_PUBLIC_URL`.

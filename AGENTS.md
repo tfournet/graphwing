@@ -16,7 +16,7 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | HTTP ops | `server.py` + `openapi.json` + `test_server.py` |
 | Published graphs | `graphs/*.json` then `scripts/publish_graphs.py` (reads `$GRAPHWING_HOME/rewst-install.json` + public URL from tunnel meta) |
 | Hermes seat text | `SOUL.md` (copied to `$GRAPHWING_HOME` with `$GRAPHWING_HOME` substituted) |
-| Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. Do not duplicate it here. |
+| Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. First run: `docs/USING.md`. Do not duplicate them here. |
 | Herdr idea spaces | `scripts/herdr-idea.sh` (`graphwing-idea` after install) |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
 
