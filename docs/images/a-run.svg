@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 280" role="img" aria-labelledby="t2 d2">
+  <title id="t2">What one Graph run does</title>
+  <desc id="d2">Trigger, named HTTP ops, optional wait for an agent job, next step from the receipt.</desc>
+  <rect width="960" height="280" fill="#121814"/>
+  <text x="32" y="36" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="0.18em">ONE RUN · NAMED OPS</text>
+
+  <g font-family="ui-sans-serif, system-ui, sans-serif">
+    <rect x="32" y="64" width="150" height="72" rx="8" fill="#24352c" stroke="#e8b86d" stroke-width="2"/>
+    <text x="107" y="94" text-anchor="middle" fill="#e8b86d" font-size="14" font-weight="700">Start</text>
+    <text x="107" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">form / webhook</text>
+
+    <rect x="230" y="64" width="170" height="72" rx="8" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
+    <text x="315" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">Named op</text>
+    <text x="315" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">git / test / fileHead</text>
+
+    <rect x="448" y="64" width="170" height="72" rx="8" fill="#24352c" stroke="#c46b3a" stroke-width="2"/>
+    <text x="533" y="94" text-anchor="middle" fill="#c46b3a" font-size="14" font-weight="700">agentRun?</text>
+    <text x="533" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">202 + wait.webhook</text>
+
+    <rect x="666" y="64" width="150" height="72" rx="8" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
+    <text x="741" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">Next edge</text>
+    <text x="741" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">commit / park / kick</text>
+
+    <rect x="848" y="64" width="80" height="72" rx="8" fill="#24352c" stroke="#d97aa8" stroke-width="2"/>
+    <text x="888" y="106" text-anchor="middle" fill="#d97aa8" font-size="14" font-weight="700">Done</text>
+  </g>
+
+  <path d="M182 100 H230" stroke="#e8b86d" stroke-width="2" fill="none"/>
+  <path d="M400 100 H448" stroke="#7dcea0" stroke-width="2" fill="none"/>
+  <path d="M618 100 H666" stroke="#c46b3a" stroke-width="2" fill="none"/>
+  <path d="M816 100 H848" stroke="#7dcea0" stroke-width="2" fill="none"/>
+
+  <text x="32" y="180" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Most steps return 200 and data. The Graph continues on that JSON.</text>
+  <text x="32" y="206" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">agentRun returns 202. The Graph waits. The laptop POSTs a receipt when the job finishes.</text>
+  <text x="32" y="232" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Prefer a new HTTP op over stuffing more work into the agent loop.</text>
+  <text x="32" y="258" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">A long walk is several runs. Each run does one slice, then kicks the next webhook.</text>
+</svg>
