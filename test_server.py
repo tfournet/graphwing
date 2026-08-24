@@ -1134,6 +1134,32 @@ class DispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(cur.stdout.strip(), "main")
 
+    def test_git_checkout_create_is_idempotent(self):
+        # Structure commits the slice map on the story branch before the run
+        # fires, so create:true routinely lands on a branch that already
+        # exists. `checkout -b` dies there with returncode 128 and the walk
+        # stops at its first writing step (seen on the SC-110290 run).
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                body = json.dumps({"repo": "scratch", "branch": "feat-x", "create": True}).encode()
+                status, payload, _ = server.dispatch("POST", "/v1/git/checkout", {}, True, body)
+                self.assertEqual(status, 200, payload)
+                subprocess.run(
+                    ["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True
+                )
+                # Same call again: switch to the existing branch, do not fail.
+                status, payload, _ = server.dispatch("POST", "/v1/git/checkout", {}, True, body)
+                self.assertEqual(status, 200, payload)
+                self.assertTrue(payload["ok"])
+                cur = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(cur.stdout.strip(), "feat-x")
+
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))

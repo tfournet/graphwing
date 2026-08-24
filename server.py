@@ -701,7 +701,15 @@ def git_checkout(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
     if create not in (None, False, True):
         return 400, {"error": "create must be a boolean", "code": "bad_create"}
     if create:
-        out = run_git(resolved, ["checkout", "-b", branch])
+        # "create if needed", not "create or fail". Structure commits the slice
+        # map on the story branch before the run fires, so by the time Graph
+        # checks out, the branch already exists and `checkout -b` dies with
+        # returncode 128. Switch to it instead.
+        exists = run_git(resolved, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+        if exists.get("ok"):
+            out = run_git(resolved, ["checkout", branch])
+        else:
+            out = run_git(resolved, ["checkout", "-b", branch])
     else:
         verify = run_git(resolved, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
         if not verify.get("ok"):
