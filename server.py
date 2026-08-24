@@ -1287,6 +1287,92 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     return 200, slice_route_lookup(class_name, size_floor, ac_count, seams)
 
 
+def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Merge a PR, but only after reading its state here and re-deciding."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    repo_name = str(data.get("repo") or "").strip()
+    repo_path = repos.get(repo_name)
+    if not repo_path:
+        return 400, {"error": f"unknown repo '{repo_name}'", "code": "unknown_repo",
+                     "allowed": sorted(repos)}
+    number = str(data.get("number") or data.get("pr") or "").strip()
+    if not number:
+        return 400, {"error": "number is required", "code": "missing_number"}
+    how = str(data.get("method") or "squash").strip()
+    if how not in {"squash", "merge", "rebase"}:
+        return 400, {"error": "method must be squash, merge, or rebase", "code": "bad_method"}
+
+    view = annotate_pr_view(gh_json(repo_path, ["pr", "view", number, "--json",
+        "number,title,state,url,headRefName,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus,labels"]))
+    if not view.get("ok"):
+        return int(view.get("status", 400)), view
+    vd = view.get("data") or {}
+    checks = annotate_pr_checks(gh_json(repo_path, ["pr", "checks", number, "--json",
+        "name,state,bucket,link"]))
+
+    state = {
+        # annotate_pr_checks sets all_green on the result, not inside data.
+        "all_green": bool(checks.get("all_green")),
+        "mergeable": vd.get("mergeable"),
+        "is_draft": bool(vd.get("isDraft")),
+        "holds": sorted(l.get("name", "") for l in (vd.get("labels") or [])
+                        if str(l.get("name", "")).startswith("hold:")),
+    }
+    allowed, why = pr_merge_allowed(
+        state,
+        auto_merge=bool(data.get("auto_merge")),
+        run_id=str(data.get("run_id") or ""),
+    )
+    if not allowed:
+        assert why is not None
+        return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number,
+                     "state": state, **why}
+
+    out = gh_text(repo_path, ["pr", "merge", number, "--" + how, "--delete-branch"])
+    return (200 if out.get("ok") else int(out.get("status", 400))), {
+        "ok": bool(out.get("ok")), "merged": bool(out.get("ok")), "repo": repo_name,
+        "number": number, "method": how, "state": state,
+        "error": out.get("error"), "code": out.get("code"),
+    }
+
+
+def pr_merge_allowed(
+    state: dict[str, Any], auto_merge: bool, run_id: str = ""
+) -> tuple[bool, dict[str, Any] | None]:
+    """Decide whether a run may merge this PR.
+
+    Off unless the run explicitly asked. The operator lock puts merge on the
+    engineer; this exists only for the runs where they said auto-merge, and
+    absence of that flag is a refusal rather than a default.
+
+    Every condition is re-checked here against freshly read PR state instead
+    of trusting whatever the graph concluded upstream. A node deciding "green"
+    on its own is exactly what let a queue receipt pass as a test result.
+    """
+    if not auto_merge:
+        return False, {"error": "auto_merge was not requested for this run",
+                       "code": "auto_merge_not_requested"}
+    if not str(run_id or "").strip():
+        # auto_merge alone only stops a graph merging by accident. Any holder
+        # of the API key could still set the flag by hand, which is how
+        # riftwing#3523 got merged from a shell. Merge belongs to a run.
+        return False, {"error": "merge is only reachable from inside a run; run_id is required",
+                       "code": "no_run_id"}
+    if state.get("is_draft"):
+        return False, {"error": "pull request is a draft", "code": "is_draft"}
+    if not state.get("all_green"):
+        return False, {"error": "checks are not all green", "code": "not_green"}
+    if str(state.get("mergeable") or "").upper() != "MERGEABLE":
+        return False, {"error": f"pull request is {state.get('mergeable')}", "code": "not_mergeable"}
+    holds = state.get("holds") or []
+    if holds:
+        return False, {"error": f"blocking labels present: {', '.join(holds)}", "code": "held"}
+    return True, None
+
+
 FINDINGS_MARKER = "<!-- engineering-findings-json"
 FINDINGS_SEVERITIES = ("blocker", "critical", "major", "minor")
 
@@ -1603,6 +1689,12 @@ def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"ok": False, "error": "gh returned non-JSON", "code": "gh_json", "status": 502}
     return {"ok": True, "data": parsed, "truncated": r["truncated"]}
+
+
+def gh_text(path: Path, args: list[str]) -> dict[str, Any]:
+    """Run gh where the output is prose. `gh pr merge` prints a sentence, and
+    routing that through gh_json reported a successful merge as a failure."""
+    return run_cmd(["gh", *args], cwd=path)
 
 
 GH_CHECK_PASS = frozenset({"pass", "skipping", "skip", "success"})
@@ -3018,6 +3110,9 @@ def dispatch_inner(
             out["repo"] = repo_name
             return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
 
+    if method == "POST" and path == "/v1/gh/pr/merge":
+        status, payload = gh_pr_merge(body, repos)
+        return json_out(status, payload)
     if method == "GET" and path == "/v1/agent/profiles":
         return json_out(200, list_agent_profiles())
     if method == "POST" and path == "/v1/agent/run":

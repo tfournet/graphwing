@@ -1245,6 +1245,131 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
 
+    def test_pr_merge_reads_the_real_gh_shapes(self):
+        # The first version of this endpoint read all_green out of
+        # checks["data"], where annotate_pr_checks does not put it, so every
+        # merge attempt crashed with AttributeError. The unit tests above
+        # passed a hand-built state dict and sailed straight past it. Drive
+        # the real function with the real gh payload shapes instead.
+        calls = []
+
+        def fake_gh_json(repo_path, argv):
+            calls.append(argv[:3])
+            if argv[1] == "view":
+                return {"ok": True, "data": {"number": 1, "mergeable": "MERGEABLE",
+                                             "isDraft": False, "reviewDecision": "APPROVED",
+                                             "mergeStateStatus": "CLEAN", "labels": []}}
+            if argv[1] == "checks":
+                return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
+            return {"ok": True, "data": {}}
+
+        def fake_gh_text(repo_path, argv):
+            calls.append(argv[:3])
+            return {"ok": True, "stdout": "Squashed and merged pull request #1"}
+
+        with mock.patch.object(server, "gh_json", fake_gh_json), \
+             mock.patch.object(server, "gh_text", fake_gh_text):
+            status, payload = server.gh_pr_merge(
+                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
+                            "run_id": "r1"}).encode(),
+                {"r": "/tmp"},
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["merged"], payload)
+        self.assertTrue(payload["state"]["all_green"], payload["state"])
+        self.assertIn(["pr", "merge", "1"], calls)
+
+    def test_pr_merge_does_not_call_gh_merge_when_it_refuses(self):
+        # A refusal that still shelled out to `gh pr merge` would be the worst
+        # possible version of this bug.
+        calls = []
+
+        def fake_gh_json(repo_path, argv):
+            calls.append(argv[1])
+            if argv[1] == "view":
+                return {"ok": True, "data": {"mergeable": "MERGEABLE", "isDraft": False,
+                                             "labels": [{"name": "hold:pm-review"}]}}
+            return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
+
+        with mock.patch.object(server, "gh_json", fake_gh_json):
+            status, payload = server.gh_pr_merge(
+                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
+                            "run_id": "r1"}).encode(),
+                {"r": "/tmp"},
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["code"], "held")
+        self.assertNotIn("merge", calls)
+
+    def test_pr_merge_reports_success_for_a_plain_text_merge(self):
+        # `gh pr merge` prints plain text, but the endpoint sent it through
+        # gh_json, so a merge that succeeded came back merged=False with
+        # code=gh_json. A caller retrying on that error would re-attempt an
+        # action that had already happened. This is not hypothetical: it is
+        # exactly what riftwing#3523 reported after it had already merged.
+        def fake_gh_json(repo_path, argv):
+            if argv[1] == "view":
+                return {"ok": True, "data": {"mergeable": "MERGEABLE", "isDraft": False,
+                                             "labels": []}}
+            return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
+
+        def fake_gh_text(repo_path, argv):
+            return {"ok": True, "stdout": "Squashed and merged pull request #1\n"}
+
+        with mock.patch.object(server, "gh_json", fake_gh_json), \
+             mock.patch.object(server, "gh_text", fake_gh_text):
+            status, payload = server.gh_pr_merge(
+                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
+                            "run_id": "abc"}).encode(),
+                {"r": "/tmp"},
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["merged"], payload)
+        self.assertNotEqual(payload.get("code"), "gh_json")
+
+    def test_pr_merge_requires_a_run_id(self):
+        # auto_merge defaults false so a graph cannot merge by accident, but
+        # any caller holding the API key could still pass the flag by hand.
+        # That is how riftwing#3523 got merged: a curl from a shell, not a run.
+        # Merge is reachable only from inside a run.
+        ok, err = server.pr_merge_allowed(
+            {"all_green": True, "mergeable": "MERGEABLE", "is_draft": False, "holds": []},
+            auto_merge=True, run_id="",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "no_run_id")
+
+    def test_pr_merge_refuses_without_an_explicit_opt_in(self):
+        # Auto-merge is per-run and off by default. The operator lock says the
+        # engineer merges; this endpoint exists only for the runs where they
+        # said otherwise, so absence of the flag must be a refusal.
+        ok, err = server.pr_merge_allowed({"all_green": True, "mergeable": "MERGEABLE",
+                                           "is_draft": False}, auto_merge=False, run_id="r1")
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "auto_merge_not_requested")
+
+    def test_pr_merge_refuses_when_not_actually_green(self):
+        # The graph deciding "green" is what let a queue receipt pass as a test
+        # pass. Re-check here rather than trusting the caller's word.
+        for state, code in (
+            ({"all_green": False, "mergeable": "MERGEABLE", "is_draft": False}, "not_green"),
+            ({"all_green": True, "mergeable": "CONFLICTING", "is_draft": False}, "not_mergeable"),
+            ({"all_green": True, "mergeable": "MERGEABLE", "is_draft": True}, "is_draft"),
+            ({"all_green": True, "mergeable": "MERGEABLE", "is_draft": False,
+              "holds": ["hold:pm-review"]}, "held"),
+        ):
+            ok, err = server.pr_merge_allowed(state, auto_merge=True, run_id="r1")
+            self.assertFalse(ok, state)
+            self.assertEqual(err["code"], code, state)
+
+    def test_pr_merge_allows_a_green_unheld_pr_when_asked(self):
+        ok, err = server.pr_merge_allowed(
+            {"all_green": True, "mergeable": "MERGEABLE", "is_draft": False, "holds": []},
+            auto_merge=True, run_id="r1",
+        )
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+
     def test_pr_findings_extracts_the_machine_verdict_not_the_prose(self):
         # pr-drive took its fix instructions from CTX.INPUT.prompt, so a human
         # had to read the review and write them. The reviewers already publish
