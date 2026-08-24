@@ -1259,6 +1259,54 @@ class DispatchTests(unittest.TestCase):
         # turn cannot read a diff and answer.
         self.assertGreaterEqual(server.REVIEW_MAX_TURNS, 8)
 
+    def test_async_gates_wait_for_the_result_not_the_ack(self):
+        # testRun and reviewRun return a queue receipt ({"ok": true,
+        # "status": "queued"}). The graph used to feed that straight into a
+        # filter checking data.ok, so both gates passed the moment the job was
+        # accepted, never learning whether tests passed or the reviewer agreed.
+        # Every long op must post its result back to a wait node, the way
+        # agentRun already did.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        for target, wait_id, filt in (
+            ("test", "wait_test", "if_test_ok"),
+            ("review1", "wait_rev1", "if_review1"),
+            ("review1b", "wait_r1b", "if_review1b"),
+            ("review2", "wait_rev2", "if_review2"),
+            ("review2b", "wait_r2b", "if_review2b"),
+        ):
+            self.assertEqual(nodes[wait_id]["type"], "action.wait.webhook", wait_id)
+            cfg = nodes[target]["config"]
+            self.assertEqual(cfg.get("response_webhook_url"), f"{{{{ TASKS.{wait_id}.pending.resumeUrl }}}}")
+            self.assertEqual(cfg.get("response_webhook_token"), f"{{{{ TASKS.{wait_id}.pending.resumeToken }}}}")
+            # the wait drives the async node, and its delivered body drives the filter
+            self.assertIn({"source": wait_id, "handle": "pending", "target": target},
+                          [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges])
+            outs = [e["target"] for e in edges if e["source"] == wait_id and e.get("sourceHandle") == "out"]
+            self.assertEqual(outs, [filt], wait_id)
+            # nothing may reach the async node except its wait
+            feeders = {e["source"] for e in edges if e["target"] == target}
+            self.assertEqual(feeders, {wait_id}, target)
+            self.assertEqual(nodes[filt]["config"]["rules"],
+                             [{"path": "request.body.status", "op": "equals", "value": "ok"}], filt)
+
+    def test_review_run_is_async_when_given_a_webhook(self):
+        body = json.dumps({
+            "repo": "scratch", "reviewer": "sonnet", "prompt": "ticket",
+            "response_webhook_url": "https://example.invalid/resume",
+        }).encode()
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "enqueue_review") as enq:
+                status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(payload["kind"], "review")
+        self.assertTrue(payload["job_id"])
+        enq.assert_called_once()
+
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))

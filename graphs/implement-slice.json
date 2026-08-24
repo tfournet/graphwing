@@ -118,6 +118,19 @@
         }
       },
       {
+        "id": "wait_rev1",
+        "type": "action.wait.webhook",
+        "label": "Wait review1",
+        "position": { "x": 1240, "y": -80 },
+        "config": {
+          "alias": "wait_rev1",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
         "id": "review1",
         "type": "action.graphwing.POST:/v1/review/run",
         "label": "specReview 1",
@@ -127,7 +140,9 @@
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
           "reviewer": "{{ TASKS.route.data.reviewer1 }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}"
+          "prompt": "{{ TASKS.ticket_head.data.text }}",
+          "response_webhook_url": "{{ TASKS.wait_rev1.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_rev1.pending.resumeToken }}"
         }
       },
       {
@@ -137,7 +152,9 @@
         "position": { "x": 1240, "y": 40 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" }
+          ]
         }
       },
       {
@@ -167,6 +184,19 @@
         }
       },
       {
+        "id": "wait_rev2",
+        "type": "action.wait.webhook",
+        "label": "Wait review2",
+        "position": { "x": 1240, "y": 240 },
+        "config": {
+          "alias": "wait_rev2",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
         "id": "review2",
         "type": "action.graphwing.POST:/v1/review/run",
         "label": "specReview 2",
@@ -176,7 +206,9 @@
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
           "reviewer": "opus",
-          "prompt": "{{ TASKS.ticket_head.data.text }}"
+          "prompt": "{{ TASKS.ticket_head.data.text }}",
+          "response_webhook_url": "{{ TASKS.wait_rev2.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_rev2.pending.resumeToken }}"
         }
       },
       {
@@ -186,7 +218,9 @@
         "position": { "x": 1360, "y": 40 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" }
+          ]
         }
       },
       {
@@ -243,6 +277,19 @@
         }
       },
       {
+        "id": "wait_r1b",
+        "type": "action.wait.webhook",
+        "label": "Wait review1b",
+        "position": { "x": 1560, "y": 80 },
+        "config": {
+          "alias": "wait_r1b",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
         "id": "review1b",
         "type": "action.graphwing.POST:/v1/review/run",
         "label": "specReview 1 again",
@@ -252,7 +299,9 @@
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
           "reviewer": "{{ TASKS.route.data.reviewer1 }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}"
+          "prompt": "{{ TASKS.ticket_head.data.text }}",
+          "response_webhook_url": "{{ TASKS.wait_r1b.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_r1b.pending.resumeToken }}"
         }
       },
       {
@@ -262,7 +311,9 @@
         "position": { "x": 1540, "y": 200 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" }
+          ]
         }
       },
       {
@@ -319,6 +370,19 @@
         }
       },
       {
+        "id": "wait_r2b",
+        "type": "action.wait.webhook",
+        "label": "Wait review2b",
+        "position": { "x": 1560, "y": 240 },
+        "config": {
+          "alias": "wait_r2b",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
         "id": "review2b",
         "type": "action.graphwing.POST:/v1/review/run",
         "label": "specReview 2 again",
@@ -328,7 +392,9 @@
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
           "reviewer": "opus",
-          "prompt": "{{ TASKS.ticket_head.data.text }}"
+          "prompt": "{{ TASKS.ticket_head.data.text }}",
+          "response_webhook_url": "{{ TASKS.wait_r2b.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_r2b.pending.resumeToken }}"
         }
       },
       {
@@ -338,7 +404,9 @@
         "position": { "x": 1660, "y": 280 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" }
+          ]
         }
       },
       {
@@ -404,6 +472,19 @@
         }
       },
       {
+        "id": "wait_test",
+        "type": "action.wait.webhook",
+        "label": "Wait test",
+        "position": { "x": 980, "y": 80 },
+        "config": {
+          "alias": "wait_test",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
         "id": "test",
         "type": "action.graphwing.POST:/v1/test/run",
         "label": "testRun",
@@ -411,7 +492,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_test.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_test.pending.resumeToken }}"
         }
       },
       {
@@ -421,7 +504,9 @@
         "position": { "x": 1120, "y": 200 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" }
+          ]
         }
       },
       {
@@ -891,13 +976,13 @@
       { "id": "e12e", "source": "switch_walk", "sourceHandle": "case-1", "target": "join_wait_human", "targetHandle": "in" },
       { "id": "e12f", "source": "switch_walk", "sourceHandle": "default", "target": "done", "targetHandle": "in" },
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
-      { "id": "e14", "source": "record", "sourceHandle": "out", "target": "test", "targetHandle": "in" },
-      { "id": "e15", "source": "test", "sourceHandle": "success", "target": "if_test_ok", "targetHandle": "in" },
+      { "id": "e14", "source": "record", "sourceHandle": "out", "target": "wait_test", "targetHandle": "in" },
+      { "id": "e15", "source": "wait_test", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
       { "id": "e_rev_skip", "source": "switch_rev", "sourceHandle": "case-0", "target": "join_commit", "targetHandle": "in" },
-      { "id": "e_rev_run", "source": "switch_rev", "sourceHandle": "default", "target": "review1", "targetHandle": "in" },
-      { "id": "e_rev1_ok", "source": "review1", "sourceHandle": "success", "target": "if_review1", "targetHandle": "in" },
+      { "id": "e_rev_run", "source": "switch_rev", "sourceHandle": "default", "target": "wait_rev1", "targetHandle": "in" },
+      { "id": "e_rev1_ok", "source": "wait_rev1", "sourceHandle": "out", "target": "if_review1", "targetHandle": "in" },
       { "id": "e_rev1_http", "source": "review1", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_rev1_pass", "source": "if_review1", "sourceHandle": "pass", "target": "join_switch_rev2", "targetHandle": "in" },
       { "id": "e_rev1_nack", "source": "if_review1", "sourceHandle": "fail", "target": "wait_rn1", "targetHandle": "in" },
@@ -907,15 +992,15 @@
       { "id": "e_rn1_fail", "source": "wait_rn1", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_rn1_th", "source": "test_rn1", "sourceHandle": "success", "target": "if_test_rn1", "targetHandle": "in" },
       { "id": "e_rn1_tf", "source": "test_rn1", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
-      { "id": "e_rn1_tok", "source": "if_test_rn1", "sourceHandle": "pass", "target": "review1b", "targetHandle": "in" },
+      { "id": "e_rn1_tok", "source": "if_test_rn1", "sourceHandle": "pass", "target": "wait_r1b", "targetHandle": "in" },
       { "id": "e_rn1_tbad", "source": "if_test_rn1", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
-      { "id": "e_r1b_ok", "source": "review1b", "sourceHandle": "success", "target": "if_review1b", "targetHandle": "in" },
+      { "id": "e_r1b_ok", "source": "wait_r1b", "sourceHandle": "out", "target": "if_review1b", "targetHandle": "in" },
       { "id": "e_r1b_http", "source": "review1b", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_r1b_pass", "source": "if_review1b", "sourceHandle": "pass", "target": "join_switch_rev2", "targetHandle": "in" },
       { "id": "e_r1b_nack", "source": "if_review1b", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
-      { "id": "e_rev2_need", "source": "switch_rev2", "sourceHandle": "case-0", "target": "review2", "targetHandle": "in" },
+      { "id": "e_rev2_need", "source": "switch_rev2", "sourceHandle": "case-0", "target": "wait_rev2", "targetHandle": "in" },
       { "id": "e_rev2_skip", "source": "switch_rev2", "sourceHandle": "default", "target": "join_commit", "targetHandle": "in" },
-      { "id": "e_rev2_ok", "source": "review2", "sourceHandle": "success", "target": "if_review2", "targetHandle": "in" },
+      { "id": "e_rev2_ok", "source": "wait_rev2", "sourceHandle": "out", "target": "if_review2", "targetHandle": "in" },
       { "id": "e_rev2_http", "source": "review2", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_rn2", "targetHandle": "in" },
@@ -925,9 +1010,9 @@
       { "id": "e_rn2_fail", "source": "wait_rn2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_rn2_th", "source": "test_rn2", "sourceHandle": "success", "target": "if_test_rn2", "targetHandle": "in" },
       { "id": "e_rn2_tf", "source": "test_rn2", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
-      { "id": "e_rn2_tok", "source": "if_test_rn2", "sourceHandle": "pass", "target": "review2b", "targetHandle": "in" },
+      { "id": "e_rn2_tok", "source": "if_test_rn2", "sourceHandle": "pass", "target": "wait_r2b", "targetHandle": "in" },
       { "id": "e_rn2_tbad", "source": "if_test_rn2", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
-      { "id": "e_r2b_ok", "source": "review2b", "sourceHandle": "success", "target": "if_review2b", "targetHandle": "in" },
+      { "id": "e_r2b_ok", "source": "wait_r2b", "sourceHandle": "out", "target": "if_review2b", "targetHandle": "in" },
       { "id": "e_r2b_http", "source": "review2b", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_r2b_pass", "source": "if_review2b", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_r2b_nack", "source": "if_review2b", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
@@ -968,7 +1053,22 @@
       { "id": "e_join_slices_complete", "source": "join_slices_complete", "sourceHandle": "out", "target": "slices_complete", "targetHandle": "in" },
       { "id": "e_join_switch_rev2", "source": "join_switch_rev2", "sourceHandle": "out", "target": "map_switch_rev2", "targetHandle": "in" },
       { "id": "e_map_switch_rev2", "source": "map_switch_rev2", "sourceHandle": "out", "target": "switch_rev2", "targetHandle": "in" },
-      { "id": "e_join_test2_http_fail", "source": "join_test2_http_fail", "sourceHandle": "out", "target": "test2_http_fail", "targetHandle": "in" }
+      { "id": "e_join_test2_http_fail", "source": "join_test2_http_fail", "sourceHandle": "out", "target": "test2_http_fail", "targetHandle": "in" },
+      { "id": "e_wait_test_pending", "source": "wait_test", "sourceHandle": "pending", "target": "test", "targetHandle": "in" },
+      { "id": "e_wait_test_timeout", "source": "wait_test", "sourceHandle": "timeout", "target": "join_test_http_fail", "targetHandle": "in" },
+      { "id": "e_wait_test_fail", "source": "wait_test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
+      { "id": "e_wait_rev1_pending", "source": "wait_rev1", "sourceHandle": "pending", "target": "review1", "targetHandle": "in" },
+      { "id": "e_wait_rev1_timeout", "source": "wait_rev1", "sourceHandle": "timeout", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_rev1_fail", "source": "wait_rev1", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_r1b_pending", "source": "wait_r1b", "sourceHandle": "pending", "target": "review1b", "targetHandle": "in" },
+      { "id": "e_wait_r1b_timeout", "source": "wait_r1b", "sourceHandle": "timeout", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_r1b_fail", "source": "wait_r1b", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_rev2_pending", "source": "wait_rev2", "sourceHandle": "pending", "target": "review2", "targetHandle": "in" },
+      { "id": "e_wait_rev2_timeout", "source": "wait_rev2", "sourceHandle": "timeout", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_rev2_fail", "source": "wait_rev2", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_r2b_pending", "source": "wait_r2b", "sourceHandle": "pending", "target": "review2b", "targetHandle": "in" },
+      { "id": "e_wait_r2b_timeout", "source": "wait_r2b", "sourceHandle": "timeout", "target": "join_review_fail", "targetHandle": "in" },
+      { "id": "e_wait_r2b_fail", "source": "wait_r2b", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" }
     ]
   }
 }

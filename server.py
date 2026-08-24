@@ -1311,21 +1311,8 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
-def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    data, err = parse_json_object(body)
-    if err:
-        return 400, err
-    assert data is not None
-    reviewer = str(data.get("reviewer") or "").strip()
-    if reviewer not in {"sonnet", "opus", "sol"}:
-        return 400, {"error": "reviewer must be sonnet, opus, or sol", "code": "bad_reviewer"}
-    prompt = data.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return 400, {"error": "prompt is required", "code": "missing_prompt"}
-    prompt = prompt.strip()
-    name, resolved = repo_from_body(data, repos)
-    if name is None:
-        return 400, resolved
+def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
+    """Run one spec-review to completion and return its verdict payload."""
     diff = git_diff(resolved, "HEAD", None)
     diff_text = str(diff.get("diff") or "")[:12000]
     body_prompt = (
@@ -1335,7 +1322,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     )
     if reviewer in {"sonnet", "opus"}:
         if not CLAUDE_BIN.is_file():
-            return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
+            return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                    "error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
         model = "sonnet" if reviewer == "sonnet" else "opus"
         cmd = [
             str(CLAUDE_BIN),
@@ -1353,7 +1341,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         env = {k: v for k, v in os.environ.items()}
     else:
         if not HERMES_BIN.is_file():
-            return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
+            return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                    "error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
         cmd = [
             str(HERMES_BIN),
             "chat",
@@ -1381,10 +1370,11 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             timeout=200,
         )
     except subprocess.TimeoutExpired:
-        return 504, {"ok": False, "verdict": "NACK", "error": "review timed out", "code": "timeout"}
+        return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                "error": "review timed out", "code": "timeout", "reviewer": reviewer}
     text = (proc.stdout or b"").decode("utf-8", "replace")
     verdict, summary = parse_review_verdict(text)
-    return 200, {
+    return {
         "ok": verdict == "PASS",
         "verdict": verdict,
         "no_verdict": review_said_nothing(text),
@@ -1392,6 +1382,119 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         "summary": summary,
         "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
         "returncode": proc.returncode,
+    }
+
+
+def review_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "ok" if result.get("ok") else "nack",
+        "job_id": job["job_id"],
+        "verdict": result.get("verdict"),
+        "no_verdict": bool(result.get("no_verdict")),
+        "reviewer": job.get("reviewer"),
+        "summary": str(result.get("summary") or result.get("error") or "")[:500],
+        "compact": result.get("compact") or "",
+    }
+
+
+def run_review_job(job_id: str) -> None:
+    job = read_job(job_id)
+    if not job:
+        return
+    job["status"] = "running"
+    job["started_at"] = utcnow()
+    write_job(job)
+    result = review_result(job["reviewer"], job["prompt"], Path(job["cwd"]))
+    receipt = review_receipt(job, result)
+    job = read_job(job_id) or job
+    job["finished_at"] = utcnow()
+    job["receipt"] = receipt
+    job["result"] = result
+    job["status"] = "completed"
+    hook = deliver_webhook(job, receipt)
+    if hook is not None:
+        job["webhook"] = hook
+    write_job(job)
+    herdr_job_done(job)
+
+
+def enqueue_review(job: dict[str, Any]) -> None:
+    herdr_follow_job(job)
+    thread = threading.Thread(
+        target=run_review_job, args=(job["job_id"],), name=f"graphwing-review-{job['job_id'][:8]}", daemon=True
+    )
+    thread.start()
+
+
+def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Spec-review. Async when a webhook is supplied, otherwise synchronous.
+
+    A real review reads a 12KB diff and thinks, which routinely outlives the
+    Cloudflare tunnel's 120s proxy read timeout: SC-110290's second run died
+    with a 524 mid-review. agentRun already solves this by returning 202 and
+    POSTing the verdict back to a wait node. Do the same here. The sync path
+    stays for direct calls that are not behind the tunnel.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    reviewer = str(data.get("reviewer") or "").strip()
+    if reviewer not in {"sonnet", "opus", "sol"}:
+        return 400, {"error": "reviewer must be sonnet, opus, or sol", "code": "bad_reviewer"}
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return 400, {"error": "prompt is required", "code": "missing_prompt"}
+    prompt = prompt.strip()
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+
+    if not webhook_url:
+        result = review_result(reviewer, prompt, resolved)
+        if result.get("code") == "not_implemented":
+            return 501, result
+        if result.get("code") == "timeout":
+            return 504, result
+        return 200, result
+
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "kind": "review",
+            "status": "queued",
+            "reviewer": reviewer,
+            "repo": name,
+            "cwd": str(resolved),
+            "prompt": prompt,
+            "response_webhook_url": webhook_url,
+            "response_webhook_token": webhook_token,
+            "resume_url": webhook_url,
+            "created_at": utcnow(),
+            "started_at": None,
+            "finished_at": None,
+            "receipt": None,
+            "log_ref": str(job_dir(job_id) / "stdout.log"),
+            "error": None,
+            "webhook": None,
+        }
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        write_job(job)
+    enqueue_review(job)
+    return 202, {
+        "ok": True,
+        "job_id": job_id,
+        "kind": "review",
+        "status": "queued",
+        "reviewer": reviewer,
+        "repo": name,
+        "poll": f"/v1/agent/jobs/{job_id}",
     }
 
 
