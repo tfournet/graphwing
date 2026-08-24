@@ -4,7 +4,7 @@ How an engineer turns an idea into a PR. Graph owns topology. This pane (Claude)
 
 Read this at the start of a **new** Herdr/Claude session. Do not reconstruct it from chat history.
 
-**Human** = any engineer on their laptop seat (not Rewst Internal).
+**Human** = any engineer on their machine (not Rewst Internal).
 
 Two different "graphs". Do not smash them:
 
