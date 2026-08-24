@@ -91,10 +91,16 @@ function unitRows(units) {
     var name = names[i]
     seen[name] = true
     var u = units && units[name] ? units[name] : {}
+    var shortName = name.replace("graphwing-", "")
+    var active = u.active === true
+    var state = String(u.state || "unknown")
+    var optional = shortName === "herdr"
+    if (optional && !active) state = "optional"
     rows.push({
-      name: name.replace("graphwing-", ""),
-      active: u.active === true,
-      state: String(u.state || "unknown")
+      name: shortName,
+      active: active,
+      optional: optional,
+      state: state
     })
   }
   for (var extra in units) {
