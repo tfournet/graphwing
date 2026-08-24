@@ -985,6 +985,28 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertIn("graphwing-api", payload["units"])
 
+    def test_job_title_strips_markdown_and_prefers_ticket(self):
+        self.assertEqual(
+            server.job_title(
+                {
+                    "kind": "agent",
+                    "prompt": "# 01-pre-commit-guardrail-tests: Test script for the pre-commit\nmore",
+                }
+            ),
+            "01-pre-commit-guardrail-tests",
+        )
+        self.assertEqual(
+            server.job_title({"kind": "agent", "ticket": "slices/demo/02-checkout.md", "prompt": "# ignore me"}),
+            "02-checkout",
+        )
+        self.assertEqual(server.job_title({"kind": "agent", "pr": 3523, "prompt": "fix ci"}), "PR 3523")
+        self.assertEqual(
+            server.job_title({"kind": "agent", "prompt": "please edit slices/demo/03-login.md today"}),
+            "03-login",
+        )
+        self.assertEqual(server.job_title({"kind": "review", "reviewer": "sonnet"}), "review sonnet")
+        self.assertEqual(server.job_title({"kind": "test", "script": "riftwing-local-gates"}), "riftwing-local-gates")
+
     def test_watch_requires_key(self):
         status, payload, _ = server.dispatch("GET", "/v1/watch", {}, False, b"")
         self.assertEqual(status, 401)
