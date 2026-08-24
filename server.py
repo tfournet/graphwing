@@ -198,6 +198,69 @@ def load_rewst_install() -> dict[str, Any]:
     return data
 
 
+REWST_HOOK_URL_KEYS = {
+    "implement-slice": "implement_slice_hook_url",
+    "pr-drive": "pr_drive_hook_url",
+}
+
+
+def rewst_fire(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Proxy a run request to a Rewst webhook trigger.
+
+    The caller sends a workflow name and its input. This process holds the
+    trigger URL and the shared secret, both in $GRAPHWING_HOME, so nothing
+    that fires a run needs the webhook key. Same reason `repos.json` lives
+    here and not in a graph: secrets belong to the seat, not the caller.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    workflow = str(data.get("workflow") or "").strip()
+    if workflow not in REWST_HOOK_URL_KEYS:
+        return 400, {
+            "error": f"unknown workflow '{workflow}'",
+            "code": "unknown_workflow",
+            "allowed": sorted(REWST_HOOK_URL_KEYS),
+        }
+    payload = data.get("input")
+    if not isinstance(payload, dict):
+        return 400, {"error": "input must be an object", "code": "bad_input"}
+
+    install = load_rewst_install()
+    url = str(install.get(REWST_HOOK_URL_KEYS[workflow]) or "").strip()
+    if not url:
+        return 503, {
+            "error": f"no trigger url recorded for '{workflow}'",
+            "code": "no_hook_url",
+            "hint": f"set {REWST_HOOK_URL_KEYS[workflow]} in rewst-install.json",
+        }
+    if not valid_webhook_url(url):
+        return 500, {"error": "recorded trigger url is not https", "code": "bad_hook_url"}
+    secret = str(install.get("hook_secret") or "").strip()
+    if not secret:
+        return 503, {"error": "no hook_secret recorded", "code": "no_hook_secret"}
+
+    req = Request(
+        url,
+        data=json.dumps({"input": payload}).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "x-rewst-secret": secret},
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            status = getattr(resp, "status", 200)
+            raw = resp.read().decode("utf-8", "replace")[:2000]
+    except Exception as exc:
+        return 502, {"ok": False, "error": str(exc)[:300], "code": "hook_failed", "workflow": workflow}
+    out: dict[str, Any] = {"ok": 200 <= status < 300, "workflow": workflow, "status": status}
+    try:
+        out["body"] = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        out["body"] = {"raw": raw}
+    return (200 if out["ok"] else 502), out
+
+
 def _base64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
@@ -420,6 +483,19 @@ def first_query(qs: dict[str, list[str]], name: str) -> str | None:
         return None
     v = vals[0].strip()
     return v or None
+
+
+def query_rel(qs: dict[str, list[str]]) -> str | None:
+    """Repo-relative file for fileHead and gitDiff.
+
+    Named `rel`, not `path`. Rewst's custom-integration connector treats a
+    parameter called `path` as the request URL path, so it overwrote the
+    endpoint with the value and sent GET /slices/01-ticket.md instead of
+    GET /v1/file/head?... The whole walk 404'd at its first fileHead.
+
+    `path` stays accepted so integration v9 keeps working until v10 ships.
+    """
+    return first_query(qs, "rel") or first_query(qs, "path")
 
 
 def default_repo_name(repos: dict[str, str]) -> str:
@@ -2579,6 +2655,9 @@ def dispatch_inner(
     if method == "POST" and path == "/v1/slice/continue":
         status, payload = slice_continue(body, repos)
         return json_out(status, payload)
+    if method == "POST" and path == "/v1/rewst/fire":
+        status, payload = rewst_fire(body)
+        return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route":
         status, payload = slice_route(body)
         return json_out(status, payload)
@@ -2597,7 +2676,7 @@ def dispatch_inner(
         if method == "GET" and path == "/v1/git/status":
             out = git_status(repo_path)
         elif method == "GET" and path == "/v1/git/diff":
-            out = git_diff(repo_path, first_query(qs, "ref"), first_query(qs, "path"))
+            out = git_diff(repo_path, first_query(qs, "ref"), query_rel(qs))
         elif method == "GET" and path == "/v1/git/log":
             try:
                 n = int(first_query(qs, "n") or "20")
@@ -2616,9 +2695,9 @@ def dispatch_inner(
         elif method == "GET" and path == "/v1/git/worktrees":
             out = git_worktree_list(repo_path)
         elif method == "GET" and path == "/v1/file/head":
-            rel = first_query(qs, "path")
+            rel = query_rel(qs)
             if not rel:
-                return json_out(400, {"error": "path is required", "code": "missing_path"})
+                return json_out(400, {"error": "rel is required", "code": "missing_rel"})
             out = file_head(repo_path, rel)
         elif method == "GET" and path == "/v1/gh/pr/list":
             try:

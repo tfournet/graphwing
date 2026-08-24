@@ -1,36 +1,28 @@
 #!/usr/bin/env bash
-# Fire graphwing-implement-slice at its Rewst webhook trigger.
+# Fire graphwing-implement-slice.
 #
 #   scripts/fire-slice.sh payload.json
 #   scripts/fire-slice.sh -            # read the payload from stdin
 #
-# Secrets come from $GRAPHWING_HOME/.env (mode 600, never committed):
-#   GRAPHWING_HOOK_SECRET               matches $GRAPHWING_HOOK_SECRET in graphs/*.json
-#   GRAPHWING_IMPLEMENT_SLICE_HOOK_URL  recorded after publish_graphs.py
+# Posts to this host's own /v1/rewst/fire, which proxies to the Rewst webhook.
+# The trigger URL and the shared secret live in $GRAPHWING_HOME/rewst-install.json
+# and never leave the service, so this script only needs the local API key.
 #
-# The payload is the workflow input, e.g.
+# The payload is the workflow input:
 #   { "input": { "repo": "riftwing", "branch": "...", "index": "...", ... } }
 
 set -euo pipefail
 
 HOME_DIR="${GRAPHWING_HOME:-$HOME/.graphwing}"
-ENV_FILE="$HOME_DIR/.env"
+BASE="${GRAPHWING_URL:-http://127.0.0.1:8645}"
+KEY_FILE="$HOME_DIR/api.key"
+WORKFLOW="${GRAPHWING_WORKFLOW:-implement-slice}"
 
-if [ ! -f "$ENV_FILE" ]; then
-    echo "no $ENV_FILE. Copy the hook secret from rewst-install.json into it." >&2
+if [ ! -f "$KEY_FILE" ]; then
+    echo "no $KEY_FILE. Is graphwing installed?" >&2
     exit 1
 fi
-# shellcheck disable=SC1090 # path is resolved at runtime from GRAPHWING_HOME
-. "$ENV_FILE"
-
-: "${GRAPHWING_HOOK_SECRET:?set GRAPHWING_HOOK_SECRET in $ENV_FILE}"
-if [ -z "${GRAPHWING_IMPLEMENT_SLICE_HOOK_URL:-}" ]; then
-    echo "GRAPHWING_IMPLEMENT_SLICE_HOOK_URL is empty in $ENV_FILE." >&2
-    echo "Run scripts/publish_graphs.py to (re)publish implement-slice, then record" >&2
-    echo "the trigger id it returns. Shape:" >&2
-    echo "  https://app.rewst.ai/api/hooks/\$GRAPHWING_ORG_ID/trigger/<trigger_id>" >&2
-    exit 1
-fi
+KEY="${GRAPHWING_KEY:-$(cat "$KEY_FILE")}"
 
 PAYLOAD_FILE="${1:-}"
 if [ -z "$PAYLOAD_FILE" ]; then
@@ -43,16 +35,21 @@ else
     PAYLOAD="$(cat "$PAYLOAD_FILE")"
 fi
 
-# Fail before the POST rather than letting Rewst reject malformed JSON.
-printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; json.load(sys.stdin)' || {
-    echo "payload is not valid JSON" >&2
-    exit 1
-}
+# Unwrap {"input": {...}} so the file stays the same shape a manual run takes,
+# and fail here rather than letting Rewst reject malformed JSON.
+BODY="$(printf '%s' "$PAYLOAD" | WORKFLOW="$WORKFLOW" python3 -c '
+import json, os, sys
+doc = json.load(sys.stdin)
+inp = doc.get("input", doc)
+if not isinstance(inp, dict):
+    sys.exit("payload input must be an object")
+json.dump({"workflow": os.environ["WORKFLOW"], "input": inp}, sys.stdout)
+')"
 
-echo "POST $GRAPHWING_IMPLEMENT_SLICE_HOOK_URL" >&2
-code="$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/fire-slice.out -w '%{http_code}' \
-    -X POST "$GRAPHWING_IMPLEMENT_SLICE_HOOK_URL" \
-    -H "x-rewst-secret: $GRAPHWING_HOOK_SECRET" \
+echo "POST $BASE/v1/rewst/fire ($WORKFLOW)" >&2
+code="$(printf '%s' "$BODY" | curl -sS -o /tmp/fire-slice.out -w '%{http_code}' \
+    -X POST "$BASE/v1/rewst/fire" \
+    -H "X-Graphwing-Key: $KEY" \
     -H 'Content-Type: application/json' \
     --data-binary @-)"
 echo "HTTP $code" >&2
@@ -60,6 +57,8 @@ cat /tmp/fire-slice.out
 echo
 case "$code" in
     2*) echo "fired. watch tab graph." >&2 ;;
-    401|403) echo "rejected: x-rewst-secret does not match the trigger. Republish or fix .env." >&2; exit 1 ;;
+    401) echo "rejected: local API key is wrong. Check $KEY_FILE." >&2; exit 1 ;;
+    503) echo "graphwing has no trigger url or secret recorded. See the body above." >&2; exit 1 ;;
+    502) echo "graphwing reached Rewst and Rewst refused. See the body above." >&2; exit 1 ;;
     *) echo "unexpected status" >&2; exit 1 ;;
 esac

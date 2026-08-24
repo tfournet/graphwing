@@ -1160,6 +1160,90 @@ class DispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(cur.stdout.strip(), "feat-x")
 
+    def test_file_head_uses_rel_not_path(self):
+        # Rewst's connector treats a query param named `path` as the request
+        # URL path, so fileHead's param had to be renamed. It sent
+        # GET /slices/01-ticket.md instead of GET /v1/file/head?... and the
+        # walk 404'd at its first fileHead (the SC-110290 run). `path` stays
+        # accepted so integration v9 keeps working until v10 ships.
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "note.md").write_text("hello\n")
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                for param in ("rel", "path"):
+                    status, payload, _ = server.dispatch(
+                        "GET", "/v1/file/head", {"repo": ["scratch"], param: ["note.md"]}, True, b""
+                    )
+                    self.assertEqual(status, 200, payload)
+                    self.assertEqual(payload["text"], "hello\n")
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/file/head", {"repo": ["scratch"]}, True, b""
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "missing_rel")
+
+    def test_openapi_has_no_path_query_param(self):
+        # Guard the whole class of bug, not just fileHead: any request query
+        # param named `path` gets eaten by the connector.
+        spec = json.loads(server.openapi_bytes())
+        offenders = [
+            (method.upper(), route, op.get("operationId"))
+            for route, item in spec["paths"].items()
+            for method, op in item.items()
+            if isinstance(op, dict)
+            for prm in (op.get("parameters") or [])
+            if prm.get("name") == "path" and prm.get("in") == "query"
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_rewst_fire_requires_recorded_url(self):
+        # The point of the proxy: the caller sends workflow + input and never
+        # holds the webhook key. With no URL recorded it must say so plainly
+        # instead of posting nowhere.
+        with mock.patch.object(server, "load_rewst_install", return_value={"hook_secret": "s"}):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/rewst/fire", {}, True,
+                json.dumps({"workflow": "implement-slice", "input": {"repo": "riftwing"}}).encode(),
+            )
+        self.assertEqual(status, 503, payload)
+        self.assertEqual(payload["code"], "no_hook_url")
+
+    def test_rewst_fire_rejects_unknown_workflow(self):
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/rewst/fire", {}, True,
+            json.dumps({"workflow": "rm-rf", "input": {}}).encode(),
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "unknown_workflow")
+
+    def test_rewst_fire_sends_secret_header_and_wraps_input(self):
+        seen = {}
+
+        class FakeResp:
+            status = 200
+            def read(self): return b'{"ok":true}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["secret"] = req.get_header("X-rewst-secret")
+            seen["body"] = json.loads(req.data.decode())
+            return FakeResp()
+
+        install = {"hook_secret": "shh", "implement_slice_hook_url": "https://app.rewst.ai/api/hooks/o/trigger/t"}
+        with mock.patch.object(server, "load_rewst_install", return_value=install), \
+             mock.patch.object(server, "urlopen", fake_urlopen):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/rewst/fire", {}, True,
+                json.dumps({"workflow": "implement-slice", "input": {"repo": "riftwing"}}).encode(),
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(seen["url"], "https://app.rewst.ai/api/hooks/o/trigger/t")
+        self.assertEqual(seen["secret"], "shh")
+        self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
+
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
@@ -1753,7 +1837,9 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("prompt", inputs)
         head = next(node for node in graph["spec"]["nodes"] if node["id"] == "ticket_head")
         self.assertIn("file/head", head["type"])
-        self.assertEqual(head["config"]["path"], "{{ TASKS.frontier.data.path }}")
+        # `rel`, not `path`: the connector eats a query param called `path`.
+        self.assertEqual(head["config"]["rel"], "{{ TASKS.frontier.data.path }}")
+        self.assertNotIn("path", head["config"])
         agent = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent")
         self.assertEqual(agent["config"]["prompt"], "{{ TASKS.ticket_head.data.text }}")
         self.assertNotIn("CTX.INPUT.prompt", agent["config"]["prompt"])

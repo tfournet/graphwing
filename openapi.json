@@ -119,7 +119,7 @@
             "schema": { "type": "string" }
           },
           {
-            "name": "path",
+            "name": "rel",
             "in": "query",
             "schema": { "type": "string" }
           }
@@ -362,7 +362,7 @@
         "summary": "Read the start of an allowlisted-repo relative file. No ..",
         "parameters": [
           { "$ref": "#/components/parameters/repo" },
-          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } }
+          { "name": "rel", "in": "query", "required": true, "schema": { "type": "string" } }
         ],
         "responses": {
           "200": { "description": "text", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FileHead" } } } },
@@ -401,6 +401,24 @@
           "200": { "description": "updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceComplete" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/rewst/fire": {
+      "post": {
+        "operationId": "rewstFire",
+        "tags": ["rewst"],
+        "summary": "Fire a Rewst webhook trigger. This host holds the trigger URL and shared secret, so the caller never needs the webhook key.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RewstFireRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "fired", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "502": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -1005,6 +1023,14 @@
           "iters_left": { "type": "string" },
           "kick_url": { "type": "string", "format": "uri", "description": "https Rewst webhook to start the next slice. Omitted: return frontier only." },
           "kick_token": { "type": "string" }
+        }
+      },
+      "RewstFireRequest": {
+        "type": "object",
+        "required": ["workflow", "input"],
+        "properties": {
+          "workflow": { "type": "string", "enum": ["implement-slice", "pr-drive"] },
+          "input": { "type": "object", "additionalProperties": true }
         }
       },
       "SliceRouteRequest": {
