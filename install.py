@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
+MARKETPLACE = "graphwing"
+PLUGIN = "graphwing-loop"
 CATALOG = (
     "server.py",
     "openapi.json",
@@ -261,6 +263,41 @@ def install_cli(home: Path) -> Path:
     return dest
 
 
+def install_claude_plugin(non_interactive: bool, opt_in: bool | None) -> None:
+    """Offer to register the operator-loop skills with Claude Code.
+
+    HUMAN-LOOP.md tells the engineer to type /grill-with-docs, /to-spec and
+    /to-tickets. Without the plugin the generic mattpocock-skills versions
+    answer, and their to-tickets writes a prose "Blocked by:" line that
+    sliceFrontier cannot parse. Claude Code owns ~/.claude, so never write
+    there unasked: no claude CLI, or no answer, prints the commands instead.
+    """
+    claude = shutil.which("claude")
+    if claude is None:
+        return
+    if opt_in is None:
+        opt_in = False if non_interactive else yes(
+            f"Install the {PLUGIN} skills into Claude Code?", True, non_interactive
+        )
+    if not opt_in:
+        print(f"skipped {PLUGIN}; install later with:")
+        print(f"  claude plugin marketplace add {REPO}")
+        print(f"  claude plugin install {PLUGIN}@{MARKETPLACE}")
+        return
+    steps = (
+        [claude, "plugin", "marketplace", "add", str(REPO)],
+        [claude, "plugin", "install", f"{PLUGIN}@{MARKETPLACE}", "--yes"],
+    )
+    for argv in steps:
+        done = subprocess.run(argv, check=False, capture_output=True, text=True)
+        if done.returncode != 0:
+            print("plugin step failed:", " ".join(argv[1:]))
+            print((done.stderr or done.stdout).strip()[:400])
+            return
+    print(f"installed {PLUGIN}@{MARKETPLACE}")
+    print(f"note: a same-named skill in ~/.claude/skills wins over {PLUGIN}; remove it to use this one")
+
+
 def systemd_user(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["systemctl", "--user", *args],
@@ -286,6 +323,19 @@ def parse_args() -> argparse.Namespace:
         default=[],
         metavar="NAME=PATH",
         help="allowlist a git checkout (repeatable). Non-interactive installs stay empty unless this is set.",
+    )
+    p.add_argument(
+        "--claude-plugin",
+        dest="claude_plugin",
+        action="store_true",
+        default=None,
+        help=f"install {PLUGIN} into Claude Code without asking",
+    )
+    p.add_argument(
+        "--no-claude-plugin",
+        dest="claude_plugin",
+        action="store_false",
+        help="skip the Claude Code plugin and just print the commands",
     )
     return p.parse_args()
 
@@ -369,6 +419,8 @@ def main() -> None:
         run_named_tunnel_setup(home)
     public = apply_openapi_url(home, args.port)
     print("openapi servers.url", public)
+
+    install_claude_plugin(ni, args.claude_plugin)
 
     print("GRAPHWING_HOME", home)
     print("api key file", key_path, "(mode 600); header X-Graphwing-Key")

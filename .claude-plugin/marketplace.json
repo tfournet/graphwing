@@ -1,0 +1,34 @@
+{
+  "name": "graphwing",
+  "owner": {
+    "name": "Tim Fournet",
+    "url": "https://github.com/tfournet"
+  },
+  "metadata": {
+    "description": "Graphwing operator-loop skills: the human half of grill, spec, structure before Rewst Graph walks the slice map",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "graphwing-loop",
+      "source": "./plugins/graphwing-loop/",
+      "description": "Steps 1, 3 and 5 of the graphwing human loop: grilling, to-spec, to-tickets",
+      "version": "0.1.0",
+      "author": {
+        "name": "Tim Fournet",
+        "url": "https://github.com/tfournet"
+      },
+      "homepage": "https://github.com/tfournet/graphwing",
+      "repository": "https://github.com/tfournet/graphwing",
+      "license": "MIT",
+      "keywords": ["graphwing", "rewst", "grilling", "spec", "tickets", "slices"],
+      "category": "workflow",
+      "strict": true,
+      "skills": [
+        "./skills/grilling",
+        "./skills/to-spec",
+        "./skills/to-tickets"
+      ]
+    }
+  ]
+}

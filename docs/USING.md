@@ -17,7 +17,7 @@ Allowlisted short names are `$GRAPHWING_HOME/repos.json`. Graph `cwd` / `repo` f
 
 ## Structure a slice map
 
-After Shortcut Ready, same tab, `/to-tickets`. Graph does not Structure.
+After Shortcut Ready, same tab, `/to-tickets` (from the `graphwing-loop` plugin; see [HUMAN-LOOP.md](HUMAN-LOOP.md) step 1 to install it). Graph does not Structure.
 
 Index JSON in the app worktree (example: [`examples/slices.example.json`](../examples/slices.example.json)):
 

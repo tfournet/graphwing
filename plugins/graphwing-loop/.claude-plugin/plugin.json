@@ -1,0 +1,26 @@
+{
+  "name": "graphwing-loop",
+  "version": "0.1.0",
+  "description": "The human half of the graphwing loop. Grill an idea into a shape, cement it as a spec, then cut a slice map Rewst Graph can walk. Replaces the generic grill/spec/ticket skills with versions that emit what Graph actually parses.",
+  "author": {
+    "name": "Tim Fournet",
+    "url": "https://github.com/tfournet"
+  },
+  "homepage": "https://github.com/tfournet/graphwing",
+  "repository": "https://github.com/tfournet/graphwing",
+  "license": "MIT",
+  "keywords": [
+    "graphwing",
+    "rewst",
+    "grilling",
+    "spec",
+    "tickets",
+    "slices",
+    "workflow"
+  ],
+  "skills": [
+    "./skills/grilling",
+    "./skills/to-spec",
+    "./skills/to-tickets"
+  ]
+}

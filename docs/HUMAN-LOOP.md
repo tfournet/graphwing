@@ -25,7 +25,7 @@ Two different "graphs". Do not smash them:
 
 ## Flow
 
-1. **Grill.** Tab `claude`, `/grill-with-docs`. Skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`).
+1. **Grill.** Tab `claude`, `/grill-with-docs`. Steps 1, 3 and 5 ship in the `graphwing-loop` plugin (`plugins/graphwing-loop/`); `install.py` offers it, or `claude plugin marketplace add <checkout> && claude plugin install graphwing-loop@graphwing`. A same-named skill in `~/.claude/skills/` **wins over the plugin**, so remove any leftover `grilling` / `to-spec` / `to-tickets` there. Seat skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills` supplies `/grill-with-docs` and `domain-modeling`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`).
 2. **UI.** Storybook throwaways; the engineer picks. Then agents may build.
 3. **Spec.** `/to-spec` onto Shortcut. The Shortcut story is the external idea, not the slice list.
 4. **Ready** (Shortcut). Spec is good enough to **Structure**. Graph does **not** write yet.
