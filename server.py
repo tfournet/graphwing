@@ -47,6 +47,10 @@ HERDR_AGENT = os.environ.get("GRAPHWING_HERDR_AGENT", "graphwing") or "graphwing
 HERDR_GRAPH_LABEL = "graph"
 HERDR_SOURCE = "graphwing"
 HERDR_JOB_TAB_MAX = 8
+# Leave a finished job's tab open long enough to actually read it. Closing on
+# completion meant the interesting output vanished the moment it appeared.
+# The tab-count cap still wins: a burst of jobs evicts lingering tabs early.
+HERDR_TAB_LINGER_SECONDS = int(os.environ.get("GRAPHWING_HERDR_TAB_LINGER", "180"))
 HERDR_LOCK = threading.Lock()
 HOME_PROFILE = "graphwing"
 
@@ -96,6 +100,8 @@ SLICE_BUDGET = {
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
+HERDR_LINGER_LOCK = threading.Lock()
+HERDR_LINGER: dict[str, float] = {}
 JWKS_LOCK = threading.Lock()
 JWKS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
@@ -1788,7 +1794,29 @@ def herdr_job_tab_label(job: dict[str, Any]) -> str:
 
 def herdr_close_tab(tab_id: str) -> None:
     if tab_id:
+        with HERDR_LINGER_LOCK:
+            HERDR_LINGER.pop(tab_id, None)
         herdr_cli(["tab", "close", tab_id])
+
+
+def herdr_tab_lingering(tab_id: str) -> bool:
+    """True while a finished tab is inside its reading window."""
+    with HERDR_LINGER_LOCK:
+        deadline = HERDR_LINGER.get(tab_id)
+    return bool(deadline and time.time() < deadline)
+
+
+def herdr_close_tab_later(tab_id: str, delay: float) -> None:
+    if not tab_id:
+        return
+    if delay <= 0:
+        herdr_close_tab(tab_id)
+        return
+    with HERDR_LINGER_LOCK:
+        HERDR_LINGER[tab_id] = time.time() + delay
+    timer = threading.Timer(delay, herdr_close_tab, args=(tab_id,))
+    timer.daemon = True
+    timer.start()
 
 
 def herdr_prune_job_tabs() -> None:
@@ -1798,8 +1826,9 @@ def herdr_prune_job_tabs() -> None:
     for tab in tabs:
         tid = str(tab.get("tab_id") or "")
         if str(tab.get("agent_status") or "") == "done":
-            herdr_close_tab(tid)
-            continue
+            if not herdr_tab_lingering(tid):
+                herdr_close_tab(tid)
+                continue
         live.append(tab)
     extra = len(live) - HERDR_JOB_TAB_MAX
     if extra <= 0:
@@ -1840,6 +1869,27 @@ def herdr_follow_job(job: dict[str, Any]) -> None:
         herdr_send(pane_id, f"tail -F '{log_path}'\n")
 
 
+def herdr_show_session(job: dict[str, Any]) -> None:
+    """Swap a finished writer's pane from the log tail to its real session.
+
+    While the job runs, the headless process owns that Hermes session, so the
+    pane tails stdout.log instead. Once it is done the tail is a frozen file
+    and the session is fully readable, which is what the linger window is for.
+    Only writer jobs have one; test and review are not Hermes, so they keep
+    the tail.
+    """
+    if HERDR_TAB_LINGER_SECONDS <= 0:
+        return
+    pane_id = str(job.get("herdr_pane_id") or "")
+    session = job.get("hermes_session")
+    if not pane_id or not isinstance(session, str) or not HERMES_SESSION_RE.fullmatch(session):
+        return
+    cwd = str(job.get("cwd") or HOME)
+    # Ctrl-C stops tail -F before the pane runs anything else.
+    herdr_send(pane_id, "\x03")
+    herdr_send(pane_id, f"{HERMES_BIN} --resume '{session}' --in '{cwd}' --no-restore-cwd\n")
+
+
 def herdr_job_done(job: dict[str, Any]) -> None:
     if not herdr_enabled():
         return
@@ -1855,7 +1905,8 @@ def herdr_job_done(job: dict[str, Any]) -> None:
             if isinstance(tab, dict) and str(tab.get("label") or "") == label:
                 tab_id = str(tab.get("tab_id") or "")
                 break
-    herdr_close_tab(tab_id)
+    herdr_show_session(job)
+    herdr_close_tab_later(tab_id, HERDR_TAB_LINGER_SECONDS)
 
 
 def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str:

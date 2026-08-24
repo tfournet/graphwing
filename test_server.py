@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1299,6 +1300,7 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
                 status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
         self.assertEqual(status, 202, payload)
@@ -1321,6 +1323,52 @@ class DispatchTests(unittest.TestCase):
             props = spec["components"]["schemas"][name].get("properties", {})
             self.assertIn("response_webhook_url", props, route)
             self.assertIn("response_webhook_token", props, route)
+
+    def test_herdr_tab_lingers_before_closing(self):
+        # A finished job's tab used to close the instant it completed, so the
+        # output you wanted to read disappeared as it arrived.
+        closed = []
+        with mock.patch.object(server, "herdr_cli", lambda args, **kw: closed.append(args) or {}):
+            server.herdr_close_tab_later("tab-1", 60)
+            self.assertTrue(server.herdr_tab_lingering("tab-1"))
+            self.assertEqual(closed, [], "must not close while lingering")
+            # prune leaves a lingering done tab alone...
+            listed = {"tabs": [{"tab_id": "tab-1", "label": "gw-x", "agent_status": "done"}]}
+            with mock.patch.object(server, "herdr_cli", lambda args, **kw: listed if args[:2] == ["tab", "list"] else closed.append(args) or {}):
+                server.herdr_prune_job_tabs()
+            self.assertEqual(closed, [], "prune closed a tab still inside its window")
+            # ...and reaps it once the window passes
+            with server.HERDR_LINGER_LOCK:
+                server.HERDR_LINGER["tab-1"] = time.time() - 1
+            self.assertFalse(server.herdr_tab_lingering("tab-1"))
+            with mock.patch.object(server, "herdr_cli", lambda args, **kw: listed if args[:2] == ["tab", "list"] else closed.append(args) or {}):
+                server.herdr_prune_job_tabs()
+            self.assertIn(["tab", "close", "tab-1"], closed)
+
+    def test_herdr_linger_is_configurable(self):
+        self.assertGreaterEqual(server.HERDR_TAB_LINGER_SECONDS, 0)
+
+    def test_finished_writer_pane_shows_the_real_session(self):
+        # The pane tails stdout.log while the job runs because the headless
+        # process owns the session. Once it is done the tail is a dead file,
+        # so the linger window should show the session you can actually read.
+        sent = []
+        job = {"job_id": "cd" * 16, "status": "completed", "herdr_pane_id": "w1:p3",
+               "hermes_session": "gwslice-" + "a" * 32, "cwd": "/tmp"}
+        with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append((pane, text))):
+            server.herdr_show_session(job)
+        self.assertEqual(sent[0], ("w1:p3", "\x03"), "must stop tail -F first")
+        self.assertIn("--resume", sent[1][1])
+        self.assertIn("gwslice-" + "a" * 32, sent[1][1])
+
+    def test_non_writer_panes_keep_the_tail(self):
+        # test and review jobs are not hermes and have no session to resume.
+        sent = []
+        with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append(text)):
+            server.herdr_show_session({"herdr_pane_id": "w1:p3", "kind": "test", "hermes_session": None})
+            server.herdr_show_session({"herdr_pane_id": "w1:p3", "hermes_session": "not-a-gwslice-name"})
+            server.herdr_show_session({"hermes_session": "gwslice-" + "b" * 32})
+        self.assertEqual(sent, [])
 
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1631,7 +1679,9 @@ class DispatchTests(unittest.TestCase):
         }
         with mock.patch.object(server, "herdr_cli", fake_cli):
             with mock.patch.object(server, "herdr_log"):
-                server.herdr_job_done(job)
+                with mock.patch.object(server, "HERDR_TAB_LINGER_SECONDS", 0):
+                    server.herdr_job_done(job)
+        # linger 0 closes inline; the default keeps the tab open to be read
         self.assertIn(["tab", "close", "w1:t9"], calls)
 
     def test_herdr_prune_closes_done_tabs(self):
