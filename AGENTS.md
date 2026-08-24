@@ -25,7 +25,7 @@ Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted
 
 ## Git (tfournet/graphwing)
 
-Work on a branch. Open a PR. Rebase onto current `main` before merge. Merge the PR as part of finishing the task (`gh pr merge --rebase --delete-branch`). Do not wait for Tim to merge. Do not push commits straight to `main`.
+Work in a git worktree (`/home/tim/work/gw-<short>`), not the primary clone. Branch from `origin/main`. Open a PR. Rebase onto current `main` before merge. Merge the PR as part of finishing the task (`gh pr merge --rebase --delete-branch`). Do not wait for Tim to merge. Do not push commits straight to `main`. After merge, `git worktree remove` the tree. If merge cannot check out `main` because another worktree holds it, still merge the PR and skip the local checkout.
 
 ## Tests
 
