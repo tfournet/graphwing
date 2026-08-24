@@ -22,9 +22,11 @@ omarchy plugin enable graphwing.watch --section right --before omarchy.agents
   finished rows show elapsed time. A finished job's receipt summary is the
   extra line, not the transcript. No webhook tokens.
 
-The icon sits dim when the daemon is unreachable, lights when jobs are in
-flight, and uses the urgent color when the API is down or a recent job failed.
-A small count appears on the icon while anything is queued or running.
+The icon stays at full contrast while the API is up, so it does not vanish
+next to Tailscale when idle. Urgent means the API is down or a job just
+failed. A small count appears while anything is queued or running. A new
+failure also fires an Omarchy notification. Existing failures at startup
+do not.
 
 ## Data
 
@@ -48,8 +50,10 @@ The daemon must be the copy in `$GRAPHWING_HOME` that already serves `/v1/watch`
 | `refreshIntervalSec` | `5` | How often the helper hits `/v1/watch` |
 | `port` | `8645` | Daemon listen port |
 | `home` | `~/.graphwing` | Seat directory that holds `api.key` |
+| `notifyOnFail` | `true` | Desktop notification when a job newly fails |
 
 ```bash
 omarchy bar set graphwing.watch refreshIntervalSec 10 --json
 omarchy bar set graphwing.watch home ~/.graphwing
+omarchy bar set graphwing.watch notifyOnFail false --json
 ```

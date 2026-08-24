@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "graphwing.watch",
   "name": "Graphwing",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "graphwing",
   "license": "MIT",
   "description": "Graphwing daemon health and in-flight workflow jobs in the Omarchy bar.",
@@ -21,7 +21,8 @@
     "defaults": {
       "refreshIntervalSec": 5,
       "port": 8645,
-      "home": ""
+      "home": "",
+      "notifyOnFail": true
     },
     "schema": [
       {
@@ -48,6 +49,12 @@
         "label": "GRAPHWING_HOME",
         "defaultValue": "",
         "description": "Empty means $GRAPHWING_HOME or ~/.graphwing. The plugin reads api.key from here."
+      },
+      {
+        "key": "notifyOnFail",
+        "type": "boolean",
+        "label": "Notify on new failures",
+        "defaultValue": true
       }
     ]
   }
