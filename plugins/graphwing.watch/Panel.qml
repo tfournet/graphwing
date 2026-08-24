@@ -16,6 +16,7 @@ Panel {
   property int jobIndex: 0
   property string focusSection: "header"
   property bool cursorActive: false
+  property double nowMs: Date.now()
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -111,9 +112,17 @@ Panel {
 
   onOpenedChanged: if (opened) {
     cursorActive = false
+    nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
     watch.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  Timer {
+    interval: 1000
+    running: root.opened
+    repeat: true
+    onTriggered: root.nowMs = Date.now()
   }
 
   Service {
@@ -393,12 +402,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: {
-            if (!jobRow.job) return ""
-            var bits = [jobRow.job.kind, jobRow.status]
-            if (jobRow.job.repo) bits.push(jobRow.job.repo)
-            return bits.join(" · ")
-          }
+          text: Model.jobDetail(jobRow.job, root.nowMs)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

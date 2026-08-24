@@ -561,7 +561,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.3")
+        self.assertEqual(spec["info"]["version"], "0.5.4")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -1072,6 +1072,7 @@ class DispatchTests(unittest.TestCase):
                     "script": "publish-graphs",
                     "created_at": "2026-08-24T10:00:00Z",
                     "finished_at": "2026-08-24T10:01:00Z",
+                    "receipt": {"status": "ok", "summary": "published implement-slice", "token": "nope"},
                 },
             )
             long_prompt = "x" * 200
@@ -1129,6 +1130,10 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(failed["status"], "failed")
             self.assertNotIn("webhook", failed)
             self.assertNotIn("prompt", failed)
+            done = next(j for j in payload["recent"] if j["job_id"] == done_id)
+            self.assertEqual(done["summary"], "published implement-slice")
+            self.assertNotIn("token", json.dumps(done))
+            self.assertNotIn("nope", json.dumps(payload))
 
     def test_watch_helper_no_key(self):
         helper = Path(__file__).resolve().parent / "plugins" / "graphwing.watch" / "status.py"

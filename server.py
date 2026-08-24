@@ -2098,6 +2098,10 @@ def watch_job(job: dict[str, Any]) -> dict[str, Any]:
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "error": clip_text(job.get("error"), WATCH_ERROR_CHARS),
+        "summary": clip_text(
+            (job.get("receipt") or {}).get("summary") if isinstance(job.get("receipt"), dict) else None,
+            80,
+        ),
     }
 
 

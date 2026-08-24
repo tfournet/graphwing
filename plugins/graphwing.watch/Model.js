@@ -35,7 +35,8 @@ function asJobs(value) {
       created_at: String(row.created_at || ""),
       started_at: String(row.started_at || ""),
       finished_at: String(row.finished_at || ""),
-      error: row.error ? String(row.error) : ""
+      error: row.error ? String(row.error) : "",
+      summary: row.summary ? String(row.summary) : ""
     })
   }
   return out
@@ -115,6 +116,42 @@ function unitRows(units) {
     })
   }
   return rows
+}
+
+function parseMs(iso) {
+  if (!iso) return 0
+  var ms = Date.parse(String(iso))
+  return isFinite(ms) ? ms : 0
+}
+
+function formatDuration(ms) {
+  if (!(ms > 0)) return ""
+  var sec = Math.floor(ms / 1000)
+  var min = Math.floor(sec / 60)
+  var hr = Math.floor(min / 60)
+  if (hr > 0) return hr + "h " + (min % 60) + "m"
+  if (min > 0) return min + "m"
+  return Math.max(1, sec) + "s"
+}
+
+function jobElapsed(job, nowMs) {
+  if (!job) return ""
+  var start = parseMs(job.started_at || job.created_at)
+  if (!start) return ""
+  var end = parseMs(job.finished_at)
+  if (!end) end = nowMs
+  return formatDuration(end - start)
+}
+
+function jobDetail(job, nowMs) {
+  if (!job) return ""
+  var bits = [job.kind, job.status]
+  if (job.repo) bits.push(job.repo)
+  var elapsed = jobElapsed(job, nowMs)
+  if (elapsed) bits.push(elapsed)
+  if (job.error) bits.push(job.error)
+  else if (job.summary) bits.push(job.summary)
+  return bits.join(" · ")
 }
 
 function statusLabel(snap) {
