@@ -4,7 +4,7 @@
     "title": "graphwing",
 
     "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
-    "version": "0.5.2"
+    "version": "0.5.3"
   },
   "servers": [
     {
@@ -13,6 +13,7 @@
   ],
   "tags": [
     { "name": "health" },
+    { "name": "watch" },
     { "name": "doorbell" },
     { "name": "git" },
     { "name": "file" },
@@ -42,6 +43,24 @@
               }
             }
           }
+        }
+      }
+    },
+    "/v1/watch": {
+      "get": {
+        "operationId": "watch",
+        "tags": ["watch"],
+        "summary": "Panel snapshot: systemd units plus in-flight and recent jobs. No secrets, no transcripts.",
+        "responses": {
+          "200": {
+            "description": "snapshot",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Watch" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     },
@@ -771,6 +790,41 @@
           "ok": { "type": "boolean" },
           "service": { "type": "string" },
           "repos": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "WatchJob": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
+          "kind": { "type": "string" },
+          "title": { "type": "string" },
+          "repo": { "type": ["string", "null"] },
+          "created_at": { "type": ["string", "null"] },
+          "started_at": { "type": ["string", "null"] },
+          "finished_at": { "type": ["string", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      },
+      "Watch": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "service": { "type": "string" },
+          "units": { "type": "object" },
+          "units_healthy": { "type": "boolean" },
+          "api_active": { "type": "boolean" },
+          "counts": {
+            "type": "object",
+            "properties": {
+              "queued": { "type": "integer" },
+              "running": { "type": "integer" },
+              "active": { "type": "integer" },
+              "failed_recent": { "type": "integer" }
+            }
+          },
+          "active": { "type": "array", "items": { "$ref": "#/components/schemas/WatchJob" } },
+          "recent": { "type": "array", "items": { "$ref": "#/components/schemas/WatchJob" } }
         }
       },
       "StackStatus": {

@@ -561,7 +561,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.2")
+        self.assertEqual(spec["info"]["version"], "0.5.3")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -595,6 +595,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(spec["paths"]["/v1/slice/e2e"]["post"]["operationId"], "sliceE2e")
         self.assertIn("/v1/agent/run", spec["paths"])
         self.assertIn("/v1/agent/jobs/{job_id}", spec["paths"])
+        self.assertIn("/v1/watch", spec["paths"])
+        self.assertEqual(spec["paths"]["/v1/watch"]["get"]["operationId"], "watch")
         doorbell = spec["paths"]["/v1/doorbell/pr-drive"]["post"]
         self.assertEqual(doorbell["operationId"], "doorbellPrDrive")
         self.assertEqual(doorbell["security"], [])
@@ -982,6 +984,154 @@ class DispatchTests(unittest.TestCase):
         status, payload, _ = server.dispatch("GET", "/v1/units/status", {}, True, b"")
         self.assertEqual(status, 200, payload)
         self.assertIn("graphwing-api", payload["units"])
+
+    def test_watch_requires_key(self):
+        status, payload, _ = server.dispatch("GET", "/v1/watch", {}, False, b"")
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["code"], "unauthorized")
+
+    def _write_watch_job(self, root: Path, job: dict) -> None:
+        jdir = root / job["job_id"]
+        jdir.mkdir(parents=True)
+        (jdir / "job.json").write_text(json.dumps(job) + "\n")
+
+    def test_watch_snapshot_strips_secrets_and_ranks_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td)
+            running_id = "aa" * 16
+            queued_id = "bb" * 16
+            failed_id = "cc" * 16
+            done_id = "dd" * 16
+            self._write_watch_job(
+                jobs,
+                {
+                    "job_id": running_id,
+                    "kind": "agent",
+                    "status": "running",
+                    "repo": "riftwing",
+                    "prompt": "implement the login tracer\nsecret second line",
+                    "response_webhook_token": "do-not-leak",
+                    "created_at": "2026-08-24T12:00:00Z",
+                    "started_at": "2026-08-24T12:00:01Z",
+                    "finished_at": None,
+                    "error": None,
+                },
+            )
+            self._write_watch_job(
+                jobs,
+                {
+                    "job_id": queued_id,
+                    "kind": "review",
+                    "status": "queued",
+                    "reviewer": "sonnet",
+                    "repo": "riftwing",
+                    "created_at": "2026-08-24T12:01:00Z",
+                },
+            )
+            self._write_watch_job(
+                jobs,
+                {
+                    "job_id": failed_id,
+                    "kind": "test",
+                    "status": "failed",
+                    "script": "riftwing-local-gates",
+                    "created_at": "2026-08-24T11:00:00Z",
+                    "finished_at": "2026-08-24T11:05:00Z",
+                    "error": "suite red\ntraceback",
+                    "response_webhook_url": "https://example.invalid/resume",
+                },
+            )
+            self._write_watch_job(
+                jobs,
+                {
+                    "job_id": done_id,
+                    "kind": "script",
+                    "status": "completed",
+                    "script": "publish-graphs",
+                    "created_at": "2026-08-24T10:00:00Z",
+                    "finished_at": "2026-08-24T10:01:00Z",
+                },
+            )
+            long_prompt = "x" * 200
+            self._write_watch_job(
+                jobs,
+                {
+                    "job_id": "ee" * 16,
+                    "kind": "agent",
+                    "status": "completed",
+                    "prompt": long_prompt,
+                    "created_at": "2026-08-24T09:00:00Z",
+                    "finished_at": "2026-08-24T09:02:00Z",
+                },
+            )
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(
+                server, "units_status", return_value={
+                    "ok": True,
+                    "healthy": False,
+                    "units": {
+                        "graphwing-api": {"active": True, "state": "active"},
+                        "graphwing-tunnel": {"active": True, "state": "active"},
+                        "graphwing-herdr": {"active": False, "state": "inactive"},
+                    },
+                }
+            ):
+                status, payload, _ = server.dispatch("GET", "/v1/watch", {}, True, b"")
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["api_active"])
+            self.assertFalse(payload["units_healthy"])
+            self.assertEqual(payload["counts"]["running"], 1)
+            self.assertEqual(payload["counts"]["queued"], 1)
+            self.assertEqual(payload["counts"]["active"], 2)
+            self.assertEqual(payload["counts"]["failed_recent"], 1)
+            active_ids = [j["job_id"] for j in payload["active"]]
+            self.assertEqual(active_ids[0], queued_id)
+            self.assertIn(running_id, active_ids)
+            titles = {j["job_id"]: j["title"] for j in payload["active"] + payload["recent"]}
+            self.assertEqual(titles[queued_id], "review sonnet")
+            self.assertEqual(titles[running_id], "implement the login tracer")
+            self.assertEqual(titles[failed_id], "riftwing-local-gates")
+            dumped = json.dumps(payload)
+            self.assertNotIn("do-not-leak", dumped)
+            self.assertNotIn("https://example.invalid/resume", dumped)
+            self.assertNotIn("secret second line", dumped)
+            long_row = next(j for j in payload["recent"] if j["job_id"] == "ee" * 16)
+            self.assertLessEqual(len(long_row["title"]), server.WATCH_TITLE_CHARS)
+            self.assertTrue(long_row["title"].endswith("…"))
+            failed = next(j for j in payload["recent"] if j["job_id"] == failed_id)
+            self.assertEqual(failed["error"], "suite red")
+            self.assertEqual(failed["status"], "failed")
+            self.assertNotIn("webhook", failed)
+            self.assertNotIn("prompt", failed)
+
+    def test_watch_helper_no_key(self):
+        helper = Path(__file__).resolve().parent / "plugins" / "graphwing.watch" / "status.py"
+        with tempfile.TemporaryDirectory() as td:
+            proc = subprocess.run(
+                [sys.executable, str(helper), td, "8645"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "no_key")
+
+    def test_watch_empty_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(server, "JOBS_DIR", Path(td)), mock.patch.object(
+                server, "units_status", return_value={
+                    "ok": True,
+                    "healthy": True,
+                    "units": {"graphwing-api": {"active": True, "state": "active"}},
+                }
+            ):
+                status, payload, _ = server.dispatch("GET", "/v1/watch", {}, True, b"")
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["counts"]["active"], 0)
+            self.assertEqual(payload["active"], [])
+            self.assertEqual(payload["recent"], [])
 
     def test_herdr_agents(self):
         status, payload, _ = server.dispatch("GET", "/v1/herdr/agents", {}, True, b"")
