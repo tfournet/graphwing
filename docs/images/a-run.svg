@@ -2,7 +2,7 @@
   <title id="t2">What one Graph run does</title>
   <desc id="d2">Trigger, named HTTP ops, optional wait for an agent job, next step from the receipt.</desc>
   <rect width="960" height="280" fill="#121814"/>
-  <text x="32" y="36" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="0.18em">ONE RUN · NAMED OPS</text>
+  <text x="32" y="36" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="0.18em">ONE WORKFLOW RUN</text>
 
   <g font-family="ui-sans-serif, system-ui, sans-serif">
     <rect x="32" y="64" width="150" height="72" rx="8" fill="#24352c" stroke="#e8b86d" stroke-width="2"/>
@@ -10,16 +10,16 @@
     <text x="107" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">form / webhook</text>
 
     <rect x="230" y="64" width="170" height="72" rx="8" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
-    <text x="315" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">Named op</text>
-    <text x="315" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">git / test / fileHead</text>
+    <text x="315" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">HTTP step</text>
+    <text x="315" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">git, test, read file</text>
 
     <rect x="448" y="64" width="170" height="72" rx="8" fill="#24352c" stroke="#c46b3a" stroke-width="2"/>
-    <text x="533" y="94" text-anchor="middle" fill="#c46b3a" font-size="14" font-weight="700">agentRun?</text>
-    <text x="533" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">202 + wait.webhook</text>
+    <text x="533" y="94" text-anchor="middle" fill="#c46b3a" font-size="14" font-weight="700">Coding agent?</text>
+    <text x="533" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">start job, Rewst waits</text>
 
     <rect x="666" y="64" width="150" height="72" rx="8" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
-    <text x="741" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">Next edge</text>
-    <text x="741" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">commit / park / kick</text>
+    <text x="741" y="94" text-anchor="middle" fill="#7dcea0" font-size="14" font-weight="700">Then</text>
+    <text x="741" y="114" text-anchor="middle" fill="#c5d4cc" font-size="11">commit, stop, or next</text>
 
     <rect x="848" y="64" width="80" height="72" rx="8" fill="#24352c" stroke="#d97aa8" stroke-width="2"/>
     <text x="888" y="106" text-anchor="middle" fill="#d97aa8" font-size="14" font-weight="700">Done</text>
@@ -30,8 +30,8 @@
   <path d="M618 100 H666" stroke="#c46b3a" stroke-width="2" fill="none"/>
   <path d="M816 100 H848" stroke="#7dcea0" stroke-width="2" fill="none"/>
 
-  <text x="32" y="180" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Most steps return 200 and data. The Graph continues on that JSON.</text>
-  <text x="32" y="206" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">agentRun returns 202. The Graph waits. Graphwing POSTs a receipt when the job finishes.</text>
-  <text x="32" y="232" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Prefer a new HTTP op over stuffing more work into the agent loop.</text>
-  <text x="32" y="258" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">A long walk is several runs. Each run does one slice, then kicks the next webhook.</text>
+  <text x="32" y="180" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Git and tests return JSON right away. Rewst goes to the next step.</text>
+  <text x="32" y="206" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">A coding agent is a background job. Graphwing POSTs the result when it exits.</text>
+  <text x="32" y="232" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">If a step is a plain command, give it its own URL. Do not fold it into the agent.</text>
+  <text x="32" y="258" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">The next ticket is a new workflow run, not a loop inside this one.</text>
 </svg>
