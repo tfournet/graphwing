@@ -18,8 +18,9 @@ omarchy plugin enable graphwing.watch --section right --before omarchy.agents
   optional. The bar only goes red when `graphwing-api` is down.
 - **Jobs** — queued and running first, then the last eight finished. Failed
   rows use the urgent color. Titles prefer a ticket path or PR number, then a
-  heading slug like `01-login`, then the recipe or reviewer. No webhook tokens,
-  no transcripts.
+  heading slug like `01-login`, then the recipe or reviewer. Running and
+  finished rows show elapsed time. A finished job's receipt summary is the
+  extra line, not the transcript. No webhook tokens.
 
 The icon sits dim when the daemon is unreachable, lights when jobs are in
 flight, and uses the urgent color when the API is down or a recent job failed.
