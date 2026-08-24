@@ -2030,6 +2030,9 @@ WATCH_RECENT = 8
 WATCH_TITLE_CHARS = 72
 WATCH_ERROR_CHARS = 120
 WATCH_ACTIVE = frozenset({"queued", "running"})
+WATCH_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$")
+WATCH_TICKET_SLUG_RE = re.compile(r"^\d{2,}[-_][A-Za-z0-9._-]+")
+WATCH_SLICE_PATH_RE = re.compile(r"(?:^|\s)((?:slices|tickets)/[A-Za-z0-9._/-]+\.md)\b")
 
 
 def clip_text(text: Any, n: int) -> str | None:
@@ -2043,6 +2046,25 @@ def clip_text(text: Any, n: int) -> str | None:
     return first
 
 
+def prompt_title(prompt: Any) -> str | None:
+    text = str(prompt or "").strip()
+    if not text:
+        return None
+    path = WATCH_SLICE_PATH_RE.search(text)
+    if path:
+        return Path(path.group(1)).stem
+    first = text.splitlines()[0].strip()
+    heading = WATCH_HEADING_RE.match(first)
+    if heading:
+        rest = heading.group(1).strip()
+        if ":" in rest:
+            slug = rest.split(":", 1)[0].strip()
+            if WATCH_TICKET_SLUG_RE.match(slug) or "-" in slug:
+                return clip_text(slug, WATCH_TITLE_CHARS)
+        return clip_text(rest, WATCH_TITLE_CHARS)
+    return clip_text(first, WATCH_TITLE_CHARS)
+
+
 def job_title(job: dict[str, Any]) -> str:
     kind = str(job.get("kind") or "agent")
     if kind in ("script", "test", "rr"):
@@ -2050,7 +2072,16 @@ def job_title(job: dict[str, Any]) -> str:
     if kind == "review":
         who = str(job.get("reviewer") or "").strip()
         return f"review {who}".strip() if who else "review"
-    return clip_text(job.get("prompt"), WATCH_TITLE_CHARS) or kind
+    ticket = str(job.get("ticket") or "").strip()
+    if ticket:
+        name = Path(ticket).name
+        if name.endswith(".md"):
+            name = name[:-3]
+        return clip_text(name, WATCH_TITLE_CHARS) or kind
+    pr = job.get("pr")
+    if pr not in (None, ""):
+        return f"PR {pr}"
+    return prompt_title(job.get("prompt")) or kind
 
 
 def watch_job(job: dict[str, Any]) -> dict[str, Any]:
