@@ -86,6 +86,13 @@ SLICE_SIZES = ("S", "M", "L")
 # reviewer already used 8. Read the diff, think, answer, and leave slack for a
 # provider hiccup or a dropped connection costing a turn.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
+# Spec-review is read-only. The claude reviewers get --permission-mode plan,
+# which enforces that in the runner. Hermes has no equivalent flag, so the sol
+# reviewer is restricted by toolset instead: the ticket and diff are already in
+# the prompt, so it needs no file or terminal tools to answer. An empty -t is
+# silently ignored (hermes falls back to the config default), so name a real
+# harmless toolset.
+REVIEW_TOOLSETS = os.environ.get("GRAPHWING_REVIEW_TOOLSETS", "todo")
 SLICE_BUDGET = {
     ("mechanical", "S"): (10, 120),
     ("mechanical", "M"): (30, 300),
@@ -1358,8 +1365,10 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
             "--in",
             str(resolved),
             "--no-restore-cwd",
+            "-t",
+            REVIEW_TOOLSETS,
             "--max-turns",
-            "8",
+            str(REVIEW_MAX_TURNS),
             "--run-budget",
             "180",
             "--yolo",

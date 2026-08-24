@@ -1260,6 +1260,51 @@ class DispatchTests(unittest.TestCase):
         # turn cannot read a diff and answer.
         self.assertGreaterEqual(server.REVIEW_MAX_TURNS, 8)
 
+    def _review_cmd(self, reviewer):
+        """Build one review command without running it."""
+        seen = {}
+
+        class FakeProc:
+            stdout = b"VERDICT: PASS\n"
+            stderr = b""
+            returncode = 0
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return FakeProc()
+
+        with mock.patch.object(server, "git_diff", return_value={"diff": "diff --git a b"}), \
+             mock.patch.object(server.subprocess, "run", fake_run), \
+             mock.patch.object(server.Path, "is_file", lambda self: True), \
+             mock.patch.object(server, "hermes_job_env", return_value={}):
+            server.review_result(reviewer, "ticket text", Path("/tmp"))
+        return seen["cmd"]
+
+    def test_sol_reviewer_cannot_write_to_the_repo(self):
+        # The claude reviewers get --permission-mode plan, which enforces
+        # read-only in the runner. The hermes reviewer got --yolo and no
+        # toolset restriction, so "do not edit files, commit, or push" was
+        # prompt text a model could ignore. Sol gates every visual and
+        # sensitive slice, which are the classes least safe to leave writable.
+        # The diff and ticket are already in the prompt, so the reviewer needs
+        # no file or terminal tools to answer.
+        cmd = self._review_cmd("sol")
+        self.assertIn("-t", cmd, "sol review must restrict toolsets")
+        toolsets = cmd[cmd.index("-t") + 1].split(",")
+        for banned in ("file", "terminal", "code_execution", "browser"):
+            self.assertNotIn(banned, toolsets)
+        # -t '' is silently ignored by hermes: an empty string falls back to
+        # the config default and the model keeps its file tools.
+        self.assertTrue(toolsets and toolsets[0], "empty -t does not restrict anything")
+
+    def test_sol_reviewer_honours_the_shared_turn_budget(self):
+        # REVIEW_MAX_TURNS is env-tunable but only the claude branch read it.
+        # The hermes branch passed a literal "8", so raising the knob did
+        # nothing for the reviewer that gates visual and sensitive slices.
+        cmd = self._review_cmd("sol")
+        self.assertIn("--max-turns", cmd)
+        self.assertEqual(cmd[cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
+
     def test_async_gates_wait_for_the_result_not_the_ack(self):
         # testRun and reviewRun return a queue receipt ({"ok": true,
         # "status": "queued"}). The graph used to feed that straight into a
