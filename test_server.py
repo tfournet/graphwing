@@ -1307,6 +1307,21 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(payload["job_id"])
         enq.assert_called_once()
 
+    def test_async_ops_declare_webhook_fields_in_the_spec(self):
+        # The graph sent response_webhook_url to reviewRun, the server read it,
+        # and it still went down the sync path: ReviewRunRequest did not declare
+        # the field, so Rewst dropped it building the request. The wait node
+        # then blocked on a callback nobody would ever send. Any operation the
+        # graph hands a webhook to must declare it, or the field vanishes
+        # between the graph and the server with no error anywhere.
+        spec = json.loads(server.openapi_bytes())
+        for route in ("/v1/review/run", "/v1/test/run", "/v1/script/run", "/v1/agent/run"):
+            body = spec["paths"][route]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            name = body["$ref"].rsplit("/", 1)[-1]
+            props = spec["components"]["schemas"][name].get("properties", {})
+            self.assertIn("response_webhook_url", props, route)
+            self.assertIn("response_webhook_token", props, route)
+
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))

@@ -1084,7 +1084,9 @@
         "properties": {
           "repo": { "type": "string" },
           "reviewer": { "type": "string", "enum": ["sonnet", "opus", "sol"] },
-          "prompt": { "type": "string" }
+          "prompt": { "type": "string" },
+          "response_webhook_url": { "type": "string" },
+          "response_webhook_token": { "type": "string" }
         }
       },
       "ReviewRunResult": {
