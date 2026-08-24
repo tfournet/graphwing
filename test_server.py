@@ -1079,7 +1079,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(status, 200, payload)
             self.assertTrue(payload["ok"])
             self.assertTrue(payload["api_active"])
-            self.assertFalse(payload["units_healthy"])
+            self.assertTrue(payload["units_healthy"])
             self.assertEqual(payload["counts"]["running"], 1)
             self.assertEqual(payload["counts"]["queued"], 1)
             self.assertEqual(payload["counts"]["active"], 2)

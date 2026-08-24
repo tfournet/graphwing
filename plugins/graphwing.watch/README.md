@@ -15,7 +15,7 @@ omarchy plugin enable graphwing.watch --section right --before omarchy.agents
 
 - **Hero** — Graphwing, and a one-line status (`Idle`, `2 running`, `Daemon down`).
 - **Units** — `api`, `tunnel`, `herdr` as systemd --user reports them. Herdr is
-  optional, so a red `inactive` there is not a daemon outage.
+  optional. The bar only goes red when `graphwing-api` is down.
 - **Jobs** — queued and running first, then the last eight finished. Failed
   rows use the urgent color. Titles are the first line of the prompt, a
   reviewer's name, or the script/test name. No webhook tokens, no transcripts.

@@ -2095,12 +2095,14 @@ def watch_snapshot() -> dict[str, Any]:
     running = sum(1 for j in active if j["status"] == "running")
     failed_recent = sum(1 for j in recent if j["status"] == "failed")
     api = (units.get("units") or {}).get("graphwing-api") or {}
+    api_active = bool(api.get("active"))
     return {
         "ok": True,
         "service": "graphwing",
         "units": units.get("units") or {},
-        "units_healthy": bool(units.get("healthy")),
-        "api_active": bool(api.get("active")),
+        # herdr and the tunnel are optional. The bar's traffic light is the API.
+        "units_healthy": api_active,
+        "api_active": api_active,
         "counts": {
             "queued": queued,
             "running": running,
