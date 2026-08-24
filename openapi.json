@@ -800,6 +800,8 @@
           "kind": { "type": "string" },
           "title": { "type": "string" },
           "repo": { "type": ["string", "null"] },
+          "tab": { "type": "string" },
+          "herdr_tab_id": { "type": ["string", "null"] },
           "created_at": { "type": ["string", "null"] },
           "started_at": { "type": ["string", "null"] },
           "finished_at": { "type": ["string", "null"] },

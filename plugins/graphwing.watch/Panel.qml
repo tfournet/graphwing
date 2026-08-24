@@ -69,6 +69,7 @@ Panel {
 
   function activateCursor() {
     if (focusSection === "header") watch.openHerdr()
+    else if (focusSection === "jobs" && jobs.length > 0) watch.openJob(jobs[jobIndex])
   }
 
   function setJobCursor(index) {
@@ -363,7 +364,9 @@ Panel {
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
       onEntered: root.setJobCursor(jobRow.rowIndex)
+      onClicked: watch.openJob(jobRow.job)
     }
 
     RowLayout {

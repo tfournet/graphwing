@@ -99,6 +99,15 @@ Item {
     Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.graphwing-herdr", "herdr", "--session", "graphwing"])
   }
 
+  function openJob(job) {
+    var label = job && job.tab ? String(job.tab) : ""
+    if (label === "") {
+      openHerdr()
+      return
+    }
+    Quickshell.execDetached(["python3", helperPath, homeDir, String(port), "focus", label])
+  }
+
   function openJournal() {
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
