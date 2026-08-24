@@ -64,6 +64,16 @@ Published slug: `graphwing-implement-slice`. Manual, form, or authenticated webh
 
 `ticket` must already be on the frontier, or omit it and Graph takes the next build.
 
+`ac_count` and `seams` feed `sliceRoute`, which may bump the size one step from countable features. Seven ACs took SC-110290 from floor `S` to `M`, which turned Sonnet spec-review on. Omitting them leaves the router blind and the floor unchanged, so send them honestly rather than to dodge a gate.
+
+Or fire from the seat without holding the webhook key:
+
+```bash
+scripts/fire-slice.sh payload.json
+```
+
+It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst trigger. The URL and `hook_secret` stay in `$GRAPHWING_HOME/rewst-install.json`. Needs `implement_slice_hook_url` recorded there; without it the endpoint answers 503 naming the key to set.
+
 `kick_url` is this workflow's own webhook. After a green slice, `sliceContinue` POSTs the next ticket there. Without it, this run does one slice and stops.
 
 Watch tab `graph`. Do not chat there.
@@ -90,7 +100,16 @@ python3 scripts/publish_graphs.py --only all --no-run
 
 Rewst rejects fan-in that is not `logic.join.*` and rejects unbounded cycles. One Graph run per slice. `kick_url` starts the next.
 
-After new OpenAPI ops, re-import the custom integration from `GET /openapi.json` then publish a new integration version, then publish graphs.
+After any `openapi.json` change, new operation or renamed field, re-import the integration **before** publishing graphs:
+
+```bash
+python3 scripts/reimport_integration.py       # PUT sourceUrl, then publish, records the version
+python3 scripts/publish_graphs.py --only implement-slice
+```
+
+Skipping this fails silently, which is the expensive part. Rewst builds every request from its own copy of the operation list, so a field the graph sends and the server reads is dropped on the floor when the integration does not declare it. SC-110290's third run lost `response_webhook_url` that way: the review ran synchronously, its wait node blocked on a callback nobody would send, and no layer reported anything.
+
+Two parameter names to avoid: the connector treats a query parameter called `path` as the request URL path and overwrites the endpoint with its value. `fileHead` and `gitDiff` use `rel` for that reason.
 
 ## Tests
 

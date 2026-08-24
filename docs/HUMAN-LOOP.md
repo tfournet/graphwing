@@ -25,7 +25,7 @@ Two different "graphs". Do not smash them:
 
 ## Flow
 
-1. **Grill.** Tab `claude`, `/grill-with-docs`. Steps 1, 3 and 5 ship in the `graphwing-loop` plugin (`plugins/graphwing-loop/`); `install.py` offers it, or `claude plugin marketplace add <checkout> && claude plugin install graphwing-loop@graphwing`. A same-named skill in `~/.claude/skills/` **wins over the plugin**, so remove any leftover `grilling` / `to-spec` / `to-tickets` there. Seat skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills` supplies `/grill-with-docs` and `domain-modeling`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`).
+1. **Grill.** Tab `claude`, `/grill-with-docs`. Steps 1, 3 and 5 ship in the `graphwing-loop` plugin (`plugins/graphwing-loop/`); `install.py` offers it, or `claude plugin marketplace add <checkout> && claude plugin install graphwing-loop@graphwing`. A same-named skill in `~/.claude/skills/` **wins over the plugin**, so remove any leftover `grilling` / `to-spec` / `to-tickets` there. Seat skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills` supplies `/grill-with-docs` and `domain-modeling`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`); both ride in `index.json`, never on the tracker card.
 2. **UI.** Storybook throwaways; the engineer picks. Then agents may build.
 3. **Spec.** `/to-spec` onto Shortcut. The Shortcut story is the external idea, not the slice list.
 4. **Ready** (Shortcut). Spec is good enough to **Structure**. Graph does **not** write yet.
@@ -133,10 +133,12 @@ Do not resume the last feature session to “fix e2e.”
 Future work lives in Obsidian `Riftwing/Notes/Graphwing human loop.md`. This list is what an engineer hits today.
 
 1. Structure is human `/to-tickets`. Graph never cuts tickets.
-2. Hermes `config.yaml` default writer is still `gpt-5.6-sol` / `openai-codex` until the seat is flipped to `grok-4.6`. `sliceRoute` still picks launcher, turns, and reviewers. Visual and sensitive spawn `claude -p`.
-3. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
-4. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
-5. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
+2. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
+3. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
+4. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
+5. **Re-import the integration after any `openapi.json` change**: `python3 scripts/reimport_integration.py`, then publish graphs. Rewst builds every request from its own copy of the operation list, so a field the graph sends and the server reads is dropped silently if the integration does not declare it. No error at any layer.
+
+The mechanical writer is `grok-4.6` via Hermes, confirmed on the first real run (SC-110290, 30 turns, 300s). The graph passes `model` explicitly from `sliceRoute`, so the seat's `config.yaml` default does not apply to slices and does not need flipping.
 
 `POST /v1/slice/e2e` runs after the map is empty when `e2e` is set: green/skip complete, `FAIL:` lines auto-add a ticket, blob drafts, three reds park. Next slice is `kick_url`, not a cycle inside one run.
 
