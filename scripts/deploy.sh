@@ -15,6 +15,23 @@ FILES=(server.py openapi.json setup_tunnel.py scripts.json tests.json)
 
 [ -d "$HOME_DIR" ] || { echo "no seat home: $HOME_DIR" >&2; exit 1; }
 
+# This copies whatever the working tree holds, so it deploys whatever branch is
+# checked out. Another session running `git checkout` in a shared clone silently
+# ships older code with a success message, which is exactly how a published
+# pr-drive graph ended up calling an endpoint the live server no longer had.
+# Work from a worktree on the branch you mean; override deliberately if not.
+BRANCH="$(git -C "$SRC" rev-parse --abbrev-ref HEAD)"
+WANT="${GRAPHWING_DEPLOY_BRANCH:-main}"
+if [ "$BRANCH" != "$WANT" ]; then
+  echo "refusing to deploy: $SRC is on '$BRANCH', expected '$WANT'" >&2
+  echo "use a worktree on $WANT, or set GRAPHWING_DEPLOY_BRANCH=$BRANCH" >&2
+  exit 1
+fi
+if ! git -C "$SRC" diff --quiet || ! git -C "$SRC" diff --cached --quiet; then
+  echo "note: deploying uncommitted changes from $SRC" >&2
+fi
+echo "deploying $BRANCH from $SRC"
+
 GRAPHWING_HOME=. python3 "$SRC/test_server.py" >/dev/null 2>&1 \
   || { echo "tests are red, not deploying" >&2; exit 1; }
 
