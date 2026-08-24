@@ -535,6 +535,52 @@
         }
       }
     },
+    "/v1/gh/pr/findings": {
+      "get": {
+        "operationId": "ghPrFindings",
+        "tags": ["gh"],
+        "summary": "Machine verdict for a PR: grade, holds, deduped findings, rendered brief",
+        "parameters": [
+          { "$ref": "#/components/parameters/repo" },
+          { "name": "number", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "findings", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/v1/gh/pr/merge": {
+      "post": {
+        "operationId": "ghPrMerge",
+        "tags": ["gh"],
+        "summary": "Merge a PR. Requires auto_merge and a run_id; re-checks green, mergeable, holds",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhPrMergeRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "merged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "409": { "description": "refused", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } }
+        }
+      }
+    },
+    "/v1/pr/continue": {
+      "post": {
+        "operationId": "prContinue",
+        "tags": ["gh"],
+        "summary": "Kick the next pr-drive attempt at kick_url, or stop at the ceiling",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrContinueRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "kicked or exhausted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
     "/v1/units/status": {
       "get": {
         "operationId": "unitsStatus",
@@ -1076,6 +1122,31 @@
           "path": { "type": "string" },
           "e2e_reds": { "type": "integer" },
           "compact": { "type": "string" }
+        }
+      },
+      "GhPrMergeRequest": {
+        "type": "object",
+        "required": ["repo", "number", "auto_merge", "run_id"],
+        "properties": {
+          "repo": { "type": "string" },
+          "number": { "type": "string" },
+          "auto_merge": { "type": "boolean", "description": "Off unless this run was started with auto-merge" },
+          "run_id": { "type": "string", "description": "Merge is only reachable from inside a run" },
+          "method": { "type": "string", "enum": ["squash", "merge", "rebase"] }
+        }
+      },
+      "PrContinueRequest": {
+        "type": "object",
+        "required": ["repo", "pr"],
+        "properties": {
+          "repo": { "type": "string" },
+          "pr": { "type": "string" },
+          "test": { "type": "string" },
+          "attempt": { "type": "integer" },
+          "max_attempts": { "type": "integer" },
+          "auto_merge": { "type": "boolean" },
+          "kick_url": { "type": "string", "description": "https Rewst webhook for the next attempt" },
+          "kick_token": { "type": "string" }
         }
       },
       "ReviewRunRequest": {

@@ -1071,6 +1071,71 @@ def slice_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
     return 200, {"ok": True, "repo": name, "index": index.strip(), "id": found["id"], "path": found["path"]}
 
 
+PR_MAX_ATTEMPTS = int(os.environ.get("GRAPHWING_PR_MAX_ATTEMPTS", "3"))
+
+
+def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Kick the next pr-drive attempt, or stop at the ceiling.
+
+    pr-drive took one swing at a red PR and ended. Driving to green means
+    looping, and Rewst forbids unbounded cycles inside one run, so the next
+    attempt is a fresh run kicked at kick_url, the way slice_continue walks
+    the slice map.
+
+    The ceiling is not optional. A writer that cannot fix a finding would
+    otherwise re-run forever, and each attempt costs a full agent session.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return 400, resolved
+    number = str(data.get("pr") or data.get("number") or "").strip()
+    if not number:
+        return 400, {"error": "pr is required", "code": "missing_pr"}
+
+    attempt, aerr = parse_optional_int(data, "attempt", 0, 99)
+    if aerr:
+        return 400, aerr
+    attempt = attempt or 1
+    ceiling, cerr = parse_optional_int(data, "max_attempts", 1, 99)
+    if cerr:
+        return 400, cerr
+    ceiling = ceiling or PR_MAX_ATTEMPTS
+
+    kick_url = data.get("kick_url")
+    if isinstance(kick_url, str) and kick_url.strip() and not valid_webhook_url(kick_url):
+        return 400, {"error": "kick_url must be https", "code": "bad_kick_url"}
+
+    out = {"ok": True, "repo": name, "pr": number, "attempt": attempt,
+           "max_attempts": ceiling, "kicked": False}
+    if attempt >= ceiling:
+        return 200, {**out, "code": "attempts_exhausted",
+                     "error": f"{attempt} of {ceiling} attempts used"}
+    if not kick_url:
+        return 200, {**out, "code": "no_kick_url"}
+
+    token = data.get("kick_token") or None
+    payload = {
+        "repo": name,
+        "pr": number,
+        "test": data.get("test"),
+        "attempt": attempt + 1,
+        "max_attempts": ceiling,
+        "auto_merge": bool(data.get("auto_merge")),
+        "kick_url": kick_url,
+        "kick_token": token,
+    }
+    hook = post_receipt(kick_url, payload, token=token)
+    out["kicked"] = bool(hook.get("ok"))
+    out["kick"] = hook
+    if not out["kicked"]:
+        return 502, {**out, "ok": False, "error": "kick failed", "code": "kick_failed"}
+    return 200, out
+
+
 def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -3110,6 +3175,9 @@ def dispatch_inner(
             out["repo"] = repo_name
             return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
 
+    if method == "POST" and path == "/v1/pr/continue":
+        status, payload = pr_continue(body, repos)
+        return json_out(status, payload)
     if method == "POST" and path == "/v1/gh/pr/merge":
         status, payload = gh_pr_merge(body, repos)
         return json_out(status, payload)

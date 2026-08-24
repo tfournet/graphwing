@@ -1339,6 +1339,52 @@ class DispatchTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(err["code"], "no_run_id")
 
+    def test_pr_continue_stops_at_the_attempt_ceiling(self):
+        # pr-drive took one swing and stopped. Looping is the point, but an
+        # unbounded loop on a PR the writer cannot fix would grind forever.
+        posted = []
+        with mock.patch.object(server, "post_receipt",
+                               lambda url, payload, token=None: posted.append(payload) or {"ok": True}):
+            status, out = server.pr_continue(json.dumps({
+                "repo": "r", "pr": 1, "attempt": 3, "max_attempts": 3,
+                "kick_url": "https://app.rewst.ai/api/hooks/x",
+            }).encode(), {"r": str(Path(server.__file__).parent)})
+        self.assertEqual(status, 200, out)
+        self.assertFalse(out["kicked"])
+        self.assertEqual(out["code"], "attempts_exhausted")
+        self.assertEqual(posted, [])
+
+    def test_pr_continue_kicks_the_next_attempt(self):
+        posted = []
+
+        def fake_post(url, payload, token=None):
+            posted.append((url, payload))
+            return {"ok": True}
+
+        with mock.patch.object(server, "post_receipt", fake_post):
+            status, out = server.pr_continue(json.dumps({
+                "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                "test": "riftwing-local-gates", "auto_merge": True,
+                "kick_url": "https://app.rewst.ai/api/hooks/x",
+            }).encode(), {"r": str(Path(server.__file__).parent)})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["kicked"])
+        self.assertEqual(len(posted), 1)
+        body = posted[0][1]
+        # The next run must carry the incremented attempt, or the ceiling
+        # never arrives and the loop is unbounded after all.
+        self.assertEqual(body["attempt"], 2)
+        # pr rides as a string, matching how gh_pr_merge and the graph treat it.
+        self.assertEqual(body["pr"], "1")
+        self.assertTrue(body["auto_merge"])
+
+    def test_pr_continue_refuses_a_non_https_kick(self):
+        status, out = server.pr_continue(json.dumps({
+            "repo": "r", "pr": 1, "attempt": 1, "kick_url": "http://evil.example/x",
+        }).encode(), {"r": str(Path(server.__file__).parent)})
+        self.assertEqual(status, 400)
+        self.assertEqual(out["code"], "bad_kick_url")
+
     def test_pr_merge_refuses_without_an_explicit_opt_in(self):
         # Auto-merge is per-run and off by default. The operator lock says the
         # engineer merges; this endpoint exists only for the runs where they

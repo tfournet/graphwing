@@ -228,6 +228,73 @@
         }
       },
       {
+        "id": "switch_merge",
+        "type": "logic.switch",
+        "label": "Auto-merge?",
+        "position": { "x": 3000, "y": 240 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "auto_merge", "rules": [{ "path": "CTX.INPUT.auto_merge", "op": "equals", "value": true }] }
+          ],
+          "default": { "label": "engineer_merges" }
+        }
+      },
+      {
+        "id": "merge",
+        "type": "action.graphwing.POST:/v1/gh/pr/merge",
+        "label": "Merge PR",
+        "position": { "x": 3200, "y": 180 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "number": "{{ CTX.INPUT.pr }}",
+          "auto_merge": "{{ CTX.INPUT.auto_merge }}",
+          "run_id": "{{ CTX.RUN.id }}",
+          "method": "squash"
+        }
+      },
+      {
+        "id": "continue",
+        "type": "action.graphwing.POST:/v1/pr/continue",
+        "label": "Kick next attempt",
+        "position": { "x": 3000, "y": 420 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "pr": "{{ CTX.INPUT.pr }}",
+          "test": "{{ CTX.INPUT.test }}",
+          "attempt": "{{ CTX.INPUT.attempt }}",
+          "max_attempts": "{{ CTX.INPUT.max_attempts }}",
+          "auto_merge": "{{ CTX.INPUT.auto_merge }}",
+          "kick_url": "{{ CTX.INPUT.kick_url }}",
+          "kick_token": "{{ CTX.INPUT.kick_token }}"
+        }
+      },
+      {
+        "id": "join_continue",
+        "type": "logic.join.any",
+        "label": "Join continue",
+        "position": { "x": 3200, "y": 420 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "join_done",
+        "type": "logic.join.any",
+        "label": "Join done",
+        "position": { "x": 3400, "y": 240 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "join_mergeable",
+        "type": "logic.join.any",
+        "label": "Join mergeable",
+        "position": { "x": 2820, "y": 240 },
+        "config": { "stopOnFirst": true }
+      },
+      {
         "id": "join_fix_test_fail",
         "type": "logic.join.any",
         "label": "Join fix_test failure",
@@ -366,7 +433,7 @@
       { "id": "e5a", "source": "review_snap", "sourceHandle": "out", "target": "switch_review", "targetHandle": "in" },
       { "id": "e5b", "source": "switch_review", "sourceHandle": "case-0", "target": "herdr_changes_requested", "targetHandle": "in" },
       { "id": "e5c", "source": "switch_review", "sourceHandle": "case-1", "target": "herdr_review_required", "targetHandle": "in" },
-      { "id": "e5d", "source": "switch_review", "sourceHandle": "default", "target": "done_mergeable", "targetHandle": "in" },
+      { "id": "e5d", "source": "switch_review", "sourceHandle": "default", "target": "join_mergeable", "targetHandle": "in" },
       { "id": "e7", "source": "switch_checks", "sourceHandle": "case-1", "target": "pr_checkout", "targetHandle": "in" },
       { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
       { "id": "e9", "source": "pr_checkout", "sourceHandle": "success", "target": "wait", "targetHandle": "in" },
@@ -393,8 +460,17 @@
 
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
       { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
-      { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "done_after_fix", "targetHandle": "in" },
-      { "id": "e21", "source": "if_green2", "sourceHandle": "fail", "target": "herdr_budget", "targetHandle": "in" }
+      { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "join_mergeable", "targetHandle": "in" },
+      { "id": "e_jm_out", "source": "join_mergeable", "sourceHandle": "out", "target": "switch_merge", "targetHandle": "in" },
+      { "id": "e_sm_merge", "source": "switch_merge", "sourceHandle": "case-0", "target": "merge", "targetHandle": "in" },
+      { "id": "e_sm_engineer", "source": "switch_merge", "sourceHandle": "default", "target": "join_done", "targetHandle": "in" },
+      { "id": "e_merge_ok", "source": "merge", "sourceHandle": "success", "target": "join_done", "targetHandle": "in" },
+      { "id": "e_merge_fail", "source": "merge", "sourceHandle": "failure", "target": "join_done", "targetHandle": "in" },
+      { "id": "e_jd_out", "source": "join_done", "sourceHandle": "out", "target": "done_after_fix", "targetHandle": "in" },
+      { "id": "e21", "source": "if_green2", "sourceHandle": "fail", "target": "continue", "targetHandle": "in" },
+      { "id": "e_cont_ok", "source": "continue", "sourceHandle": "success", "target": "join_continue", "targetHandle": "in" },
+      { "id": "e_cont_fail", "source": "continue", "sourceHandle": "failure", "target": "join_continue", "targetHandle": "in" },
+      { "id": "e_jc_out", "source": "join_continue", "sourceHandle": "out", "target": "herdr_budget", "targetHandle": "in" }
     ]
   }
 }
