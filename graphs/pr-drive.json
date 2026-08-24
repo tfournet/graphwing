@@ -16,9 +16,14 @@
           "allowDrafts": false,
           "inputs": {
             "repo": { "type": "string", "required": true },
-            "pr": { "type": "string", "required": true },
+            "pr_number": { "type": "string", "required": true, "description": "PR number. Named pr_number because a plain `pr` input never reaches CTX.INPUT." },
+            "attempt": { "type": "string", "required": false },
+            "max_attempts": { "type": "string", "required": false },
+            "auto_merge": { "type": "string", "required": false },
+            "kick_url": { "type": "string", "required": false },
+            "kick_token": { "type": "string", "required": false },
             "test": { "type": "string", "required": true },
-            "prompt": { "type": "string", "required": true },
+            "prompt": { "type": "string", "required": false },
             "commit_message": { "type": "string", "required": true }
           }
         }
@@ -63,7 +68,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr }}"
+          "number": "{{ CTX.INPUT.pr_number }}"
         }
       },
       {
@@ -75,7 +80,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr }}"
+          "number": "{{ CTX.INPUT.pr_number }}"
         }
       },
       {
@@ -272,7 +277,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr }}",
+          "number": "{{ CTX.INPUT.pr_number }}",
           "auto_merge": "{{ CTX.INPUT.auto_merge }}",
           "run_id": "{{ CTX.RUN.id }}",
           "method": "squash"
@@ -287,7 +292,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "pr": "{{ CTX.INPUT.pr }}",
+          "pr": "{{ CTX.INPUT.pr_number }}",
           "test": "{{ CTX.INPUT.test }}",
           "attempt": "{{ CTX.INPUT.attempt }}",
           "max_attempts": "{{ CTX.INPUT.max_attempts }}",
@@ -346,7 +351,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr }}"
+          "number": "{{ CTX.INPUT.pr_number }}"
         }
       },
       {
@@ -394,7 +399,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr }}"
+          "number": "{{ CTX.INPUT.pr_number }}"
         }
       },
       {

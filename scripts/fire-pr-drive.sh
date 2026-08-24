@@ -13,7 +13,7 @@ KEY="$(cat "$HOME_DIR/api.key")"
 payload=$(python3 -c '
 import json, sys
 print(json.dumps({"workflow": "pr-drive", "input": {
-    "repo": sys.argv[1], "pr": sys.argv[2], "test": sys.argv[3],
+    "repo": sys.argv[1], "pr_number": sys.argv[2], "test": sys.argv[3],
     "attempt": 1, "max_attempts": 3,
     "auto_merge": sys.argv[4].lower() == "true",
 }}))' "$repo" "$pr" "$test_name" "$auto_merge")

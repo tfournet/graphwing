@@ -1371,11 +1371,13 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(out["kicked"])
         self.assertEqual(len(posted), 1)
         body = posted[0][1]
+        # The next run reads CTX.INPUT.pr_number; a plain `pr` key never arrives.
+        self.assertIn("pr_number", body)
         # The next run must carry the incremented attempt, or the ceiling
         # never arrives and the loop is unbounded after all.
         self.assertEqual(body["attempt"], 2)
         # pr rides as a string, matching how gh_pr_merge and the graph treat it.
-        self.assertEqual(body["pr"], "1")
+        self.assertEqual(body["pr_number"], "1")
         self.assertTrue(body["auto_merge"])
 
     def test_pr_continue_refuses_a_non_https_kick(self):

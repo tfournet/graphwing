@@ -1120,7 +1120,10 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     token = data.get("kick_token") or None
     payload = {
         "repo": name,
-        "pr": number,
+        # The next run reads this as CTX.INPUT.pr_number. A plain `pr` key never
+        # arrives: the graph declared one and every reference resolved empty, so
+        # pr-drive died at ghPrView with no `number` on the query string.
+        "pr_number": number,
         "test": data.get("test"),
         "attempt": attempt + 1,
         "max_attempts": ceiling,
