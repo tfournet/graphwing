@@ -111,6 +111,20 @@ Skipping this fails silently, which is the expensive part. Rewst builds every re
 
 Two parameter names to avoid: the connector treats a query parameter called `path` as the request URL path and overwrites the endpoint with its value. `fileHead` and `gitDiff` use `rel` for that reason.
 
+## Deploy to the seat
+
+systemd runs `$GRAPHWING_HOME/server.py`, a **copy**, not a symlink. `systemctl restart`
+on its own comes back green while still serving the last copy, and nothing reports that
+your change is not live.
+
+```bash
+scripts/deploy.sh
+```
+
+Runs the tests, copies the code files, restarts, then re-compares to prove the live file
+is the one you built. `repos.json` and `stacks.json` are tracked in git but hold
+placeholders; the real ones are seat config, so deploy never touches them.
+
 ## Tests
 
 ```bash
