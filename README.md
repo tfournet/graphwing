@@ -1,15 +1,15 @@
 # Graphwing
 
 <p align="center">
-  <img src="docs/images/hero.jpg" alt="Instrument panel: a person at a terminal, a laptop catalog of HTTP ports, and a Rewst node graph joined by patch cables" width="100%">
+  <img src="docs/images/hero.jpg" alt="Instrument panel: a person at a terminal, a catalog of HTTP ports, and a Rewst node graph joined by patch cables" width="100%">
 </p>
 
-Graphwing is a **node catalog on your laptop** for [Rewst Graph](https://rewst.io). Rewst holds the workflow map. This repo is the list of named HTTP operations that map can call: git, tests, one bounded agent job. It is not a mega-agent and not Rewst Internal.
+Graphwing is a **local node catalog** for [Rewst Graph](https://rewst.io). It runs on the machine that has the git checkouts. Rewst holds the workflow map. This repo is the list of named HTTP operations that map can call: git, tests, one bounded agent job. It is not a mega-agent and not Rewst Internal.
 
 You grill ideas in Herdr. Graph runs the map. You prove the result and merge the PR.
 
 <p align="center">
-  <img src="docs/images/architecture.svg" alt="Laptop seat, named tunnel, Rewst Graph, and you" width="100%">
+  <img src="docs/images/architecture.svg" alt="Catalog host, named tunnel, Rewst Graph, and you" width="100%">
 </p>
 
 | Piece | Job |
@@ -17,7 +17,7 @@ You grill ideas in Herdr. Graph runs the map. You prove the result and merge the
 | This git repo | Source of truth for ops (`server.py`, `openapi.json`) and workflow JSON (`graphs/`) |
 | `~/.graphwing` | Runtime. API key, tunnel, jobs, Hermes state. Do not commit it. |
 | Rewst Graph | Published topology. A run is `{ "input": { … } }`. Same map, new payload. |
-| Named tunnel | Public URL so Rewst can reach the laptop. Loopback is blocked. |
+| Named tunnel | Public URL so Rewst can reach this host. Loopback is blocked. |
 
 Cloud GitHub and Shortcut stay Rewst integrations. This seat does not hold those keys.
 
@@ -55,7 +55,7 @@ flowchart LR
   B --> C{"agentRun?"}
   C -->|no| D["Next edge"]
   C -->|yes| E["Wait webhook"]
-  E --> F["Laptop POSTs receipt"]
+  E --> F["Catalog POSTs receipt"]
   F --> D
   D --> G["Commit, park, or kick next run"]
   style A fill:#24352c,stroke:#e8b86d,color:#e8b86d

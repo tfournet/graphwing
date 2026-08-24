@@ -31,7 +31,7 @@
   <path d="M816 100 H848" stroke="#7dcea0" stroke-width="2" fill="none"/>
 
   <text x="32" y="180" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Most steps return 200 and data. The Graph continues on that JSON.</text>
-  <text x="32" y="206" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">agentRun returns 202. The Graph waits. The laptop POSTs a receipt when the job finishes.</text>
+  <text x="32" y="206" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">agentRun returns 202. The Graph waits. Graphwing POSTs a receipt when the job finishes.</text>
   <text x="32" y="232" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Prefer a new HTTP op over stuffing more work into the agent loop.</text>
   <text x="32" y="258" fill="#8aa197" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">A long walk is several runs. Each run does one slice, then kicks the next webhook.</text>
 </svg>

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="t d">
   <title id="t">How Graphwing fits together</title>
-  <desc id="d">Engineer in Herdr, laptop Graphwing catalog, tunnel to Rewst Graph. Named HTTP ops go out. Agent receipts come back.</desc>
+  <desc id="d">Engineer in Herdr, Graphwing catalog on this host, tunnel to Rewst Graph. Named HTTP ops go out. Agent receipts come back.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#1a2420"/>
@@ -14,9 +14,9 @@
   <rect width="960" height="420" fill="url(#bg)"/>
   <text x="32" y="36" fill="#7dcea0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="0.18em">GRAPHWING · THREE MACHINES</text>
 
-  <!-- laptop -->
+  <!-- catalog host -->
   <rect x="40" y="64" width="280" height="300" rx="10" fill="#24352c" stroke="#7dcea0" stroke-width="2"/>
-  <text x="60" y="96" fill="#e8b86d" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="700">Laptop seat</text>
+  <text x="60" y="96" fill="#e8b86d" font-family="ui-sans-serif, system-ui, sans-serif" font-size="18" font-weight="700">This host</text>
   <text x="60" y="122" fill="#c5d4cc" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Graphwing OpenAPI on :8645</text>
   <text x="60" y="160" fill="#7dcea0" font-family="ui-monospace, Menlo, monospace" font-size="12">gitStatus  testRun  fileHead</text>
   <text x="60" y="180" fill="#7dcea0" font-family="ui-monospace, Menlo, monospace" font-size="12">agentRun   gitCommit  …</text>
