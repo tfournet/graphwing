@@ -1244,6 +1244,21 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
 
+    def test_review_no_verdict_is_flagged_not_an_opinion(self):
+        # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran
+        # counted as a reviewer that said no. Both SC-110290 review passes died
+        # that way. Verdict stays NACK for the graph, but no_verdict makes a
+        # provider blip distinguishable from a real rejection.
+        self.assertTrue(server.review_said_nothing("Error: Reached max turns (1)"))
+        self.assertTrue(server.review_said_nothing(""))
+        self.assertFalse(server.review_said_nothing("VERDICT: PASS"))
+        self.assertFalse(server.review_said_nothing("VERDICT: NACK\nmissing a case"))
+
+    def test_review_turn_budget_is_not_one(self):
+        # The claude branch hardcoded --max-turns 1 while hermes used 8. One
+        # turn cannot read a diff and answer.
+        self.assertGreaterEqual(server.REVIEW_MAX_TURNS, 8)
+
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))

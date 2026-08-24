@@ -76,6 +76,12 @@ SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_SIZES = ("S", "M", "L")
+# Spec-review turn budget. Was hardcoded to 1 for the claude reviewers, so
+# every review died on "Reached max turns (1)" and parsed as a NACK without
+# reading anything (SC-110290's first run nacked twice that way). The hermes
+# reviewer already used 8. Read the diff, think, answer, and leave slack for a
+# provider hiccup or a dropped connection costing a turn.
+REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
 SLICE_BUDGET = {
     ("mechanical", "S"): (10, 120),
     ("mechanical", "M"): (30, 300),
@@ -1268,6 +1274,23 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     return 200, slice_route_lookup(class_name, size_floor, ac_count, seams)
 
 
+def review_said_nothing(text: str) -> bool:
+    """True when the reviewer never emitted a verdict.
+
+    A reviewer that ran out of turns, lost its connection, or died is not a
+    reviewer that said no. The lock treats "timeout, no verdict" as a retry,
+    and only a finished chain that still nacks as a strike. Callers get this
+    as `no_verdict` so a provider blip is diagnosable in the trace instead of
+    looking like an opinion.
+    """
+    upper = (text or "").upper()
+    if any(t in upper for t in ("VERDICT: PASS", "VERDICT:PASS", '"VERDICT": "PASS"')):
+        return False
+    if any(t in upper for t in ("VERDICT: NACK", "VERDICT: REQUEST_CHANGES", "VERDICT: FAIL")):
+        return False
+    return parse_receipt_text(text or "") is None
+
+
 def parse_review_verdict(text: str) -> tuple[str, str]:
     raw = text or ""
     upper = raw.upper()
@@ -1322,7 +1345,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "--permission-mode",
             "plan",
             "--max-turns",
-            "1",
+            str(REVIEW_MAX_TURNS),
             "--model",
             model,
             body_prompt,
@@ -1364,6 +1387,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     return 200, {
         "ok": verdict == "PASS",
         "verdict": verdict,
+        "no_verdict": review_said_nothing(text),
         "reviewer": reviewer,
         "summary": summary,
         "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
