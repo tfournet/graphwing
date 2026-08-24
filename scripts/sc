@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Thin Shortcut REST wrapper. Reads SHORTCUT_API_TOKEN from the environment.
+#
+# Exists because the Shortcut MCP server is only reachable from an interactive
+# hermes session: a `--source tool` run reports the tools unavailable, so no
+# automated step in the loop can read or write a story through it.
+#
+#   sc show <id>              story name, type, state, epic, branches, PRs
+#   sc states                 workflow states for the story's board
+#   sc mv <id> <state-name>   move a story ("In Review", "Done", ...)
+#   sc comment <id> <text>    post a comment
+set -euo pipefail
+
+API="https://api.app.shortcut.com/api/v3"
+: "${SHORTCUT_API_TOKEN:?SHORTCUT_API_TOKEN is not set}"
+
+api() {  # api METHOD PATH [json-body]
+  local method="$1" path="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -sS -m 30 -X "$method" -H "Shortcut-Token: $SHORTCUT_API_TOKEN" \
+      -H "Content-Type: application/json" -d "$body" "$API$path"
+  else
+    curl -sS -m 30 -X "$method" -H "Shortcut-Token: $SHORTCUT_API_TOKEN" "$API$path"
+  fi
+}
+
+# Story ids are typed as SC-110290 or 110290; the API wants the bare number.
+num() { printf '%s' "${1#[Ss][Cc]-}"; }
+
+# Build a JSON body without shell-quoting user text into it.
+json() { python3 -c 'import json,sys; print(json.dumps({sys.argv[1]: sys.argv[2]}))' "$1" "$2"; }
+
+case "${1:-}" in
+  show)
+    api GET "/stories/$(num "${2:?story id}")" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "id" not in d:
+    sys.exit("shortcut: %s" % d.get("message", d))
+for k in ("id", "name", "story_type", "epic_id", "workflow_state_id", "completed", "archived"):
+    print("%-18s %s" % (k, d.get(k)))
+print("%-18s %s" % ("branches", [b.get("name") for b in d.get("branches", [])]))
+print("%-18s %s" % ("pull_requests", [p.get("number") for p in d.get("pull_requests", [])]))
+'
+    ;;
+  states)
+    sid=$(api GET "/stories/$(num "${2:?story id}")" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workflow_state_id"])')
+    api GET "/workflows" | python3 -c '
+import json, sys
+cur = int(sys.argv[1])
+for w in json.load(sys.stdin):
+    if any(s["id"] == cur for s in w["states"]):
+        print("workflow: %s" % w["name"])
+        for s in w["states"]:
+            print("  %-11s %s%s" % (s["type"], s["name"], "   <-- current" if s["id"] == cur else ""))
+' "$sid"
+    ;;
+  mv)
+    id=$(num "${2:?story id}"); want="${3:?state name}"
+    cur=$(api GET "/stories/$id" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workflow_state_id"])')
+    target=$(api GET "/workflows" | python3 -c '
+import json, sys
+cur, want = int(sys.argv[1]), sys.argv[2].lower()
+for w in json.load(sys.stdin):
+    if any(s["id"] == cur for s in w["states"]):
+        for s in w["states"]:
+            if s["name"].lower() == want:
+                print(s["id"]); sys.exit()
+        sys.exit("no state %r on %s; try: sc states" % (sys.argv[2], w["name"]))
+sys.exit("story state %s not found in any workflow" % cur)
+' "$cur" "$want")
+    api PUT "/stories/$id" "{\"workflow_state_id\": $target}" >/dev/null
+    echo "SC-$id -> $want"
+    ;;
+  comment)
+    id=$(num "${2:?story id}"); shift 2
+    api POST "/stories/$id/comments" "$(json text "$*")" >/dev/null
+    echo "commented on SC-$id"
+    ;;
+  *)
+    sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

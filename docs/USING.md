@@ -111,6 +111,22 @@ Skipping this fails silently, which is the expensive part. Rewst builds every re
 
 Two parameter names to avoid: the connector treats a query parameter called `path` as the request URL path and overwrites the endpoint with its value. `fileHead` and `gitDiff` use `rel` for that reason.
 
+## Shortcut from the seat
+
+The Shortcut MCP server only answers inside an interactive hermes session; a
+`--source tool` run reports its tools unavailable, so no automated step can reach it.
+`scripts/sc` is a thin REST wrapper over `SHORTCUT_API_TOKEN` for that reason.
+
+```bash
+sc show SC-110290            # name, type, state, epic, branches, PRs
+sc states 110290             # the states available on that story's board
+sc mv 110290 "In Review"     # move it
+sc comment 110290 "text"     # the receipt Graph still cannot post itself
+```
+
+Every failure path exits non-zero, including an unknown state name, so a caller cannot
+mistake "did nothing" for "moved it".
+
 ## Deploy to the seat
 
 systemd runs `$GRAPHWING_HOME/server.py`, a **copy**, not a symlink. `systemctl restart`
