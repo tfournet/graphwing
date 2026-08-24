@@ -27,6 +27,13 @@
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false
+    },
+    {
+      "name": "riftwing-local-gates",
+      "argv": ["env", "RIFTWING_HOOK_NONINTERACTIVE=1", "bash", ".githooks/pre-commit"],
+      "cwd": "riftwing",
+      "timeout_seconds": 120,
+      "async": false
     }
   ]
 }

@@ -39,6 +39,8 @@ Each ticket file is what the writer sees. `kind` is `build` or `decision`. `stat
 
 Name a `tests.json` recipe for the story suite. Visual without a recipe has no per-slice gate.
 
+For riftwing, use `riftwing-local-gates`. That runs `.githooks/pre-commit` (gitleaks, lockfile) with `RIFTWING_HOOK_NONINTERACTIVE=1`. It does not run pre-push fetch or Shortcut.
+
 ## Fire implement-slice
 
 Published slug: `graphwing-implement-slice`. Manual, form, or authenticated webhook.

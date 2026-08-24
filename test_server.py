@@ -1515,6 +1515,36 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(payload.get("compact"))
         self.assertLessEqual(len(payload["compact"]), server.COMPACT_MAX_CHARS)
 
+    def test_load_tests_repo_short_name_cwd(self):
+        extra = Path(self.scratch) / ".githooks"
+        extra.mkdir()
+        (extra / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+        recipes = {
+            "tests": [
+                {
+                    "name": "local-gates",
+                    "argv": ["bash", ".githooks/pre-commit"],
+                    "cwd": "scratch",
+                    "timeout_seconds": 15,
+                    "async": False,
+                },
+                {
+                    "name": "missing-repo",
+                    "argv": ["true"],
+                    "cwd": "nope",
+                    "timeout_seconds": 5,
+                    "async": False,
+                },
+            ]
+        }
+        path = Path(self.scratch) / "tests.json"
+        path.write_text(json.dumps(recipes))
+        with mock.patch.object(server, "TESTS_PATH", path):
+            catalog = server.load_tests({"scratch": str(self.scratch)})
+        self.assertIn("local-gates", catalog)
+        self.assertEqual(catalog["local-gates"]["cwd"], Path(self.scratch).resolve())
+        self.assertNotIn("missing-repo", catalog)
+
     def test_test_run_unknown_and_argv(self):
         status, payload, _ = server.dispatch(
             "POST", "/v1/test/run", {}, True, b'{"name":"go-test-everything"}'
