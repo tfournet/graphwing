@@ -133,22 +133,6 @@
         }
       },
       {
-        "id": "done_mergeable",
-        "type": "transforms.objectBuilder",
-        "label": "Done (mergeable)",
-        "position": { "x": 1540, "y": 80 },
-        "config": {
-          "alias": "done_mergeable",
-          "version": 1,
-          "mappings": [
-            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
-            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "mergeable" } },
-            { "id": "m3", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
-            { "id": "m4", "output": "pr", "expression": { "kind": "getField", "path": "CTX.INPUT.pr" } }
-          ]
-        }
-      },
-      {
         "id": "pr_checkout",
         "type": "action.graphwing.POST:/v1/git/checkout",
         "label": "Checkout PR head",
@@ -228,6 +212,19 @@
         }
       },
       {
+        "id": "merge_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Merge snapshot",
+        "position": { "x": 2900, "y": 240 },
+        "config": {
+          "alias": "merge_snap",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "auto_merge", "expression": { "kind": "getField", "path": "CTX.INPUT.auto_merge" } }
+          ]
+        }
+      },
+      {
         "id": "switch_merge",
         "type": "logic.switch",
         "label": "Auto-merge?",
@@ -235,7 +232,7 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "auto_merge", "rules": [{ "path": "CTX.INPUT.auto_merge", "op": "equals", "value": true }] }
+            { "label": "auto_merge", "rules": [{ "path": "auto_merge", "op": "equals", "value": true }] }
           ],
           "default": { "label": "engineer_merges" }
         }
@@ -461,7 +458,8 @@
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
       { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
       { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "join_mergeable", "targetHandle": "in" },
-      { "id": "e_jm_out", "source": "join_mergeable", "sourceHandle": "out", "target": "switch_merge", "targetHandle": "in" },
+      { "id": "e_jm_out", "source": "join_mergeable", "sourceHandle": "out", "target": "merge_snap", "targetHandle": "in" },
+      { "id": "e_ms_out", "source": "merge_snap", "sourceHandle": "out", "target": "switch_merge", "targetHandle": "in" },
       { "id": "e_sm_merge", "source": "switch_merge", "sourceHandle": "case-0", "target": "merge", "targetHandle": "in" },
       { "id": "e_sm_engineer", "source": "switch_merge", "sourceHandle": "default", "target": "join_done", "targetHandle": "in" },
       { "id": "e_merge_ok", "source": "merge", "sourceHandle": "success", "target": "join_done", "targetHandle": "in" },
