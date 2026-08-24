@@ -321,9 +321,14 @@ def load_recipes(path: Path, key: str, repos: dict[str, str] | None = None) -> d
         argv = item.get("argv")
         if not name or not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
             raise RuntimeError(f"{path} entry missing name/argv: {item!r}")
-        cwd = resolve_under_home(item.get("cwd"))
+        raw_cwd = item.get("cwd")
+        repos_map = repos if repos is not None else load_repos()
+        if isinstance(raw_cwd, str) and raw_cwd.strip() in repos_map:
+            cwd = Path(repos_map[raw_cwd.strip()]).resolve()
+        else:
+            cwd = resolve_under_home(raw_cwd)
         if str(cwd) not in allowed_cwds:
-            raise RuntimeError(f"{name} cwd is not allowlisted: {cwd}")
+            continue
         try:
             timeout = int(item.get("timeout_seconds"))
         except (TypeError, ValueError):
