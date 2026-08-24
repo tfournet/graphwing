@@ -80,6 +80,35 @@ Watch tab `graph`. Do not chat there.
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
+## Drive a PR to green
+
+```bash
+scripts/fire-pr-drive.sh riftwing 3523 riftwing-local-gates
+```
+
+Or the payload directly:
+
+```json
+{ "input": {
+  "repo": "riftwing", "pr": "3523", "test": "riftwing-local-gates",
+  "attempt": 1, "max_attempts": 3, "auto_merge": false,
+  "kick_url": "https://app.rewst.ai/api/hooks/..."
+} }
+```
+
+`kick_url` is this workflow's own webhook. Without it the run does one fix attempt
+and stops, because Rewst forbids unbounded cycles inside a run: the loop is a chain
+of runs, not a cycle.
+
+The writer's prompt is not yours to write. A `findings` node reads the reviewers'
+`engineering-findings-json`, dedupes by fingerprint (two reviewers raising one defect
+is one fix), orders by severity, and hands over the remedies without the argument.
+
+`auto_merge` is per-run and defaults false. When true and the PR is green, mergeable,
+and carries no `hold:*` label, the run merges with `--squash --delete-branch`. The
+endpoint re-reads the PR and re-decides rather than trusting the graph, and refuses
+without a `run_id`, so a hand-rolled curl cannot merge anything.
+
 ## Other graphs
 
 | Slug | When |

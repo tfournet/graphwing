@@ -33,7 +33,9 @@ Two different "graphs". Do not smash them:
 6. **Write.** A **frontier** ticket path fires `graphwing-implement-slice`. Graph **walks serially** until the map is empty, a slice **fails** the valve, or the next ticket is a **`decision`**. Watch tab `graph`; do not chat there.
 7. **E2E.** After the map is empty, **before** PR/CI: named smoke/e2e on the seat. Green is supposed to comment `slices complete` (Graph does not post it yet). Red goes back to slices (below).
 8. **Proof.** Bug: the failing command is green. UI: drive a live stack. Minor UI: before/after on the story. You, not Graph.
-9. **PR.** Then GitHub CI (deterministic) then Engineering grade (AI, same vendor table as spec-review). Merge is the engineer. Graph does not move Shortcut columns; you close the story after proof + merge. Doorbell can start one fix run if CI is red.
+9. **PR.** Then GitHub CI (deterministic) then Engineering grade (AI, same vendor table as spec-review). Graph does not move Shortcut columns; you close the story after proof + merge.
+10. **Drive to green.** Getting a PR from red to mergeable is `graphwing-pr-drive`, not hand work. It reads the reviewers' `engineering-findings-json` itself, so nobody writes a fix brief. Red → one fix slice → test → commit → push → re-check → kick the next attempt, up to `max_attempts` (default 3). See [USING.md](USING.md#drive-a-pr-to-green).
+11. **Merge.** Yours by default. A run started with `auto_merge: true` may merge when it is green, mergeable, and unheld; the endpoint re-reads the PR and re-decides rather than trusting the graph. Merge requires a `run_id`, so it is reachable only from inside a run.
 
 ## Slice map
 
