@@ -40,6 +40,8 @@
         "config": {
           "enabled": true,
           "requireAuthHeader": true,
+          "headerKey": "x-rewst-secret",
+          "headerValue": "$GRAPHWING_HOOK_SECRET",
           "allowedMethods": ["POST"]
         }
       },
