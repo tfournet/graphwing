@@ -80,7 +80,7 @@ The server enforces these. Violating one returns 400 and the run never starts:
 
 Number ids in dependency order, blockers first, so the file reads in walk order.
 
-Graph preserves keys beside `tickets` when it rewrites the index, so story id, test recipe, class, and size floor are safe at the top level.
+Graph preserves keys beside `tickets` when it rewrites the index, so story id, test recipe, class, and size floor are safe at the top level. That is where the grill's class and size floor land. They stay off the tracker card, which holds the idea, not graphwing's routing metadata.
 
 Name the `tests.json` recipe that gates every slice. The spec supplies which one, because recipes belong to the project, not to this skill. A visual story with no named recipe has no per-slice gate, so give it one, a smoke test or a tiny happy path.
 

@@ -38,14 +38,16 @@ Confirm the seams with the engineer before publishing. `to-tickets` enforces one
 
 Use the template below.
 
-### 4. Stamp class and size floor
+### 4. Carry class and size floor forward
 
-Carry both from the grill onto the card:
+Hold both from the grill and hand them to `to-tickets`, which writes them into `index.json`:
 
 - **class**: `mechanical`, `visual`, or `sensitive`. Absent means `mechanical`.
 - **size floor**: `S`, `M`, or `L`.
 
-These pick the writer model and the reviewer at run time, so they have to survive from the grill to the run payload. `to-tickets` copies them into the index JSON alongside the test recipe.
+They pick the writer model and the reviewer at run time, so they have to survive from the grill to the run payload. `index.json` is where they survive.
+
+Keep them off the card. They are graphwing routing metadata, they mean nothing to anyone else reading the tracker, and a second copy nobody updates goes stale.
 
 ### 5. Move to Ready
 
@@ -88,11 +90,6 @@ art in the codebase to follow.
 ## Out of scope
 
 What this deliberately does not do.
-
-## Stamp
-
-class: <mechanical|visual|sensitive>
-size floor: <S|M|L>
 ```
 
 Keep file paths and code snippets out of the spec; they go stale fast. The exception is a snippet from a prototype that encodes a decision more precisely than prose can, a schema or a type shape, trimmed to the decision.
