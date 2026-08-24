@@ -20,11 +20,14 @@ Item {
   property string lastError: ""
   property string lastCode: ""
   property bool refreshing: false
+  property var notifiedFailed: ({})
+  property bool seededFailures: false
 
   readonly property int activeCount: Number(counts.active || 0)
   readonly property int failedRecent: Number(counts.failed_recent || 0)
   readonly property bool busy: activeCount > 0
   readonly property bool alarming: !online || !apiActive || failedRecent > 0
+  readonly property bool notifyOnFail: setting("notifyOnFail", true) !== false
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 5, 2, 120)
   readonly property int port: intSetting("port", 8645, 1, 65535)
@@ -83,6 +86,51 @@ Item {
     lastError = snap.online ? "" : String(snap.error || "daemon down")
     lastCode = String(snap.code || "")
     statusText = Model.statusLabel(snap)
+    scanFailures()
+  }
+
+  function rememberFailed(id) {
+    var next = {}
+    for (var key in notifiedFailed) next[key] = true
+    next[id] = true
+    notifiedFailed = next
+  }
+
+  function notifyFailed(job) {
+    if (!notifyOnFail) return
+    var title = job && job.title ? String(job.title) : "job"
+    Quickshell.execDetached([
+      "omarchy-notification-send",
+      "-u", "critical",
+      "-g", "󰘬",
+      "--app-name", "graphwing",
+      "--exec", "omarchy-shell graphwing.watch open",
+      "Graphwing failed",
+      title
+    ])
+  }
+
+  function scanFailures() {
+    if (!online) return
+    var jobs = (activeJobs || []).concat(recentJobs || [])
+    var failed = []
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i]
+      if (job && job.status === "failed" && job.job_id) failed.push(job)
+    }
+    if (!seededFailures) {
+      var seed = {}
+      for (var j = 0; j < failed.length; j++) seed[String(failed[j].job_id)] = true
+      notifiedFailed = seed
+      seededFailures = true
+      return
+    }
+    for (var k = 0; k < failed.length; k++) {
+      var id = String(failed[k].job_id)
+      if (notifiedFailed[id]) continue
+      rememberFailed(id)
+      notifyFailed(failed[k])
+    }
   }
 
   function refresh() {

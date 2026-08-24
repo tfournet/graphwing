@@ -27,8 +27,8 @@ Panel {
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
   readonly property color barIconColor: {
     if (!watch.online || !watch.apiActive) return urgent
-    if (watch.busy) return foreground
-    return dim
+    if (watch.failedRecent > 0) return urgent
+    return foreground
   }
   readonly property string heroMeta: watch.statusText
   readonly property string glyph: "󰘬"
