@@ -1926,7 +1926,15 @@ def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str
 
 
 _ANNOUNCE_SKIP_PREFIX = ("/v1/agent/jobs/",)
-_ANNOUNCE_SKIP = {"/v1/health", "/health", "/openapi.json", "/v1/openapi.json", "/v1/herdr/agents", "/v1/units/status"}
+_ANNOUNCE_SKIP = {
+    "/v1/health",
+    "/health",
+    "/openapi.json",
+    "/v1/openapi.json",
+    "/v1/herdr/agents",
+    "/v1/units/status",
+    "/v1/watch",
+}
 
 
 def herdr_announce(method: str, path: str, status: int, payload: dict[str, Any] | bytes) -> None:
@@ -2016,6 +2024,92 @@ def active_job_count() -> int:
         if isinstance(data, dict) and data.get("status") in ("queued", "running"):
             n += 1
     return n
+
+
+WATCH_RECENT = 8
+WATCH_TITLE_CHARS = 72
+WATCH_ERROR_CHARS = 120
+WATCH_ACTIVE = frozenset({"queued", "running"})
+
+
+def clip_text(text: Any, n: int) -> str | None:
+    if text is None:
+        return None
+    first = str(text).strip().splitlines()[0].strip() if str(text).strip() else ""
+    if not first:
+        return None
+    if len(first) > n:
+        return first[: n - 1] + "…"
+    return first
+
+
+def job_title(job: dict[str, Any]) -> str:
+    kind = str(job.get("kind") or "agent")
+    if kind in ("script", "test", "rr"):
+        return str(job.get("script") or kind)
+    if kind == "review":
+        who = str(job.get("reviewer") or "").strip()
+        return f"review {who}".strip() if who else "review"
+    return clip_text(job.get("prompt"), WATCH_TITLE_CHARS) or kind
+
+
+def watch_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "status": str(job.get("status") or ""),
+        "kind": str(job.get("kind") or "agent"),
+        "title": job_title(job),
+        "repo": job.get("repo"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "error": clip_text(job.get("error"), WATCH_ERROR_CHARS),
+    }
+
+
+def watch_snapshot() -> dict[str, Any]:
+    """Compact panel payload: units plus in-flight and recent jobs. No secrets."""
+    units = units_status()
+    active: list[dict[str, Any]] = []
+    finished: list[dict[str, Any]] = []
+    if JOBS_DIR.is_dir():
+        for path in JOBS_DIR.glob("*/job.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            job_id = str(data.get("job_id") or "")
+            if not JOB_ID_RE.fullmatch(job_id):
+                continue
+            row = watch_job(data)
+            if row["status"] in WATCH_ACTIVE:
+                active.append(row)
+            else:
+                finished.append(row)
+    active.sort(key=lambda j: str(j.get("created_at") or ""), reverse=True)
+    finished.sort(key=lambda j: str(j.get("finished_at") or j.get("created_at") or ""), reverse=True)
+    recent = finished[:WATCH_RECENT]
+    queued = sum(1 for j in active if j["status"] == "queued")
+    running = sum(1 for j in active if j["status"] == "running")
+    failed_recent = sum(1 for j in recent if j["status"] == "failed")
+    api = (units.get("units") or {}).get("graphwing-api") or {}
+    return {
+        "ok": True,
+        "service": "graphwing",
+        "units": units.get("units") or {},
+        "units_healthy": bool(units.get("healthy")),
+        "api_active": bool(api.get("active")),
+        "counts": {
+            "queued": queued,
+            "running": running,
+            "active": len(active),
+            "failed_recent": failed_recent,
+        },
+        "active": active,
+        "recent": recent,
+    }
 
 
 def resolve_run_cwd(raw: str | None, repos: dict[str, str]) -> tuple[str, Path] | tuple[None, dict[str, Any]]:
@@ -2791,6 +2885,8 @@ def dispatch_inner(
     if method == "GET" and path == "/v1/units/status":
         out = units_status()
         return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
+    if method == "GET" and path == "/v1/watch":
+        return json_out(200, watch_snapshot())
 
     if method == "GET" and path == "/v1/herdr/agents":
         out = herdr_agents()

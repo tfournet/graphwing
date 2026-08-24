@@ -19,6 +19,7 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. First run: `docs/USING.md`. Do not duplicate them here. |
 | Herdr idea spaces | `scripts/herdr-idea.sh` (`graphwing-idea` after install) |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
+| Omarchy bar | `plugins/graphwing.watch/` then `install.py` (copies into `~/.config/omarchy/plugins/`) |
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.
 
