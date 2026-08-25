@@ -21,7 +21,7 @@
             "ticket": { "type": "string", "required": false, "description": "Optional ticket path; must already be on the frontier. Omit to take the next build." },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
-            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" },
+            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same native session with a compact test signal" },
             "class": { "type": "string", "required": false, "description": "mechanical (default), visual, or sensitive" },
             "size": { "type": "string", "required": false, "description": "S, M (default), or L floor" },
             "ac_count": { "type": "string", "required": false },
@@ -246,7 +246,10 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
+          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
+          "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
@@ -339,7 +342,10 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
+          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
+          "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
@@ -445,6 +451,7 @@
           "cwd": "{{ CTX.INPUT.repo }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
+          "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
@@ -467,7 +474,8 @@
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
-            { "id": "m7", "output": "hermes_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.hermes_session" } }
+            { "id": "m7", "output": "hermes_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.hermes_session" } },
+            { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.session_identity" } }
           ]
         }
       },
@@ -483,6 +491,13 @@
           "responseStatus": 200,
           "timeoutSeconds": 960
         }
+      },
+      {
+        "id": "if_receipt_ok",
+        "type": "logic.filter",
+        "label": "writer receipt ok?",
+        "position": { "x": 900, "y": 80 },
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
       },
       {
         "id": "test",
@@ -532,11 +547,14 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
+          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
+          "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"
         }
@@ -555,9 +573,38 @@
             { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } },
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
-            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } }
+            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
+            { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } }
           ]
         }
+      },
+      {
+        "id": "if_receipt_ok2",
+        "type": "logic.filter",
+        "label": "retry writer receipt ok?",
+        "position": { "x": 1950, "y": 320 },
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
+      },
+      {
+        "id": "if_receipt_ok3",
+        "type": "logic.filter",
+        "label": "second retry writer receipt ok?",
+        "position": { "x": 2580, "y": 320 },
+        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
+      },
+      {
+        "id": "if_receipt_ok_rn1",
+        "type": "logic.filter",
+        "label": "review1 resume receipt ok?",
+        "position": { "x": 1330, "y": 200 },
+        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
+      },
+      {
+        "id": "if_receipt_ok_rn2",
+        "type": "logic.filter",
+        "label": "review2 resume receipt ok?",
+        "position": { "x": 1450, "y": 360 },
+        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
       },
       {
         "id": "test2",
@@ -603,11 +650,14 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
+          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
+          "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"
         }
@@ -727,6 +777,13 @@
         "type": "logic.join.any",
         "label": "Commit after any test pass",
         "position": { "x": 2500, "y": 80 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "join_receipt_fail",
+        "type": "logic.join.any",
+        "label": "Join receipt failures",
+        "position": { "x": 1520, "y": 500 },
         "config": { "stopOnFirst": true }
       },
       {
@@ -893,6 +950,7 @@
       },
       { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
       { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
+      { "id": "receipt_fail", "type": "action.noop", "label": "Writer receipt not ok", "position": { "x": 980, "y": -160 }, "config": {} },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
       { "id": "ticket_fail", "type": "action.noop", "label": "Herdr: ticket fileHead failed", "position": { "x": 490, "y": -160 }, "config": {} },
       { "id": "frontier_fail", "type": "action.noop", "label": "Herdr: sliceFrontier failed", "position": { "x": 455, "y": -160 }, "config": {} },
@@ -976,7 +1034,9 @@
       { "id": "e12e", "source": "switch_walk", "sourceHandle": "case-1", "target": "join_wait_human", "targetHandle": "in" },
       { "id": "e12f", "source": "switch_walk", "sourceHandle": "default", "target": "done", "targetHandle": "in" },
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
-      { "id": "e14", "source": "record", "sourceHandle": "out", "target": "wait_test", "targetHandle": "in" },
+      { "id": "e14", "source": "record", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
+      { "id": "e14b", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "wait_test", "targetHandle": "in" },
+      { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e15", "source": "wait_test", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
@@ -987,7 +1047,9 @@
       { "id": "e_rev1_pass", "source": "if_review1", "sourceHandle": "pass", "target": "join_switch_rev2", "targetHandle": "in" },
       { "id": "e_rev1_nack", "source": "if_review1", "sourceHandle": "fail", "target": "wait_rn1", "targetHandle": "in" },
       { "id": "e_rn1_pend", "source": "wait_rn1", "sourceHandle": "pending", "target": "agent_rn1", "targetHandle": "in" },
-      { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "if_receipt_ok_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_receipt_ok", "source": "if_receipt_ok_rn1", "sourceHandle": "pass", "target": "test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_receipt_bad", "source": "if_receipt_ok_rn1", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn1_to", "source": "wait_rn1", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn1_fail", "source": "wait_rn1", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_rn1_th", "source": "test_rn1", "sourceHandle": "success", "target": "if_test_rn1", "targetHandle": "in" },
@@ -1005,7 +1067,9 @@
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_rn2", "targetHandle": "in" },
       { "id": "e_rn2_pend", "source": "wait_rn2", "sourceHandle": "pending", "target": "agent_rn2", "targetHandle": "in" },
-      { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "if_receipt_ok_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_receipt_ok", "source": "if_receipt_ok_rn2", "sourceHandle": "pass", "target": "test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_receipt_bad", "source": "if_receipt_ok_rn2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn2_to", "source": "wait_rn2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn2_fail", "source": "wait_rn2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_rn2_th", "source": "test_rn2", "sourceHandle": "success", "target": "if_test_rn2", "targetHandle": "in" },
@@ -1021,7 +1085,9 @@
       { "id": "e24", "source": "wait2", "sourceHandle": "out", "target": "record2", "targetHandle": "in" },
       { "id": "e25", "source": "wait2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e26", "source": "wait2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
-      { "id": "e27", "source": "record2", "sourceHandle": "out", "target": "test2", "targetHandle": "in" },
+      { "id": "e27", "source": "record2", "sourceHandle": "out", "target": "if_receipt_ok2", "targetHandle": "in" },
+      { "id": "e27a", "source": "if_receipt_ok2", "sourceHandle": "pass", "target": "test2", "targetHandle": "in" },
+      { "id": "e27b", "source": "if_receipt_ok2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e28", "source": "test2", "sourceHandle": "success", "target": "if_test_ok2", "targetHandle": "in" },
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e_commit_retry", "source": "if_test_ok2", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
@@ -1030,7 +1096,9 @@
       { "id": "e_complete_fail", "source": "complete", "sourceHandle": "failure", "target": "complete_fail", "targetHandle": "in" },
       { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait3", "targetHandle": "in" },
       { "id": "e31b", "source": "wait3", "sourceHandle": "pending", "target": "agent3", "targetHandle": "in" },
-      { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "test3", "targetHandle": "in" },
+      { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "if_receipt_ok3", "targetHandle": "in" },
+      { "id": "e31c_ok", "source": "if_receipt_ok3", "sourceHandle": "pass", "target": "test3", "targetHandle": "in" },
+      { "id": "e31c_bad", "source": "if_receipt_ok3", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e31d", "source": "wait3", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e31e", "source": "wait3", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e31f", "source": "test3", "sourceHandle": "success", "target": "if_test_ok3", "targetHandle": "in" },
@@ -1040,6 +1108,7 @@
       { "id": "e34", "source": "wait_human", "sourceHandle": "pending", "target": "herdr_waiting", "targetHandle": "in" },
       { "id": "e35", "source": "wait_human", "sourceHandle": "timeout", "target": "nack_timeout", "targetHandle": "in" },
       { "id": "e36", "source": "wait_human", "sourceHandle": "out", "target": "human_ack", "targetHandle": "in" },
+      { "id": "e_join_receipt_fail", "source": "join_receipt_fail", "sourceHandle": "out", "target": "receipt_fail", "targetHandle": "in" },
       { "id": "e_join_wait_human", "source": "join_wait_human", "sourceHandle": "out", "target": "wait_human", "targetHandle": "in" },
       { "id": "e_join_review_fail", "source": "join_review_fail", "sourceHandle": "out", "target": "review_fail", "targetHandle": "in" },
       { "id": "e_join_wait2_timeout", "source": "join_wait2_timeout", "sourceHandle": "out", "target": "wait2_timeout", "targetHandle": "in" },
