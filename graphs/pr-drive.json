@@ -177,6 +177,9 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "prompt": "{{ TASKS.findings.data.brief | default(CTX.INPUT.prompt) }}",
+          "_comment": "Without these the writer takes AGENT_RUN_BUDGET=300 and is SIGINTed at 300+60. Three laps ran 260s, 335s and 363s, so a fix round is L-sized work, not M. wait is 960, which clears 600+60 with room.",
+          "max_turns": "50",
+          "run_budget_seconds": "600",
           "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}"
         }

@@ -16,6 +16,7 @@ rewst-install.json plus BWS_ACCESS_TOKEN.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,6 +45,44 @@ def summarize(trace) -> None:
         print(line)
 
 
+def findings(mcp: str, repo: str, pr: str):
+    """Read the PR's machine verdict through the same endpoint the graph uses."""
+    import urllib.error
+    import urllib.request
+    home = Path(os.environ.get("GRAPHWING_HOME", str(Path.home() / ".graphwing")))
+    key = (home / "api.key").read_text().strip()
+    url = "http://127.0.0.1:8645/v1/gh/pr/findings?repo=%s&number=%s" % (repo, pr)
+    req = urllib.request.Request(url, headers={"X-Graphwing-Key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, ValueError) as exc:
+        print("findings read failed:", exc)
+        return None
+
+
+def wait_for_fresh_review(mcp, repo, pr, previous, tries: int = 40, gap: int = 30) -> None:
+    """Block until the audit has produced a verdict for the new commit.
+
+    Fingerprints are stable per defect, so a changed set means the reviewer has
+    looked again. A returning hold:pm-review means it is still looking.
+    """
+    import time
+    before = {f.get("fingerprint") for f in (previous.get("findings") or [])}
+    for _ in range(tries):
+        time.sleep(gap)
+        now = findings(mcp, repo, pr)
+        if now is None:
+            return
+        if now.get("holds"):
+            continue
+        after = {f.get("fingerprint") for f in (now.get("findings") or [])}
+        if after != before or not now.get("blocking"):
+            print("review re-ran: grade=%s blocking=%s" % (now.get("grade"), now.get("blocking")))
+            return
+    print("review did not settle in time; continuing anyway")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("pr")
@@ -69,21 +108,47 @@ def main() -> int:
         "auto_merge": "true" if args.auto_merge else "false",
         "commit_message": args.message,
     }
-    # run_slug posts this body verbatim. It must be wrapped: a bare payload
-    # arrives as a manual trigger with body {} and CTX.INPUT is never created,
-    # so every {{ CTX.INPUT.* }} in the graph resolves empty and pr-drive dies
-    # at ghPrView with no `number`. The smoke run in publish_graphs.py has
-    # always wrapped it; this script did not.
-    print("input", json.dumps(payload))
-    status, rid, run, trace = pg.run_slug(
-        mcp, "graphwing-pr-drive", {"input": payload}, wait=args.wait
-    )
-    print("run", rid, "->", status)
-    print("output", json.dumps(run.get("output"))[:600])
-    print("nodes:")
-    summarize(trace)
-    print("full trace: /tmp/gw-run-graphwing-pr-drive.json")
-    return 0 if status == "completed" else 1
+    # The loop lives here, not in the graph. The graph's `continue` node kicks
+    # the next attempt at kick_url, which is a Rewst webhook, and a
+    # webhook-triggered run never creates CTX.INPUT: every template resolves
+    # empty and the run dies at ghPrView while Rewst reports it completed. So
+    # the chain can only be driven from a caller that can reach
+    # POST /workflows/{slug}/run. implement-slice chains slices the same broken
+    # way; its one green run was a single-ticket map, so it never noticed.
+    last = 1
+    for attempt in range(1, int(args.max_attempts) + 1):
+        payload["attempt"] = str(attempt)
+        print("\n=== attempt %d of %s ===" % (attempt, args.max_attempts))
+        # run_slug posts this body verbatim, and it must be wrapped: a bare
+        # payload arrives as a manual trigger with body {}.
+        print("input", json.dumps(payload))
+        status, rid, run, trace = pg.run_slug(
+            mcp, "graphwing-pr-drive", {"input": payload}, wait=args.wait
+        )
+        print("run", rid, "->", status)
+        print("nodes:")
+        summarize(trace)
+        last = 0 if status == "completed" else 1
+
+        state = findings(mcp, args.repo, args.pr)
+        if state is None:
+            print("could not read findings; stopping")
+            return 1
+        print("after attempt %d: grade=%s blocking=%s major=%s minor=%s"
+              % (attempt, state.get("grade"), state.get("blocking"),
+                 state.get("major"), state.get("minor")))
+        if not state.get("blocking"):
+            print("nothing left to fix")
+            return last
+        if attempt == int(args.max_attempts):
+            print("attempts exhausted with findings still open")
+            return 1
+        # The audit re-runs against the new sha. Reading findings before it
+        # finishes returns the previous round and burns an attempt fixing what
+        # is already fixed.
+        print("waiting for the review to re-run against the new commit...")
+        wait_for_fresh_review(mcp, args.repo, args.pr, state)
+    return last
 
 
 if __name__ == "__main__":

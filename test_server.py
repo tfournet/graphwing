@@ -1571,6 +1571,20 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
         self.assertIn("findings", nodes["agent"]["config"]["prompt"])
 
+    def test_pr_drive_agent_budget_fits_inside_its_wait(self):
+        # The agent node passed no budget, so the writer took
+        # AGENT_RUN_BUDGET=300 and was SIGINTed at 300+60 while still working.
+        # rc 130 at 363s, and the graph read the dead receipt as a nack.
+        # An explicit budget must leave the wait node room to hear the answer.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        cfg = nodes["agent"]["config"]
+        budget = int(cfg["run_budget_seconds"])
+        self.assertGreater(budget, server.AGENT_RUN_BUDGET,
+                           "an unset budget is what killed three writers")
+        self.assertGreater(nodes["wait"]["config"]["timeoutSeconds"], budget + 60,
+                           "the wait must outlast the budget plus its grace period")
+
     def test_pr_drive_waits_outlast_the_work_they_wait_on(self):
         # A writer took 335s against a 300s wait and the run was discarded at
         # herdr_wait_timeout, 35 seconds short, with rc 0 and the work staged.
