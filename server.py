@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -69,6 +70,7 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
 HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
 CODEX_BIN = resolve_executable("codex", "GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex")
 CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
+GROK_BIN = resolve_executable("grok", "GRAPHWING_GROK_BIN", Path.home() / ".local" / "bin" / "grok")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
 HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
 AGENT_MAX_TURNS = 30
@@ -81,6 +83,7 @@ NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 NATIVE_LAUNCHERS = {
     "codex": {"provider": "openai", "models": ("gpt-5.6-sol",)},
     "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
+    "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
@@ -3154,6 +3157,223 @@ def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, di
     return proc, None
 
 
+def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None]:
+    """Run one bounded ACP turn and return its structured session identity."""
+    path = job_dir(job["job_id"])
+    stdout_path = path / "stdout.log"
+    stderr_path = path / "stderr.log"
+    cwd = str(Path(job["cwd"]).resolve())
+    env = hermes_job_env(job)
+    env["GROK_DISABLE_AUTOUPDATER"] = "1"
+    try:
+        proc = subprocess.Popen(
+            [str(GROK_BIN), "agent", "--always-approve", "--model", "grok-4.6", "stdio"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=cwd, env=env, start_new_session=True, bufsize=0,
+        )
+    except OSError as exc:
+        return 1, False, None, f"spawn failed: {exc}"
+    job["pid"] = proc.pid
+    write_job(job)
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+
+    def drain_stderr() -> None:
+        remaining = FILE_MAX_BYTES
+        with stderr_path.open("wb") as log:
+            while True:
+                part = os.read(proc.stderr.fileno(), 4096)
+                if not part:
+                    return
+                if remaining:
+                    kept = part[:remaining]
+                    log.write(kept)
+                    remaining -= len(kept)
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    deadline = time.monotonic() + int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET)
+    request_id = 0
+    wire = b""
+    wire_bytes = 0
+    chunks: list[str] = []
+    chunk_bytes = 0
+    session_id: str | None = (job.get("session_identity") or {}).get("native_session_id")
+
+    def read_message(log: Any) -> dict[str, Any]:
+        nonlocal wire, wire_bytes
+        while b"\n" not in wire:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+                raise TimeoutError("Grok ACP request timed out")
+            part = os.read(proc.stdout.fileno(), 4096)
+            if not part:
+                code = proc.poll()
+                raise RuntimeError(f"Grok ACP process exited {code if code is not None else 'early'}")
+            wire += part
+            wire_bytes += len(part)
+            if len(wire) > CMD_MAX_BYTES or wire_bytes > CMD_MAX_BYTES:
+                raise ValueError("Grok ACP wire exceeded output limit")
+        raw, wire = wire.split(b"\n", 1)
+        log.write(raw + b"\n")
+        log.flush()
+        try:
+            message = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("malformed Grok ACP wire") from exc
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+            raise ValueError("malformed Grok ACP wire")
+        return message
+
+    def request(log: Any, method: str, params: dict[str, Any], collect: bool = False) -> dict[str, Any]:
+        nonlocal request_id, chunk_bytes
+        request_id += 1
+        payload = (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n").encode()
+        sent = 0
+        while sent < len(payload):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [proc.stdin], [], remaining)[1]:
+                raise TimeoutError("Grok ACP request timed out")
+            written = os.write(proc.stdin.fileno(), payload[sent : sent + 4096])
+            if not written:
+                raise BrokenPipeError("Grok ACP stdin closed")
+            sent += written
+        while True:
+            message = read_message(log)
+            if message.get("method") == "session/update":
+                if any(key in message for key in ("id", "result", "error")):
+                    raise ValueError("malformed Grok session update")
+                update_params = message.get("params")
+                update = update_params.get("update") if isinstance(update_params, dict) else None
+                if (
+                    not isinstance(update, dict)
+                    or not isinstance(update.get("sessionUpdate"), str)
+                    or update_params.get("sessionId") != session_id
+                ):
+                    raise ValueError("malformed or changed Grok session update")
+                if update.get("sessionUpdate") == "agent_message_chunk":
+                    content = update.get("content")
+                    text = content.get("text") if isinstance(content, dict) else None
+                    if not isinstance(content, dict) or content.get("type") != "text" or not isinstance(text, str):
+                        raise ValueError("malformed Grok agent message chunk")
+                    if collect:
+                        chunk_bytes += len(text.encode())
+                        if chunk_bytes > FILE_MAX_BYTES:
+                            raise ValueError("Grok assistant output exceeded limit")
+                        chunks.append(text)
+                continue
+            if type(message.get("id")) is not int or message["id"] != request_id:
+                raise ValueError("unexpected Grok ACP response")
+            if ("result" in message) == ("error" in message):
+                raise ValueError(f"invalid Grok ACP {method} response")
+            if "error" in message:
+                raise RuntimeError(f"Grok ACP {method} error")
+            result = message["result"]
+            if not isinstance(result, dict):
+                raise ValueError(f"invalid Grok ACP {method} result")
+            return result
+
+    timed_out = False
+    error: str | None = None
+    returncode = 1
+    try:
+        with stdout_path.open("wb") as stdout_f:
+            initialized = request(stdout_f, "initialize", {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False,
+                },
+            })
+            if type(initialized.get("protocolVersion")) is not int or initialized["protocolVersion"] != 1:
+                raise ValueError("unsupported Grok ACP protocol version")
+            auth_methods = initialized.get("authMethods", [])
+            if not isinstance(auth_methods, list):
+                raise ValueError("malformed Grok ACP authentication methods")
+            method_by_id: dict[str, dict[str, Any]] = {}
+            for method in auth_methods:
+                method_id = method.get("id") if isinstance(method, dict) else None
+                if (
+                    not isinstance(method_id, str)
+                    or not method_id.strip()
+                    or method_id in method_by_id
+                ):
+                    raise ValueError("malformed Grok ACP authentication methods")
+                method_by_id[method_id] = method
+            if auth_methods:
+                method_id = "xai.api_key" if os.environ.get("XAI_API_KEY") else "cached_token"
+                selected = method_by_id.get(method_id)
+                if selected is None or selected.get("type", "agent") != "agent":
+                    raise RuntimeError("unsupported Grok ACP authentication")
+                request(stdout_f, "authenticate", {"methodId": method_id, "_meta": {"headless": True}})
+            if session_id:
+                capabilities = initialized.get("agentCapabilities")
+                if not isinstance(capabilities, dict) or capabilities.get("loadSession") is not True:
+                    raise RuntimeError("Grok ACP does not support session/load")
+                loaded = request(stdout_f, "session/load", {
+                    "sessionId": session_id, "cwd": cwd, "mcpServers": [],
+                })
+                if loaded.get("sessionId") not in (None, session_id):
+                    raise ValueError("Grok session identity changed during load")
+            else:
+                created = request(stdout_f, "session/new", {"cwd": cwd, "mcpServers": []})
+                candidate = created.get("sessionId")
+                if not isinstance(candidate, str) or not NATIVE_SESSION_RE.fullmatch(candidate.strip()):
+                    raise ValueError("missing structured Grok session identity")
+                session_id = candidate.strip()
+            prompted = request(stdout_f, "session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": path.joinpath("prompt.txt").read_text()}],
+            }, collect=True)
+            if prompted.get("stopReason") != "end_turn":
+                raise RuntimeError("Grok ACP prompt did not end_turn")
+            final_message = "".join(chunks)
+            path.joinpath("last-message.txt").write_text(final_message)
+            parsed = parse_receipt_text(final_message)
+            if not (
+                isinstance(parsed, dict)
+                and set(parsed) == {"status", "sha", "pr_url", "summary"}
+                and parsed["status"] in ("ok", "error", "timeout")
+                and (parsed["sha"] is None or isinstance(parsed["sha"], str))
+                and (parsed["pr_url"] is None or isinstance(parsed["pr_url"], str))
+                and isinstance(parsed["summary"], str)
+                and bool(parsed["summary"].strip())
+            ):
+                raise ValueError("missing or invalid final receipt")
+            returncode = 0
+    except TimeoutError as exc:
+        timed_out, error = True, str(exc)
+    except (BrokenPipeError, OSError, RuntimeError, ValueError) as exc:
+        error = str(exc)
+        code = proc.poll()
+        if code not in (None, 0):
+            returncode = code
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            exit_code = proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_proc(proc)
+            exit_code = proc.returncode
+        if exit_code not in (None, 0):
+            returncode = exit_code
+            if error is None:
+                error = f"Grok ACP process exited {exit_code}"
+        proc.stdout.close()
+        stderr_thread.join(timeout=1)
+        proc.stderr.close()
+        if error:
+            summary = (error + "\n").encode()[-FILE_MAX_BYTES:]
+            with stderr_path.open("a+b") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.truncate(min(fh.tell(), FILE_MAX_BYTES - len(summary)))
+                fh.write(summary)
+    return returncode, timed_out, session_id, error
+
+
 def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
     if job.get("launcher") == "codex":
         return spawn_codex(job)
@@ -3200,7 +3420,11 @@ def run_agent_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    proc, err = spawn_writer(job)
+    if job.get("launcher") == "grok":
+        returncode, timed_out, session_id, protocol_error = run_grok_acp(job)
+        proc, err = None, None
+    else:
+        proc, err = spawn_writer(job)
     if err:
         job["status"] = "failed"
         job["finished_at"] = utcnow()
@@ -3213,22 +3437,26 @@ def run_agent_job(job_id: str) -> None:
         write_job(job)
         herdr_job_done(job)
         return
-    assert proc is not None
-    job["pid"] = proc.pid
-    write_job(job)
-    timed_out = False
-    wait_for = int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET) + 60
-    try:
-        returncode = proc.wait(timeout=wait_for)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_proc(proc)
-        returncode = proc.returncode if proc.returncode is not None else -9
+    if proc is not None:
+        job["pid"] = proc.pid
+        write_job(job)
+        timed_out = False
+        wait_for = int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET) + 60
+        try:
+            returncode = proc.wait(timeout=wait_for)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_proc(proc)
+            returncode = proc.returncode if proc.returncode is not None else -9
+        session_id = None
+        protocol_error = None
     stdout = read_bounded_output(job_dir(job_id) / "stdout.log")
     final_message = read_bounded_output(job_dir(job_id) / "last-message.txt")
     parsed = parse_receipt_text(final_message) or parse_receipt_text(stdout)
-    session_id = parse_native_session_id(stdout, str(job.get("launcher") or ""))
+    session_id = session_id or parse_native_session_id(stdout, str(job.get("launcher") or ""))
     session_error = record_native_session(job, session_id)
+    if protocol_error and not timed_out:
+        session_error = protocol_error
     receipt = normalize_receipt(job, parsed, returncode, timed_out)
     if session_error:
         receipt["status"] = "error"
@@ -3460,7 +3688,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, session_err
     launcher = str(data.get("launcher") or "hermes").strip()
     if launcher != "hermes" and launcher not in NATIVE_LAUNCHERS:
-        return 400, {"error": "launcher must be hermes, claude, or codex", "code": "bad_launcher"}
+        return 400, {"error": "launcher must be hermes, claude, codex, or grok", "code": "bad_launcher"}
     native = launcher in NATIVE_LAUNCHERS
     if native and session is not None:
         return 400, {"error": f"{launcher} launcher cannot use hermes_session", "code": "launcher_state_mismatch"}
@@ -3496,9 +3724,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         provider = provider.strip()
     if native_spec and (provider != native_spec["provider"] or model not in native_spec["models"]):
         return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
-    binary = {"hermes": HERMES_BIN, "claude": CLAUDE_BIN, "codex": CODEX_BIN}[launcher]
+    binary = {"hermes": HERMES_BIN, "claude": CLAUDE_BIN, "codex": CODEX_BIN, "grok": GROK_BIN}[launcher]
     if not binary.is_file():
-        code = "provider_unavailable" if native else "not_implemented"
+        code = "missing_binary" if launcher == "grok" else ("provider_unavailable" if native else "not_implemented")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": code}
     session_identity = None
     if native:
