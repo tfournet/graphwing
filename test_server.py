@@ -1582,6 +1582,39 @@ class DispatchTests(unittest.TestCase):
             server.review_result(reviewer, "ticket text", Path("/tmp"))
         return seen["cmd"]
 
+    def test_sol_does_not_review_when_sol_plans(self):
+        # Sol is the planning session, so Sol grading slices against its own
+        # spec is the failure the opposing-vendor rule exists to prevent, one
+        # step earlier in the chain. visual and sensitive both reviewed with
+        # Sol; they now review with Anthropic models.
+        for cls in ("visual", "sensitive"):
+            for size in ("S", "M", "L"):
+                r = server.slice_route_lookup(cls, size)
+                self.assertNotIn("sol", (r["reviewer1"], r["reviewer2"]),
+                                 f"{cls}/{size} still reviews with the planner")
+
+    def test_fable_is_a_usable_reviewer(self):
+        # Adding a reviewer name the runner cannot launch would nack every
+        # slice with not_implemented, which parses as a real rejection.
+        seen = {}
+
+        class FakeProc:
+            stdout = b"VERDICT: PASS\n"
+            stderr = b""
+            returncode = 0
+
+        with mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+             mock.patch.object(server.subprocess, "run",
+                               lambda cmd, **kw: (seen.__setitem__("cmd", cmd), FakeProc())[1]), \
+             mock.patch.object(server.Path, "is_file", lambda self: True), \
+             mock.patch.object(server, "hermes_job_env", return_value={}):
+            out = server.review_result("fable", "ticket", Path("/tmp"))
+        self.assertEqual(out["verdict"], "PASS", out)
+        self.assertIn("--model", seen["cmd"])
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1], "claude-fable-5")
+        # Reviewers are read-only; plan mode is what enforces that.
+        self.assertIn("plan", seen["cmd"])
+
     def test_sol_reviewer_cannot_write_to_the_repo(self):
         # The claude reviewers get --permission-mode plan, which enforces
         # read-only in the runner. The hermes reviewer got --yolo and no
@@ -2487,16 +2520,16 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(payload["launcher"], "claude")
         self.assertEqual(payload["size"], "M")
-        self.assertEqual(payload["reviewer1"], "sol")
+        self.assertEqual(payload["reviewer1"], "fable")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"M"}'
         )
         self.assertEqual(payload["launcher"], "claude")
-        self.assertEqual(payload["reviewer1"], "sol")
+        self.assertEqual(payload["reviewer1"], "fable")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"sensitive","size":"M"}'
         )
-        self.assertEqual(payload["reviewer1"], "sol")
+        self.assertEqual(payload["reviewer1"], "fable")
         self.assertEqual(payload["reviewer2"], "opus")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"nope","size":"M"}'

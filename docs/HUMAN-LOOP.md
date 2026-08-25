@@ -76,9 +76,18 @@ Closed table. Graph looks up the row. No per-slice model picker. Missing class â
 | class | writer launcher / model | spec-review (plan mode) |
 |---|---|---|
 | `mechanical` | Hermes `agentRun` `grok-4.6` (`xai-oauth`) | Anthropic Sonnet |
-| `mechanical` (seat today) | still `gpt-5.6-sol` / `openai-codex` until flipped | Anthropic Sonnet |
-| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Sol** (`gpt-5.6-sol`) |
-| `sensitive` | `claude -p` `claude-opus-5` | **Sol, then Opus** (both must ack) |
+| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Fable** (`claude -p claude-fable-5`) |
+| `sensitive` | `claude -p` `claude-opus-5` | **Fable, then Opus** (both must ack) |
+
+**Sol plans, so Sol does not review.** The planning session is
+`HERMES_HOME=$GRAPHWING_HOME hermes chat -s grilling` on `gpt-5.6-sol`, and a
+reviewer that wrote the spec is the same conflict the opposing-vendor rule
+prevents, one step earlier in the chain. `visual` and `sensitive` used to review
+with Sol; they now review with Anthropic models through `claude -p`.
+
+That trades vendor diversity for model diversity on those two classes: Opus
+writes and Fable grades. `mechanical` is unaffected and keeps true opposing
+vendors, Grok writing and Sonnet reviewing.
 
 Example budgets (tune later; Graph wait â‰¥ budget):
 

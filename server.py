@@ -1326,11 +1326,16 @@ def slice_route_lookup(
         launcher, model = "hermes", "grok-4.6"
         reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
     elif class_name == "visual":
+        # Sol is the planning session. A reviewer that wrote the spec is the
+        # same conflict the opposing-vendor rule prevents, one step earlier,
+        # so visual and sensitive review with Anthropic models instead. The
+        # writer is Opus, so the diversity here is model, not vendor: Fable
+        # grades what Opus wrote.
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "sol", "none"
+        reviewer1, reviewer2 = "fable", "none"
     else:
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "sol", "opus"
+        reviewer1, reviewer2 = "fable", "opus"
     return {
         "ok": True,
         "class": class_name,
@@ -1342,7 +1347,8 @@ def slice_route_lookup(
         "run_budget_seconds": wait,
         "reviewer1": reviewer1,
         "reviewer2": reviewer2,
-        "review": "none" if reviewer1 == "none" else ("sol_opus" if reviewer2 == "opus" else reviewer1),
+        "review": "none" if reviewer1 == "none" else (
+            f"{reviewer1}_{reviewer2}" if reviewer2 != "none" else reviewer1),
     }
 
 
@@ -1588,11 +1594,11 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
         f"Ticket:\n{prompt[:8000]}\n\nDiff:\n{diff_text}\n"
     )
-    if reviewer in {"sonnet", "opus"}:
+    if reviewer in {"sonnet", "opus", "fable"}:
         if not CLAUDE_BIN.is_file():
             return {"ok": False, "verdict": "NACK", "no_verdict": True,
                     "error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
-        model = "sonnet" if reviewer == "sonnet" else "opus"
+        model = {"sonnet": "sonnet", "opus": "opus", "fable": "claude-fable-5"}[reviewer]
         cmd = [
             str(CLAUDE_BIN),
             "-p",
@@ -1710,8 +1716,9 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 400, err
     assert data is not None
     reviewer = str(data.get("reviewer") or "").strip()
-    if reviewer not in {"sonnet", "opus", "sol"}:
-        return 400, {"error": "reviewer must be sonnet, opus, or sol", "code": "bad_reviewer"}
+    if reviewer not in {"sonnet", "opus", "fable", "sol"}:
+        return 400, {"error": "reviewer must be sonnet, opus, fable, or sol",
+                     "code": "bad_reviewer"}
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return 400, {"error": "prompt is required", "code": "missing_prompt"}
