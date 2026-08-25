@@ -320,6 +320,128 @@ SECRET_VALUE_RES = (
         r"/(?:[^\s/?#]*[0-9][^\s/?#]*|[^\s/?#]{16,})"
     ),
 )
+# Workflow completion supervisor. Rewst's trigger.workflowCompleted delivers
+# every terminal source run to one named reconciliation op here; this half owns
+# the durable launch registry, the delivery dedupe, the retry ladder, and the
+# circuit breaker. Bumping the version is a promise to migrate: a document this
+# service cannot read is reported, never rewritten.
+SUPERVISOR_STATE_VERSION = 1
+SUPERVISOR_DIR = HOME / "supervisor"
+SUPERVISOR_LOCK = threading.Lock()
+SUPERVISOR_WATCHER_LOCK = threading.Lock()
+SUPERVISOR_ACTIVE_WATCHERS: set[tuple[str, str]] = set()
+SUPERVISOR_RECOVERY_LOCK = threading.Lock()
+SUPERVISOR_RECOVERED_ROOTS: set[str] = set()
+# The published listener. It filters supervised source workflows by this tag and
+# must never be able to select itself.
+SUPERVISOR_LISTENER_SLUG = "graphwing-build-completion-supervisor"
+SUPERVISOR_TAG = "graphwing-supervised"
+# A Rewst run id is the external correlation key, so it is validated as an
+# opaque handle rather than parsed. `..` can never appear because the on-disk
+# name is a digest of it, not the value.
+SUPERVISOR_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+# Listener identity is workflow slug plus published version, e.g.
+# "graphwing-build-completion-supervisor@7". Only the slug half is the dedupe
+# key; the version is diagnostics, so republishing the listener cannot re-run a
+# decision the previous version already made.
+SUPERVISOR_LISTENER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+SUPERVISOR_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SUPERVISOR_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SUPERVISOR_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Failure codes are slugs, never text. A free-text field here is how a raw
+# provider error or a stack frame ends up on disk.
+SUPERVISOR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+SUPERVISOR_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+SUPERVISOR_LOOSE_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})?$"
+)
+SUPERVISOR_TERMINAL_STATUSES = ("completed", "failed", "canceled", "timed_out")
+SUPERVISOR_EXECUTION_MODES = ("live", "preview", "demo")
+SUPERVISOR_FAILURE_CLASSES = ("transient", "deterministic", "unknown")
+# The retry class is derived here and nowhere else. It is a function of the
+# terminal status the trigger delivered, which the listener cannot choose:
+# a timeout is transient, an operator cancel is deterministic because rerunning
+# it unchanged is exactly what the operator stopped, and a plain failure is
+# unknown. A caller-supplied class would be a caller-supplied retry budget.
+SUPERVISOR_STATUS_CLASS = {
+    "timed_out": "transient",
+    "canceled": "deterministic",
+    "failed": "unknown",
+    "completed": "unknown",
+}
+# What a report says when the completion named no node. A stable label rather
+# than a blank keeps the operator line readable and keeps "no node" from
+# looking like a distinct node on every delivery.
+SUPERVISOR_UNKNOWN_NODE = "unknown"
+# Transient means the dispatch or the network dropped it, so the same call can
+# work. Deterministic means the graph, the schema, or the config is wrong, and
+# retrying unchanged only burns another run. Unknown gets exactly one retry:
+# enough to shake off a one-off, not enough to loop.
+SUPERVISOR_RETRY_BUDGET = {"transient": 3, "deterministic": 0, "unknown": 1}
+SUPERVISOR_CIRCUIT_THRESHOLD = 2
+SUPERVISOR_RELAUNCH_MAX = 1
+SUPERVISOR_REPORTS_KEPT = 32
+SUPERVISOR_RUNS_MAX = 500
+SUPERVISOR_DELIVERIES_MAX = 2000
+SUPERVISOR_CIRCUITS_MAX = 256
+SUPERVISOR_WATCHES_MAX = 500
+SUPERVISOR_TAGS_MAX = 32
+SUPERVISOR_TAGS_JSON_MAX_BYTES = 8192
+SUPERVISOR_OUTPUT_MAX_KEYS = 32
+SUPERVISOR_STATE_MAX_BYTES = 1024 * 1024
+SUPERVISOR_CONTINUATION_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+SUPERVISOR_CONTINUATION_FIELDS = frozenset(
+    {
+        "repo",
+        "writer_prompt",
+        "writer_prompt_ref",
+        "fast_recipe",
+        "integration_recipe",
+        "reviewer",
+        "class_stamp",
+        "route_stamp",
+    }
+)
+# The one supervised source workflow. The listener's continuation starts this
+# slug and nothing else, and the reconcile answer names it so the topology has
+# a single place the contract is written down.
+SUPERVISOR_SOURCE_SLUG = "graphwing-pre-pr-build"
+# Actions a retry, a relaunch, a watch handoff, a park, or an open circuit
+# produce. Every one of them writes a durable report and attempts the exact
+# planning pane; `receipt` and `ignored` do neither, because nothing happened
+# an operator has to act on.
+SUPERVISOR_REPORTED_ACTIONS = frozenset({"retry_event", "relaunch", "watch", "park", "circuit_open"})
+# The actions that come with the input for one bounded source continuation.
+# A watch terminates the listener run; its server-owned worker resolves or
+# parks the build and never launches another source run.
+SUPERVISOR_CONTINUATION_ACTIONS = frozenset({"retry_event", "relaunch"})
+# Watch wake-up. The server owns this lifecycle; no callback capability is
+# accepted or persisted. The loop is bounded by the registered deadline and a
+# short receipt-settle window after the local job goes terminal.
+SUPERVISOR_WATCH_POLL_SECONDS = float(os.environ.get("GRAPHWING_WATCH_POLL", "2") or "2")
+SUPERVISOR_WATCH_SETTLE_SECONDS = 30
+SUPERVISOR_WATCH_OUTCOMES = (
+    "receipt",
+    "job_finished_without_receipt",
+    "job_missing",
+    "deadline_exceeded",
+)
+
+# The listener sends `error.present`, a boolean. Anything that could carry the
+# message, the body, or the stack is refused outright rather than redacted:
+# redaction is a bound on accidents, not a licence to post an error blob.
+SUPERVISOR_RAW_ERROR_KEYS = frozenset(
+    {
+        "message", "messages", "detail", "details", "description", "text", "body",
+        "trace", "traceback", "stack", "stacktrace", "exception", "exceptions",
+        "response", "raw", "output", "cause", "causes", "context", "payload",
+    }
+)
+# Linear pre-PR order, used to tell "the build has not got there yet" from "the
+# build moved past this event without ever recording it".
+BUILD_STAGE_ORDER = ("created", "writing", "verifying", "evidence", "review", "ready", "pr_opened")
+HERDR_PLAN_LABEL = os.environ.get("GRAPHWING_PLAN_TAB", "plan") or "plan"
+HERDR_PANE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 BUILD_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 RUNS_LOCK = threading.Lock()
@@ -2133,8 +2255,11 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    supervised_source_run_id, supervised_err = parse_supervised_source_run_id(data)
+    if supervised_err:
+        return 400, supervised_err
 
-    if not webhook_url:
+    if not webhook_url and supervised_source_run_id is None:
         result = review_result(reviewer, prompt, resolved)
         if result.get("code") == "not_implemented":
             return 501, result
@@ -2142,11 +2267,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             return 504, result
         return 200, result
 
-    with JOB_LOCK:
-        if active_job_count() >= AGENT_MAX_CONCURRENT:
-            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
-        job_id = uuid.uuid4().hex
-        job = {
+    job_id = uuid.uuid4().hex
+    job = {
             "job_id": job_id,
             "kind": "review",
             "status": "queued",
@@ -2163,10 +2285,12 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "receipt": None,
             "log_ref": str(job_dir(job_id) / "stdout.log"),
             "error": None,
-            "webhook": None,
-        }
-        job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        write_job(job)
+        "webhook": None,
+        "supervised_source_run_id": supervised_source_run_id,
+    }
+    persist_err = persist_new_job(job, supervised_source_run_id)
+    if persist_err:
+        return int(persist_err.get("status") or 409), persist_err
     enqueue_review(job)
     return 202, {
         "ok": True,
@@ -2471,6 +2595,93 @@ def herdr_log(line: str) -> None:
         herdr_report(pane_id, HERDR_GRAPH_LABEL, "idle", line[:120])
 
 
+def herdr_pane_known(pane_id: str) -> tuple[bool, str]:
+    """Is this the exact pane the saved planning session is on?
+
+    The registration names one pane and supervision reports to that pane or to
+    nowhere. Checking it at registration is the only moment a typo is cheap:
+    afterwards the build is running and a report that went to the graph
+    dashboard instead is a report the planner never saw.
+
+    A host with no human surface has nothing to check against, so the pane is
+    taken at face value there and every later delivery against it is recorded
+    as attempted-and-failed. That is louder than a silent redirect, which is
+    the outcome this whole path exists to prevent.
+    """
+    if not herdr_enabled():
+        return True, ""
+    panes = herdr_cli(["pane", "list"])
+    if panes is None:
+        return False, "plan_pane_unverifiable"
+    for pane in panes.get("panes") or []:
+        if isinstance(pane, dict) and str(pane.get("pane_id") or "") == pane_id:
+            return True, ""
+    return False, "unknown_plan_pane"
+
+
+def herdr_plan_deliver(pane_id: str | None, line: str) -> dict[str, Any]:
+    """Post one supervisor outcome to the exact planning pane, and say what happened.
+
+    There is no fallback pane. An earlier draft walked the `plan` tab label and
+    then the graph dashboard when the saved pane was gone, which reads as
+    robustness and is not: the operator who opened the build stops getting
+    reports and nothing anywhere says so. Delivery is therefore a fact with a
+    receipt -- attempted, ok, and a code -- and the caller stores it next to
+    the report it belongs to.
+
+    Run inline rather than on a thread because the receipt has to reach disk in
+    the same write as the report. A backgrounded delivery whose failure lands
+    after the state was saved is exactly the silent redirect in another shape.
+    """
+    receipt: dict[str, Any] = {
+        "attempted": False,
+        "ok": False,
+        "pane_id": pane_id,
+        "code": None,
+        "at": utcnow(),
+    }
+    if not pane_id:
+        receipt["code"] = "missing_plan_pane"
+        return receipt
+    if not herdr_enabled():
+        receipt["code"] = "herdr_disabled"
+        return receipt
+    receipt["attempted"] = True
+    try:
+        with HERDR_LOCK:
+            known, code = herdr_pane_known(pane_id)
+            if not known:
+                receipt["code"] = code
+                return receipt
+            safe = "".join(c if (c.isprintable() and c != "'") else " " for c in line).strip()[:240]
+            sent = run_cmd(
+                [
+                    "herdr", "--session", HERDR_SESSION, "pane", "send-text", pane_id,
+                    f"printf '%s\\n' '{utcnow()} {safe}'\n",
+                ],
+                timeout=8,
+            )
+            if not sent.get("ok"):
+                receipt["code"] = "plan_pane_unreachable"
+                return receipt
+            herdr_report(pane_id, HERDR_PLAN_LABEL, "idle", line[:120])
+    except Exception:
+        receipt["code"] = "plan_pane_unreachable"
+        return receipt
+    receipt["ok"] = True
+    return receipt
+
+
+def plan_delivery_skipped(pane_id: str | None) -> dict[str, Any]:
+    """The receipt for an outcome nobody has to act on.
+
+    `receipt` and `ignored` are not reported, so recording them as a failed
+    delivery would fill the operator's report with failures that never had a
+    message behind them.
+    """
+    return {"attempted": False, "ok": True, "pane_id": pane_id, "code": "not_reported", "at": utcnow()}
+
+
 def herdr_job_tab_label(job: dict[str, Any]) -> str:
     job_id = str(job.get("job_id") or "")
     tag = {"script": "s", "test": "t", "rr": "r"}.get(str(job.get("kind") or ""), "s" if job.get("script") else "a")
@@ -2709,6 +2920,56 @@ def active_job_count() -> int:
         if isinstance(data, dict) and data.get("status") in ("queued", "running"):
             n += 1
     return n
+
+
+def parse_supervised_source_run_id(data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    raw = data.get("supervised_source_run_id")
+    if raw in (None, ""):
+        return None, None
+    if not isinstance(raw, str) or not SUPERVISOR_RUN_ID_RE.fullmatch(raw.strip()):
+        return None, {
+            "error": "supervised_source_run_id must be a registered Rewst run id",
+            "code": "bad_source_run_id",
+        }
+    return raw.strip(), None
+
+
+def persist_new_job(
+    job: dict[str, Any],
+    supervised_source_run_id: str | None,
+    prompt_contents: str | None = None,
+) -> dict[str, Any] | None:
+    """Persist and bind a job before any worker can observe the queue."""
+
+    def write_new_job() -> dict[str, Any] | None:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return {"error": "too many in-flight agent jobs", "code": "busy", "status": 429}
+        job_dir(job["job_id"]).mkdir(parents=True, exist_ok=True)
+        if prompt_contents is not None:
+            (job_dir(job["job_id"]) / "prompt.txt").write_text(prompt_contents)
+        write_job(job)
+        return None
+
+    if supervised_source_run_id is None:
+        with JOB_LOCK:
+            return write_new_job()
+    # Keep the same lock order as reconciliation, which enters supervisor state
+    # before reading a local job. Binding failure never exposes queued work.
+    with SUPERVISOR_LOCK:
+        with JOB_LOCK:
+            err = write_new_job()
+            if err:
+                return err
+        bind_err = supervisor_bind_job_locked(supervised_source_run_id, job["job_id"])
+        if bind_err:
+            with JOB_LOCK:
+                failed = read_job(job["job_id"]) or job
+                failed["status"] = "failed"
+                failed["finished_at"] = utcnow()
+                failed["error"] = str(bind_err.get("error") or "supervisor binding failed")
+                write_job(failed)
+            return bind_err
+    return None
 
 
 WATCH_RECENT = 8
@@ -3401,8 +3662,11 @@ def named_cmd_run(
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    supervised_source_run_id, supervised_err = parse_supervised_source_run_id(data)
+    if supervised_err:
+        return 400, supervised_err
     timeout = int(spec["timeout_seconds"])
-    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT
+    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT or supervised_source_run_id is not None
     if not async_run:
         result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=timeout)
         if result.get("code") == "missing_binary":
@@ -3429,32 +3693,31 @@ def named_cmd_run(
             "truncated": bool(result.get("truncated")),
             "compact": compact_cmd_signal(result),
         }
-    with JOB_LOCK:
-        if active_job_count() >= AGENT_MAX_CONCURRENT:
-            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
-        job_id = uuid.uuid4().hex
-        log_ref = str(job_dir(job_id) / "stdout.log")
-        job = {
-            "job_id": job_id,
-            "kind": kind,
-            "status": "queued",
-            "script": name,
-            "argv": list(spec["argv"]),
-            "cwd": str(spec["cwd"]),
-            "timeout_seconds": timeout,
-            "response_webhook_url": webhook_url,
-            "response_webhook_token": webhook_token,
-            "resume_url": webhook_url,
-            "created_at": utcnow(),
-            "started_at": None,
-            "finished_at": None,
-            "receipt": None,
-            "log_ref": log_ref,
-            "error": None,
-            "webhook": None,
-        }
-        job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        write_job(job)
+    job_id = uuid.uuid4().hex
+    log_ref = str(job_dir(job_id) / "stdout.log")
+    job = {
+        "job_id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "script": name,
+        "argv": list(spec["argv"]),
+        "cwd": str(spec["cwd"]),
+        "timeout_seconds": timeout,
+        "response_webhook_url": webhook_url,
+        "response_webhook_token": webhook_token,
+        "resume_url": webhook_url,
+        "created_at": utcnow(),
+        "started_at": None,
+        "finished_at": None,
+        "receipt": None,
+        "log_ref": log_ref,
+        "error": None,
+        "webhook": None,
+        "supervised_source_run_id": supervised_source_run_id,
+    }
+    persist_err = persist_new_job(job, supervised_source_run_id)
+    if persist_err:
+        return int(persist_err.get("status") or 409), persist_err
     enqueue_script(job)
     return 202, {
         "ok": True,
@@ -3522,6 +3785,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    supervised_source_run_id, supervised_err = parse_supervised_source_run_id(data)
+    if supervised_err:
+        return 400, supervised_err
     session, session_err = parse_hermes_session(data)
     if session_err:
         return 400, session_err
@@ -3545,38 +3811,39 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
     if launcher == "claude" and not CLAUDE_BIN.is_file():
         return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
-    with JOB_LOCK:
-        if active_job_count() >= AGENT_MAX_CONCURRENT:
-            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
-        job_id = uuid.uuid4().hex
-        log_ref = str(job_dir(job_id) / "stdout.log")
-        hermes_session = session or f"gwslice-{job_id}"
-        job = {
-            "job_id": job_id,
-            "status": "queued",
-            "profile": profile,
-            "repo": repo_name,
-            "cwd": str(resolved),
-            "prompt": prompt,
-            "hermes_session": hermes_session,
-            "launcher": launcher,
-            "model": model,
-            "max_turns": turns or AGENT_MAX_TURNS,
-            "run_budget_seconds": budget or AGENT_RUN_BUDGET,
-            "response_webhook_url": webhook_url,
-            "response_webhook_token": webhook_token,
-            "resume_url": webhook_url,
-            "created_at": utcnow(),
-            "started_at": None,
-            "finished_at": None,
-            "receipt": None,
-            "log_ref": log_ref,
-            "error": None,
-            "webhook": None,
-        }
-        job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        (job_dir(job_id) / "prompt.txt").write_text(wrap_prompt(job_id, prompt, str(resolved)))
-        write_job(job)
+    job_id = uuid.uuid4().hex
+    log_ref = str(job_dir(job_id) / "stdout.log")
+    hermes_session = session or f"gwslice-{job_id}"
+    job = {
+        "job_id": job_id,
+        "kind": "agent",
+        "status": "queued",
+        "profile": profile,
+        "repo": repo_name,
+        "cwd": str(resolved),
+        "prompt": prompt,
+        "hermes_session": hermes_session,
+        "launcher": launcher,
+        "model": model,
+        "max_turns": turns or AGENT_MAX_TURNS,
+        "run_budget_seconds": budget or AGENT_RUN_BUDGET,
+        "response_webhook_url": webhook_url,
+        "response_webhook_token": webhook_token,
+        "resume_url": webhook_url,
+        "created_at": utcnow(),
+        "started_at": None,
+        "finished_at": None,
+        "receipt": None,
+        "log_ref": log_ref,
+        "error": None,
+        "webhook": None,
+        "supervised_source_run_id": supervised_source_run_id,
+    }
+    persist_err = persist_new_job(
+        job, supervised_source_run_id, wrap_prompt(job_id, prompt, str(resolved))
+    )
+    if persist_err:
+        return int(persist_err.get("status") or 409), persist_err
     enqueue_agent(job)
     return 202, {
         "ok": True,
@@ -8138,6 +8405,2312 @@ def build_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         out.update(ok=True, replayed=False, receipt=receipt)
         return 200, out
 
+# --- workflow completion supervisor -----------------------------------------
+#
+# Rewst ships trigger.workflowCompleted, so every terminal run of a supervised
+# source workflow is delivered to one named, authenticated op here. Four rules
+# make that delivery worth trusting:
+#
+#   1. The launcher registers the source run id before monitoring starts. A
+#      run that fails before it declares anything is still supervised, because
+#      the mapping to build id, event id, workflow version, expected stage and
+#      deadline was durable before the run could fail. The declared output is
+#      corroboration, never the only way to find the build.
+#   2. Delivery is idempotent on source run id plus the listener *slug*, with
+#      the published version deliberately left out of the key. Rewst's outbox
+#      retries and the listener gets republished; both must return the first
+#      answer rather than spend a second retry.
+#   3. Rewst `completed` is not success. Only Graphwing's own terminal receipt
+#      is, so a graph that reported completed while skipping the intended path
+#      is a workflow_fault and parks.
+#   4. Retry is bounded and typed by this service. The class comes only from
+#      terminal status. Circuit identity starts with the registered workflow
+#      id/version, then uses bounded node/code metadata when the authenticated
+#      listener has it, or stable status/error-presence when it does not.
+#
+# Nothing here stores a raw error, a trace body, a Graphwing key, a Rewst
+# token, or a callback capability URL: identity fields are refused when they
+# look like credentials, blobs are redacted and bounded, and the error channel
+# is a boolean.
+
+
+def supervisor_dir(build_id: str) -> Path:
+    return SUPERVISOR_DIR / "builds" / build_id
+
+
+def supervisor_path(build_id: str) -> Path:
+    return supervisor_dir(build_id) / "supervisor.json"
+
+
+def supervisor_run_key(source_run_id: str) -> str:
+    """Name the index file after a digest of the run id, never the id itself.
+
+    A Rewst run id is an opaque external string. Digesting it means no value
+    Rewst ever invents can become a path segment, so the traversal question
+    does not arise for the one field this service does not control.
+    """
+    return hashlib.sha256(source_run_id.encode()).hexdigest()
+
+
+def supervisor_run_index_path(source_run_id: str) -> Path:
+    return SUPERVISOR_DIR / "runs" / f"{supervisor_run_key(source_run_id)}.json"
+
+
+def supervisor_write_json(path: Path, doc: dict[str, Any]) -> dict[str, Any] | None:
+    """Atomic, private, bounded. Returns an error dict instead of raising.
+
+    Private for the same reason the build document is: this file names the
+    worktree, the stacks, and the local job ids of unshipped work.
+    """
+    raw = json.dumps(doc, indent=2) + "\n"
+    if len(raw.encode()) > SUPERVISOR_STATE_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "supervisor state exceeds the write bound",
+            "code": "supervisor_state_too_large",
+            "status": 413,
+        }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".supervisor-", suffix=".json.tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, str(path))
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"could not persist supervisor state: {exc}"[:BUILD_REDACT_MAX_STRING],
+            "code": "supervisor_write_failed",
+            "status": 500,
+        }
+    return None
+
+
+def supervisor_read_json(path: Path, expect: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read a supervisor file, telling missing apart from unreadable.
+
+    The third case is the one that matters. Collapsing an unreadable file into
+    "never registered" would let a completed source run look unsupervised, and
+    the whole point of the registry is that the launch record exists before the
+    run can fail.
+    """
+    if not path.exists():
+        return None, None
+    unreadable = {
+        "ok": False,
+        "error": "supervisor state exists but cannot be read; it has been left untouched",
+        "code": "supervisor_state_unreadable",
+        "status": 409,
+    }
+    if not path.is_file():
+        return None, unreadable
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return None, dict(unreadable, detail=str(exc)[:BUILD_REDACT_MAX_STRING])
+    if not isinstance(data, dict):
+        return None, dict(unreadable, detail="supervisor state is not an object")
+    for key, value in expect.items():
+        if data.get(key) != value:
+            return None, dict(unreadable, detail=f"supervisor state names a different {key}")
+    return data, None
+
+
+def supervisor_load(build_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    return supervisor_read_json(supervisor_path(build_id), {"build_id": build_id})
+
+
+def supervisor_new(build_id: str) -> dict[str, Any]:
+    return {
+        "version": SUPERVISOR_STATE_VERSION,
+        "build_id": build_id,
+        "created_at": utcnow(),
+        "updated_at": utcnow(),
+        "runs": {},
+        "run_order": [],
+        "deliveries": {},
+        "delivery_order": [],
+        # Retry and relaunch counters, keyed by build event id rather than by
+        # source run id: every retry is a different Rewst run.
+        "events": {},
+        "circuits": {},
+        # One watch per source run and event id. Keyed rather than listed so a
+        # redelivered watch request joins the watcher that is already running
+        # instead of putting a second one on the same local job.
+        "watches": {},
+        "watch_order": [],
+        "reports": [],
+    }
+
+
+def supervisor_save(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """Persist, evicting only the things that are safe to forget.
+
+    Reports are a window and deliveries are not: forgetting a report loses a
+    line an operator can read again on the state endpoint, and forgetting a
+    delivery lets Rewst's outbox run the same reconciliation twice. Runs and
+    deliveries are refused at their ceiling rather than evicted, for the same
+    reason build event ids are.
+    """
+    doc["updated_at"] = utcnow()
+    # A watch is stable identity only. Scrub legacy C1 callback fields on every
+    # write so an upgraded service cannot preserve an expiring capability that
+    # was already present on disk.
+    for watch in (doc.get("watches") or {}).values():
+        if isinstance(watch, dict):
+            for field in (
+                "response_webhook_url",
+                "response_webhook_token",
+                "resume_url",
+                "callback",
+                "next",
+            ):
+                watch.pop(field, None)
+    reports = doc.setdefault("reports", [])
+    if len(reports) > SUPERVISOR_REPORTS_KEPT:
+        doc["reports"] = reports[-SUPERVISOR_REPORTS_KEPT:]
+    circuits = doc.setdefault("circuits", {})
+    if len(circuits) > SUPERVISOR_CIRCUITS_MAX:
+        # Only closed circuits are droppable; an open one is a park an
+        # operator still has to clear.
+        for key in [k for k, v in circuits.items() if not (isinstance(v, dict) and v.get("open"))][
+            : len(circuits) - SUPERVISOR_CIRCUITS_MAX
+        ]:
+            circuits.pop(key, None)
+    return supervisor_write_json(supervisor_path(doc["build_id"]), doc)
+
+
+def supervisor_write_index(source_run_id: str, build_id: str) -> dict[str, Any] | None:
+    """Point the run id at its build. Written after the launch record, and
+    rewritten by any later identical registration that finds it missing."""
+    return supervisor_write_json(
+        supervisor_run_index_path(source_run_id),
+        {
+            "version": SUPERVISOR_STATE_VERSION,
+            "source_run_id": source_run_id,
+            "build_id": build_id,
+            "registered_at": utcnow(),
+        },
+    )
+
+
+def supervisor_run_lookup(source_run_id: str) -> tuple[str | None, dict[str, Any] | None]:
+    doc, err = supervisor_read_json(
+        supervisor_run_index_path(source_run_id), {"source_run_id": source_run_id}
+    )
+    if err:
+        return None, err
+    if doc is None:
+        return None, None
+    build_id = doc.get("build_id")
+    return (build_id if valid_build_id(build_id) else None), None
+
+
+def parse_supervisor_string(
+    container: dict[str, Any],
+    key: str,
+    pattern: re.Pattern[str],
+    code: str,
+    required: bool = True,
+    label: str | None = None,
+    blank_ok: bool = False,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """One bounded, pattern-checked identity field.
+
+    Absent is absent. `null` and `""` are refused with every other wrong type
+    rather than folded into absent: a caller that meant to name the failed node
+    and sent nothing usable should find out, not get a report that says the
+    node is unknown.
+
+    `blank_ok` is the one exception, and only for fields a Rewst template
+    renders directly. A missing Jinja value renders as an empty string, not as
+    an omitted key, so refusing "" for `source_workflow.slug` would reject a
+    correct listener for saying nothing about an optional field.
+    """
+    name = label or key
+    bad = {"error": f"{name} must match {pattern.pattern}", "code": code}
+    if key not in container or (blank_ok and container[key] in (None, "")):
+        if required and key not in container:
+            return None, {"error": f"{name} is required", "code": code}
+        if required:
+            return None, bad
+        return None, None
+    raw = container[key]
+    if not isinstance(raw, str):
+        return None, bad
+    value = raw.strip()
+    if not pattern.fullmatch(value):
+        return None, bad
+    secret = reject_secret_text(value, name.replace(".", "_"))
+    if secret:
+        return None, secret
+    return value, None
+
+
+def parse_supervisor_timestamp(
+    container: dict[str, Any], key: str, label: str
+) -> tuple[str | None, dict[str, Any] | None]:
+    # "" is absent here, not a bad timestamp: the listener renders these
+    # straight out of the Rewst payload, and a run that never started has no
+    # startedAt to render.
+    if key not in container or container[key] in (None, ""):
+        return None, None
+    raw = container[key]
+    if not isinstance(raw, str) or not SUPERVISOR_LOOSE_TS_RE.fullmatch(raw.strip()):
+        return None, {"error": f"{label} must be an ISO 8601 timestamp", "code": "bad_timestamp"}
+    return raw.strip(), None
+
+
+def parse_supervisor_deadline(container: dict[str, Any]) -> tuple[str | None, float | None, dict[str, Any] | None]:
+    """A deadline is required, and it is a UTC instant, not a duration.
+
+    A duration would be measured from whenever this call happened to arrive,
+    so a retried registration would silently extend the window it was meant to
+    bound.
+    """
+    raw = container.get("deadline")
+    bad = {"error": "deadline must be a UTC timestamp like 2026-08-25T13:00:00Z", "code": "bad_deadline"}
+    if not isinstance(raw, str) or not SUPERVISOR_TS_RE.fullmatch(raw.strip()):
+        return None, None, bad
+    value = raw.strip()
+    epoch = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    return value, epoch, None
+
+
+def parse_supervisor_plan_pane(container: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """The exact planning pane, required, and never defaulted.
+
+    Required because the alternative is a default, and a default here is a
+    report delivered to whichever `plan` tab happened to be open, or to the
+    graph dashboard nobody is reading. The launch is the only moment the
+    caller still knows which planning session asked for this build, so that is
+    where the pane is pinned.
+
+    Checked against the live session for the same reason: refusing a pane that
+    does not exist costs one 400 at launch, and accepting it costs every later
+    park going nowhere.
+    """
+    raw = container.get("plan_pane")
+    if raw in (None, ""):
+        return None, {
+            "error": (
+                "plan_pane is required: supervision reports go to the exact saved planning "
+                "session, never to a default tab or the graph dashboard"
+            ),
+            "code": "missing_plan_pane",
+        }
+    if not isinstance(raw, str) or not HERDR_PANE_ID_RE.fullmatch(raw.strip()):
+        return None, {"error": "plan_pane must be a herdr pane id", "code": "bad_plan_pane"}
+    pane = raw.strip()
+    known, code = herdr_pane_known(pane)
+    if not known:
+        return None, {
+            "error": "plan_pane is not a pane in this herdr session",
+            "code": code,
+            "plan_pane": pane,
+        }
+    return pane, None
+
+
+def parse_supervisor_tags(container: dict[str, Any]) -> tuple[list[str], dict[str, Any] | None]:
+    if "tags" not in container or container["tags"] is None:
+        return [], None
+    raw = container["tags"]
+    # OpenAPI is array-first. The one string form admitted is the exact compact
+    # JSON emitted at the custom-action boundary after objectBuilder preserved
+    # the trigger's array type. Python reprs, CSV, scalar strings, and malformed
+    # JSON remain refusals.
+    if isinstance(raw, str):
+        if len(raw.encode()) > SUPERVISOR_TAGS_JSON_MAX_BYTES:
+            return [], {"error": "source_workflow.tags encoding is too long", "code": "bad_tags"}
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return [], {"error": "source_workflow.tags must encode a JSON array", "code": "bad_tags"}
+    if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+        return [], {"error": "source_workflow.tags must be a list of strings", "code": "bad_tags"}
+    if len(raw) > SUPERVISOR_TAGS_MAX:
+        return [], {"error": "source_workflow.tags is too long", "code": "bad_tags"}
+    tags = [t.strip() for t in raw]
+    if any(not SUPERVISOR_TAG_RE.fullmatch(tag) for tag in tags):
+        return [], {
+            "error": f"source_workflow.tags elements must match {SUPERVISOR_TAG_RE.pattern}",
+            "code": "bad_tags",
+        }
+    return tags, None
+
+
+def parse_supervisor_error_present(data: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+    """The error channel is a boolean, and it is enforced as one.
+
+    Rewst's payload exposes `error.present` when a public error exists. Every
+    neighbouring key on that object is a message, a body, or a stack, so an
+    error object carrying anything but `present` is refused instead of being
+    quietly redacted. Redaction is what bounds an accident; refusal is what
+    keeps the trace body from being sent at all.
+    """
+    raw = data.get("error", data.get("error_present"))
+    return supervisor_bool_flag(raw, "error.present")
+
+
+def supervisor_bool_flag(raw: Any, label: str) -> tuple[bool, dict[str, Any] | None]:
+    """A boolean, or the two strings a Jinja template renders one as.
+
+    A Rewst node config is a string template, so `{{ ...error.present }}`
+    arrives as "true", "false", or "" — never as a JSON boolean. Accepting
+    exactly those three and nothing else keeps the field a flag: "yes", "1",
+    and a sentence are all still refused, so no message can ride in on it.
+    """
+    if raw is None or raw == "":
+        return False, None
+    if isinstance(raw, bool):
+        return raw, None
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "false"):
+        return raw.strip().lower() == "true", None
+    if isinstance(raw, dict):
+        extra = sorted(str(k) for k in raw if str(k).lower() != "present")
+        if extra:
+            return False, {
+                "error": f"error carries raw failure text ({', '.join(extra[:4])}); send only error.present",
+                "code": "raw_error_forbidden",
+            }
+        return supervisor_bool_flag(raw.get("present"), label)
+    return False, {"error": f"{label} must be true or false", "code": "bad_error_present"}
+
+
+def parse_supervisor_failure(
+    data: dict[str, Any], status: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Normalize available failure identity; classify from status alone.
+
+    `node` and `code` are strict, bounded metadata from the authenticated
+    completion listener. They label reports and refine canonical circuit
+    identity when the trigger or declared workflow metadata actually supplies
+    them. They never select the retry budget. Missing detail stays missing for
+    identity purposes and uses the stable status/error-presence fallback; no
+    failed node or trace detail is inferred.
+
+    So `failure.class` is refused outright rather than ignored. Ignoring it
+    would leave a listener quietly believing it still steered the ladder.
+    """
+    failure_class = SUPERVISOR_STATUS_CLASS[status]
+    raw, shape_err = parse_build_object(data, "failure", "bad_failure")
+    if shape_err:
+        return None, shape_err
+    if raw is None:
+        return {
+            "class": failure_class,
+            "node": SUPERVISOR_UNKNOWN_NODE,
+            "code": status,
+            "declared": False,
+        }, None
+    extra = sorted(k for k in raw if k not in ("node", "code"))
+    if extra:
+        return None, {
+            "error": (
+                f"failure has unsupported keys ({', '.join(extra[:4])}); only node and code are "
+                "read, and both are labels: the retry class comes from source_run.status"
+            ),
+            "code": "bad_failure",
+        }
+    node, node_err = parse_supervisor_string(
+        raw, "node", SUPERVISOR_NODE_RE, "bad_failure_node", required=False, label="failure.node", blank_ok=True
+    )
+    if node_err:
+        return None, node_err
+    code, code_err = parse_supervisor_string(
+        raw, "code", SUPERVISOR_CODE_RE, "bad_failure_code", required=False, label="failure.code", blank_ok=True
+    )
+    if code_err:
+        return None, code_err
+    return {
+        "class": failure_class,
+        "node": node or SUPERVISOR_UNKNOWN_NODE,
+        "code": code or status,
+        "declared": node is not None or code is not None,
+    }, None
+
+
+def parse_supervisor_output(data: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The declared source output, bounded and redacted, and never load-bearing.
+
+    A run that fails before it declares anything sends nothing here, which is
+    the whole reason the launch registry exists. What arrives is kept only as
+    corroboration: a build id or event id that disagrees with the registration
+    parks the build rather than repointing it.
+    """
+    raw, shape_err = parse_build_object(data, "output", "bad_output")
+    if shape_err:
+        return None, shape_err
+    if raw is None:
+        return None, None
+    if len(raw) > SUPERVISOR_OUTPUT_MAX_KEYS:
+        return None, {"error": "output has too many keys", "code": "bad_output"}
+    leaked = sorted(k for k in raw if str(k).lower() in SUPERVISOR_RAW_ERROR_KEYS)
+    if leaked:
+        return None, {
+            "error": f"output carries raw failure text ({', '.join(leaked[:4])})",
+            "code": "raw_error_forbidden",
+        }
+    return redact_secrets(raw), None
+
+
+def supervisor_stage_index(stage: Any) -> int | None:
+    try:
+        return BUILD_STAGE_ORDER.index(str(stage))
+    except ValueError:
+        return None
+
+
+def supervisor_listener_slug(listener_id: str) -> str:
+    """The half of the listener identity that survives a republish.
+
+    A Rewst listener is identified as slug@published-version, and republishing
+    it changes the version. Keying the delivery dedupe on the whole id would
+    let version 8 re-decide every completion version 7 already answered: a
+    second retry spent, a second park written, a second tick on the circuit,
+    all for one source run. The version stays on the report, where it is
+    diagnostics, and stays out of the key, where it would be a bug.
+    """
+    return listener_id.split("@", 1)[0].strip() or listener_id
+
+
+def supervisor_circuit_signature(
+    workflow_id: str,
+    workflow_version: str,
+    status: str,
+    failure: dict[str, Any],
+    error_present: bool,
+) -> str:
+    """Canonical bounded identity from registered and authenticated metadata.
+
+    Workflow identity is pinned in the launch record. A completion listener may
+    refine the identity with the trigger's or workflow's declared node/code,
+    but those fields are strict slugs. When they are unavailable, the stable
+    fallback is terminal status plus public error presence; no trace is
+    invented and no free text enters a key.
+    """
+    prefix = f"{workflow_id}@{workflow_version}#"
+    if failure.get("declared"):
+        return f"{prefix}{failure['node']}:{failure['code']}"
+    presence = "error" if error_present else "no_error"
+    return f"{prefix}unknown:{status}:{presence}"
+
+
+def supervisor_circuit_overflow_signature(
+    workflow_id: str, workflow_version: str, status: str, error_present: bool
+) -> str:
+    presence = "error" if error_present else "no_error"
+    return f"{workflow_id}@{workflow_version}#overflow:{status}:{presence}"
+
+
+SUPERVISOR_NEXT_ACTION = {
+    "receipt": (
+        "none: build {build_id} already recorded the terminal receipt for event {event_id}"
+    ),
+    "watch": (
+        "watch local job {job_id} (status {local_job_status}); it still owns event {event_id} "
+        "on build {build_id}"
+    ),
+    "relaunch": (
+        "relaunch event {event_id} on build {build_id} at stage {expected_stage}: the claimed "
+        "local job {job_id} never started"
+    ),
+    "retry_event": (
+        "re-run graphwing-pre-pr-build with build_id={build_id} event_id={event_id}; attempt "
+        "{attempts} of {retry_budget}"
+    ),
+    "ignored": (
+        "none: source run {source_run_id} ran in {execution_mode} mode, which is not supervised"
+    ),
+}
+SUPERVISOR_PARK_NEXT = {
+    "workflow_fault": (
+        "read the Rewst trace for run {source_run_id}: {workflow_id}@{workflow_version} reported "
+        "completed without recording event {event_id} on build {build_id}. Fix the skipped path, "
+        "then register a new event id. Worktree {worktree} and stacks {stacks} are untouched."
+    ),
+    "deterministic_failure": (
+        "fix the graph, schema, or config behind node {failed_node} on "
+        "{workflow_id}@{workflow_version}, then register a new event id for build {build_id}. "
+        "Do not re-run event {event_id} unchanged."
+    ),
+    "retry_exhausted": (
+        "transient retry for event {event_id} on build {build_id} is spent after {attempts} "
+        "attempts; check the tunnel and the Rewst integration, then register a new event id"
+    ),
+    "circuit_open": (
+        "stop retrying {workflow_id}@{workflow_version}: it ended {source_status} and was given up "
+        "on {circuit_count} times (last reported node {failed_node}, {error_code}). Fix the graph, "
+        "then register a new event id for build {build_id}."
+    ),
+    "state_trace_disagreement": (
+        "compare build {build_id} at stage {build_stage} with Rewst run {source_run_id}; they "
+        "disagree, so nothing was advanced. Worktree {worktree} and stacks {stacks} are intact."
+    ),
+    "deadline_exceeded": (
+        "build {build_id} passed its supervision deadline {deadline} at stage {build_stage}; "
+        "decide to resume or abandon it by hand. Worktree {worktree} and stacks {stacks} are intact."
+    ),
+    "build_parked": (
+        "build {build_id} is already parked ({build_park_reason}); clear that park before "
+        "supervising another run"
+    ),
+    "relaunch_exhausted": (
+        "local job {job_id} for event {event_id} on build {build_id} was relaunched and still "
+        "never started; check the agent seat by hand"
+    ),
+    "missing_build": (
+        "build {build_id} registered for run {source_run_id} has no state document; re-open the "
+        "build before retrying"
+    ),
+    "build_unreadable": (
+        "build {build_id} state cannot be read and has been left untouched; repair it by hand "
+        "before supervising run {source_run_id} again"
+    ),
+}
+
+
+def supervisor_next_action(action: str, park_reason: str | None, ctx: dict[str, Any]) -> str:
+    template = (
+        SUPERVISOR_PARK_NEXT.get(park_reason or "", "")
+        if action in ("park", "circuit_open")
+        else SUPERVISOR_NEXT_ACTION.get(action, "")
+    )
+    if not template:
+        return f"inspect build {ctx.get('build_id')} and Rewst run {ctx.get('source_run_id')} by hand"
+    return template.format_map({k: ("" if v is None else v) for k, v in ctx.items()})[:BUILD_REDACT_MAX_STRING]
+
+
+def supervisor_report_line(report: dict[str, Any]) -> str:
+    return (
+        f"supervisor {report.get('action')} build={report.get('build_id')} "
+        f"run={report.get('source_run_id')} wf={report.get('workflow_id')}@"
+        f"{report.get('workflow_version')} node={report.get('failed_node') or '-'} "
+        f"stage={report.get('build_stage')} job={report.get('local_job_status')} "
+        f"next={report.get('next_operator_action')}"
+    )
+
+
+def supervisor_delivery_intent(report: dict[str, Any], line: str) -> dict[str, Any]:
+    identity = {
+        "build_id": report.get("build_id"),
+        "source_run_id": report.get("source_run_id"),
+        "event_id": report.get("event_id"),
+        "watch_id": report.get("watch_id"),
+        "action": report.get("action"),
+    }
+    delivery_id = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "delivery_id": delivery_id,
+        "state": "pending",
+        "pane_id": report.get("plan_pane"),
+        "line": line,
+        "attempts": 0,
+        "attempted": False,
+        "ok": False,
+        "code": "pending",
+        "at": utcnow(),
+        # Herdr send-text has no idempotency key. A crash after send and before
+        # this receipt write can repeat the same stable delivery id.
+        "at_least_once": True,
+    }
+
+
+def supervisor_attempt_delivery(build_id: str, delivery_id: str) -> dict[str, Any] | None:
+    """Attempt one durable intent, marking delivered only after send succeeds."""
+    with SUPERVISOR_LOCK:
+        doc, read_err = supervisor_load(build_id)
+        if read_err or doc is None:
+            return None
+        report = next(
+            (
+                row
+                for row in doc.get("reports") or []
+                if isinstance(row, dict)
+                and isinstance(row.get("delivery"), dict)
+                and row["delivery"].get("delivery_id") == delivery_id
+            ),
+            None,
+        )
+        if not isinstance(report, dict) or report["delivery"].get("state") != "pending":
+            return report.get("delivery") if isinstance(report, dict) else None
+        pane_id = report["delivery"].get("pane_id")
+        line = str(report["delivery"].get("line") or "")
+    receipt = herdr_plan_deliver(pane_id, f"[{delivery_id}] {line}")
+    with SUPERVISOR_LOCK:
+        doc, read_err = supervisor_load(build_id)
+        if read_err or doc is None:
+            return None
+        report = next(
+            (
+                row
+                for row in doc.get("reports") or []
+                if isinstance(row, dict)
+                and isinstance(row.get("delivery"), dict)
+                and row["delivery"].get("delivery_id") == delivery_id
+            ),
+            None,
+        )
+        if not isinstance(report, dict) or report["delivery"].get("state") != "pending":
+            return report.get("delivery") if isinstance(report, dict) else None
+        delivery = report["delivery"]
+        delivery["attempts"] = int(delivery.get("attempts") or 0) + 1
+        delivery["attempted"] = bool(receipt.get("attempted"))
+        delivery["ok"] = bool(receipt.get("ok"))
+        delivery["code"] = receipt.get("code")
+        delivery["last_attempt_at"] = receipt.get("at") or utcnow()
+        delivery["receipt"] = receipt
+        if receipt.get("ok"):
+            delivery["state"] = "delivered"
+            delivery["delivered_at"] = delivery["last_attempt_at"]
+        for entry in (doc.get("deliveries") or {}).values():
+            result = entry.get("result") if isinstance(entry, dict) else None
+            if isinstance(result, dict) and (result.get("report") or {}).get("delivery", {}).get("delivery_id") == delivery_id:
+                result["delivery"] = delivery
+                result["delivery_ok"] = bool(delivery.get("ok"))
+                result["delivery_code"] = delivery.get("code")
+        watch_id = report.get("watch_id")
+        if watch_id:
+            for record in (doc.get("watches") or {}).values():
+                if isinstance(record, dict) and record.get("watch_id") == watch_id:
+                    record["delivery"] = delivery
+                    break
+        save_err = supervisor_save(doc)
+        if save_err:
+            return None
+        return dict(delivery)
+
+
+def supervisor_recover_deliveries() -> int:
+    pending: list[tuple[str, str]] = []
+    root = SUPERVISOR_DIR / "builds"
+    if root.is_dir():
+        with SUPERVISOR_LOCK:
+            for path in root.glob("*/supervisor.json"):
+                build_id = path.parent.name
+                if not valid_build_id(build_id):
+                    continue
+                doc, read_err = supervisor_load(build_id)
+                if read_err or doc is None:
+                    continue
+                for report in doc.get("reports") or []:
+                    delivery = report.get("delivery") if isinstance(report, dict) else None
+                    if isinstance(delivery, dict) and delivery.get("state") == "pending":
+                        pending.append((build_id, str(delivery.get("delivery_id") or "")))
+    for build_id, delivery_id in pending:
+        if delivery_id:
+            supervisor_attempt_delivery(build_id, delivery_id)
+    return len(pending)
+
+
+def supervisor_local_job(job_id: str | None) -> tuple[str, dict[str, Any] | None]:
+    """What the local writer/test/reviewer job is actually doing right now.
+
+    `unclaimed` and `missing` are different answers and drive different
+    recoveries: nothing was ever claimed, versus a claim that exists on the
+    launch record but has no job on disk to go with it.
+    """
+    if not job_id:
+        return "unclaimed", None
+    with JOB_LOCK:
+        job = read_job(job_id)
+    if job is None:
+        return "missing", None
+    status = str(job.get("status") or "")
+    if status in WATCH_ACTIVE:
+        return "active", job
+    return (status or "unknown"), job
+
+
+def parse_supervisor_continuation(
+    data: dict[str, Any], repos: dict[str, str]
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    raw, shape_err = parse_build_object(data, "continuation", "bad_continuation")
+    if shape_err:
+        return None, shape_err
+    if raw is None:
+        return None, {"error": "continuation is required", "code": "bad_continuation"}
+    extra = sorted(str(k) for k in raw if k not in SUPERVISOR_CONTINUATION_FIELDS)
+    missing = sorted(k for k in SUPERVISOR_CONTINUATION_FIELDS if k not in raw)
+    if extra or missing:
+        return None, {
+            "error": "continuation must contain exactly the bounded source invocation fields",
+            "code": "bad_continuation",
+            "missing": missing,
+            "unsupported": extra,
+        }
+
+    repo, _resolved = resolve_repo(raw.get("repo"), repos)
+    if repo is None:
+        return None, {"error": "continuation.repo must be an allowlisted repo", "code": "bad_continuation"}
+    prompt = raw.get("writer_prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > PROMPT_MAX_CHARS:
+        return None, {"error": "continuation.writer_prompt is required and bounded", "code": "bad_continuation"}
+    prompt = prompt.strip()
+    secret = reject_secret_text(prompt, "continuation.writer_prompt")
+    if secret:
+        return None, secret
+
+    prompt_ref = raw.get("writer_prompt_ref")
+    if not isinstance(prompt_ref, str):
+        return None, {"error": "continuation.writer_prompt_ref is required", "code": "bad_continuation"}
+    prompt_ref = prompt_ref.strip()
+    if (
+        not SUPERVISOR_CONTINUATION_REF_RE.fullmatch(prompt_ref)
+        or ".." in Path(prompt_ref).parts
+        or prompt_ref.startswith("/")
+    ):
+        return None, {"error": "continuation.writer_prompt_ref must be repo-relative", "code": "bad_continuation"}
+    secret = reject_secret_text(prompt_ref, "continuation.writer_prompt_ref")
+    if secret:
+        return None, secret
+
+    out = {"repo": repo, "writer_prompt": prompt, "writer_prompt_ref": prompt_ref}
+    for field in ("fast_recipe", "integration_recipe", "class_stamp", "route_stamp"):
+        value, value_err = parse_supervisor_string(
+            raw, field, SUPERVISOR_SLUG_RE, "bad_continuation", label=f"continuation.{field}"
+        )
+        if value_err:
+            return None, value_err
+        assert value is not None
+        out[field] = value
+    reviewer, reviewer_err = parse_supervisor_string(
+        raw, "reviewer", SUPERVISOR_SLUG_RE, "bad_continuation", label="continuation.reviewer"
+    )
+    if reviewer_err:
+        return None, reviewer_err
+    assert reviewer is not None
+    if reviewer not in {"sonnet", "opus", "fable", "sol", "grok", "terra"}:
+        return None, {"error": "continuation.reviewer is not supported", "code": "bad_continuation"}
+    out["reviewer"] = reviewer
+    return out, None
+
+
+def supervisor_register(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    source_run_id, run_err = parse_supervisor_string(
+        data, "source_run_id", SUPERVISOR_RUN_ID_RE, "bad_source_run_id"
+    )
+    if run_err:
+        return 400, run_err
+    assert source_run_id is not None
+    build_id = data.get("build_id")
+    if not valid_build_id(build_id):
+        return 400, {"error": "invalid build_id", "code": "bad_build_id"}
+    assert isinstance(build_id, str)
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"error": "event_id is required", "code": "bad_event_id"}
+    workflow_id, wf_err = parse_supervisor_string(
+        data, "workflow_id", SUPERVISOR_SLUG_RE, "bad_workflow_id"
+    )
+    if wf_err:
+        return 400, wf_err
+    workflow_version, ver_err = parse_supervisor_string(
+        data, "workflow_version", SUPERVISOR_SLUG_RE, "bad_workflow_version"
+    )
+    if ver_err:
+        return 400, ver_err
+    expected_stage = data.get("expected_stage")
+    if expected_stage not in BUILD_STAGE_ORDER:
+        return 400, {
+            "error": "expected_stage must be a pre-PR build stage",
+            "code": "bad_expected_stage",
+            "allowed": list(BUILD_STAGE_ORDER),
+        }
+    deadline, deadline_epoch, dl_err = parse_supervisor_deadline(data)
+    if dl_err:
+        return 400, dl_err
+    job_id = data.get("job_id")
+    if job_id not in (None, "") and not (isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id)):
+        return 400, {"error": "job_id must be a graphwing job id", "code": "bad_job_id"}
+    job_id = job_id or None
+    plan_pane, pane_err = parse_supervisor_plan_pane(data)
+    if pane_err:
+        return 400, pane_err
+    continuation, continuation_err = parse_supervisor_continuation(data, repos)
+    if continuation_err:
+        return 400, continuation_err
+    assert continuation is not None
+
+    record = {
+        "source_run_id": source_run_id,
+        "build_id": build_id,
+        "event_id": event_id,
+        "workflow_id": workflow_id,
+        "workflow_version": workflow_version,
+        "expected_stage": expected_stage,
+        "deadline": deadline,
+        "deadline_epoch": deadline_epoch,
+        "job_id": job_id,
+        "plan_pane": plan_pane,
+        "continuation": continuation,
+    }
+    # Everything the registration promises. A second registration that changes
+    # any of it is a different launch wearing the same run id, which is exactly
+    # the conflict this rejects.
+    fingerprint = event_fingerprint({k: record[k] for k in sorted(record) if k != "deadline_epoch"})
+
+    with SUPERVISOR_LOCK:
+        mapped, index_err = supervisor_run_lookup(source_run_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        if mapped is not None and mapped != build_id:
+            return 409, {
+                "ok": False,
+                "error": "source_run_id is already registered to a different build",
+                "code": "registration_conflict",
+                "source_run_id": source_run_id,
+                "build_id": mapped,
+            }
+        # The build has to exist first. Registering against a build that was
+        # never opened would make an unsupervisable run look supervised, and
+        # the completion would arrive with nothing to reconcile against.
+        with BUILD_LOCK:
+            build, build_err = load_build(build_id)
+        if build_err:
+            return int(build_err["status"]), build_err
+        if build is None:
+            return 404, {"error": "unknown build", "code": "unknown_build", "build_id": build_id}
+        if build.get("version") != BUILD_STATE_VERSION:
+            return 409, build_version_park(build)
+
+        doc, read_err = supervisor_load(build_id)
+        if read_err:
+            return int(read_err["status"]), read_err
+        if doc is None:
+            doc = supervisor_new(build_id)
+        if doc.get("version") != SUPERVISOR_STATE_VERSION:
+            return 409, {
+                "ok": False,
+                "error": "supervisor state version is not readable by this service",
+                "code": "incompatible_supervisor_version",
+                "found_version": doc.get("version"),
+                "expected_version": SUPERVISOR_STATE_VERSION,
+                "build_id": build_id,
+            }
+        runs = doc.setdefault("runs", {})
+        existing = runs.get(source_run_id)
+        if isinstance(existing, dict):
+            if existing.get("fingerprint") != fingerprint:
+                return 409, {
+                    "ok": False,
+                    "error": "source_run_id is already registered with different input",
+                    "code": "registration_conflict",
+                    "source_run_id": source_run_id,
+                    "build_id": build_id,
+                }
+            # The launch record survived a registration whose index write did
+            # not. Nothing else ever recreates that entry, so an identical
+            # retry has to: without it the run stays permanently unsupervised,
+            # and it looks registered while it does. This is why the retry is
+            # worth making idempotent rather than merely cheap.
+            if mapped is None:
+                repair_err = supervisor_write_index(source_run_id, build_id)
+                if repair_err:
+                    return int(repair_err["status"]), repair_err
+            out = {
+                "ok": True,
+                "registered": False,
+                "supervised": True,
+                **{k: v for k, v in record.items() if k != "continuation"},
+            }
+            out["version"] = SUPERVISOR_STATE_VERSION
+            out["index_repaired"] = mapped is None
+            out.pop("deadline_epoch", None)
+            return 200, out
+        if len(runs) >= SUPERVISOR_RUNS_MAX:
+            # Evicting a launch record would make an old run unsupervisable,
+            # so refuse without touching what is already there.
+            return 409, {
+                "ok": False,
+                "error": "build has registered its whole supervision history; open a new build",
+                "code": "supervision_history_full",
+                "build_id": build_id,
+                "run_count": len(runs),
+                "run_capacity": SUPERVISOR_RUNS_MAX,
+            }
+        runs[source_run_id] = {**record, "fingerprint": fingerprint, "registered_at": utcnow()}
+        doc.setdefault("run_order", []).append(source_run_id)
+        save_err = supervisor_save(doc)
+        if save_err:
+            return int(save_err["status"]), save_err
+        # The index is written second on purpose. An index entry with no launch
+        # record would answer "supervised" for a run this service cannot
+        # reconcile; a launch record with no index entry is invisible only
+        # until the next registration, which repairs it above.
+        index_err = supervisor_write_index(source_run_id, build_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        out = {
+            "ok": True,
+            "registered": True,
+            "supervised": True,
+            **{k: v for k, v in record.items() if k != "continuation"},
+        }
+        out["version"] = SUPERVISOR_STATE_VERSION
+        out["index_repaired"] = False
+        out.pop("deadline_epoch", None)
+        return 201, out
+
+
+def supervisor_bind_job_locked(source_run_id: str, job_id: str) -> dict[str, Any] | None:
+    """Bind while SUPERVISOR_LOCK is held. None means new or exact replay."""
+    build_id, index_err = supervisor_run_lookup(source_run_id)
+    if index_err:
+        return index_err
+    if build_id is None:
+        return {
+            "ok": False,
+            "error": "source run has no launch registration; it is not supervised",
+            "code": "unknown_source_run",
+            "status": 404,
+            "source_run_id": source_run_id,
+        }
+    doc, read_err = supervisor_load(build_id)
+    if read_err:
+        return read_err
+    launch = (doc or {}).get("runs", {}).get(source_run_id)
+    if not isinstance(doc, dict) or not isinstance(launch, dict):
+        return {
+            "error": "launch registration is missing",
+            "code": "supervisor_state_unreadable",
+            "status": 409,
+        }
+    existing = launch.get("job_id")
+    if existing not in (None, "", job_id):
+        return {
+            "ok": False,
+            "error": "source run is already bound to a different local job",
+            "code": "job_binding_conflict",
+            "status": 409,
+            "source_run_id": source_run_id,
+            "build_id": build_id,
+            "job_id": existing,
+        }
+    if existing in (None, ""):
+        launch["job_id"] = job_id
+        save_err = supervisor_save(doc)
+        if save_err:
+            return save_err
+    return None
+
+
+def supervisor_bind(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"source_run_id", "job_id"}:
+        return 400, {"error": "source_run_id and job_id are the only accepted fields", "code": "bad_job_binding"}
+    source_run_id, run_err = parse_supervisor_string(
+        data, "source_run_id", SUPERVISOR_RUN_ID_RE, "bad_source_run_id"
+    )
+    if run_err:
+        return 400, run_err
+    job_id = data.get("job_id")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"error": "job_id must be a graphwing job id", "code": "bad_job_id"}
+    assert source_run_id is not None
+
+    with SUPERVISOR_LOCK:
+        build_id, index_err = supervisor_run_lookup(source_run_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        doc, read_err = supervisor_load(build_id) if build_id else (None, None)
+        existing = ((doc or {}).get("runs", {}).get(source_run_id) or {}).get("job_id")
+        bind_err = supervisor_bind_job_locked(source_run_id, job_id)
+        if bind_err:
+            return int(bind_err.get("status") or 409), bind_err
+        assert build_id is not None
+        launch = ((doc or {}).get("runs", {}).get(source_run_id) or {})
+        bound = existing in (None, "")
+        return 200, {
+            "ok": True,
+            "bound": bound,
+            "source_run_id": source_run_id,
+            "build_id": build_id,
+            "event_id": launch.get("event_id"),
+            "job_id": job_id,
+        }
+
+
+def supervisor_public(doc: dict[str, Any], build_id: str) -> dict[str, Any]:
+    circuits = doc.get("circuits") or {}
+    return {
+        "ok": True,
+        "version": doc.get("version"),
+        "build_id": build_id,
+        "reports": (doc.get("reports") or [])[-SUPERVISOR_REPORTS_KEPT:],
+        "circuits": [
+            {"signature": sig, **{k: rec.get(k) for k in ("count", "open", "first_at", "last_at")}}
+            for sig, rec in circuits.items()
+            if isinstance(rec, dict)
+        ],
+        "circuit_threshold": SUPERVISOR_CIRCUIT_THRESHOLD,
+        "events": doc.get("events") or {},
+        "watches": [
+            {
+                "key": key,
+                **{
+                    k: rec.get(k)
+                    for k in (
+                        "watch_id", "source_run_id", "event_id", "job_id", "state",
+                        "action", "outcome", "park_reason", "deadline", "started_at", "finished_at",
+                        "job_status", "delivery",
+                    )
+                },
+            }
+            for key, rec in (doc.get("watches") or {}).items()
+            if isinstance(rec, dict)
+        ],
+        # The reports an operator was meant to read and this service could not
+        # deliver. Surfaced as its own count so a wedged planning pane is a
+        # number on the state endpoint, not something you find by reading every
+        # report's delivery block.
+        "undelivered_report_count": sum(
+            1
+            for r in (doc.get("reports") or [])
+            if isinstance(r, dict) and not ((r.get("delivery") or {}).get("ok", True))
+        ),
+        "run_count": len(doc.get("runs") or {}),
+        "run_capacity": SUPERVISOR_RUNS_MAX,
+        "delivery_count": len(doc.get("deliveries") or {}),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+def supervisor_report_op(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    """Read the saved planning-session reports back.
+
+    This is the whole human path: there is no wait node in the listener and no
+    idle callback, so the report an operator acts on is a durable record they
+    can fetch again after the run, the terminal, and the Rewst trace are gone.
+    """
+    build_id = first_query(qs, "build_id")
+    source_run_id = first_query(qs, "source_run_id")
+    if not build_id and not source_run_id:
+        return 400, {"error": "build_id or source_run_id is required", "code": "missing_selector"}
+    if source_run_id:
+        if not SUPERVISOR_RUN_ID_RE.fullmatch(source_run_id):
+            return 400, {"error": "invalid source_run_id", "code": "bad_source_run_id"}
+        mapped, index_err = supervisor_run_lookup(source_run_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        if mapped is None:
+            return 404, {
+                "error": "source run is not registered for supervision",
+                "code": "unknown_source_run",
+                "source_run_id": source_run_id,
+            }
+        if build_id and build_id != mapped:
+            return 409, {
+                "error": "source_run_id is registered to a different build",
+                "code": "registration_conflict",
+                "source_run_id": source_run_id,
+                "build_id": mapped,
+            }
+        build_id = mapped
+    if not valid_build_id(build_id):
+        return 400, {"error": "invalid build_id", "code": "bad_build_id"}
+    assert build_id is not None
+    doc, read_err = supervisor_load(build_id)
+    if read_err:
+        return int(read_err["status"]), read_err
+    if doc is None:
+        return 404, {"error": "no supervision state for this build", "code": "unknown_supervision", "build_id": build_id}
+    out = supervisor_public(doc, build_id)
+    if source_run_id:
+        out["source_run_id"] = source_run_id
+        out["reports"] = [r for r in out["reports"] if r.get("source_run_id") == source_run_id]
+    return 200, out
+
+
+def supervisor_event_counters(doc: dict[str, Any], event_id: str) -> dict[str, Any]:
+    """Retry counters live on the build event, not on the source run.
+
+    A retry produces a *new* Rewst run with a new run id and its own launch
+    registration, so a counter kept on the launch record would read zero every
+    time and the bound would never bind. The build event id is the thing all
+    those runs have in common, so that is what the budget is spent against.
+    """
+    events = doc.setdefault("events", {})
+    entry = events.get(event_id)
+    if not isinstance(entry, dict):
+        entry = {"attempts": 0, "relaunches": 0, "gave_up": 0}
+        events[event_id] = entry
+    return entry
+
+
+# The park reasons this supervisor writes when it gives up on a failure shape.
+# A build sitting in one of these is parked *by* the ladder, so the ladder is
+# still entitled to count the next delivery of that shape against the circuit.
+SUPERVISOR_OWNED_PARKS = frozenset(
+    {"workflow_fault", "deterministic_failure", "retry_exhausted", "relaunch_exhausted", "circuit_open"}
+)
+
+
+def supervisor_owns_park(build: dict[str, Any]) -> bool:
+    """True when the park the build is sitting in is one this supervisor wrote.
+
+    The proof is the build's own receipt log, not a flag kept on the side:
+    every automatic park this service writes lands under a `supervisor:<run>`
+    event id carrying the reason it parked for. An operator park has no such
+    receipt, so an operator-parked build stays short-circuited and its reason
+    stays its own.
+    """
+    reason = str(build.get("park_reason") or "")
+    if reason not in SUPERVISOR_OWNED_PARKS:
+        return False
+    for event_id, entry in (build_event_seen(build) or {}).items():
+        if not str(event_id).startswith("supervisor:") or not isinstance(entry, dict):
+            continue
+        receipt = entry.get("receipt")
+        if isinstance(receipt, dict) and receipt.get("park_reason") == reason:
+            return True
+    return False
+
+
+def supervisor_prior_park(build: dict[str, Any], source_run_id: str) -> dict[str, Any] | None:
+    """The park this exact source run already wrote on this build, if any.
+
+    Two durable writes back one park: the build state, and the supervisor state
+    that records the delivery. They cannot be made one write, so the second can
+    fail after the first landed. Rewst's outbox then redelivers a completion
+    this service has already acted on, and without this the redelivery would
+    walk the ladder again -- another give-up charged to the circuit, on the
+    strength of a park it wrote itself a moment ago.
+
+    The proof is the receipt `build_park` left under `supervisor:<run>`, which
+    is durable, run-scoped, and written in the same transaction as the park.
+    """
+    entry = (build_event_seen(build) or {}).get(f"supervisor:{source_run_id}")
+    if not isinstance(entry, dict):
+        return None
+    receipt = entry.get("receipt")
+    return receipt if isinstance(receipt, dict) and receipt.get("park_reason") else None
+
+
+def supervisor_decide(
+    doc: dict[str, Any],
+    launch: dict[str, Any],
+    build: dict[str, Any] | None,
+    build_err: dict[str, Any] | None,
+    status: str,
+    failure: dict[str, Any],
+    error_present: bool,
+    source_run_id: str,
+    now: float,
+) -> dict[str, Any]:
+    """The whole reconciliation ladder, as one decision over durable state.
+
+    Ordered so the cheap, certain answers come first. A recorded terminal
+    receipt ends it; an already-parked build ends it; a trace that disagrees
+    with the state ends it. Only when none of those apply does this spend a
+    retry.
+
+    The circuit counts the times this supervisor *gave up* on one failure
+    shape, not the times that shape appeared. Counting appearances would make
+    the breaker fire on the second transient blip and the bounded retry above
+    it would be dead code. Counting give-ups reads AC6 as one ladder:
+    deterministic never retries, so it parks on the first and opens the circuit
+    on the second; transient parks only once its budget is spent.
+    """
+    event_id = launch["event_id"]
+    counters = supervisor_event_counters(doc, event_id)
+    out: dict[str, Any] = {
+        "receipt": None,
+        "workflow_fault": False,
+        "circuit": None,
+        "attempts": int(counters.get("attempts") or 0),
+        "retry_budget": SUPERVISOR_RETRY_BUDGET[failure["class"]],
+        "local_job_status": "unclaimed",
+    }
+
+    def give_up(reason: str) -> dict[str, Any]:
+        """Park, and let a second give-up on the same shape open the circuit."""
+        signature = supervisor_circuit_signature(
+            str(launch.get("workflow_id")),
+            str(launch.get("workflow_version")),
+            status,
+            failure,
+            error_present,
+        )
+        circuits = doc.setdefault("circuits", {})
+        # Reserve the final slot for a deterministic overflow bucket. New
+        # authoritative node/code identities remain separate until the bound;
+        # after it, a caller cannot grow the map by minting more valid slugs.
+        if signature not in circuits and len(circuits) >= max(0, SUPERVISOR_CIRCUITS_MAX - 1):
+            signature = supervisor_circuit_overflow_signature(
+                str(launch.get("workflow_id")),
+                str(launch.get("workflow_version")),
+                status,
+                error_present,
+            )
+        if signature not in circuits and len(circuits) >= SUPERVISOR_CIRCUITS_MAX:
+            closed = sorted(
+                key
+                for key, value in circuits.items()
+                if not (isinstance(value, dict) and value.get("open"))
+            )
+            if closed:
+                circuits.pop(closed[0], None)
+            elif circuits:
+                # Legacy state may already have filled every slot with open
+                # entries before the reserved overflow bucket existed. Reuse a
+                # stable existing bucket rather than exceed the hard bound.
+                signature = sorted(circuits)[0]
+        entry = circuits.get(signature)
+        if not isinstance(entry, dict):
+            entry = {"count": 0, "open": False, "first_at": utcnow(), "last_at": None}
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["last_at"] = utcnow()
+        entry["open"] = entry["count"] >= SUPERVISOR_CIRCUIT_THRESHOLD
+        circuits[signature] = entry
+        counters["gave_up"] = int(counters.get("gave_up") or 0) + 1
+        out["circuit"] = {
+            "signature": signature,
+            "count": entry["count"],
+            "open": entry["open"],
+            "threshold": SUPERVISOR_CIRCUIT_THRESHOLD,
+        }
+        if entry["open"]:
+            return {**out, "action": "circuit_open", "park_reason": "circuit_open"}
+        return {**out, "action": "park", "park_reason": reason}
+
+    if build_err:
+        return {**out, "action": "park", "park_reason": "build_unreadable", "build_stage": None}
+    if build is None:
+        return {**out, "action": "park", "park_reason": "missing_build", "build_stage": None}
+    stage = str(build.get("stage") or "")
+    out["build_stage"] = stage
+
+    receipt = (build_event_seen(build) or {}).get(event_id)
+    job_state, _job = supervisor_local_job(launch.get("job_id"))
+    out["local_job_status"] = job_state
+    if job_state == "active":
+        # A start/claim receipt is not terminal while its bound local job is
+        # still active. Watching must win before the receipt shortcut.
+        return {**out, "action": "watch", "park_reason": None}
+    if job_state == "missing":
+        # Likewise, a claim whose acknowledged job vanished remains eligible
+        # for the one bounded relaunch even though the claim receipt exists.
+        if int(counters.get("relaunches") or 0) < SUPERVISOR_RELAUNCH_MAX:
+            counters["relaunches"] = int(counters.get("relaunches") or 0) + 1
+            return {**out, "action": "relaunch", "park_reason": None}
+        return give_up("relaunch_exhausted")
+    claim_receipt = receipt.get("receipt") if isinstance(receipt, dict) else None
+    if (
+        job_state == "unclaimed"
+        and isinstance(claim_receipt, dict)
+        and claim_receipt.get("action") in {"start_writer", "verify_passed", "review_passed"}
+    ):
+        # The Graph acknowledged the transition but never durably named the
+        # local job. Treating this as terminal success is the ACK/bind crash.
+        return {**out, "action": "park", "park_reason": "state_trace_disagreement"}
+    if isinstance(receipt, dict) and receipt.get("fingerprint"):
+        # Graphwing's own terminal receipt is the only proof the transition
+        # ran. Having it makes every terminal Rewst status the same answer,
+        # including a failure that happened after the receipt was written.
+        return {**out, "action": "receipt", "park_reason": None, "receipt": receipt.get("receipt")}
+
+    # No receipt. Rewst calling this run `completed` is therefore a fault, not
+    # a success: the graph reported done without doing the thing.
+    out["workflow_fault"] = status == "completed"
+
+    if stage == "parked":
+        prior = supervisor_prior_park(build, source_run_id)
+        if prior is not None:
+            # This delivery's own park is already on the build, so the write
+            # that records the delivery is what did not land. Returning the
+            # recorded outcome is the whole answer: charging the circuit again
+            # would count one give-up twice, and re-parking would overwrite the
+            # reason with the reason it already has.
+            reason = str(prior.get("park_reason"))
+            action = "circuit_open" if reason == "circuit_open" else "park"
+            return {**out, "action": action, "park_reason": reason, "park_replayed": True}
+        if not supervisor_owns_park(build):
+            return {**out, "action": "park", "park_reason": "build_parked"}
+        # This supervisor parked the build for a fault it owns, and the same
+        # graph version just failed again. Ending here would freeze the
+        # circuit at one: the shape that keeps recurring after the first park
+        # is exactly what the breaker exists to catch. So the shape is
+        # counted, but the build is never advanced out of its park.
+        return give_up("build_parked")
+
+    expected_index = supervisor_stage_index(launch.get("expected_stage"))
+    stage_index = supervisor_stage_index(stage)
+    if expected_index is not None and stage_index is not None and stage_index > expected_index:
+        # The build is past the stage this run was launched to reach, and it
+        # got there without recording this event. Something else advanced it.
+        return {**out, "action": "park", "park_reason": "state_trace_disagreement"}
+
+    deadline_epoch = launch.get("deadline_epoch")
+    if isinstance(deadline_epoch, (int, float)) and now > float(deadline_epoch):
+        return {**out, "action": "park", "park_reason": "deadline_exceeded"}
+
+    if job_state != "unclaimed":
+        # The job finished and no terminal receipt exists. The trace and the
+        # state disagree, so nothing is advanced and nothing is torn down.
+        return {**out, "action": "park", "park_reason": "state_trace_disagreement"}
+
+    if out["workflow_fault"]:
+        # Re-running a graph that deterministically skipped its own path just
+        # skips it again, so the fault parks with a report instead.
+        return give_up("workflow_fault")
+
+    if out["attempts"] < out["retry_budget"]:
+        counters["attempts"] = out["attempts"] + 1
+        out["attempts"] = counters["attempts"]
+        return {**out, "action": "retry_event", "park_reason": None}
+    return give_up("deterministic_failure" if failure["class"] == "deterministic" else "retry_exhausted")
+
+
+def supervisor_reconcile(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    listener_id, listener_err = parse_supervisor_string(
+        data, "listener_id", SUPERVISOR_LISTENER_ID_RE, "bad_listener_id"
+    )
+    if listener_err:
+        return 400, listener_err
+    assert listener_id is not None
+    workflow_raw, wf_shape_err = parse_build_object(data, "source_workflow", "bad_source_workflow")
+    if wf_shape_err:
+        return 400, wf_shape_err
+    if workflow_raw is None:
+        return 400, {"error": "source_workflow is required", "code": "bad_source_workflow"}
+    src_workflow_id, src_id_err = parse_supervisor_string(
+        workflow_raw, "id", SUPERVISOR_SLUG_RE, "bad_source_workflow", label="source_workflow.id"
+    )
+    if src_id_err:
+        return 400, src_id_err
+    src_slug, slug_err = parse_supervisor_string(
+        workflow_raw,
+        "slug",
+        SUPERVISOR_SLUG_RE,
+        "bad_source_workflow",
+        required=False,
+        label="source_workflow.slug",
+        blank_ok=True,
+    )
+    if slug_err:
+        return 400, slug_err
+    tags, tags_err = parse_supervisor_tags(workflow_raw)
+    if tags_err:
+        return 400, tags_err
+    if src_slug == SUPERVISOR_LISTENER_SLUG or SUPERVISOR_LISTENER_SLUG in tags:
+        # The listener cannot supervise itself. The trigger's own filter is the
+        # first guard; this is the one that holds when someone edits it.
+        return 409, {
+            "ok": False,
+            "error": "the completion supervisor cannot listen to itself",
+            "code": "self_listener",
+            "listener_id": listener_id,
+        }
+    run_raw, run_shape_err = parse_build_object(data, "source_run", "bad_source_run")
+    if run_shape_err:
+        return 400, run_shape_err
+    if run_raw is None:
+        return 400, {"error": "source_run is required", "code": "bad_source_run"}
+    source_run_id, run_err = parse_supervisor_string(
+        run_raw, "id", SUPERVISOR_RUN_ID_RE, "bad_source_run_id", label="source_run.id"
+    )
+    if run_err:
+        return 400, run_err
+    assert source_run_id is not None
+    status = run_raw.get("status")
+    if status not in SUPERVISOR_TERMINAL_STATUSES:
+        return 400, {
+            "error": "source_run.status must be a terminal status",
+            "code": "bad_source_status",
+            "allowed": list(SUPERVISOR_TERMINAL_STATUSES),
+        }
+    # Empty is live: the listener's trigger already filters to live runs, so a
+    # template that rendered nothing here has not told us it was preview.
+    execution_mode = run_raw.get("execution_mode") or run_raw.get("executionMode") or "live"
+    if execution_mode not in SUPERVISOR_EXECUTION_MODES:
+        return 400, {
+            "error": "source_run.execution_mode must be live, preview, or demo",
+            "code": "bad_execution_mode",
+        }
+    started_at, started_err = parse_supervisor_timestamp(run_raw, "started_at", "source_run.started_at")
+    if started_err:
+        return 400, started_err
+    finished_at, finished_err = parse_supervisor_timestamp(run_raw, "finished_at", "source_run.finished_at")
+    if finished_err:
+        return 400, finished_err
+    error_present, error_err = parse_supervisor_error_present(data)
+    if error_err:
+        return 400, error_err
+    failure, failure_err = parse_supervisor_failure(data, str(status))
+    if failure_err:
+        return 400, failure_err
+    assert failure is not None
+    output, output_err = parse_supervisor_output(data)
+    if output_err:
+        return 400, output_err
+
+    # Source run id plus the listener slug, with the published version left
+    # out. The run id alone would dedupe unrelated listeners together; the full
+    # id would make every republish a fresh delivery of work already done. The
+    # version rides along on the report instead, where it costs nothing.
+    listener_slug = supervisor_listener_slug(listener_id)
+    delivery_key = f"{source_run_id}|{listener_slug}"
+    fingerprint = event_fingerprint(
+        {
+            "listener_slug": listener_slug,
+            "source_run_id": source_run_id,
+            "status": status,
+            "execution_mode": execution_mode,
+            "source_workflow_id": src_workflow_id,
+            "error_present": error_present,
+            "failure": {k: failure[k] for k in ("class", "node", "code")},
+            "output": output,
+        }
+    )
+
+    with SUPERVISOR_LOCK:
+        build_id, index_err = supervisor_run_lookup(source_run_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        if build_id is None:
+            # No launch record, so this run was never supervised. Answering
+            # anything else would invent a build for a run nobody registered.
+            return 404, {
+                "ok": False,
+                "error": "source run has no launch registration; it is not supervised",
+                "code": "unknown_source_run",
+                "source_run_id": source_run_id,
+            }
+        doc, read_err = supervisor_load(build_id)
+        if read_err:
+            return int(read_err["status"]), read_err
+        if doc is None or doc.get("version") != SUPERVISOR_STATE_VERSION:
+            return 409, {
+                "ok": False,
+                "error": "supervisor state for this build is missing or unreadable",
+                "code": "supervisor_state_unreadable",
+                "build_id": build_id,
+                "source_run_id": source_run_id,
+            }
+        deliveries = doc.setdefault("deliveries", {})
+        prior = deliveries.get(delivery_key)
+        if isinstance(prior, dict):
+            if prior.get("fingerprint") != fingerprint:
+                return 409, {
+                    "ok": False,
+                    "error": "this delivery was already reconciled with different input",
+                    "code": "idempotency_conflict",
+                    "source_run_id": source_run_id,
+                    "listener_id": listener_id,
+                    "listener_slug": listener_slug,
+                    "build_id": build_id,
+                }
+            replay = dict(prior.get("result") or {})
+            if replay.get("action") == "watch":
+                launch = (doc.get("runs") or {}).get(source_run_id)
+                if not isinstance(launch, dict):
+                    return 409, {
+                        "ok": False,
+                        "error": "launch registration is missing from supervisor state",
+                        "code": "supervisor_state_unreadable",
+                        "build_id": build_id,
+                        "source_run_id": source_run_id,
+                    }
+                key, record, changed, watch_err = supervisor_ensure_watch_record(
+                    doc, source_run_id, launch
+                )
+                if watch_err:
+                    return 409, watch_err
+                if changed:
+                    save_err = supervisor_save(doc)
+                    if save_err:
+                        return int(save_err["status"]), save_err
+                if record is not None and record.get("state") == "watching":
+                    supervisor_schedule_watch(build_id, key)
+            replay["replayed"] = True
+            # The first delivery may have returned retry_event or relaunch and
+            # started one bounded source invocation. Replaying that action
+            # would launch a second one for the same completion, so a duplicate
+            # is an explicit ignored terminal answer with no continuation.
+            replay["action"] = "ignored"
+            replay["resolution"] = "ignored"
+            replay["continuation"] = None
+            return int(prior.get("status") or 200), replay
+        if len(deliveries) >= SUPERVISOR_DELIVERIES_MAX:
+            return 409, {
+                "ok": False,
+                "error": "build has used its whole delivery history; open a new build",
+                "code": "delivery_history_full",
+                "build_id": build_id,
+                "delivery_count": len(deliveries),
+            }
+        launch = (doc.get("runs") or {}).get(source_run_id)
+        if not isinstance(launch, dict):
+            return 409, {
+                "ok": False,
+                "error": "launch registration is missing from supervisor state",
+                "code": "supervisor_state_unreadable",
+                "build_id": build_id,
+                "source_run_id": source_run_id,
+            }
+        if launch.get("build_id") != build_id:
+            return 409, {
+                "ok": False,
+                "error": "launch registration names a different build",
+                "code": "registration_conflict",
+                "build_id": build_id,
+                "source_run_id": source_run_id,
+            }
+
+        # Corroboration only. The declared output cannot repoint the build; a
+        # disagreement is a park, because one of the two accounts is wrong and
+        # advancing either one commits a real side effect on a guess.
+        declared = output or {}
+        disagreement = None
+        if declared.get("build_id") not in (None, "", build_id):
+            disagreement = "declared output names a different build"
+        elif declared.get("event_id") not in (None, "", launch.get("event_id")):
+            disagreement = "declared output names a different event"
+        elif src_workflow_id != launch.get("workflow_id"):
+            disagreement = "completion names a different source workflow"
+
+        with BUILD_LOCK:
+            build, build_read_err = load_build(build_id)
+            if build is not None and build.get("version") != BUILD_STATE_VERSION:
+                build, build_read_err = None, build_version_park(build)
+            now = time.time()
+            counters = supervisor_event_counters(doc, str(launch.get("event_id")))
+            short_circuit = {
+                "park_reason": None,
+                "build_stage": (build or {}).get("stage"),
+                "receipt": None,
+                "workflow_fault": False,
+                "circuit": None,
+                "attempts": int(counters.get("attempts") or 0),
+                "retry_budget": SUPERVISOR_RETRY_BUDGET[failure["class"]],
+                "local_job_status": supervisor_local_job(launch.get("job_id"))[0],
+            }
+            if disagreement is not None:
+                decision = {
+                    **short_circuit,
+                    "action": "park",
+                    "park_reason": "state_trace_disagreement",
+                    "workflow_fault": status == "completed",
+                }
+            elif execution_mode != "live":
+                # Only live runs are supervised. The trigger already filters
+                # to live; this keeps a hand-fired preview out of the ladder.
+                decision = {**short_circuit, "action": "ignored"}
+            else:
+                decision = supervisor_decide(
+                    doc,
+                    launch,
+                    build,
+                    build_read_err,
+                    str(status),
+                    failure,
+                    error_present,
+                    source_run_id,
+                    now,
+                )
+            park_reason = decision.get("park_reason")
+            parked = decision["action"] in ("park", "circuit_open")
+            # Park the build itself, so no other caller advances work this
+            # supervisor has already declared unexplained. An already-parked
+            # build keeps its original reason: overwriting it would erase why.
+            if parked and build is not None and build.get("stage") != "parked" and park_reason:
+                park_status, park_out = build_park(
+                    build,
+                    park_reason,
+                    f"completion supervisor: {supervisor_report_line({'action': decision['action'], 'source_run_id': source_run_id})}",
+                    f"supervisor:{source_run_id}",
+                    fingerprint,
+                    listener_id,
+                )
+                if park_status != 409:
+                    # The park did not reach disk. Recording the delivery now
+                    # would answer "parked" forever for a build that is not,
+                    # so nothing is recorded and the outbox gets to redeliver.
+                    return int(park_status), park_out
+            if parked and build is not None and build.get("stage") == "parked":
+                decision["build_stage"] = "parked"
+
+        ctx = {
+            "build_id": build_id,
+            "event_id": launch.get("event_id"),
+            "source_run_id": source_run_id,
+            "workflow_id": launch.get("workflow_id"),
+            "workflow_version": launch.get("workflow_version"),
+            "expected_stage": launch.get("expected_stage"),
+            "deadline": launch.get("deadline"),
+            "job_id": launch.get("job_id"),
+            "execution_mode": execution_mode,
+            "source_status": status,
+            "failed_node": failure["node"],
+            "error_code": failure["code"],
+            "attempts": decision.get("attempts"),
+            "retry_budget": decision.get("retry_budget"),
+            "local_job_status": decision.get("local_job_status") or "unclaimed",
+            "build_stage": decision.get("build_stage"),
+            "build_park_reason": (build or {}).get("park_reason") if build else None,
+            "circuit_count": (decision.get("circuit") or {}).get("count"),
+            "worktree": (build or {}).get("worktree") if build else None,
+            "stacks": ", ".join((build or {}).get("stacks") or []) if build else "",
+        }
+        next_action = supervisor_next_action(decision["action"], park_reason, ctx)
+        report = {
+            "at": utcnow(),
+            "source_run_id": source_run_id,
+            # The full id carries the published listener version, which is
+            # diagnostics: the slug beside it is what deduped the delivery.
+            "listener_id": listener_id,
+            "listener_slug": listener_slug,
+            "build_id": build_id,
+            "event_id": launch.get("event_id"),
+            "workflow_id": launch.get("workflow_id"),
+            "workflow_version": launch.get("workflow_version"),
+            "source_status": status,
+            "execution_mode": execution_mode,
+            "error_present": error_present,
+            "failure_class": failure["class"],
+            "failed_node": failure["node"],
+            "error_code": failure["code"],
+            "build_stage": decision.get("build_stage"),
+            "local_job_status": ctx["local_job_status"],
+            "job_id": launch.get("job_id"),
+            "action": decision["action"],
+            "park_reason": park_reason,
+            "workflow_fault": decision.get("workflow_fault", False),
+            "attempts": decision.get("attempts"),
+            "retry_budget": decision.get("retry_budget"),
+            "circuit": decision.get("circuit"),
+            "next_operator_action": next_action,
+            "worktree": ctx["worktree"],
+            "stacks": (build or {}).get("stacks") or [] if build else [],
+            "files_intact": True,
+            "plan_pane": launch.get("plan_pane"),
+        }
+        # Durable intent comes first. Herdr has no idempotency key, so recovery
+        # is honestly at-least-once across a crash after send and before the
+        # receipt write. It is never send-before-intent.
+        report["delivery"] = (
+            supervisor_delivery_intent(report, supervisor_report_line(report))
+            if decision["action"] in SUPERVISOR_REPORTED_ACTIONS
+            else plan_delivery_skipped(launch.get("plan_pane"))
+        )
+        resolution = {
+            "receipt": "resolved",
+            "watch": "watching",
+            "relaunch": "retry",
+            "retry_event": "retry",
+            "ignored": "ignored",
+            "park": "parked",
+            "circuit_open": "parked",
+        }[decision["action"]]
+        result = {
+            "ok": not parked,
+            "version": SUPERVISOR_STATE_VERSION,
+            "replayed": False,
+            "source_run_id": source_run_id,
+            "listener_id": listener_id,
+            "listener_slug": listener_slug,
+            "build_id": build_id,
+            "event_id": launch.get("event_id"),
+            "workflow_id": launch.get("workflow_id"),
+            "workflow_version": launch.get("workflow_version"),
+            "expected_stage": launch.get("expected_stage"),
+            "source_status": status,
+            "execution_mode": execution_mode,
+            "action": decision["action"],
+            "resolution": resolution,
+            "parked": parked,
+            "park_reason": park_reason,
+            "park_replayed": bool(decision.get("park_replayed")),
+            "workflow_fault": decision.get("workflow_fault", False),
+            "build_stage": decision.get("build_stage"),
+            "local_job_status": ctx["local_job_status"],
+            "job_id": launch.get("job_id"),
+            "attempts": decision.get("attempts"),
+            "retry_budget": decision.get("retry_budget"),
+            "circuit": decision.get("circuit"),
+            "receipt": decision.get("receipt"),
+            "report": report,
+            "next_operator_action": next_action,
+            "files_intact": True,
+            "plan_pane": launch.get("plan_pane"),
+            "deadline": launch.get("deadline"),
+            "source_workflow_slug": SUPERVISOR_SOURCE_SLUG,
+            # Everything the listener needs to start exactly one source
+            # continuation, and nothing it could invent for itself. The build
+            # id and event id are the registered ones, so a continuation runs
+            # against the same durable claim rather than opening a new one.
+            "continuation": (
+                {
+                    **(launch.get("continuation") or {}),
+                    "workflow_slug": SUPERVISOR_SOURCE_SLUG,
+                    "build_id": build_id,
+                    "event_id": launch.get("event_id"),
+                    "expected_stage": launch.get("expected_stage"),
+                    "deadline": launch.get("deadline"),
+                    "plan_pane": launch.get("plan_pane"),
+                    "repo": (build or {}).get("repo") if build else None,
+                    "reason": decision["action"],
+                    "attempt": decision.get("attempts"),
+                    "bounded": True,
+                }
+                if decision["action"] in SUPERVISOR_CONTINUATION_ACTIONS
+                else None
+            ),
+            # The handoff to supervisorWatch. Present only when a live local
+            # job still owns the event, because that is the only case where
+            # there is something to wake up on.
+            "watch": (
+                {
+                    "source_run_id": source_run_id,
+                    "build_id": build_id,
+                    "event_id": launch.get("event_id"),
+                    "job_id": launch.get("job_id"),
+                    "deadline": launch.get("deadline"),
+                    "plan_pane": launch.get("plan_pane"),
+                }
+                if decision["action"] == "watch"
+                else None
+            ),
+            "delivery": report["delivery"],
+            "delivery_ok": bool(report["delivery"].get("ok")),
+            "delivery_code": report["delivery"].get("code"),
+        }
+        if parked:
+            result["error"] = next_action
+            result["code"] = park_reason
+        # Reported before the answer is returned, not after: a retry, a park,
+        # and an open circuit are exactly the outcomes an operator has to see,
+        # and the listener has no wait node to hold the run open for them.
+        doc.setdefault("reports", []).append(report)
+        deliveries[delivery_key] = {
+            "fingerprint": fingerprint,
+            "status": 200,
+            "at": utcnow(),
+            "result": result,
+        }
+        doc.setdefault("delivery_order", []).append(delivery_key)
+        watch_schedule = None
+        if decision["action"] == "watch":
+            watch_key, _record, _changed, watch_err = supervisor_ensure_watch_record(
+                doc, source_run_id, launch
+            )
+            if watch_err:
+                return 409, watch_err
+            watch_schedule = (build_id, watch_key)
+        save_err = supervisor_save(doc)
+        if save_err:
+            return int(save_err["status"]), save_err
+        pending_delivery_id = (
+            str(report["delivery"].get("delivery_id") or "")
+            if report["delivery"].get("state") == "pending"
+            else ""
+        )
+    if watch_schedule is not None:
+        supervisor_schedule_watch(*watch_schedule)
+    if pending_delivery_id:
+        delivered = supervisor_attempt_delivery(build_id, pending_delivery_id)
+        if delivered is not None:
+            result["report"]["delivery"] = delivered
+            result["delivery"] = delivered
+            result["delivery_ok"] = bool(delivered.get("ok"))
+            result["delivery_code"] = delivered.get("code")
+    return 200, result
+
+
+# --- durable server-owned watch --------------------------------------------
+#
+# A watch is durable work owned by this process, not an expiring Rewst callback.
+# The request carries one stable source-run id. The registered build, event,
+# job, deadline, and exact plan pane are persisted before one daemon thread is
+# scheduled. Startup and the first supervisor request recover watching records.
+
+
+def supervisor_watch_key(source_run_id: str, event_id: str) -> str:
+    return f"{source_run_id}|{event_id}"
+
+
+def supervisor_ensure_watch_record(
+    doc: dict[str, Any], source_run_id: str, launch: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None, bool, dict[str, Any] | None]:
+    """Ensure the durable identity row for a registered launch.
+
+    Callers hold SUPERVISOR_LOCK and include the mutation in their next
+    supervisor_save. The launch record is authoritative; no request or Graph
+    callback capability contributes fields to the watch.
+    """
+    build_id = str(doc.get("build_id") or "")
+    event_id = str(launch.get("event_id") or "")
+    job_id = str(launch.get("job_id") or "")
+    deadline_epoch = launch.get("deadline_epoch")
+    if not job_id:
+        return "", None, False, {
+            "ok": False,
+            "error": "this launch never claimed a local job, so there is nothing to watch",
+            "code": "no_local_job",
+            "build_id": build_id,
+            "source_run_id": source_run_id,
+        }
+    if not isinstance(deadline_epoch, (int, float)):
+        return "", None, False, {
+            "ok": False,
+            "error": "launch registration has no usable deadline",
+            "code": "bad_deadline",
+            "build_id": build_id,
+            "source_run_id": source_run_id,
+        }
+
+    key = supervisor_watch_key(source_run_id, event_id)
+    watches = doc.setdefault("watches", {})
+    record = watches.get(key)
+    created = not isinstance(record, dict)
+    if created:
+        if len(watches) >= SUPERVISOR_WATCHES_MAX:
+            return key, None, False, {
+                "ok": False,
+                "error": "build has used its whole watch history; open a new build",
+                "code": "watch_history_full",
+                "build_id": build_id,
+            }
+        record = {
+            "watch_id": uuid.uuid4().hex,
+            "state": "watching",
+            "started_at": utcnow(),
+            "finished_at": None,
+            "action": None,
+            "outcome": None,
+            "park_reason": None,
+            "job_status": None,
+            "build_stage": None,
+        }
+        watches[key] = record
+        doc.setdefault("watch_order", []).append(key)
+
+    assert isinstance(record, dict)
+    before = dict(record)
+    if record.get("state") not in {"watching", "settled"}:
+        record["state"] = "watching"
+        record["finished_at"] = None
+    record.update(
+        {
+            "watch_id": record.get("watch_id") or uuid.uuid4().hex,
+            "source_run_id": source_run_id,
+            "build_id": build_id,
+            "event_id": event_id,
+            "job_id": job_id,
+            "deadline": launch.get("deadline"),
+            "deadline_epoch": float(deadline_epoch),
+            "plan_pane": launch.get("plan_pane"),
+        }
+    )
+    return key, record, created or record != before, None
+
+
+def supervisor_job_snapshot(job_id: str | None) -> tuple[str, dict[str, Any] | None]:
+    """One stable read of the local job, under JOB_LOCK.
+
+    The lock is what makes this a snapshot rather than a sample. `write_job`
+    renames into place so a torn file is not the risk; the risk is reading
+    between the two writes a job makes as it finishes and reporting a status
+    that was never true for longer than an instant.
+    """
+    if not job_id:
+        return "unclaimed", None
+    with JOB_LOCK:
+        job = read_job(job_id)
+    if job is None:
+        return "missing", None
+    status = str(job.get("status") or "")
+    if status in WATCH_ACTIVE:
+        return "active", job
+    return (status or "unknown"), job
+
+
+def supervisor_event_receipt(build_id: str, event_id: str) -> tuple[str | None, dict[str, Any] | None]:
+    """The build's own terminal receipt for this event, if it has one yet."""
+    with BUILD_LOCK:
+        build, _err = load_build(build_id)
+    if build is None or build.get("version") != BUILD_STATE_VERSION:
+        return None, None
+    entry = (build_event_seen(build) or {}).get(event_id)
+    receipt = entry.get("receipt") if isinstance(entry, dict) and entry.get("fingerprint") else None
+    return str(build.get("stage") or ""), receipt if isinstance(receipt, dict) else None
+
+
+def supervisor_watch_line(record: dict[str, Any]) -> str:
+    return (
+        f"supervisor watch {record.get('outcome')} build={record.get('build_id')} "
+        f"run={record.get('source_run_id')} event={record.get('event_id')} "
+        f"job={record.get('job_id')}/{record.get('job_status')} "
+        f"stage={record.get('build_stage')} next={record.get('next')}"
+    )
+
+
+def supervisor_watch_settle(
+    build_id: str,
+    event_id: str,
+    job_id: str,
+    deadline_epoch: float,
+) -> dict[str, Any]:
+    """Wait for the local job, then for its receipt, both bounded.
+
+    The exit-between-read-and-return race is the reason there is a re-read at
+    every boundary rather than one read per loop. A job that was `running` when
+    the deadline arrived may have finished in that same instant, and reporting
+    `deadline_exceeded` for a build that actually succeeded would park a green
+    build. So the deadline branch reads once more before it decides, and the
+    terminal branch keeps checking the build for the receipt the job's own exit
+    does not write.
+    """
+    job_status, job = supervisor_job_snapshot(job_id)
+    while job_status == "active":
+        if time.time() >= deadline_epoch:
+            # Last look. The job may have exited between the read above and
+            # this comparison.
+            job_status, job = supervisor_job_snapshot(job_id)
+            break
+        time.sleep(SUPERVISOR_WATCH_POLL_SECONDS)
+        job_status, job = supervisor_job_snapshot(job_id)
+
+    settle_until = min(time.time() + SUPERVISOR_WATCH_SETTLE_SECONDS, deadline_epoch)
+    stage, receipt = supervisor_event_receipt(build_id, event_id)
+    while receipt is None and job_status != "active" and time.time() < settle_until:
+        time.sleep(SUPERVISOR_WATCH_POLL_SECONDS)
+        stage, receipt = supervisor_event_receipt(build_id, event_id)
+
+    if receipt is not None:
+        outcome = "receipt"
+    elif job_status == "active":
+        outcome = "deadline_exceeded"
+    elif job_status == "missing":
+        outcome = "job_missing"
+    else:
+        outcome = "job_finished_without_receipt"
+    return {
+        "outcome": outcome,
+        "job_status": job_status,
+        "build_stage": stage,
+        "build_receipt": receipt,
+        "job": public_job(job) if isinstance(job, dict) else None,
+    }
+
+
+def supervisor_watch_worker(build_id: str, key: str) -> None:
+    """Settle one persisted watch, parking before exact-pane notification."""
+    retry_needed = False
+    try:
+        with SUPERVISOR_LOCK:
+            doc, read_err = supervisor_load(build_id)
+            record = (doc or {}).get("watches", {}).get(key)
+            if read_err or not isinstance(record, dict) or record.get("state") != "watching":
+                return
+            assert doc is not None
+            event_id = str(record.get("event_id") or "")
+            job_id = str(record.get("job_id") or "")
+            deadline_epoch = record.get("deadline_epoch")
+            if not isinstance(deadline_epoch, (int, float)):
+                deadline = str(record.get("deadline") or "")
+                try:
+                    deadline_epoch = datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    ).timestamp()
+                except ValueError:
+                    deadline_epoch = 0.0
+        settled = supervisor_watch_settle(build_id, event_id, job_id, float(deadline_epoch))
+
+        # Re-read both sources at the settlement boundary. A job can exit and
+        # its build receipt can land between the watch loop's last two reads.
+        job_status, job = supervisor_job_snapshot(job_id)
+        stage, receipt = supervisor_event_receipt(build_id, event_id)
+        if receipt is not None:
+            settled.update({"outcome": "receipt", "job_status": job_status, "job": job, "build_stage": stage, "build_receipt": receipt})
+
+        with SUPERVISOR_LOCK:
+            doc, read_err = supervisor_load(build_id)
+            record = (doc or {}).get("watches", {}).get(key)
+            if read_err or not isinstance(record, dict) or record.get("state") != "watching":
+                return
+            assert doc is not None
+            action = "receipt" if settled.get("build_receipt") is not None else "park"
+            park_reason = None
+            if action == "park":
+                park_reason = (
+                    "deadline_exceeded"
+                    if settled.get("outcome") == "deadline_exceeded" or time.time() >= float(deadline_epoch)
+                    else "state_trace_disagreement"
+                )
+                with BUILD_LOCK:
+                    build, build_err = load_build(build_id)
+                    if build_err or build is None:
+                        park_reason = "build_unreadable" if build_err else "missing_build"
+                    elif build.get("stage") != "parked":
+                        park_status, park_out = build_park(
+                            build,
+                            park_reason,
+                            f"completion watch: job {job_id} ended {settled.get('job_status')} without event {event_id}",
+                            f"supervisor-watch:{record.get('watch_id')}",
+                            event_fingerprint({"watch_id": record.get("watch_id"), "reason": park_reason}),
+                            str(record.get("source_run_id") or "supervisor-watch"),
+                        )
+                        if park_status != 409:
+                            record["settlement_error"] = {"code": park_out.get("code"), "error": park_out.get("error")}
+                            supervisor_save(doc)
+                            retry_needed = True
+                            return
+                    if build is not None:
+                        stage = str(build.get("stage") or stage or "")
+            next_action = (
+                "none: expected Graphwing build receipt recorded"
+                if action == "receipt"
+                else supervisor_next_action(
+                    "park",
+                    park_reason,
+                    {
+                        "build_id": build_id,
+                        "event_id": event_id,
+                        "source_run_id": record.get("source_run_id"),
+                        "deadline": record.get("deadline"),
+                        "build_stage": stage,
+                        "worktree": "preserved",
+                        "stacks": "preserved",
+                    },
+                )
+            )
+            record.update(
+                {
+                    "action": action,
+                    "outcome": settled.get("outcome"),
+                    "park_reason": park_reason,
+                    "job_status": settled.get("job_status"),
+                    "job_receipt": (job or {}).get("receipt") if isinstance(job, dict) else None,
+                    "build_stage": stage,
+                    "build_receipt": settled.get("build_receipt"),
+                    "next_operator_action": next_action,
+                    "finished_at": utcnow(),
+                }
+            )
+            report = {
+                "at": utcnow(),
+                "source_run_id": record.get("source_run_id"),
+                "build_id": build_id,
+                "event_id": event_id,
+                "job_id": job_id,
+                "action": action,
+                "outcome": settled.get("outcome"),
+                "park_reason": park_reason,
+                "job_status": settled.get("job_status"),
+                "build_stage": stage,
+                "watch_id": record.get("watch_id"),
+                "next_operator_action": next_action,
+                "plan_pane": record.get("plan_pane"),
+                "files_intact": True,
+            }
+            report["delivery"] = (
+                supervisor_delivery_intent(report, supervisor_watch_line(record))
+                if action == "park"
+                else plan_delivery_skipped(record.get("plan_pane"))
+            )
+            record["delivery"] = report["delivery"]
+            record["state"] = "settled"
+            doc.setdefault("reports", []).append(report)
+            # Settlement, report, and pending delivery intent are one durable
+            # write. Recovery retries only the delivery, never the transition.
+            save_err = supervisor_save(doc)
+            if save_err:
+                retry_needed = True
+                return
+            delivery_id = str(report["delivery"].get("delivery_id") or "")
+        if delivery_id:
+            supervisor_attempt_delivery(build_id, delivery_id)
+    except Exception as exc:
+        retry_needed = True
+        with SUPERVISOR_LOCK:
+            doc, read_err = supervisor_load(build_id)
+            record = (doc or {}).get("watches", {}).get(key)
+            if not read_err and isinstance(record, dict) and record.get("state") == "watching":
+                assert doc is not None
+                record["worker_error"] = {"code": "watch_worker_failed", "error": str(exc)[:240]}
+                supervisor_save(doc)
+    finally:
+        with SUPERVISOR_WATCHER_LOCK:
+            SUPERVISOR_ACTIVE_WATCHERS.discard((build_id, key))
+        if retry_needed:
+            supervisor_schedule_watch_retry(build_id, key)
+
+
+def supervisor_schedule_watch(build_id: str, key: str) -> bool:
+    """Claim and schedule one in-process watcher for one durable record."""
+    identity = (build_id, key)
+    with SUPERVISOR_WATCHER_LOCK:
+        if identity in SUPERVISOR_ACTIVE_WATCHERS:
+            return False
+        SUPERVISOR_ACTIVE_WATCHERS.add(identity)
+    try:
+        thread = threading.Thread(
+            target=supervisor_watch_worker,
+            args=(build_id, key),
+            name=f"graphwing-watch-{hashlib.sha256(key.encode()).hexdigest()[:8]}",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        with SUPERVISOR_WATCHER_LOCK:
+            SUPERVISOR_ACTIVE_WATCHERS.discard(identity)
+        raise
+    return True
+
+
+def supervisor_schedule_watch_retry(build_id: str, key: str) -> None:
+    timer = threading.Timer(
+        max(SUPERVISOR_WATCH_POLL_SECONDS, 0.01), supervisor_schedule_watch, args=(build_id, key)
+    )
+    timer.name = f"graphwing-watch-retry-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+    timer.daemon = True
+    timer.start()
+
+
+def supervisor_recover_watches() -> int:
+    """Schedule every durable open watch; the scheduler deduplicates repeats."""
+    pending: list[tuple[str, str]] = []
+    root = SUPERVISOR_DIR / "builds"
+    if root.is_dir():
+        with SUPERVISOR_LOCK:
+            for path in root.glob("*/supervisor.json"):
+                build_id = path.parent.name
+                if not valid_build_id(build_id):
+                    continue
+                doc, read_err = supervisor_load(build_id)
+                if read_err or doc is None:
+                    continue
+                for key, record in (doc.get("watches") or {}).items():
+                    if isinstance(record, dict) and record.get("state") == "watching":
+                        pending.append((build_id, str(key)))
+    for build_id, key in pending:
+        supervisor_schedule_watch(build_id, key)
+    supervisor_recover_deliveries()
+    return len(pending)
+
+
+def supervisor_recover_once() -> int:
+    """Recover at first supervisor access for each configured state root."""
+    root = str(SUPERVISOR_DIR.resolve())
+    with SUPERVISOR_RECOVERY_LOCK:
+        if root in SUPERVISOR_RECOVERED_ROOTS:
+            return 0
+        SUPERVISOR_RECOVERED_ROOTS.add(root)
+    return supervisor_recover_watches()
+
+
+def supervisor_watch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"source_run_id"}:
+        return 400, {
+            "error": "watch accepts only source_run_id",
+            "code": "bad_watch_request",
+        }
+    source_run_id, run_err = parse_supervisor_string(
+        data, "source_run_id", SUPERVISOR_RUN_ID_RE, "bad_source_run_id"
+    )
+    if run_err:
+        return 400, run_err
+    assert source_run_id is not None
+    with SUPERVISOR_LOCK:
+        build_id, index_err = supervisor_run_lookup(source_run_id)
+        if index_err:
+            return int(index_err["status"]), index_err
+        if build_id is None:
+            return 404, {
+                "ok": False,
+                "error": "source run has no launch registration; it is not supervised",
+                "code": "unknown_source_run",
+                "source_run_id": source_run_id,
+            }
+        doc, read_err = supervisor_load(build_id)
+        if read_err:
+            return int(read_err["status"]), read_err
+        if doc is None or doc.get("version") != SUPERVISOR_STATE_VERSION:
+            return 409, {
+                "ok": False,
+                "error": "supervisor state for this build is missing or unreadable",
+                "code": "supervisor_state_unreadable",
+                "build_id": build_id,
+                "source_run_id": source_run_id,
+            }
+        launch = (doc.get("runs") or {}).get(source_run_id)
+        if not isinstance(launch, dict):
+            return 409, {
+                "ok": False,
+                "error": "launch registration is missing from supervisor state",
+                "code": "supervisor_state_unreadable",
+                "build_id": build_id,
+                "source_run_id": source_run_id,
+            }
+        # This is normally an acknowledgement for the row reconcile already
+        # saved. Creating it remains supported for launches recorded by an
+        # older server, before reconcile owned the durable handoff.
+        expected_key = supervisor_watch_key(source_run_id, str(launch.get("event_id") or ""))
+        was_present = isinstance((doc.get("watches") or {}).get(expected_key), dict)
+        key, record, changed, watch_err = supervisor_ensure_watch_record(doc, source_run_id, launch)
+        if watch_err:
+            return 409, watch_err
+        assert record is not None
+        if changed:
+            save_err = supervisor_save(doc)
+            if save_err:
+                return int(save_err["status"]), save_err
+        out = {
+            "ok": True,
+            "started": bool(not was_present and record.get("state") == "watching"),
+            "version": SUPERVISOR_STATE_VERSION,
+            "watch_id": record.get("watch_id"),
+            "build_id": build_id,
+            "event_id": record.get("event_id"),
+            "source_run_id": source_run_id,
+            "job_id": record.get("job_id"),
+            "state": record.get("state"),
+            "outcome": record.get("outcome"),
+            "action": record.get("action"),
+            "park_reason": record.get("park_reason"),
+            "deadline": record.get("deadline"),
+            "plan_pane": record.get("plan_pane"),
+            "settle_seconds": SUPERVISOR_WATCH_SETTLE_SECONDS,
+            "poll": f"/v1/supervisor/report?build_id={build_id}",
+        }
+    if record.get("state") == "watching":
+        supervisor_schedule_watch(build_id, key)
+    return (202 if record.get("state") == "watching" else 200), out
+
 
 def json_out(status: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
     return status, payload, "application/json"
@@ -8170,6 +10743,9 @@ def dispatch_inner(
 
     if not authed:
         return json_out(401, {"error": "invalid or missing X-Graphwing-Key", "code": "unauthorized"})
+
+    if path.startswith("/v1/supervisor/"):
+        supervisor_recover_once()
 
     if method == "GET" and path == "/v1/units/status":
         out = units_status()
@@ -8268,6 +10844,21 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/build/finalize":
         status, payload = build_finalize(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/supervisor/register":
+        status, payload = supervisor_register(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/supervisor/bind":
+        status, payload = supervisor_bind(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/supervisor/reconcile":
+        status, payload = supervisor_reconcile(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/supervisor/watch":
+        status, payload = supervisor_watch(body, repos)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/supervisor/report":
+        status, payload = supervisor_report_op(qs)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":
@@ -8461,6 +11052,7 @@ def main() -> None:
         load_stacks()
     if not OPENAPI_PATH.is_file():
         raise SystemExit(f"missing {OPENAPI_PATH}")
+    supervisor_recover_once()
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(f"graphwing listening on http://{LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     httpd.serve_forever()
