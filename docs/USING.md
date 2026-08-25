@@ -83,18 +83,25 @@ On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review na
 ## Drive a PR to green
 
 ```bash
-scripts/fire-pr-drive.sh riftwing 3523 riftwing-local-gates
+python3 scripts/drive-pr.py 3526 --message "fix: address review findings [SC-110507]"
 ```
 
-Or the payload directly:
+It starts the run through `POST /workflows/{slug}/run` and then prints the node trace,
+which is the only per-node visibility available; the run status endpoint returns nothing
+but `completed`.
 
-```json
-{ "input": {
-  "repo": "riftwing", "pr": "3523", "test": "riftwing-local-gates",
-  "attempt": 1, "max_attempts": 3, "auto_merge": false,
-  "kick_url": "https://app.rewst.ai/api/hooks/..."
-} }
-```
+**Do not fire this workflow by webhook.** A webhook-triggered run never creates
+`CTX.INPUT` at all, so every `{{ CTX.INPUT.* }}` in the graph resolves empty and the run
+dies at `ghPrView` with no `number` on the query string. Nothing reports it: `repo` still
+arrives, because `openapi.json` declares a default of `riftwing` for that parameter, so
+the request looks half-correct. `fire-pr-drive.sh` posts to the webhook and cannot work.
+
+`run_slug` wraps the body as `{"input": {...}}`. A bare payload arrives as a manual
+trigger with `body: {}` and fails the same silent way.
+
+`--message` is not optional in spirit: `git_commit` rejects an empty message, and a run
+that reaches the commit has already spent a full writer session. The graph defaults it
+too, so a caller that forgets loses nothing.
 
 `kick_url` is this workflow's own webhook. Without it the run does one fix attempt
 and stops, because Rewst forbids unbounded cycles inside a run: the loop is a chain
@@ -103,6 +110,13 @@ of runs, not a cycle.
 The writer's prompt is not yours to write. A `findings` node reads the reviewers'
 `engineering-findings-json`, dedupes by fingerprint (two reviewers raising one defect
 is one fix), orders by severity, and hands over the remedies without the argument.
+
+Two node-output traps worth knowing before editing this graph. A node result is exposed
+as `TASKS.<node>.data.<field>`, so an endpoint that nests its payload under `data` makes
+every path a double `.data.data` that silently reads null. And a large output is replaced
+by an artifact stub: `TASKS.checks.all_green` is unreadable because that node returns
+~21KB, which is why the findings endpoint runs `gh pr checks` itself and returns
+`all_green` flat.
 
 `auto_merge` is per-run and defaults false. When true and the PR is green, mergeable,
 and carries no `hold:*` label, the run merges with `--squash --delete-branch`. The
