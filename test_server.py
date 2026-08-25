@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -568,7 +569,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.5")
+        self.assertEqual(spec["info"]["version"], "0.6.0")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -2993,6 +2994,1245 @@ class InstallTests(unittest.TestCase):
             self.assertIn("not starting", proc.stdout)
             self.assertNotIn("installing Hermes", proc.stdout)
             self.assertNotIn("installing herdr", proc.stdout)
+
+
+class BuildStateTests(unittest.TestCase):
+    """graphwing-pre-pr-build is many bounded Rewst calls against one build.
+
+    Every test here is a retry story: the same call arriving twice, two runs
+    racing for the same build, a lease that outlived the caller holding it, a
+    service that restarted mid-build. Each one of those, answered wrong,
+    duplicates a real side effect — a second writer session, a second PR.
+    """
+
+    BUILD = "bld-0000001"
+    BRANCH = "feature/issue-52"
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        root = Path(self._td.name)
+        self.home = root / "gwhome"
+        self.builds = self.home / "builds"
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        for args in (
+            ["git", "init", "-b", "main", str(self.repo)],
+            ["git", "-C", str(self.repo), "config", "user.email", "gw@test"],
+            ["git", "-C", str(self.repo), "config", "user.name", "graphwing-test"],
+            ["git", "-C", str(self.repo), "config", "commit.gpgsign", "false"],
+        ):
+            subprocess.run(args, check=True, capture_output=True)
+        (self.repo / "README").write_text("hi\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "init"], check=True, capture_output=True)
+        # The build's identity is what git says, so the fixture has to be a
+        # real checkout of the branch under test. A declared branch the repo
+        # is not on, or a made-up head, tests the guard against itself and
+        # passes no matter what the checkout is doing.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-b", self.BRANCH], check=True, capture_output=True
+        )
+        self.head = self._git("rev-parse", "HEAD")
+        self.assertRegex(self.head, r"^[0-9a-f]{40}$")
+        bp = mock.patch.object(server, "BUILDS_DIR", self.builds)
+        bp.start()
+        self.addCleanup(bp.stop)
+        rp = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)})
+        rp.start()
+        self.addCleanup(rp.stop)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _git(self, *args):
+        out = subprocess.run(
+            ["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True
+        )
+        return out.stdout.strip()
+
+    def _commit(self, text):
+        """Move the worktree HEAD the way a writer agent would."""
+        (self.repo / "README").write_text(text)
+        self._git("add", "README")
+        self._git("commit", "-m", text)
+        return self._git("rev-parse", "HEAD")
+
+    def _create_body(self, **over):
+        body = {
+            "build_id": self.BUILD,
+            "story": "issue-52 pre-PR build",
+            "repo": "scratch",
+            "branch": self.BRANCH,
+            "head": self.head,
+            "index": "slices/demo/index.json",
+            "ticket": "slices/demo/01-build-state.md",
+            "route": {"launcher": "hermes", "model": "sol"},
+            "verification": {"fast": ["graphwing-compile"], "integration": ["graphwing-unit"]},
+            "stacks": ["riftwing-52"],
+            "budget": {"jobs_max": 12},
+        }
+        body.update(over)
+        return body
+
+    def _create(self, **over):
+        body = self._create_body(**over)
+        return server.dispatch("POST", "/v1/build/create", {}, True, json.dumps(body).encode())
+
+    def _create_omitting(self, *fields, **over):
+        body = self._create_body(**over)
+        for field in fields:
+            body.pop(field)
+        return server.dispatch("POST", "/v1/build/create", {}, True, json.dumps(body).encode())
+
+    def _advance(self, action, event_id, holder="rewst-run-1", **over):
+        body = {"build_id": self.BUILD, "event_id": event_id, "action": action, "holder": holder}
+        body.update(over)
+        return server.dispatch("POST", "/v1/build/advance", {}, True, json.dumps(body).encode())
+
+    def _state(self, build_id=None):
+        return server.dispatch("GET", "/v1/build/state", {"build_id": [build_id or self.BUILD]}, True, b"")
+
+    def _doc_path(self, build_id=None):
+        return self.builds / (build_id or self.BUILD) / "build.json"
+
+    def _expire_lease(self):
+        doc = json.loads(self._doc_path().read_text())
+        self.assertIsNotNone(doc["lease"], "test needs a live lease to expire")
+        doc["lease"]["expires_epoch"] = time.time() - 1
+        self._doc_path().write_text(json.dumps(doc, indent=2) + "\n")
+
+    def _age_out_event_receipt(self, event_id):
+        doc = json.loads(self._doc_path().read_text())
+        for i in range(server.BUILD_RECEIPTS_KEPT):
+            filler_id = f"filler-{i}"
+            server.build_record_event(
+                doc,
+                filler_id,
+                f"fingerprint-{i}",
+                {"event_id": filler_id, "filler": True},
+                200,
+            )
+        self.assertIsNone(server.write_build(doc, self.BUILD))
+        aged = json.loads(self._doc_path().read_text())
+        self.assertNotIn(event_id, aged["events"])
+        self.assertNotIn(event_id, aged["event_order"])
+        self.assertIn(event_id, aged["event_seen"])
+
+    def _through_verify(self, holder="rewst-run-1", **create_over):
+        self.assertEqual(self._create(**create_over)[0], 201)
+        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
+            status, payload, _ = self._advance(action, f"evt-{i}", holder=holder)
+            self.assertEqual(status, 200, payload)
+        return payload
+
+    # -- creating -----------------------------------------------------------
+
+    def test_create_records_a_versioned_document_and_the_next_action(self):
+        status, payload, _ = self._create()
+        self.assertEqual(status, 201, payload)
+        self.assertTrue(payload["created"])
+        self.assertEqual(payload["version"], server.BUILD_STATE_VERSION)
+        self.assertEqual(payload["build_id"], self.BUILD)
+        self.assertEqual(payload["stage"], "created")
+        self.assertEqual(payload["next_action"], "start_writer")
+        self.assertEqual(payload["budget_left"], 12)
+        self.assertEqual(payload["worktree"], str(self.repo))
+        # A 40-hex git object id is not a secret. Redaction that eats the head
+        # would take the build's whole identity guard with it.
+        self.assertEqual(payload["head"], self.head)
+        self.assertEqual(payload["branch"], self.BRANCH)
+        self.assertEqual(payload["stacks"], ["riftwing-52"])
+        self.assertEqual(payload["verification"]["integration"], ["graphwing-unit"])
+        self.assertEqual(payload["event_count"], 0)
+        self.assertEqual(payload["event_capacity"], server.BUILD_EVENT_HARD_MAX)
+        self.assertTrue(self._doc_path().is_file())
+
+    def test_create_replayed_with_the_same_input_does_not_start_a_second_build(self):
+        first = self._create()[1]
+        status, payload, _ = self._create()
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["created"])
+        self.assertEqual(payload["created_at"], first["created_at"])
+
+    def test_create_reusing_a_build_id_with_new_input_is_a_conflict(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._create(story="a completely different story")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "idempotency_conflict")
+        self.assertEqual(self._state()[1]["story"], "issue-52 pre-PR build")
+
+    def test_create_without_a_build_id_is_refused_rather_than_generating_one(self):
+        # A generated id is an id the caller cannot repeat, so every timed-out
+        # retry would open a second build against the same worktree, each with
+        # its own lease and its own budget.
+        status, payload, _ = self._create(build_id=None)
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "missing_build_id")
+        self.assertFalse(self.builds.exists(), "a refused create must not create state")
+
+    def test_create_refuses_a_worktree_the_repo_allowlist_does_not_back(self):
+        status, payload, _ = self._create(worktree="/tmp/not-the-repo")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "worktree_mismatch")
+        self.assertFalse(self._doc_path().exists())
+
+    def test_create_refuses_a_branch_the_worktree_is_not_actually_on(self):
+        self._git("checkout", "main")
+        status, payload, _ = self._create()
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "branch_mismatch")
+        self.assertEqual(payload["branch"], "main", "the answer names the live branch, not the declared one")
+        self.assertFalse(self._doc_path().exists(), "no state exists yet, so there is nothing to park")
+
+    def test_create_refuses_a_head_the_worktree_is_not_at(self):
+        status, payload, _ = self._create(head="b" * 40)
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "head_mismatch")
+        self.assertEqual(payload["head"], self.head)
+        self.assertFalse(self._doc_path().exists())
+
+    def test_create_takes_its_head_from_git_even_when_the_caller_omits_one(self):
+        status, payload, _ = self._create(head=None)
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["head"], self.head)
+
+    def test_create_object_fields_reject_falsey_non_objects_and_accept_empty_objects(self):
+        for field in ("verification", "route", "budget"):
+            for bad in (None, "", False, 0, []):
+                with self.subTest(field=field, value=bad):
+                    status, payload, _ = self._create(**{field: bad})
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], f"bad_{field}")
+                    self.assertFalse(self._doc_path().exists(), "a refused create must not create state")
+
+        status, payload, _ = self._create(verification={}, route={}, budget={})
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["verification"]["fast"], [])
+        self.assertEqual(payload["verification"]["integration"], [])
+        self.assertEqual(payload["route"], {})
+        self.assertEqual(payload["budget"], {"jobs_max": None, "jobs_used": 0})
+
+    def test_create_object_field_omission_uses_defaults_and_route_is_null(self):
+        status, payload, _ = self._create_omitting(
+            "verification", "route", "budget", build_id="bld-0000002"
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(
+            payload["verification"],
+            {"fast": [], "integration": [], "needs_visual_proof": False, "human_visual_review": False},
+        )
+        self.assertIsNone(payload["route"])
+        self.assertEqual(payload["budget"], {"jobs_max": None, "jobs_used": 0})
+
+    def test_verification_command_lists_are_strict_and_trim_command_names(self):
+        bad_values = (None, "", False, True, 0, 1, {}, "graphwing-unit", [""], ["graphwing-unit", 1])
+        for field in ("fast", "integration"):
+            for bad in bad_values:
+                with self.subTest(field=field, value=bad):
+                    verification = {"fast": [], "integration": [], field: bad}
+                    status, payload, _ = self._create(verification=verification)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], "bad_verification")
+                    self.assertFalse(self._doc_path().exists(), "a refused create must not create state")
+
+        status, payload, _ = self._create(verification={})
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["verification"]["fast"], [])
+        self.assertEqual(payload["verification"]["integration"], [])
+
+        status, payload, _ = self._create(
+            build_id="bld-0000002", verification={"fast": [], "integration": []}
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["verification"]["fast"], [])
+        self.assertEqual(payload["verification"]["integration"], [])
+
+        status, payload, _ = self._create(
+            build_id="bld-0000003",
+            verification={
+                "fast": [" graphwing-compile ", "graphwing-unit"],
+                "integration": [" graphwing-integration "],
+            },
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["verification"]["fast"], ["graphwing-compile", "graphwing-unit"])
+        self.assertEqual(payload["verification"]["integration"], ["graphwing-integration"])
+
+    def test_create_stacks_must_be_an_array_when_supplied(self):
+        for bad in (None, "riftwing-52", False, 0, {}):
+            with self.subTest(stacks=bad):
+                status, payload, _ = self._create(stacks=bad)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_stacks")
+                self.assertFalse(self._doc_path().exists(), "a refused create must not create state")
+
+        status, payload, _ = self._create(stacks=[])
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["stacks"], [])
+
+        status, payload, _ = self._create_omitting("stacks", build_id="bld-0000002")
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["stacks"], [])
+
+    def test_create_replay_fingerprints_raw_capability_urls_before_redaction(self):
+        capability_url_a = "https://rewst.test/webhooks/custom/9f2c-aaaa1111"
+        capability_url_b = "https://rewst.test/webhooks/custom/7b41-bbbb2222"
+
+        def raw_input(url):
+            body = {
+                "build_id": self.BUILD,
+                "story": "issue-52 pre-PR build",
+                "repo": "scratch",
+                "branch": self.BRANCH,
+                "head": self.head,
+                "index": "slices/demo/index.json",
+                "ticket": "slices/demo/01-build-state.md",
+                "route": {"next": url},
+                "verification": {"fast": ["graphwing-compile"], "integration": ["graphwing-unit"]},
+                "stacks": ["riftwing-52"],
+                "budget": {"jobs_max": 12},
+            }
+            return json.dumps(body).encode()
+
+        first_input = raw_input(capability_url_a)
+        status, created, _ = server.dispatch("POST", "/v1/build/create", {}, True, first_input)
+        self.assertEqual(status, 201, created)
+        self.assertTrue(created["created"])
+        self.assertEqual(created["route"], {"next": "[redacted]"})
+
+        status, replay, _ = server.dispatch("POST", "/v1/build/create", {}, True, first_input)
+        self.assertEqual(status, 200, replay)
+        self.assertFalse(replay["created"])
+        self.assertEqual(replay["route"], {"next": "[redacted]"})
+
+        status, conflict, _ = server.dispatch(
+            "POST", "/v1/build/create", {}, True, raw_input(capability_url_b)
+        )
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "idempotency_conflict")
+
+        on_disk = self._doc_path().read_text()
+        document = json.loads(on_disk)
+        self.assertEqual(document["route"], {"next": "[redacted]"})
+        self.assertNotIn(capability_url_a, on_disk)
+        self.assertNotIn(capability_url_b, on_disk)
+
+    def test_index_and_ticket_are_bounded_repo_relative_paths_or_absent(self):
+        bad_values = (
+            None,
+            "",
+            False,
+            0,
+            ["slices/demo"],
+            {"path": "slices/demo"},
+            7,
+            True,
+            "/tmp/ticket",
+            "slices/../ticket",
+            "x" * 257,
+        )
+        for field in ("index", "ticket"):
+            for bad in bad_values:
+                with self.subTest(field=field, value=bad):
+                    status, payload, _ = self._create(**{field: bad})
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], f"bad_{field}")
+                    self.assertFalse(self._doc_path().exists(), "a refused create must not create state")
+
+        bounded = "x" * server.BUILD_NAME_MAX
+        status, payload, _ = self._create(index=bounded, ticket=bounded)
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["index"], bounded)
+        self.assertEqual(payload["ticket"], bounded)
+
+        absent_body = {
+            "build_id": "bld-0000002",
+            "story": "build without planner paths",
+            "repo": "scratch",
+            "branch": self.BRANCH,
+            "head": self.head,
+        }
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/build/create", {}, True, json.dumps(absent_body).encode()
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertIsNone(payload["index"])
+        self.assertIsNone(payload["ticket"])
+
+    def test_visual_review_flags_accept_only_actual_booleans_or_omission(self):
+        bad_values = ("false", "true", 0, 1, None, [], {})
+        for field in ("needs_visual_proof", "human_visual_review"):
+            for bad in bad_values:
+                with self.subTest(field=field, value=bad):
+                    verification = {"fast": [], "integration": [], field: bad}
+                    status, payload, _ = self._create(verification=verification)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], "bad_verification")
+                    self.assertFalse(self._doc_path().exists(), "a refused create must not create state")
+
+        status, payload, _ = self._create(
+            verification={
+                "fast": [],
+                "integration": [],
+                "needs_visual_proof": True,
+                "human_visual_review": False,
+            }
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertTrue(payload["verification"]["needs_visual_proof"])
+        self.assertFalse(payload["verification"]["human_visual_review"])
+
+        status, payload, _ = self._create(
+            build_id="bld-0000002", verification={"fast": [], "integration": []}
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertFalse(payload["verification"]["needs_visual_proof"])
+        self.assertFalse(payload["verification"]["human_visual_review"])
+
+    # -- transitions --------------------------------------------------------
+
+    def test_the_whole_path_runs_when_no_visual_proof_is_declared(self):
+        self.assertEqual(self._create()[0], 201)
+        steps = [
+            ("start_writer", "writing", {"writer_session": "gwslice-" + "0" * 32}),
+            ("writer_done", "verifying", {}),
+            # needs_visual_proof is false, so evidence is skipped outright.
+            ("verify_passed", "review", {}),
+            ("review_passed", "ready", {"review": {"author": "sol", "verdict": "clear"}}),
+            ("pr_opened", "pr_opened", {"pr": {"number": 7, "url": "https://example.test/pull/7"}}),
+        ]
+        for i, (action, stage, data) in enumerate(steps, start=1):
+            status, payload, _ = self._advance(action, f"evt-{i}", data=data)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["stage"], stage, action)
+            self.assertEqual(payload["receipt"]["to"], stage)
+        self.assertIsNone(payload["next_action"])
+        self.assertIsNone(payload["lease"], "a finished build must not hold a lease")
+        self.assertEqual(payload["writer_session"], "gwslice-" + "0" * 32)
+        self.assertEqual(payload["pr"]["number"], 7)
+        self.assertEqual(payload["budget_left"], 7)
+
+    def test_evidence_is_a_real_stage_when_visual_proof_is_declared(self):
+        self.assertEqual(
+            self._create(verification={"fast": [], "integration": [], "needs_visual_proof": True})[0], 201
+        )
+        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
+            status, payload, _ = self._advance(action, f"evt-{i}")
+        self.assertEqual(payload["stage"], "evidence", payload)
+        self.assertEqual(payload["next_action"], "evidence_captured")
+        status, payload, _ = self._advance(
+            "evidence_captured", "evt-4", data={"round": {"n": 1, "shots": ["home.png"]}}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "review")
+        self.assertEqual(payload["evidence_rounds"], [{"n": 1, "shots": ["home.png"]}])
+
+    def test_an_out_of_order_action_is_refused_and_names_the_expected_one(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("review_passed", "evt-wrong")
+        self.assertEqual(status, 409, payload)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "invalid_transition")
+        self.assertEqual(payload["expected_action"], "start_writer")
+        self.assertEqual(self._state()[1]["stage"], "created")
+        self.assertEqual(self._state()[1]["budget_left"], 12, "a refused action spends nothing")
+
+    def test_an_unknown_action_is_a_request_error_not_a_park(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("ship_it", "evt-1")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_action")
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_advance_object_fields_reject_falsey_non_objects_without_rewriting_state(self):
+        self.assertEqual(self._create()[0], 201)
+        before = self._doc_path().read_bytes()
+        event = 1
+        for field in ("data", "expect"):
+            for bad in (None, "", False, 0, []):
+                with self.subTest(field=field, value=bad):
+                    status, payload, _ = self._advance("start_writer", f"evt-bad-{event}", **{field: bad})
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], f"bad_{field}")
+                    self.assertEqual(
+                        self._doc_path().read_bytes(), before, "a refused advance must not rewrite state"
+                    )
+                event += 1
+
+        status, payload, _ = self._advance("start_writer", "evt-empty", data={}, expect={})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "writing")
+
+        status, payload, _ = self._advance("writer_done", "evt-omitted")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "verifying")
+
+    # -- idempotency --------------------------------------------------------
+
+    def test_replaying_an_event_id_returns_the_receipt_without_rerunning(self):
+        self.assertEqual(self._create()[0], 201)
+        first = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})[1]
+        status, payload, _ = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["receipt"], first["receipt"])
+        self.assertEqual(payload["stage"], "writing")
+        self.assertEqual(payload["budget_left"], first["budget_left"], "a replay spends no budget")
+        self.assertEqual(payload["event_count"], 1, "one id accepted, however many times it arrives")
+
+    def test_a_successful_event_replays_after_its_recent_receipt_ages_out(self):
+        self.assertEqual(self._create()[0], 201)
+        first_status, first, _ = self._advance("start_writer", "evt-old")
+        self.assertEqual(first_status, 200, first)
+        self._age_out_event_receipt("evt-old")
+        before = self._doc_path().read_bytes()
+
+        status, payload, _ = self._advance("start_writer", "evt-old")
+        self.assertEqual(status, first_status, payload)
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["receipt"], first["receipt"])
+        self.assertEqual(self._doc_path().read_bytes(), before, "a replay must not rewrite state")
+
+    def test_reusing_an_event_id_with_different_input_is_a_conflict(self):
+        self.assertEqual(self._create()[0], 201)
+        first = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})[1]
+        status, payload, _ = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "2" * 32})
+        self.assertEqual(status, 409, payload)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["replayed"])
+        self.assertEqual(payload["code"], "idempotency_conflict")
+        after = self._state()[1]
+        self.assertEqual(after["stage"], "writing")
+        self.assertEqual(after["writer_session"], "gwslice-" + "1" * 32)
+        self.assertEqual(after["budget_left"], first["budget_left"])
+
+    def test_every_input_that_changes_the_outcome_is_part_of_the_event_identity(self):
+        # A retry that asks for nine jobs, a longer lease, a different owner,
+        # or the lease dropped is a different request. Fingerprinting only
+        # action and data answered all four with the original receipt, so the
+        # caller was told its new terms had been applied when they had not.
+        self.assertEqual(self._create()[0], 201)
+        first = self._advance("start_writer", "evt-1")[1]
+        for field, value in (
+            ("holder", "rewst-run-2"),
+            ("jobs_spent", 9),
+            ("lease_seconds", 900),
+            ("release_lease", True),
+        ):
+            with self.subTest(field=field):
+                status, payload, _ = self._advance("start_writer", "evt-1", **{field: value})
+                self.assertEqual(status, 409, payload)
+                self.assertFalse(payload["replayed"])
+                self.assertEqual(payload["code"], "idempotency_conflict")
+                after = self._state()[1]
+                self.assertEqual(after["stage"], "writing")
+                self.assertEqual(after["budget_left"], first["budget_left"])
+                self.assertEqual(after["lease"]["holder"], "rewst-run-1")
+
+    # -- leases -------------------------------------------------------------
+
+    def test_a_live_lease_keeps_a_second_caller_out(self):
+        self.assertEqual(self._create()[0], 201)
+        held = self._advance("start_writer", "evt-1", holder="rewst-run-1")[1]
+        self.assertEqual(held["lease"]["holder"], "rewst-run-1")
+        status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-2")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "lease_held")
+        self.assertEqual(self._state()[1]["stage"], "writing", "the loser must not advance the build")
+
+    def test_the_lease_holder_keeps_going_without_reacquiring(self):
+        self.assertEqual(self._create()[0], 201)
+        self.assertEqual(self._advance("start_writer", "evt-1", holder="rewst-run-1")[0], 200)
+        status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-1")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "verifying")
+
+    def test_an_expired_lease_is_recoverable_and_keeps_the_verified_boundary(self):
+        verified = self._through_verify(holder="rewst-run-1")
+        self.assertEqual(verified["stage"], "review")
+        boundary = verified["verified_boundary"]
+        self.assertIsNotNone(boundary)
+        self.assertEqual(boundary["head"], self.head)
+        self._expire_lease()
+        status, payload, _ = self._advance("review_passed", "evt-4", holder="rewst-run-2")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "ready")
+        self.assertEqual(payload["lease"]["holder"], "rewst-run-2")
+        self.assertEqual(payload["verified_boundary"], boundary, "recovery must not roll the boundary back")
+
+    def test_releasing_the_lease_hands_the_build_to_the_next_caller(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", holder="rewst-run-1", release_lease=True)
+        self.assertEqual(status, 200, payload)
+        self.assertIsNone(payload["lease"])
+        status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-2")
+        self.assertEqual(status, 200, payload)
+
+    def test_release_lease_accepts_omission_or_booleans_and_rejects_coercion(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1")
+        self.assertEqual(status, 200, payload)
+        self.assertIsNotNone(payload["lease"], "omission defaults to keeping the lease")
+
+        status, payload, _ = self._advance("writer_done", "evt-2", release_lease=False)
+        self.assertEqual(status, 200, payload)
+        self.assertIsNotNone(payload["lease"])
+
+        status, payload, _ = self._advance("verify_passed", "evt-3", release_lease=True)
+        self.assertEqual(status, 200, payload)
+        self.assertIsNone(payload["lease"])
+
+        before = self._doc_path().read_bytes()
+        for i, bad in enumerate(("false", "true", 0, 1, None, [], {}), start=4):
+            with self.subTest(release_lease=bad):
+                status, payload, _ = self._advance("review_passed", f"evt-{i}", release_lease=bad)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_release_lease")
+                self.assertEqual(self._doc_path().read_bytes(), before, "a bad flag must not change state")
+
+    # -- parking ------------------------------------------------------------
+
+    def test_a_moved_head_parks_with_a_named_reason(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", expect={"head": "b" * 40})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "head_moved")
+        self.assertEqual(payload["stage"], "parked")
+        parked = self._state()[1]
+        self.assertEqual(parked["stage"], "parked")
+        self.assertEqual(parked["park_reason"], "head_moved")
+        self.assertIsNone(parked["next_action"])
+
+    def test_a_foreign_worktree_parks_instead_of_guessing(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", expect={"worktree": "/tmp/some-other-tree"})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "worktree_mismatch")
+        self.assertEqual(self._state()[1]["park_reason"], "worktree_mismatch")
+
+    def test_a_branch_moved_under_the_build_parks_against_the_live_checkout(self):
+        # The stored branch is compared to what git reports, not to a copy of
+        # the caller's own claim. Comparing belief to belief agrees with
+        # itself while the worktree is somewhere else entirely.
+        self.assertEqual(self._create()[0], 201)
+        self._git("checkout", "main")
+        status, payload, _ = self._advance("start_writer", "evt-1")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "branch_mismatch")
+        self.assertIn("main", payload["park_detail"])
+        self.assertEqual(self._state()[1]["park_reason"], "branch_mismatch")
+
+    def test_retrying_an_automatic_park_replays_it_instead_of_parking_twice(self):
+        # An automatic park is an outcome, not an error on the way to one. If
+        # it is not recorded under the event id, the caller's retry re-runs the
+        # guard and parks again — a second receipt and a second budget charge
+        # for one transition the caller only asked for once.
+        self.assertEqual(self._create()[0], 201)
+        moved = self._commit("writer moved the head")
+        self.assertNotEqual(moved, self.head)
+        first_status, first, _ = self._advance("start_writer", "evt-1", expect={"head": self.head})
+        self.assertEqual(first_status, 409, first)
+        self.assertEqual(first["code"], "head_moved")
+        self.assertFalse(first["replayed"])
+        self.assertEqual(first["receipt"]["jobs_spent"], 0)
+        self.assertTrue(first["receipt"]["automatic"])
+
+        status, payload, _ = self._advance("start_writer", "evt-1", expect={"head": self.head})
+        self.assertEqual(status, 409, payload)
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["receipt"], first["receipt"], "the same park, not a second one")
+        self.assertEqual(payload["code"], "head_moved")
+        after = self._state()[1]
+        self.assertEqual(after["stage"], "parked")
+        self.assertEqual(after["budget_left"], 12, "parking twice would have charged the budget twice")
+        self.assertEqual(len([r for r in after["receipts"] if r]), 1)
+
+    def test_an_automatic_park_replays_after_its_recent_receipt_ages_out(self):
+        self.assertEqual(self._create()[0], 201)
+        moved = self._commit("writer moved the head")
+        self.assertNotEqual(moved, self.head)
+        first_status, first, _ = self._advance("start_writer", "evt-park", expect={"head": self.head})
+        self.assertEqual(first_status, 409, first)
+        self.assertTrue(first["receipt"]["automatic"])
+        self._age_out_event_receipt("evt-park")
+        before = self._doc_path().read_bytes()
+
+        status, payload, _ = self._advance("start_writer", "evt-park", expect={"head": self.head})
+        self.assertEqual(status, first_status, payload)
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["receipt"], first["receipt"])
+        self.assertEqual(payload["code"], first["code"])
+        self.assertEqual(self._doc_path().read_bytes(), before, "a park replay must not rewrite state")
+
+    # -- identity is read, never written ------------------------------------
+
+    def test_a_head_in_the_payload_cannot_move_the_builds_identity(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", data={"head": "b" * 40})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["head"], self.head, "identity comes from the repository, not the payload")
+        self.assertEqual(self._state()[1]["head"], self.head)
+        self.assertEqual(payload["receipt"]["head"], self.head)
+
+    def test_only_start_writer_may_bind_the_writer_session(self):
+        # The session handle is what resumes the one agent holding this build.
+        # A later transition that repointed it would strand the real writer and
+        # hand the resume handle to whatever the caller happened to send.
+        session = "gwslice-" + "4" * 32
+        self.assertEqual(self._create()[0], 201)
+        self.assertEqual(self._advance("start_writer", "evt-1", data={"writer_session": session})[0], 200)
+        status, payload, _ = self._advance(
+            "writer_done", "evt-2", data={"writer_session": "gwslice-" + "5" * 32}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "writer_session_locked")
+        after = self._state()[1]
+        self.assertEqual(after["writer_session"], session)
+        self.assertEqual(after["stage"], "writing", "a refused rebind advances nothing")
+
+    def test_a_writer_session_that_is_not_a_session_id_is_refused(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", data={"writer_session": "the writer agent"})
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_writer_session")
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_overrunning_the_job_budget_parks(self):
+        self.assertEqual(self._create(budget={"jobs_max": 1})[0], 201)
+        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
+        status, payload, _ = self._advance("writer_done", "evt-2")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "budget_exhausted")
+        self.assertEqual(self._state()[1]["stage"], "parked")
+
+    def test_a_state_version_we_cannot_read_parks_and_is_left_alone(self):
+        self.assertEqual(self._create()[0], 201)
+        doc = json.loads(self._doc_path().read_text())
+        doc["version"] = server.BUILD_STATE_VERSION + 99
+        doc["a_field_from_the_future"] = True
+        self._doc_path().write_text(json.dumps(doc, indent=2) + "\n")
+        status, payload, _ = self._state()
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "incompatible_state_version")
+        self.assertEqual(payload["park_reason"], "state_version")
+        self.assertEqual(self._advance("start_writer", "evt-1")[0], 409)
+        after = json.loads(self._doc_path().read_text())
+        self.assertEqual(after["version"], server.BUILD_STATE_VERSION + 99)
+        self.assertTrue(after["a_field_from_the_future"], "a version we cannot read must not be rewritten")
+
+    def test_a_deliberate_park_is_a_transition_like_any_other(self):
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("park", "evt-1", data={"reason": "human_review", "detail": "waiting"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "parked")
+        self.assertEqual(payload["park_reason"], "human_review")
+        self.assertEqual(self._advance("start_writer", "evt-2")[1]["code"], "invalid_transition")
+
+    # -- durability ---------------------------------------------------------
+
+    def test_state_survives_a_service_restart(self):
+        self.assertEqual(
+            self._create(
+                verification={
+                    "fast": ["graphwing-compile"],
+                    "integration": ["graphwing-unit"],
+                    "needs_visual_proof": True,
+                }
+            )[0],
+            201,
+        )
+        session = "gwslice-" + "3" * 32
+        for i, (action, data) in enumerate(
+            (
+                ("start_writer", {"writer_session": session, "stacks": ["riftwing-52", "gw-52"]}),
+                ("writer_done", {}),
+                ("verify_passed", {}),
+                ("evidence_captured", {"round": {"n": 1, "shots": ["home.png"]}}),
+                ("review_passed", {"review": {"author": "sol", "verdict": "clear"}}),
+                ("pr_opened", {"pr": {"number": 7, "url": "https://example.test/pull/7"}}),
+            ),
+            start=1,
+        ):
+            self.assertEqual(self._advance(action, f"evt-{i}", data=data)[0], 200, action)
+        before = self._state()[1]
+
+        # A genuinely fresh process: no patched globals, no warm module. It
+        # reads through buildState, the operation Rewst actually calls, so the
+        # proof covers the public answer rather than an internal helper.
+        root = Path(server.__file__).resolve().parent
+        env = dict(os.environ, GRAPHWING_HOME=str(self.home), GRAPHWING_HERDR="0", PYTHONPATH=str(root))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json, sys; import server; "
+                "status, payload = server.build_state_op({'build_id': [sys.argv[1]]}); "
+                "print(json.dumps({'status': status, 'payload': payload}))",
+                self.BUILD,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        restarted = json.loads(proc.stdout)
+        self.assertEqual(restarted["status"], 200, proc.stderr)
+        after = restarted["payload"]
+        for field in (
+            "story",
+            "repo",
+            "worktree",
+            "branch",
+            "head",
+            "index",
+            "ticket",
+            "route",
+            "verification",
+            "writer_session",
+            "stacks",
+            "evidence_rounds",
+            "reviews",
+            "budget",
+            "budget_left",
+            "verified_boundary",
+            "receipts",
+            "event_count",
+            "pr",
+            "lease",
+            "stage",
+            "next_action",
+            "created_at",
+        ):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(after["story"], "issue-52 pre-PR build")
+        self.assertEqual(after["repo"], "scratch")
+        self.assertEqual(after["branch"], self.BRANCH)
+        self.assertEqual(after["head"], self.head, "the head read back is the one git reported")
+        self.assertEqual(after["index"], "slices/demo/index.json")
+        self.assertEqual(after["ticket"], "slices/demo/01-build-state.md")
+        self.assertEqual(after["route"], {"launcher": "hermes", "model": "sol"})
+        self.assertTrue(after["verification"]["needs_visual_proof"])
+        self.assertEqual(after["writer_session"], session)
+        self.assertEqual(after["stacks"], ["riftwing-52", "gw-52"])
+        self.assertEqual(after["evidence_rounds"], [{"n": 1, "shots": ["home.png"]}])
+        self.assertEqual(after["reviews"], [{"author": "sol", "verdict": "clear"}])
+        self.assertEqual(after["verified_boundary"]["head"], self.head)
+        self.assertEqual(after["budget"], {"jobs_max": 12, "jobs_used": 6})
+        self.assertEqual(after["budget_left"], 6)
+        self.assertEqual(after["event_count"], 6)
+        self.assertEqual([r["event_id"] for r in after["receipts"]], [f"evt-{i}" for i in range(1, 7)])
+        self.assertEqual(after["pr"], {"number": 7, "url": "https://example.test/pull/7"})
+        self.assertIsNone(after["lease"], "a finished build holds no lease across a restart either")
+        self.assertEqual(after["stage"], "pr_opened")
+        self.assertIsNone(after["next_action"])
+
+    def test_writes_are_atomic_and_leave_no_partial_file(self):
+        self.assertEqual(self._create()[0], 201)
+        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
+            self.assertEqual(self._advance(action, f"evt-{i}")[0], 200, action)
+        leftovers = sorted(p.name for p in self._doc_path().parent.iterdir() if p.name != "build.json")
+        self.assertEqual(leftovers, [], "the temp file must be renamed, not left behind")
+        self.assertLessEqual(self._doc_path().stat().st_size, server.BUILD_STATE_MAX_BYTES)
+        on_disk = json.loads(self._doc_path().read_text())
+        self.assertEqual(on_disk["build_id"], self.BUILD)
+        self.assertEqual(on_disk["stage"], "review")
+
+    def test_concurrent_writes_get_their_own_temp_file_and_leave_a_valid_state(self):
+        # A shared temp name is two writers filling one file: whoever renames
+        # second publishes a document half of which is the other one's bytes.
+        other = "bld-0000003"
+        errors = []
+        docs = [
+            {
+                "version": server.BUILD_STATE_VERSION,
+                "build_id": other,
+                "stage": "writing",
+                "story": f"writer {i}",
+                "events": {},
+                "event_order": [],
+                "event_seen": {},
+            }
+            for i in range(8)
+        ]
+
+        def write(doc):
+            errors.append(server.write_build(doc, other))
+
+        threads = [threading.Thread(target=write, args=(doc,)) for doc in docs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([e for e in errors if e], [])
+        files = sorted(p.name for p in self._doc_path(other).parent.iterdir())
+        self.assertEqual(files, ["build.json"], "every writer must clean up after itself")
+        on_disk = json.loads(self._doc_path(other).read_text())
+        self.assertEqual(on_disk["build_id"], other)
+        self.assertIn(on_disk["story"], [d["story"] for d in docs], "one whole document, not a blend of eight")
+
+    def test_the_state_directory_and_file_are_private_to_the_seat(self):
+        # The document carries the worktree path, the writer session handle,
+        # and the review record for unshipped work. 0644 under the seat umask
+        # puts all of that in front of every local account.
+        self.assertEqual(self._create()[0], 201)
+        self.assertEqual(self.builds.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self._doc_path().parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self._doc_path().stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
+        self.assertEqual(self._doc_path().stat().st_mode & 0o777, 0o600, "a rewrite must not widen it")
+
+    def test_receipts_age_out_while_every_accepted_event_id_is_remembered(self):
+        total = 400
+        doc = {
+            "version": server.BUILD_STATE_VERSION,
+            "build_id": "bld-0000002",
+            "stage": "writing",
+            "events": {
+                f"evt-{i}": {"fingerprint": f"f{i}", "receipt": {"event_id": f"evt-{i}"}, "status": 200}
+                for i in range(total)
+            },
+            "event_order": [f"evt-{i}" for i in range(total)],
+        }
+        self.assertIsNone(server.write_build(doc))
+        on_disk = json.loads(self._doc_path("bld-0000002").read_text())
+        self.assertEqual(len(on_disk["event_order"]), server.BUILD_RECEIPTS_KEPT)
+        self.assertEqual(on_disk["event_order"][-1], f"evt-{total - 1}", "the newest receipts are the kept ones")
+        self.assertEqual(sorted(on_disk["events"]), sorted(on_disk["event_order"]))
+        # Losing a receipt loses a report. Losing an event id lets a retry run
+        # a second time, so the two bounds are deliberately not the same one.
+        self.assertEqual(len(on_disk["event_seen"]), total)
+        self.assertEqual(
+            on_disk["event_seen"]["evt-0"],
+            {"fingerprint": "f0", "status": 200, "receipt": {"event_id": "evt-0"}},
+        )
+        self.assertEqual(server.build_public(on_disk)["event_count"], total)
+        self.assertLessEqual(len(json.dumps(on_disk).encode()), server.BUILD_STATE_MAX_BYTES)
+
+    def test_a_full_event_history_refuses_and_never_frees_an_id_for_reuse(self):
+        self.assertEqual(self._create()[0], 201)
+        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
+        doc = json.loads(self._doc_path().read_text())
+        doc["event_seen"] = {f"old-{i}": "some-earlier-fingerprint" for i in range(server.BUILD_EVENT_HARD_MAX)}
+        self._doc_path().write_text(json.dumps(doc, indent=2) + "\n")
+        before = self._doc_path().read_bytes()
+
+        status, payload, _ = self._advance("writer_done", "evt-2")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "event_history_full")
+        self.assertEqual(payload["event_count"], server.BUILD_EVENT_HARD_MAX)
+        self.assertEqual(payload["event_capacity"], server.BUILD_EVENT_HARD_MAX)
+        self.assertEqual(self._doc_path().read_bytes(), before, "a refusal must not rewrite the document")
+
+        # The refusal is the point: accepting evt-2 would mean evicting an id,
+        # and an evicted id is one a retry could execute a second time. Even at
+        # capacity an id already spent is answered, never re-run.
+        status, payload, _ = self._advance("writer_done", "old-0")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "idempotency_conflict")
+        self.assertEqual(self._doc_path().read_bytes(), before)
+        self.assertEqual(self._state()[1]["stage"], "writing")
+
+    def test_a_build_document_this_service_cannot_read_is_reported_not_replaced(self):
+        # Collapsing unreadable into missing is how a truncated build.json
+        # becomes a brand new build, and the real one — its lease, its budget,
+        # its record of which event ids have already run — is gone.
+        self.assertEqual(self._create()[0], 201)
+        for broken in ('{"truncated', "[]", json.dumps({"build_id": "bld-0000009", "version": 1})):
+            with self.subTest(broken=broken[:24]):
+                self._doc_path().write_text(broken)
+                for status, payload in (
+                    self._create()[:2],
+                    self._advance("start_writer", "evt-1")[:2],
+                    self._state()[:2],
+                ):
+                    self.assertEqual(status, 409, payload)
+                    self.assertEqual(payload["code"], "state_unreadable")
+                    self.assertEqual(payload["park_reason"], "state_unreadable")
+                self.assertEqual(self._doc_path().read_text(), broken, "left exactly as it was found")
+
+    def test_a_write_cannot_be_redirected_onto_a_different_build(self):
+        doc = {
+            "version": server.BUILD_STATE_VERSION,
+            "build_id": "bld-0000002",
+            "stage": "created",
+            "events": {},
+            "event_order": [],
+            "event_seen": {},
+        }
+        err = server.write_build(doc, self.BUILD)
+        self.assertIsNotNone(err)
+        self.assertEqual(err["code"], "build_id_mismatch")
+        self.assertEqual(err["status"], 500)
+        self.assertFalse(self._doc_path().exists(), "the named build must not be clobbered")
+        self.assertFalse(self._doc_path("bld-0000002").exists(), "and neither must the one in the document")
+        escape = server.write_build({"build_id": "../../etc/passwd", "stage": "created"})
+        self.assertEqual(escape["code"], "bad_build_id")
+        self.assertFalse(self.builds.exists())
+
+    def test_secret_shaped_values_never_reach_the_state_file(self):
+        self._through_verify()
+        token = "ghp_" + "A" * 32
+        status, payload, _ = self._advance(
+            "review_passed",
+            "evt-4",
+            data={
+                "review": {
+                    "author": "sol",
+                    "verdict": "clear",
+                    "token": token,
+                    "note": f"ran gh with {token}",
+                    "hook_secret": "s3cret",
+                }
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        review = payload["reviews"][-1]
+        self.assertEqual(review["token"], "[redacted]")
+        self.assertEqual(review["hook_secret"], "[redacted]")
+        self.assertEqual(review["note"], "[redacted]", "a token pasted into prose is still a token")
+        # `author` contains no credential; a substring match on "auth" would
+        # have eaten the one field that says who reviewed.
+        self.assertEqual(review["author"], "sol")
+        self.assertEqual(review["verdict"], "clear")
+        self.assertNotIn("ghp_", self._doc_path().read_text())
+
+    def test_a_resume_url_is_a_credential_even_though_its_name_looks_harmless(self):
+        # kick_url and resume_url are what Rewst hands a build to continue a
+        # run. Possessing either one is possessing the right to resume it, and
+        # neither name contains a secret-shaped word, so a segment match alone
+        # writes both of them to disk in the clear.
+        resume = "https://rewst.test/webhooks/resume/9f2c"
+        self.assertEqual(
+            self._create(route={"launcher": "hermes", "model": "sol", "kick_url": resume})[0], 201
+        )
+        route = self._state()[1]["route"]
+        self.assertEqual(route["kick_url"], "[redacted]")
+        self.assertEqual(route["launcher"], "hermes", "the routing the build needs must survive")
+        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
+            self.assertEqual(self._advance(action, f"evt-{i}")[0], 200, action)
+        status, payload, _ = self._advance(
+            "review_passed",
+            "evt-4",
+            data={
+                "review": {
+                    "author": "sol",
+                    "verdict": "clear",
+                    "resume_url": resume,
+                    "callbackUrl": resume,
+                    "webhook_url": resume,
+                    "clientSecret": "cs-abcdefgh",
+                    "refresh_token": "rt-abcdefgh",
+                    "AWS_SECRET_ACCESS_KEY": "wJalr",
+                    "signed_link": "https://example.test/artifact?signature=abcdef",
+                    "mirror": "https://deploy:hunter2@example.test/repo.git",
+                    "docs_url": "https://example.test/docs?utm_source=graphwing&page=2",
+                    "commit": self.head,
+                }
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        review = payload["reviews"][-1]
+        for field in (
+            "resume_url",
+            "callbackUrl",
+            "webhook_url",
+            "clientSecret",
+            "refresh_token",
+            "AWS_SECRET_ACCESS_KEY",
+            "signed_link",
+            "mirror",
+        ):
+            self.assertEqual(review[field], "[redacted]", field)
+        # A public URL and a 40-hex object id are the two things redaction most
+        # easily eats. Losing the head would take the identity guard with it.
+        self.assertEqual(review["docs_url"], "https://example.test/docs?utm_source=graphwing&page=2")
+        self.assertEqual(review["commit"], self.head)
+        self.assertEqual(review["author"], "sol")
+        on_disk = self._doc_path().read_text()
+        for leaked in ("rewst.test/webhooks/resume", "hunter2", "cs-abcdefgh", "rt-abcdefgh"):
+            self.assertNotIn(leaked, on_disk, leaked)
+
+    def test_rewst_capability_urls_redact_by_value_under_generic_keys(self):
+        callback = "https://app.rewst.ai/api/callbacks/11111111-1111-1111-1111-111111111111"
+        webhook = "https://hooks.rewst.io/webhooks/custom/22222222-2222-2222-2222-222222222222"
+        public = "https://docs.rewst.io/guides/webhooks/setup"
+        status, payload, _ = self._create(
+            route={"launcher": "hermes", "next": callback, "hop": webhook, "docs": public}
+        )
+        self.assertEqual(status, 201, payload)
+        route = payload["route"]
+        self.assertEqual(route["next"], "[redacted]")
+        self.assertEqual(route["hop"], "[redacted]")
+        self.assertEqual(route["docs"], public)
+        on_disk = self._doc_path().read_text()
+        self.assertNotIn(callback, on_disk)
+        self.assertNotIn(webhook, on_disk)
+        self.assertIn(public, on_disk)
+
+    def test_an_identity_field_carrying_a_credential_is_refused_not_redacted(self):
+        # Two callers whose holder both redacted to [redacted] would compare
+        # equal, and the second one would inherit the first one's lease.
+        token = "ghp_" + "B" * 32
+        status, payload, _ = self._create(story=f"build for {token}")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "secret_in_story")
+        self.assertEqual(self._create()[0], 201)
+        status, payload, _ = self._advance("start_writer", "evt-1", holder=token)
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "secret_in_holder")
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_the_environment_lease_default_is_clamped_the_way_a_request_is(self):
+        # A request asking for 0 or 100000 seconds is a 400. An environment
+        # saying the same thing must not become a lease that never expires
+        # (locking every future caller out) or one that expires instantly
+        # (letting two Rewst runs drive the same build).
+        for raw, expected in (
+            ("-5", 1),
+            ("0", 1),
+            ("1", 1),
+            ("300", 300),
+            ("  600 ", 600),
+            (str(server.BUILD_LEASE_MAX_SECONDS + 1), server.BUILD_LEASE_MAX_SECONDS),
+            ("100000", server.BUILD_LEASE_MAX_SECONDS),
+            ("five minutes", 300),
+            ("", 300),
+            (None, 300),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(server.build_default_lease_seconds(raw), expected)
+        self.assertGreaterEqual(server.BUILD_LEASE_SECONDS, 1)
+        self.assertLessEqual(server.BUILD_LEASE_SECONDS, server.BUILD_LEASE_MAX_SECONDS)
+
+    def test_a_requested_lease_outside_the_range_is_a_request_error(self):
+        self.assertEqual(self._create()[0], 201)
+        for bad in (0, -1, server.BUILD_LEASE_MAX_SECONDS + 1, "soon"):
+            with self.subTest(lease_seconds=bad):
+                status, payload, _ = self._advance("start_writer", "evt-1", lease_seconds=bad)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_lease_seconds")
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_runtime_state_lives_under_graphwing_home_and_not_in_git(self):
+        # The build document is service state, not a product artifact. It goes
+        # under $GRAPHWING_HOME and it is ignored in the checkout, so a build
+        # in flight can never end up inside the diff it is building.
+        root = Path(server.__file__).resolve().parent
+        self.assertEqual(str(self.builds), str(self.home / "builds"))
+        ignored = [line.strip() for line in (root / ".gitignore").read_text().splitlines()]
+        self.assertIn("builds/", ignored)
+        self.assertIn("jobs/", ignored)
+
+    # -- planner metadata ---------------------------------------------------
+
+    def test_slice_index_keeps_routing_and_verification_metadata(self):
+        # sliceComplete rewrites the index. Rebuilding each ticket from the
+        # five normalized fields dropped class/size/ac_count/seams, and the
+        # pre-PR build then had nothing left to route on.
+        rel = "slices/demo/index.json"
+        dest = self.repo / "slices" / "demo"
+        dest.mkdir(parents=True)
+        (dest / "index.json").write_text(
+            json.dumps(
+                {
+                    "test": "graphwing-unit",
+                    "verification": {"fast": ["graphwing-compile"], "needs_visual_proof": False},
+                    "tickets": [
+                        {
+                            "id": "01-build-state",
+                            "path": "slices/demo/01-build-state.md",
+                            "blocked_by": [],
+                            "kind": "build",
+                            "status": "open",
+                            "class": "sensitive",
+                            "size": "L",
+                            "ac_count": 8,
+                            "seams": 1,
+                            "build_id": self.BUILD,
+                        },
+                        {
+                            "id": "02-mechanical-path",
+                            "path": "slices/demo/02-mechanical-path.md",
+                            "blocked_by": ["01-build-state"],
+                            "kind": "build",
+                            "status": "open",
+                            "class": "mechanical",
+                            "size": "M",
+                            "ac_count": 8,
+                            "seams": 1,
+                        },
+                    ],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        status, payload, _ = server.dispatch(
+            "POST",
+            "/v1/slice/complete",
+            {},
+            True,
+            json.dumps({"repo": "scratch", "index": rel, "id": "01-build-state"}).encode(),
+        )
+        self.assertEqual(status, 200, payload)
+        idx = json.loads((self.repo / rel).read_text())
+        first, second = idx["tickets"]
+        self.assertEqual(first["status"], "done")
+        self.assertEqual(first["class"], "sensitive")
+        self.assertEqual(first["size"], "L")
+        self.assertEqual(first["ac_count"], 8)
+        self.assertEqual(first["seams"], 1)
+        self.assertEqual(first["build_id"], self.BUILD)
+        self.assertEqual(second["class"], "mechanical")
+        self.assertEqual(idx["verification"]["fast"], ["graphwing-compile"])
+        self.assertEqual(idx["test"], "graphwing-unit")
+
+    # -- catalog ------------------------------------------------------------
+
+    def test_openapi_declares_the_build_operations(self):
+        spec = json.loads(server.openapi_bytes())
+        for route, method, op_id in (
+            ("/v1/build/create", "post", "buildCreate"),
+            ("/v1/build/advance", "post", "buildAdvance"),
+            ("/v1/build/state", "get", "buildState"),
+        ):
+            self.assertIn(route, spec["paths"])
+            self.assertEqual(spec["paths"][route][method]["operationId"], op_id)
+        schemas = spec["components"]["schemas"]
+        self.assertEqual(
+            schemas["BuildCreateRequest"]["required"],
+            ["build_id", "story", "repo", "branch"],
+        )
+        create_properties = schemas["BuildCreateRequest"]["properties"]
+        for field in ("index", "ticket"):
+            with self.subTest(field=field):
+                self.assertEqual(create_properties[field]["minLength"], 1)
+                self.assertEqual(create_properties[field]["maxLength"], 256)
+        self.assertEqual(
+            sorted(schemas["BuildAdvanceRequest"]["required"]),
+            ["action", "build_id", "event_id", "holder"],
+        )
+        advance_properties = schemas["BuildAdvanceRequest"]["properties"]
+        self.assertEqual(
+            advance_properties["expect"]["properties"]["branch"]["type"],
+            "string",
+        )
+        data_description = advance_properties["data"]["description"]
+        self.assertIn(
+            "Branch and head identity come from the live Git read",
+            data_description,
+        )
+        self.assertIn("a data.head is ignored", data_description)
+        # The spec and the state machine drift apart silently otherwise: Rewst
+        # would send an action the server has never heard of.
+        self.assertEqual(
+            set(advance_properties["action"]["enum"]),
+            set(server.BUILD_TRANSITIONS) | {"park"},
+        )
+        stages = {"parked"}
+        for frm, to in server.BUILD_TRANSITIONS.values():
+            stages.update((frm, to))
+        self.assertEqual(set(schemas["BuildState"]["properties"]["stage"]["enum"]), stages)
 
 
 if __name__ == "__main__":

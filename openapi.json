@@ -4,7 +4,7 @@
     "title": "graphwing",
 
     "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
-    "version": "0.5.5"
+    "version": "0.6.0"
   },
   "servers": [
     {
@@ -25,7 +25,8 @@
     { "name": "stack" },
     { "name": "port" },
     { "name": "test" },
-    { "name": "rr" }
+    { "name": "rr" },
+    { "name": "build" }
   ],
   "paths": {
     "/v1/health": {
@@ -411,7 +412,7 @@
       "post": {
         "operationId": "sliceComplete",
         "tags": ["slice"],
-        "summary": "Mark a ticket done in the index file. Does not commit.",
+        "summary": "Mark a ticket done in the index file. Does not commit. Ticket keys beyond the core five (class, size, ac_count, seams, build_id, verification) survive the rewrite.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceCompleteRequest" } } }
@@ -502,6 +503,61 @@
           "200": { "description": "next", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceContinue" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/build/create": {
+      "post": {
+        "operationId": "buildCreate",
+        "tags": ["build"],
+        "summary": "Open a versioned pre-PR build under $GRAPHWING_HOME and return its build_id, stage, and next allowed action. Re-posting the same build_id with identical input returns the existing build (created=false); different input is an idempotency conflict.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildCreateRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "already exists, unchanged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/advance": {
+      "post": {
+        "operationId": "buildAdvance",
+        "tags": ["build"],
+        "summary": "Apply one durable transition. event_id makes it idempotent: same id + same payload replays the receipt, same id + different payload is 409 idempotency_conflict. holder takes a lease so a second Rewst run cannot advance the same build until it expires. A head, worktree, or state-version the build cannot explain parks it with a named reason.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildAdvanceRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "applied, or replayed when replayed=true", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "invalid_transition, idempotency_conflict, lease_held, or a park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "413": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/state": {
+      "get": {
+        "operationId": "buildState",
+        "tags": ["build"],
+        "summary": "Read a build back from disk. Survives a service restart: stage, receipts, writer session, stacks, evidence rounds, and remaining budget all come from the state document, not memory.",
+        "parameters": [
+          { "name": "build_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -1185,6 +1241,110 @@
           "path": { "type": "string" },
           "e2e_reds": { "type": "integer" },
           "compact": { "type": "string" }
+        }
+      },
+      "BuildVerification": {
+        "type": "object",
+        "description": "Verification the plan declared for this build. Names are tests.json recipes.",
+        "properties": {
+          "fast": { "type": "array", "items": { "type": "string" } },
+          "integration": { "type": "array", "items": { "type": "string" } },
+          "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage: verify_passed goes straight to review." },
+          "human_visual_review": { "type": "boolean" }
+        }
+      },
+      "BuildCreateRequest": {
+        "type": "object",
+        "required": ["build_id", "story", "repo", "branch"],
+        "properties": {
+          "build_id": { "type": "string", "description": "Caller-chosen id, 8-64 chars of [A-Za-z0-9._-]. Required: the caller is the only party that can repeat it, so a generated id would turn every timed-out retry into a second build with its own lease and budget." },
+          "story": { "type": "string", "description": "Rejected with secret_in_story if it carries a credential: identity fields are refused, not redacted." },
+          "repo": { "type": "string", "description": "Allowlisted short name. The build's worktree identity is that repo's path." },
+          "branch": { "type": "string" },
+          "head": { "type": "string", "description": "Git object id the build starts from." },
+          "worktree": { "type": "string", "description": "Optional assertion; must equal the allowlisted repo path." },
+          "index": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Optional: omit the key for no index. When present it must be a non-empty repo-relative path of at most 256 characters (BUILD_NAME_MAX), because a later stage opens it inside the build's worktree. null, an empty string, and a non-string are refused with bad_index rather than folded into absent. The service additionally refuses an absolute path, a leading ~, a backslash, and any '..' segment; that rule is enforced server-side, not by this schema." },
+          "ticket": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Optional: omit the key for no ticket. When present it must be a non-empty repo-relative path of at most 256 characters (BUILD_NAME_MAX), because a later stage opens it inside the build's worktree. null, an empty string, and a non-string are refused with bad_ticket rather than folded into absent. The service additionally refuses an absolute path, a leading ~, a backslash, and any '..' segment; that rule is enforced server-side, not by this schema." },
+          "route": { "type": "object", "additionalProperties": true, "description": "sliceRoute row: launcher, model, reviewers, turns." },
+          "verification": { "$ref": "#/components/schemas/BuildVerification" },
+          "stacks": { "type": "array", "items": { "type": "string" } },
+          "budget": {
+            "type": "object",
+            "properties": { "jobs_max": { "type": "integer", "minimum": 1, "maximum": 500 } }
+          }
+        }
+      },
+      "BuildAdvanceRequest": {
+        "type": "object",
+        "required": ["build_id", "event_id", "action", "holder"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string", "description": "Names one requested transition. Reuse it to retry safely." },
+          "action": {
+            "type": "string",
+            "enum": ["start_writer", "writer_done", "verify_passed", "evidence_captured", "review_passed", "pr_opened", "park"]
+          },
+          "holder": { "type": "string", "description": "Lease owner, normally the Rewst run id. Rejected with secret_in_holder if it carries a credential: redacting it would make two callers compare equal and share a lease." },
+          "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+          "release_lease": { "type": "boolean", "description": "Drop the lease after this transition instead of holding it." },
+          "jobs_spent": { "type": "integer", "minimum": 0, "maximum": 500, "description": "Default 1, or 0 for park. Overrunning jobs_max parks the build." },
+          "expect": {
+            "type": "object",
+            "description": "Guards. A mismatch parks the build rather than guessing.",
+            "properties": {
+              "head": { "type": "string", "description": "Optional. Compared to the live worktree HEAD, never to the stored document." },
+              "branch": { "type": "string", "description": "Optional plain ref name. Compared to the branch the allowlisted checkout is live on, not to the branch recorded on the build; a mismatch parks with branch_mismatch. Rejected with bad_expect_branch if it is not a plain ref name." },
+              "worktree": { "type": "string", "description": "Optional assertion; compared to the worktree the build was opened on." }
+            }
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Transition payload. Secret-shaped keys and values are redacted before the write. Branch and head identity come from the live Git read of the allowlisted checkout, so no payload field can move them: a data.head is ignored. Unknown keys are dropped. The fields that fold into state are writer_session (a gwslice-<32 hex> session id, bound by start_writer only), stacks, review (review_passed), round (evidence_captured), pr (pr_opened), and reason/detail (park)."
+          }
+        }
+      },
+      "BuildState": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "integer" },
+          "build_id": { "type": "string" },
+          "stage": {
+            "type": "string",
+            "enum": ["created", "writing", "verifying", "evidence", "review", "ready", "pr_opened", "parked"]
+          },
+          "next_action": { "type": ["string", "null"] },
+          "park_reason": { "type": ["string", "null"] },
+          "park_detail": { "type": ["string", "null"] },
+          "event_count": { "type": "integer", "description": "Event ids this build will never accept a second time. Receipts age out; this count does not." },
+          "event_capacity": { "type": "integer", "description": "Ceiling on event_count. Reaching it is 409 event_history_full, not an eviction." },
+          "created": { "type": "boolean", "description": "buildCreate only. False when the build already existed." },
+          "replayed": { "type": "boolean", "description": "buildAdvance only. True when the event_id had already run." },
+          "receipt": { "type": ["object", "null"], "additionalProperties": true },
+          "receipts": { "type": "array", "items": { "type": ["object", "null"], "additionalProperties": true } },
+          "story": { "type": ["string", "null"] },
+          "repo": { "type": ["string", "null"] },
+          "worktree": { "type": ["string", "null"] },
+          "branch": { "type": ["string", "null"] },
+          "head": { "type": ["string", "null"] },
+          "index": { "type": ["string", "null"] },
+          "ticket": { "type": ["string", "null"] },
+          "route": { "type": ["object", "null"], "additionalProperties": true },
+          "verification": { "$ref": "#/components/schemas/BuildVerification" },
+          "writer_session": { "type": ["string", "null"] },
+          "stacks": { "type": "array", "items": { "type": "string" } },
+          "reviews": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "evidence_rounds": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "budget": { "type": ["object", "null"], "additionalProperties": true },
+          "budget_left": { "type": ["integer", "null"] },
+          "verified_boundary": { "type": ["object", "null"], "additionalProperties": true },
+          "lease": { "type": ["object", "null"], "additionalProperties": true },
+          "pr": { "type": ["object", "null"], "additionalProperties": true },
+          "created_at": { "type": ["string", "null"] },
+          "updated_at": { "type": ["string", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
         }
       },
       "GhPrMergeRequest": {

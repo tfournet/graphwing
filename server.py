@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -32,6 +33,7 @@ TESTS_PATH = HOME / "tests.json"
 RR_PATH = HOME / "rr.json"
 KEY_PATH = HOME / "api.key"
 JOBS_DIR = HOME / "jobs"
+BUILDS_DIR = HOME / "builds"
 RUNS_PATH = HOME / "workflow-runs.jsonl"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GRAPHWING_PORT", "8645"))
@@ -78,6 +80,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
+SLICE_TICKET_CORE_KEYS = frozenset({"id", "path", "kind", "status", "blocked_by"})
 SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_SIZES = ("S", "M", "L")
@@ -107,6 +110,122 @@ SLICE_BUDGET = {
 }
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Pre-PR build state. Bumping BUILD_STATE_VERSION is a promise to migrate:
+# a document this service cannot read parks instead of being rewritten.
+BUILD_STATE_VERSION = 1
+BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$")
+BUILD_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+BUILD_HEAD_RE = re.compile(r"^[0-9a-f]{7,64}$")
+BUILD_PARK_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# One linear pre-PR path. `evidence` is skipped when the build's declared
+# verification says no visual proof is needed, so the writer never has to
+# invent a screenshot round to reach review.
+BUILD_TRANSITIONS: dict[str, tuple[str, str]] = {
+    "start_writer": ("created", "writing"),
+    "writer_done": ("writing", "verifying"),
+    "verify_passed": ("verifying", "evidence"),
+    "evidence_captured": ("evidence", "review"),
+    "review_passed": ("review", "ready"),
+    "pr_opened": ("ready", "pr_opened"),
+}
+BUILD_TERMINAL = frozenset({"pr_opened", "parked"})
+BUILD_LEASE_MAX_SECONDS = 3600
+
+
+def build_default_lease_seconds(raw: str | None) -> int:
+    """Clamp the environment default into the same range a request must satisfy.
+
+    A request asking for 0 or 100000 seconds is a 400. An environment that
+    says the same thing must not become a lease that never expires (locking
+    every future caller out) or one that expires instantly (letting two Rewst
+    runs drive the same build). Unparseable falls back rather than raising:
+    a typo in a unit file should not stop the service from booting.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 300
+    return max(1, min(value, BUILD_LEASE_MAX_SECONDS))
+
+
+BUILD_LEASE_SECONDS = build_default_lease_seconds(os.environ.get("GRAPHWING_BUILD_LEASE_SECONDS", "300"))
+BUILD_STATE_MAX_BYTES = 1024 * 1024
+# Receipts age out; event ids never do. The two bounds are deliberately
+# different because forgetting a receipt loses a report, and forgetting an
+# event id lets a retry execute a second time.
+BUILD_RECEIPTS_KEPT = 64
+BUILD_EVENT_HARD_MAX = 2 * 500
+BUILD_RECEIPTS_SHOWN = 32
+BUILD_LIST_MAX = 32
+BUILD_STACKS_MAX = 16
+BUILD_VERIFICATION_MAX = 16
+BUILD_JOBS_MAX = 500
+BUILD_ROUTE_MAX_KEYS = 32
+BUILD_NAME_MAX = 256
+BUILD_REDACT_MAX_DEPTH = 6
+BUILD_REDACT_MAX_KEYS = 64
+BUILD_REDACT_MAX_ITEMS = 64
+BUILD_REDACT_MAX_STRING = 512
+SECRET_KEY_PARTS = frozenset(
+    {
+        "secret", "secrets", "token", "tokens", "password", "passwd", "pass",
+        "apikey", "key", "keys", "authorization", "auth", "cookie", "cookies",
+        "credential", "credentials", "creds", "bearer", "signature", "hook",
+        "webhook", "pem", "passphrase", "privkey",
+    }
+)
+# Whole-key names that carry a credential without containing a secret-shaped
+# word. `kick_url` and `resume_url` are the two Rewst hands back to a build:
+# possessing either one is possessing the right to resume that run.
+SECRET_KEY_EXACT = frozenset(
+    {
+        "kickurl", "resumeurl", "callbackurl", "webhookurl", "hookurl",
+        "continueurl", "replyurl", "notifyurl",
+        "privatekey", "sshkey", "sshprivatekey", "identityfile",
+        "awssecretaccesskey", "awsaccesskeyid", "awssessiontoken",
+        "clientsecret", "refreshtoken",
+    }
+)
+SECRET_VALUE_RES = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(r"(?i)bearer\s+\S{8,}"),
+    # 64+ hex is a digest or a key. A 40-hex git object id must survive, so
+    # the floor sits above it deliberately.
+    re.compile(r"[0-9a-fA-F]{64,}"),
+    # scheme://user:pass@host — the credential is in the URL itself, so the
+    # key name it arrived under says nothing about whether to keep it.
+    re.compile(r"(?i)[a-z][a-z0-9+.\-]*://[^/\s?#@]*:[^/\s?#@]*@"),
+    # A signed or keyed query string. The parameter list is deliberately
+    # narrow: an ordinary public URL with utm_source or page must survive.
+    re.compile(
+        r"(?i)[a-z][a-z0-9+.\-]*://\S*[?&]"
+        r"(?:token|api[_-]?key|access[_-]?key|secret|password|passwd|pwd|sig|"
+        r"signature|auth|credential|sas|x-amz-signature|code)=[^&\s]"
+    ),
+    # A capability URL: an ordinary-looking link whose path carries the right
+    # to resume, kick, or call back into a run. SECRET_KEY_EXACT only catches
+    # the ones that arrive under a name we predicted, and a Rewst graph author
+    # can put the same webhook under `next` or `hop` or nothing at all. So the
+    # shape is matched by value, whatever key it came in under.
+    #
+    # The tail is what keeps this off ordinary public URLs: a capability
+    # segment only counts when a later segment looks like an opaque id — has a
+    # digit, or is long enough to be a token. A docs page at /guides/webhooks
+    # or /webhooks/setup survives; /webhooks/custom/<uuid> does not.
+    re.compile(
+        r"(?i)[a-z][a-z0-9+.\-]*://[^\s/?#]+"
+        r"(?:/[^\s/?#]+)*?"
+        r"/(?:(?:web)?hooks?|callbacks?|resumes?|kicks?|continue|notify|reply|triggers?)"
+        r"(?:/[^\s/?#]+)*"
+        r"/(?:[^\s/?#]*[0-9][^\s/?#]*|[^\s/?#]{16,})"
+    ),
+)
+BUILD_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 RUNS_LOCK = threading.Lock()
 HERDR_LINGER_LOCK = threading.Lock()
@@ -1105,8 +1224,21 @@ def parse_slice_index(data: Any) -> tuple[list[dict[str, Any]] | None, dict[str,
         if not isinstance(blocked, list) or not all(isinstance(x, str) for x in blocked):
             return None, {"ok": False, "error": "blocked_by must be a list of ids", "code": "bad_blocked_by", "status": 400}
         seen.add(tid)
+        # Carry every other key through untouched. sliceComplete and sliceE2e
+        # rewrite this file, and rebuilding each ticket from the five
+        # normalized fields used to drop the planner's routing and
+        # verification metadata (class, size, ac_count, seams, build_id) on the
+        # first completion — the pre-PR build then had nothing to route on.
+        extra = {k: v for k, v in item.items() if k not in SLICE_TICKET_CORE_KEYS}
         tickets.append(
-            {"id": tid, "path": path.strip(), "kind": kind, "status": status, "blocked_by": list(blocked)}
+            {
+                **extra,
+                "id": tid,
+                "path": path.strip(),
+                "kind": kind,
+                "status": status,
+                "blocked_by": list(blocked),
+            }
         )
     ids = {t["id"] for t in tickets}
     for t in tickets:
@@ -3336,6 +3468,1196 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     }
 
 
+# --- pre-PR build state -----------------------------------------------------
+#
+# graphwing-pre-pr-build is many bounded Rewst invocations, not one run, so the
+# build lives on disk under $GRAPHWING_HOME and every call is a transition
+# against it. Three rules make the retries safe:
+#
+#   1. An event id names one requested transition. Replaying it returns the
+#      recorded receipt; reusing it for different input is a conflict.
+#   2. A lease names the caller that currently owns the build, so two Rewst
+#      runs cannot advance the same build past each other.
+#   3. Anything the state cannot explain — a moved head, a different worktree,
+#      a state version this build does not understand — parks with a named
+#      reason. Guessing here would commit real side effects twice.
+
+
+def build_dir(build_id: str) -> Path:
+    return BUILDS_DIR / build_id
+
+
+def build_path(build_id: str) -> Path:
+    return build_dir(build_id) / "build.json"
+
+
+def valid_build_id(raw: Any) -> bool:
+    return isinstance(raw, str) and ".." not in raw and bool(BUILD_ID_RE.fullmatch(raw))
+
+
+def secret_shaped_key(key: str) -> bool:
+    """True when a key name promises a credential.
+
+    Two passes. Segment match, not substring, catches the ordinary names:
+    `author` is not `auth`, and dropping the author of a review receipt would
+    be a silent data loss bug. Whole-key match catches the ones whose parts
+    are all innocent — `kick_url` is `kick` plus `url`, and it is a bearer
+    capability to resume a Rewst run.
+    """
+    lowered = key.lower()
+    if re.sub(r"[^a-z0-9]+", "", lowered) in SECRET_KEY_EXACT:
+        return True
+    return any(part in SECRET_KEY_PARTS for part in re.split(r"[^a-z0-9]+", lowered) if part)
+
+
+def secret_shaped_value(value: str) -> bool:
+    """Search, not fullmatch: a token pasted into a sentence is still a token."""
+    return any(pat.search(value) for pat in SECRET_VALUE_RES)
+
+
+def reject_secret_text(value: str, field: str) -> dict[str, Any] | None:
+    """Refuse a credential in an identity field instead of redacting it.
+
+    `story` and `holder` are not blobs — they are compared and displayed.
+    Redacting them would be worse than storing them: two different callers
+    whose ids both redacted to `[redacted]` would compare equal, and the
+    second one would inherit the first one's lease.
+    """
+    if secret_shaped_value(value):
+        return {"error": f"{field} looks like a credential", "code": f"secret_in_{field}"}
+    return None
+
+
+def redact_secrets(value: Any, depth: int = 0) -> Any:
+    """Bound and redact a caller-supplied blob before it reaches disk.
+
+    Bounding is part of redaction, not a separate concern: an unbounded blob
+    is how a whole environment dump ends up in build.json.
+    """
+    if depth >= BUILD_REDACT_MAX_DEPTH:
+        return "[truncated]"
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in list(value)[:BUILD_REDACT_MAX_KEYS]:
+            name = str(key)[:BUILD_REDACT_MAX_STRING]
+            out[name] = "[redacted]" if secret_shaped_key(name) else redact_secrets(value[key], depth + 1)
+        if len(value) > BUILD_REDACT_MAX_KEYS:
+            out["[truncated]"] = len(value) - BUILD_REDACT_MAX_KEYS
+        return out
+    if isinstance(value, list):
+        return [redact_secrets(v, depth + 1) for v in value[:BUILD_REDACT_MAX_ITEMS]]
+    if isinstance(value, str):
+        if secret_shaped_value(value):
+            return "[redacted]"
+        return value[:BUILD_REDACT_MAX_STRING]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)[:BUILD_REDACT_MAX_STRING]
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def event_fingerprint(payload: dict[str, Any]) -> str:
+    """Digest the raw request, never the redacted copy.
+
+    Two calls that differ only in a token value are different requests. If the
+    fingerprint were taken after redaction they would collide and the second
+    one would silently replay the first one's receipt.
+    """
+    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+
+
+def load_build(build_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read a build, telling missing apart from unreadable.
+
+    Returns (doc, None) when the build is there, (None, None) when no build
+    with that id has ever been written, and (None, error) when the file
+    exists but this service cannot make sense of it. The third case is the
+    one that matters: collapsing it into "missing" is how a truncated
+    build.json becomes a brand new build, and the real one — its lease, its
+    receipts, its record of which event ids have already run — is gone.
+    """
+    path = build_path(build_id)
+    if not path.exists():
+        return None, None
+    unreadable = {
+        "ok": False,
+        "build_id": build_id,
+        "stage": "parked",
+        "park_reason": "state_unreadable",
+        "error": "build state exists but cannot be read; it has been left untouched",
+        "code": "state_unreadable",
+        "status": 409,
+    }
+    if not path.is_file():
+        return None, unreadable
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return None, dict(unreadable, detail=str(exc)[:BUILD_REDACT_MAX_STRING])
+    if not isinstance(data, dict):
+        return None, dict(unreadable, detail="state document is not an object")
+    if data.get("build_id") != build_id:
+        # The document under this id claims to be a different build. Writing
+        # to it would corrupt whichever one is real.
+        return None, dict(unreadable, detail="state document names a different build")
+    return data, None
+
+
+def read_build(build_id: str) -> dict[str, Any] | None:
+    doc, _err = load_build(build_id)
+    return doc
+
+
+def build_event_seen(doc: dict[str, Any]) -> dict[str, Any]:
+    """Every event id this build has ever accepted, mapped to its outcome.
+
+    Separate from `events` because the receipt window ages out and this must
+    not. Two different losses hide behind one name here. An id that fell out
+    of the map is an id a retry could execute a second time. An id that is
+    still in the map but whose outcome fell out is one the retry gets a shrug
+    for: 200 with a null receipt, when the caller is asking about a park that
+    returned 409. The story promises the recorded receipt, so the outcome is
+    kept alongside the fingerprint for every accepted id through
+    BUILD_EVENT_HARD_MAX. `events` stays the recent window the state
+    endpoint reports.
+
+    Each value is `{fingerprint, status, receipt}`. Documents written before
+    that shape existed hold a bare fingerprint string; those are lifted here,
+    and their receipt is recovered from `events` when it is still in range.
+    """
+    seen = doc.get("event_seen")
+    if isinstance(seen, dict) and all(isinstance(v, dict) for v in seen.values()):
+        return seen
+    if not isinstance(seen, dict):
+        seen = {
+            eid: rec.get("fingerprint")
+            for eid, rec in (doc.get("events") or {}).items()
+            if isinstance(rec, dict)
+        }
+    events = doc.get("events") or {}
+    migrated: dict[str, Any] = {}
+    for eid, entry in seen.items():
+        if isinstance(entry, dict):
+            record = {k: entry.get(k) for k in ("fingerprint", "status", "receipt")}
+        else:
+            # Legacy: the entry was the fingerprint and nothing else. A
+            # non-string here (an older migration could leave None) becomes a
+            # fingerprint that matches nothing, so the id is remembered as
+            # spent and any retry is a conflict rather than a second run.
+            record = {
+                "fingerprint": entry if isinstance(entry, str) else None,
+                "status": None,
+                "receipt": None,
+            }
+        if record["receipt"] is None:
+            prior = events.get(eid)
+            if isinstance(prior, dict) and isinstance(prior.get("receipt"), dict):
+                record["receipt"] = prior.get("receipt")
+                record["status"] = prior.get("status")
+        migrated[eid] = record
+    doc["event_seen"] = migrated
+    return migrated
+
+
+def write_build(doc: dict[str, Any], expected_id: str | None = None) -> dict[str, Any] | None:
+    """Atomic, private, bounded write. Returns an error dict instead of raising.
+
+    Private because a build document carries the worktree path, the writer
+    session handle, and the review record for unshipped work; 0644 under the
+    seat umask puts all of that in front of every local account.
+    """
+    build_id = doc.get("build_id")
+    if not valid_build_id(build_id):
+        return {
+            "ok": False,
+            "error": "refusing to write a build document without a valid build_id",
+            "code": "bad_build_id",
+            "status": 500,
+        }
+    if expected_id is not None and build_id != expected_id:
+        # The document and the request disagree about which build this is.
+        # One of them is wrong and writing either way clobbers a real build.
+        return {
+            "ok": False,
+            "error": "build document does not match the requested build_id",
+            "code": "build_id_mismatch",
+            "status": 500,
+        }
+    doc["updated_at"] = utcnow()
+    order = doc.setdefault("event_order", [])
+    events = doc.setdefault("events", {})
+    build_event_seen(doc)
+    raw = json.dumps(doc, indent=2) + "\n"
+    # Only receipts are evictable. `event_seen` is never touched here.
+    while len(order) > 1 and (len(order) > BUILD_RECEIPTS_KEPT or len(raw.encode()) > BUILD_STATE_MAX_BYTES):
+        events.pop(order.pop(0), None)
+        raw = json.dumps(doc, indent=2) + "\n"
+    if len(raw.encode()) > BUILD_STATE_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "build state exceeds the write bound",
+            "code": "state_too_large",
+            "status": 413,
+        }
+    path = build_path(build_id)
+    try:
+        BUILDS_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(BUILDS_DIR, 0o700)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".build-", suffix=".json.tmp")
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, str(path))
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        # The rename is only durable once the directory entry is. Without
+        # this a crash can leave the build with no build.json at all.
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"could not persist build state: {exc}",
+            "code": "state_write_failed",
+            "status": 500,
+        }
+    return None
+
+
+def build_needs_visual(doc: dict[str, Any]) -> bool:
+    verification = doc.get("verification") or {}
+    return bool(verification.get("needs_visual_proof"))
+
+
+def build_transition_target(doc: dict[str, Any], action: str) -> str:
+    to = BUILD_TRANSITIONS[action][1]
+    if to == "evidence" and not build_needs_visual(doc):
+        return "review"
+    return to
+
+
+def build_next_action(doc: dict[str, Any]) -> str | None:
+    stage = doc.get("stage")
+    if stage in BUILD_TERMINAL:
+        return None
+    for action, (frm, _to) in BUILD_TRANSITIONS.items():
+        if frm == stage:
+            return action
+    return None
+
+
+def build_budget_left(doc: dict[str, Any]) -> int | None:
+    budget = doc.get("budget") or {}
+    jobs_max = budget.get("jobs_max")
+    if not isinstance(jobs_max, int):
+        return None
+    return max(0, jobs_max - int(budget.get("jobs_used") or 0))
+
+
+def build_public(doc: dict[str, Any]) -> dict[str, Any]:
+    lease = doc.get("lease")
+    return {
+        "ok": True,
+        "version": doc.get("version"),
+        "build_id": doc.get("build_id"),
+        "stage": doc.get("stage"),
+        "next_action": build_next_action(doc),
+        "park_reason": doc.get("park_reason"),
+        "park_detail": doc.get("park_detail"),
+        "story": doc.get("story"),
+        "repo": doc.get("repo"),
+        "worktree": doc.get("worktree"),
+        "branch": doc.get("branch"),
+        "head": doc.get("head"),
+        "index": doc.get("index"),
+        "ticket": doc.get("ticket"),
+        "route": doc.get("route"),
+        "verification": doc.get("verification"),
+        "writer_session": doc.get("writer_session"),
+        "stacks": doc.get("stacks") or [],
+        "reviews": doc.get("reviews") or [],
+        "evidence_rounds": doc.get("evidence_rounds") or [],
+        "budget": doc.get("budget"),
+        "budget_left": build_budget_left(doc),
+        "verified_boundary": doc.get("verified_boundary"),
+        "lease": None if not lease else {k: lease.get(k) for k in ("holder", "acquired_at", "expires_at")},
+        "pr": doc.get("pr"),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "receipts": [
+            (doc.get("events") or {}).get(eid, {}).get("receipt")
+            for eid in (doc.get("event_order") or [])[-BUILD_RECEIPTS_SHOWN:]
+        ],
+        # Receipts are a window; this is the count of event ids the build
+        # will never accept a second time.
+        "event_count": len(doc.get("event_seen") or {}),
+        "event_capacity": BUILD_EVENT_HARD_MAX,
+    }
+
+
+def build_version_park(doc: dict[str, Any]) -> dict[str, Any]:
+    """Report a park for a document this build cannot read.
+
+    Deliberately does not rewrite the file. A version we do not understand is
+    exactly the case where writing our own shape over it would destroy the
+    state a newer service still needs.
+    """
+    return {
+        "ok": False,
+        "build_id": doc.get("build_id"),
+        "stage": "parked",
+        "park_reason": "state_version",
+        "found_version": doc.get("version"),
+        "expected_version": BUILD_STATE_VERSION,
+        "error": "build state version is not readable by this service",
+        "code": "incompatible_state_version",
+        "status": 409,
+    }
+
+
+def build_record_event(
+    doc: dict[str, Any], event_id: str, fingerprint: str, receipt: dict[str, Any], status: int
+) -> None:
+    """Bind one event id to one outcome, forever.
+
+    `event_seen` is the durable half and never loses an entry or its outcome;
+    `events` holds the same receipt while it is still recent enough to show up
+    in the public window.
+    """
+    build_event_seen(doc)[event_id] = {
+        "fingerprint": fingerprint,
+        "status": status,
+        "receipt": receipt,
+    }
+    doc.setdefault("events", {})[event_id] = {
+        "fingerprint": fingerprint,
+        "receipt": receipt,
+        "status": status,
+    }
+    order = doc.setdefault("event_order", [])
+    if event_id not in order:
+        order.append(event_id)
+
+
+def build_park(
+    doc: dict[str, Any],
+    reason: str,
+    detail: str,
+    event_id: str | None = None,
+    fingerprint: str | None = None,
+    holder: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Park the build and record the park under the event id that caused it.
+
+    An automatic park is a real outcome, not an error on the way to one. If
+    it is not recorded, the caller's retry finds no event record, re-runs the
+    same guard, and parks a second time — with a second receipt, a second
+    budget charge, and no way to tell the two apart.
+    """
+    detail = detail[:BUILD_REDACT_MAX_STRING]
+    frm = doc.get("stage")
+    doc["stage"] = "parked"
+    doc["park_reason"] = reason
+    doc["park_detail"] = detail
+    doc["lease"] = None
+    receipt: dict[str, Any] | None = None
+    if event_id and fingerprint:
+        receipt = {
+            "event_id": event_id,
+            "action": "park",
+            "from": frm,
+            "to": "parked",
+            "at": utcnow(),
+            "holder": holder,
+            "recovered_lease": None,
+            "jobs_spent": 0,
+            "budget_left": build_budget_left(doc),
+            "automatic": True,
+            "park_reason": reason,
+            "park_detail": detail,
+            "error": detail,
+            "code": reason,
+        }
+        build_record_event(doc, event_id, fingerprint, receipt, 409)
+    err = write_build(doc, doc.get("build_id"))
+    if err:
+        return int(err["status"]), err
+    out = build_public(doc)
+    out["ok"] = False
+    out["replayed"] = False
+    out["error"] = detail
+    out["code"] = reason
+    if receipt is not None:
+        out["receipt"] = receipt
+    return 409, out
+
+
+def parse_build_object(
+    container: dict[str, Any], key: str, code: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Absent is the default; present has to be a real object.
+
+    `container.get(key) or {}` cannot tell an omitted key from a supplied
+    `null`, `""`, `false`, `0`, or `[]` -- every one of those reads as an empty
+    object and the call proceeds as if the caller had said nothing. That is
+    wrong in both directions: a caller that sent `"expect": null` meant to
+    state an identity guard and got the type wrong, and silently dropping it
+    lets the transition run against a worktree nobody checked. An empty object
+    is a different statement -- "I have nothing to add" -- and stays valid.
+
+    Returns `(None, None)` for absent, so the caller picks the default rather
+    than having one baked in here.
+    """
+    if key not in container:
+        return None, None
+    value = container[key]
+    if not isinstance(value, dict):
+        return None, {"error": f"{key} must be an object", "code": code}
+    return value, None
+
+
+def parse_build_verification(container: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    raw, shape_err = parse_build_object(container, "verification", "bad_verification")
+    if shape_err:
+        return None, shape_err
+    if raw is None:
+        return {"fast": [], "integration": [], "needs_visual_proof": False, "human_visual_review": False}, None
+    out: dict[str, Any] = {}
+    for key in ("fast", "integration"):
+        # Only an omitted key means "no checks". `or []` folded null, "", 0 and
+        # false into absent, so a caller that got the type wrong was told the
+        # build has no fast tests instead of being told to fix the request.
+        if key not in raw:
+            out[key] = []
+            continue
+        names = raw[key]
+        if not isinstance(names, list) or not all(isinstance(n, str) and n.strip() for n in names):
+            return None, {"error": f"verification.{key} must be a list of names", "code": "bad_verification"}
+        if len(names) > BUILD_VERIFICATION_MAX:
+            return None, {"error": f"verification.{key} is too long", "code": "bad_verification"}
+        out[key] = [n.strip()[:BUILD_NAME_MAX] for n in names]
+    for key in ("needs_visual_proof", "human_visual_review"):
+        # needs_visual_proof decides whether `evidence` is a real stage, so a
+        # coerced "false" would make the build demand a screenshot round the
+        # plan never asked for -- and the writer would have to invent one to
+        # reach review.
+        flag, flag_err = parse_strict_bool(raw, key, "bad_verification")
+        if flag_err:
+            return None, flag_err
+        out[key] = flag
+    return out, None
+
+
+def parse_strict_bool(container: dict[str, Any], key: str, code: str) -> tuple[bool, dict[str, Any] | None]:
+    """Omitted is false; present has to be an actual boolean.
+
+    `bool(value)` is the wrong reader for a JSON flag. `bool("false")` is
+    True, so a caller that sends the string "false" for `release_lease` drops
+    the lease it just asked to keep, and the next Rewst run walks in on a
+    build that is still mid-transition. Null is refused with the rest: an
+    explicit null is a caller that meant to say something and got the type
+    wrong, which is worth a 400 rather than a silent default.
+    """
+    if key not in container:
+        return False, None
+    value = container[key]
+    # isinstance(True, int) is True, so the bool check has to come first --
+    # but isinstance(1, bool) is False, so numbers land here and are refused.
+    if not isinstance(value, bool):
+        return False, {"error": f"{key} must be true or false", "code": code}
+    return value, None
+
+
+def parse_build_ref(container: dict[str, Any], field: str) -> tuple[str | None, dict[str, Any] | None]:
+    """A repo-relative path, or nothing at all.
+
+    `index` and `ticket` name files a later stage opens inside the build's
+    worktree. The catalog has always declared them as optional strings, but
+    create took whatever JSON arrived, so a list or an object reached the
+    state file and every consumer that read them as a path got a shape the
+    spec cannot express. Absolute paths and `..` are refused for the reason
+    the build id refuses them: these get joined against a worktree, and a
+    path that leaves it is not this build's file.
+
+    Only an omitted key means "no file". `null` and `""` are refused rather
+    than folded into absent: both are a caller that meant to name a ticket and
+    sent nothing usable, and answering with a build that has no ticket sends
+    the writer at the whole story instead.
+    """
+    if field not in container:
+        return None, None
+    raw = container[field]
+    bad = {"error": f"{field} must be a repo-relative path", "code": f"bad_{field}"}
+    if not isinstance(raw, str):
+        return None, bad
+    value = raw.strip()
+    if not value:
+        return None, bad
+    if len(value) > BUILD_NAME_MAX:
+        return None, {"error": f"{field} is too long", "code": f"bad_{field}"}
+    if value.startswith("/") or value.startswith("~") or "\\" in value or "\x00" in value:
+        return None, bad
+    if ".." in value:
+        return None, {"error": f"{field} must not escape the worktree", "code": f"bad_{field}"}
+    return value, None
+
+
+def parse_build_stacks(container: dict[str, Any]) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Absent is no stacks; present has to be a list. An empty list is valid.
+
+    `null` and `""` are refused with every other wrong type, so a caller that
+    meant to name the stacks this build needs up finds out rather than getting
+    a build that quietly declares none.
+    """
+    if "stacks" not in container:
+        return [], None
+    raw = container["stacks"]
+    if not isinstance(raw, list) or not all(isinstance(s, str) and s.strip() for s in raw):
+        return None, {"error": "stacks must be a list of names", "code": "bad_stacks"}
+    if len(raw) > BUILD_STACKS_MAX:
+        return None, {"error": "too many stacks", "code": "bad_stacks"}
+    return [s.strip()[:BUILD_NAME_MAX] for s in raw], None
+
+
+def parse_build_head(raw: Any, field: str) -> tuple[str | None, dict[str, Any] | None]:
+    if raw in (None, ""):
+        return None, None
+    if not isinstance(raw, str) or not BUILD_HEAD_RE.fullmatch(raw.strip()):
+        return None, {"error": f"{field} must be a git object id", "code": f"bad_{field}"}
+    return raw.strip(), None
+
+
+def parse_build_route(container: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The route is the sliceRoute row, so it is an object or it is absent.
+
+    The catalog says object; accepting a string, a list, or a `null` here would
+    put a shape in the state file that no consumer of the spec can read.
+
+    Validation only: the route comes back as the caller sent it. Redacting
+    here would hand the same value to the fingerprint and to disk, and two
+    different Rewst capability URLs under one generic key both redact to
+    `[redacted]` — so a second create with a different resume URL would
+    fingerprint equal to the first and replay its receipt instead of
+    conflicting. The caller redacts separately, on the copy it persists.
+    """
+    raw, shape_err = parse_build_object(container, "route", "bad_route")
+    if shape_err:
+        return None, shape_err
+    if raw is None:
+        return None, None
+    if len(raw) > BUILD_ROUTE_MAX_KEYS:
+        return None, {"error": "route has too many keys", "code": "bad_route"}
+    return raw, None
+
+
+def build_live_identity(worktree: Path) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Ask the repository what branch and commit it is actually on.
+
+    The build's identity cannot come from the caller. A caller that says
+    `head: aaa...` and `branch: feature/x` is describing what it believes,
+    and every guard built on comparing that belief to a stored copy of the
+    same belief agrees with itself no matter what the checkout is doing.
+    """
+    branch = run_git(worktree, ["rev-parse", "--abbrev-ref", "HEAD"])
+    head = run_git(worktree, ["rev-parse", "HEAD"])
+    if not branch.get("ok") or not head.get("ok"):
+        detail = str(branch.get("error") or head.get("error") or "git could not read the worktree")
+        return None, {
+            "error": f"could not resolve the live worktree identity: {detail}"[:BUILD_REDACT_MAX_STRING],
+            "code": "identity_unreadable",
+        }
+    name = branch["stdout"].strip()
+    sha = head["stdout"].strip()
+    if not BUILD_HEAD_RE.fullmatch(sha):
+        return None, {"error": "live HEAD is not a git object id", "code": "identity_unreadable"}
+    return {"branch": name, "head": sha}, None
+
+
+def build_resolve_identity(
+    doc: dict[str, Any], repos: dict[str, str]
+) -> tuple[dict[str, str] | None, str | None]:
+    """Re-resolve the build's worktree through the allowlist, then read it.
+
+    Returns (identity, park_detail). The allowlist is consulted again rather
+    than trusting the stored path: a repo dropped from repos.json must stop
+    the build, not keep driving a directory the operator revoked.
+    """
+    name, resolved = resolve_repo(doc.get("repo"), repos)
+    if name is None:
+        return None, f"repo '{doc.get('repo')}' is no longer an allowlisted worktree"
+    if str(resolved) != doc.get("worktree"):
+        return None, f"repo '{name}' now resolves to {resolved}, build was opened on {doc.get('worktree')}"
+    live, err = build_live_identity(resolved)
+    if err:
+        return None, str(err["error"])
+    return live, None
+
+
+# Transitions that consume the verification result rather than produce it.
+# Past this line the build is asserting that reviewed, verified code is what
+# ships, so the commit under it is not allowed to have changed.
+BUILD_POST_VERIFY_ACTIONS = frozenset({"evidence_captured", "review_passed", "pr_opened"})
+
+
+def build_identity_park(
+    doc: dict[str, Any],
+    action: str,
+    expected_worktree: Any,
+    expected_branch: str | None,
+    expected_head: str | None,
+    repos: dict[str, str],
+) -> tuple[dict[str, str] | None, tuple[str, str] | None]:
+    """Compare all five accounts of where this build is, before it advances.
+
+    The five are the caller's `expect`, the stored document, the allowlist,
+    the live checkout, and the verified boundary. Any disagreement parks:
+    the whole point of a resumable build is that it stops when it cannot
+    explain the ground it is standing on, rather than committing a second
+    real side effect on a guess.
+
+    Returns (live_identity, None) when they agree, or (None, (reason, detail)).
+    """
+    if expected_worktree not in (None, "") and str(expected_worktree) != doc.get("worktree"):
+        return None, (
+            "worktree_mismatch",
+            f"expected worktree {expected_worktree}, build was opened on {doc.get('worktree')}",
+        )
+    live, detail = build_resolve_identity(doc, repos)
+    if live is None:
+        return None, ("worktree_mismatch", str(detail))
+
+    # The branch is the durable half of identity: a build never changes it.
+    if live["branch"] != doc.get("branch"):
+        return None, (
+            "branch_mismatch",
+            f"worktree is on branch '{live['branch']}', build was opened on '{doc.get('branch')}'",
+        )
+    if expected_branch not in (None, "") and expected_branch != live["branch"]:
+        return None, (
+            "branch_mismatch",
+            f"caller expected branch '{expected_branch}', worktree is on '{live['branch']}'",
+        )
+
+    # The head is the moving half: the writer commits between transitions. So
+    # expect.head is checked against the live repository, never against the
+    # stored copy of an earlier caller's claim.
+    if expected_head and expected_head != live["head"]:
+        return None, (
+            "head_moved",
+            f"caller expected head {expected_head}, worktree HEAD is {live['head']}",
+        )
+
+    boundary = doc.get("verified_boundary")
+    if action in BUILD_POST_VERIFY_ACTIONS and isinstance(boundary, dict):
+        verified_head = boundary.get("head")
+        if verified_head and verified_head != live["head"]:
+            return None, (
+                "head_moved_after_verify",
+                f"verification passed at {verified_head}, worktree HEAD is now {live['head']}",
+            )
+    return live, None
+
+
+def build_create(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    story = data.get("story")
+    if not isinstance(story, str) or not story.strip():
+        return 400, {"error": "story is required", "code": "missing_story"}
+    story_err = reject_secret_text(story, "story")
+    if story_err:
+        return 400, story_err
+    repo_name, resolved = repo_from_body(data, repos)
+    if repo_name is None:
+        return 400, resolved
+    worktree = str(resolved)
+    declared_worktree = data.get("worktree")
+    if declared_worktree not in (None, "") and str(declared_worktree) != worktree:
+        # The caller thinks it is somewhere else. That is the identity guard
+        # firing before any state exists, so refuse rather than park.
+        return 400, {
+            "error": "worktree does not match the allowlisted repo path",
+            "code": "worktree_mismatch",
+            "worktree": worktree,
+        }
+    branch = data.get("branch")
+    if not isinstance(branch, str) or not valid_branch(branch.strip()):
+        return 400, {"error": "branch is required and must be a plain ref name", "code": "bad_branch"}
+    branch = branch.strip()
+    head, head_err = parse_build_head(data.get("head"), "head")
+    if head_err:
+        return 400, head_err
+    live, live_err = build_live_identity(resolved)
+    if live_err:
+        return 409, {**live_err, "worktree": worktree}
+    assert live is not None
+    if live["branch"] != branch:
+        # No state exists yet, so there is nothing to park. Refusing here is
+        # the last moment a wrong branch is cheap to say no to.
+        return 400, {
+            "error": f"worktree is on branch '{live['branch']}', not '{branch}'",
+            "code": "branch_mismatch",
+            "branch": live["branch"],
+            "worktree": worktree,
+        }
+    if head and not live["head"].startswith(head) and not head.startswith(live["head"]):
+        return 400, {
+            "error": f"worktree HEAD is {live['head']}, not {head}",
+            "code": "head_mismatch",
+            "head": live["head"],
+            "worktree": worktree,
+        }
+    # Identity is what the repository says, not what the caller declared.
+    head = live["head"]
+    verification, ver_err = parse_build_verification(data)
+    if ver_err:
+        return 400, ver_err
+    stacks, stacks_err = parse_build_stacks(data)
+    if stacks_err:
+        return 400, stacks_err
+    raw_budget, budget_shape_err = parse_build_object(data, "budget", "bad_budget")
+    if budget_shape_err:
+        return 400, budget_shape_err
+    jobs_max, budget_err = parse_optional_int(raw_budget or {}, "jobs_max", 1, BUILD_JOBS_MAX)
+    if budget_err:
+        return 400, budget_err
+    route_raw, route_err = parse_build_route(data)
+    if route_err:
+        return 400, route_err
+    # Two copies, deliberately. `route_raw` is fingerprinted and then dropped;
+    # only `route` is written or returned, so no raw capability URL leaves
+    # this function.
+    route = redact_secrets(route_raw) if route_raw is not None else None
+    index, index_err = parse_build_ref(data, "index")
+    if index_err:
+        return 400, index_err
+    ticket, ticket_err = parse_build_ref(data, "ticket")
+    if ticket_err:
+        return 400, ticket_err
+    build_id = data.get("build_id")
+    if build_id in (None, ""):
+        # Generating one here would make every timed-out retry open another
+        # build against the same worktree, each with its own lease and its
+        # own budget. The caller owns the id because only the caller can
+        # repeat it.
+        return 400, {
+            "error": "build_id is required so a retried create returns the same build",
+            "code": "missing_build_id",
+        }
+    if not valid_build_id(build_id):
+        return 400, {"error": "invalid build_id", "code": "bad_build_id"}
+
+    fingerprint = event_fingerprint(
+        {
+            "story": story.strip(),
+            "repo": repo_name,
+            "branch": branch,
+            "index": index,
+            "ticket": ticket,
+            # The raw row, not the redacted one: see parse_build_route.
+            "route": route_raw,
+            "verification": verification,
+            "stacks": stacks,
+            "jobs_max": jobs_max,
+        }
+    )
+    with BUILD_LOCK:
+        existing, read_err = load_build(build_id)
+        if read_err:
+            # Never recreate over state we could not read. The file may hold
+            # the only record of which event ids have already run.
+            return int(read_err["status"]), read_err
+        if existing is not None:
+            if existing.get("version") != BUILD_STATE_VERSION:
+                return 409, build_version_park(existing)
+            if existing.get("create_fingerprint") != fingerprint:
+                return 409, {
+                    "error": "build_id already exists with different input",
+                    "code": "idempotency_conflict",
+                    "build_id": build_id,
+                }
+            out = build_public(existing)
+            out["created"] = False
+            return 200, out
+        doc = {
+            "version": BUILD_STATE_VERSION,
+            "build_id": build_id,
+            "stage": "created",
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
+            "story": story.strip()[:BUILD_NAME_MAX],
+            "repo": repo_name,
+            "worktree": worktree,
+            "branch": branch,
+            "head": head,
+            # Already validated to a bounded repo-relative path, so it goes
+            # in as itself. Running it through redact_secrets would let a
+            # 64-hex path segment turn the ticket into "[redacted]", and the
+            # build would have lost the file it was opened to write.
+            "index": index,
+            "ticket": ticket,
+            "route": route,
+            "verification": verification,
+            "writer_session": None,
+            "stacks": stacks,
+            "reviews": [],
+            "evidence_rounds": [],
+            "budget": {"jobs_max": jobs_max, "jobs_used": 0},
+            "verified_boundary": None,
+            "lease": None,
+            "park_reason": None,
+            "park_detail": None,
+            "pr": None,
+            "create_fingerprint": fingerprint,
+            "events": {},
+            "event_order": [],
+            "event_seen": {},
+        }
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out["created"] = True
+        return 201, out
+
+
+def build_lease_live(doc: dict[str, Any], now: float) -> dict[str, Any] | None:
+    lease = doc.get("lease")
+    if not isinstance(lease, dict):
+        return None
+    try:
+        expires = float(lease.get("expires_epoch") or 0)
+    except (TypeError, ValueError):
+        return None
+    return lease if expires > now else None
+
+
+def build_apply(doc: dict[str, Any], action: str, data: dict[str, Any], target: str) -> None:
+    """Fold a transition's payload into the document.
+
+    Every field here is one of the things the story requires the state to keep
+    across a service restart, so the merge is explicit rather than a blind
+    dict update: an unknown key is dropped, not stored.
+    """
+    session = data.get("writer_session")
+    if action == "start_writer" and isinstance(session, str) and session.strip():
+        # Shape already checked by the caller, so no second bound is needed.
+        # Only start_writer binds it, and the caller has already been told off
+        # if it tried to rebind an existing one.
+        doc["writer_session"] = session.strip()
+    stacks, _ = parse_build_stacks(data)
+    if stacks:
+        doc["stacks"] = stacks
+    # data.head is deliberately not folded in. Identity comes from the live
+    # repository read, so a payload field cannot move the build's head.
+    if action == "review_passed" and isinstance(data.get("review"), dict):
+        doc["reviews"] = (doc.get("reviews") or [])[-(BUILD_LIST_MAX - 1):] + [redact_secrets(data["review"])]
+    if action == "evidence_captured" and isinstance(data.get("round"), dict):
+        rounds = (doc.get("evidence_rounds") or [])[-(BUILD_LIST_MAX - 1):]
+        doc["evidence_rounds"] = rounds + [redact_secrets(data["round"])]
+    if action == "pr_opened" and isinstance(data.get("pr"), dict):
+        doc["pr"] = redact_secrets(data["pr"])
+    if action == "verify_passed":
+        # The last verified boundary. A lease takeover after expiry must not
+        # roll this back, so it is written here and never cleared. The stage
+        # recorded is the one the build reached, not the one it left: a
+        # recovering caller needs to know where verified work ends.
+        doc["verified_boundary"] = {
+            "stage": target,
+            "head": doc.get("head"),
+            "at": utcnow(),
+            "verification": doc.get("verification"),
+        }
+
+
+def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    build_id = data.get("build_id")
+    if not valid_build_id(build_id):
+        return 400, {"error": "invalid build_id", "code": "bad_build_id"}
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"error": "event_id is required", "code": "bad_event_id"}
+    action = data.get("action")
+    if action not in BUILD_TRANSITIONS and action != "park":
+        return 400, {
+            "error": "unknown action",
+            "code": "bad_action",
+            "allowed": sorted(BUILD_TRANSITIONS) + ["park"],
+        }
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return 400, {"error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return 400, holder_err
+    lease_seconds, lease_err = parse_optional_int(data, "lease_seconds", 1, BUILD_LEASE_MAX_SECONDS)
+    if lease_err:
+        return 400, lease_err
+    lease_seconds = lease_seconds or BUILD_LEASE_SECONDS
+    jobs_spent, spend_err = parse_optional_int(data, "jobs_spent", 0, BUILD_JOBS_MAX)
+    if spend_err:
+        return 400, spend_err
+    if jobs_spent is None:
+        jobs_spent = 0 if action == "park" else 1
+    payload, payload_err = parse_build_object(data, "data", "bad_data")
+    if payload_err:
+        return 400, payload_err
+    if payload is None:
+        payload = {}
+    session = payload.get("writer_session")
+    if session not in (None, "") and not (
+        isinstance(session, str) and HERMES_SESSION_RE.fullmatch(session.strip())
+    ):
+        # The writer session is the handle that resumes one agent. Anything
+        # that is not a real session id is either a typo that would strand the
+        # writer or free text that has no business on disk.
+        return 400, {"error": "writer_session must be a gwslice session id", "code": "bad_writer_session"}
+    if session not in (None, "") and action != "start_writer":
+        # The session handle names the agent this build started. A later
+        # transition that repointed it would strand the real writer and hand
+        # the build's resume handle to whatever the caller happened to send.
+        return 400, {
+            "error": "writer_session may only be set by start_writer",
+            "code": "writer_session_locked",
+        }
+    expect, expect_err = parse_build_object(data, "expect", "bad_expect")
+    if expect_err:
+        return 400, expect_err
+    if expect is None:
+        expect = {}
+    release_lease, release_err = parse_strict_bool(data, "release_lease", "bad_release_lease")
+    if release_err:
+        return 400, release_err
+
+    # The fingerprint is every input that changes what this call does. Leaving
+    # holder, jobs_spent, lease_seconds, or release_lease out of it meant the
+    # same event id could be retried asking to spend nine jobs instead of one
+    # and be answered with the one-job receipt.
+    fingerprint = event_fingerprint(
+        {
+            "build_id": build_id,
+            "action": action,
+            "holder": holder,
+            "expect": expect,
+            "data": payload,
+            "jobs_spent": jobs_spent,
+            "lease_seconds": lease_seconds,
+            "release_lease": release_lease,
+        }
+    )
+    with BUILD_LOCK:
+        doc, read_err = load_build(build_id)
+        if read_err:
+            return int(read_err["status"]), read_err
+        if doc is None:
+            return 404, {"error": "unknown build", "code": "unknown_build", "build_id": build_id}
+        if doc.get("version") != BUILD_STATE_VERSION:
+            return 409, build_version_park(doc)
+
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            # Replay is answered before the lease check on purpose: the caller
+            # retrying a timed-out call has usually lost its lease already, and
+            # the transition it is asking about has demonstrably run.
+            record = seen.get(event_id) or {}
+            if record.get("fingerprint") != fingerprint:
+                out = build_public(doc)
+                out["ok"] = False
+                out["replayed"] = False
+                out["error"] = "event_id was already used with different input"
+                out["code"] = "idempotency_conflict"
+                return 409, out
+            out = build_public(doc)
+            out["replayed"] = True
+            prior_receipt = record.get("receipt")
+            out["receipt"] = prior_receipt
+            if isinstance(prior_receipt, dict):
+                # The replay record outlives the receipt window, so this is
+                # the original receipt and the original status even when the
+                # public window moved on long ago.
+                status = int(record.get("status") or 200)
+            else:
+                # Only reachable for a document written before replay records
+                # existed, whose receipt had already aged out of `events` by
+                # the time this service read it. Still a replay: what must
+                # never happen is running it again.
+                out["receipt_available"] = False
+                status = 200
+            if status != 200:
+                receipt = out.get("receipt") or {}
+                out["ok"] = False
+                out["error"] = receipt.get("error") or doc.get("park_detail")
+                out["code"] = receipt.get("code") or doc.get("park_reason")
+            return status, out
+        if len(seen) >= BUILD_EVENT_HARD_MAX:
+            # Accepting this would mean evicting an id, and an evicted id is
+            # a replayable one. Refuse without touching the document.
+            return 409, {
+                "ok": False,
+                "build_id": build_id,
+                "stage": doc.get("stage"),
+                "error": "build has used its whole event history; open a new build",
+                "code": "event_history_full",
+                "event_count": len(seen),
+                "event_capacity": BUILD_EVENT_HARD_MAX,
+            }
+
+        now = time.time()
+        live = build_lease_live(doc, now)
+        if live is not None and live.get("holder") != holder:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "another caller holds the build lease"
+            out["code"] = "lease_held"
+            return 409, out
+        # An expired lease held by someone else means this caller is taking a
+        # build over, not continuing its own. Naming that in the receipt is the
+        # difference between a recovery and a silent second driver.
+        stale = doc.get("lease")
+        recovered_from = (
+            stale.get("holder")
+            if live is None and isinstance(stale, dict) and stale.get("holder") not in (None, holder)
+            else None
+        )
+
+        expected_head, head_err = parse_build_head(expect.get("head"), "head")
+        if head_err:
+            return 400, head_err
+        expected_branch = expect.get("branch")
+        if expected_branch not in (None, "") and not (
+            isinstance(expected_branch, str) and valid_branch(expected_branch.strip())
+        ):
+            return 400, {"error": "expect.branch must be a plain ref name", "code": "bad_expect_branch"}
+        live, park = build_identity_park(
+            doc,
+            action,
+            expect.get("worktree"),
+            expected_branch.strip() if isinstance(expected_branch, str) else None,
+            expected_head,
+            repos,
+        )
+        if park is not None:
+            reason, detail = park
+            return build_park(doc, reason, detail, event_id, fingerprint, holder)
+        assert live is not None
+
+        stage = doc.get("stage")
+        if action == "park":
+            reason = str(payload.get("reason") or "requested")
+            if not BUILD_PARK_REASON_RE.fullmatch(reason):
+                return 400, {"error": "park reason must be a short slug", "code": "bad_park_reason"}
+            if stage in BUILD_TERMINAL:
+                out = build_public(doc)
+                out["ok"] = False
+                out["error"] = f"build is already {stage}"
+                out["code"] = "invalid_transition"
+                return 409, out
+            target = "parked"
+        else:
+            frm = BUILD_TRANSITIONS[action][0]
+            if stage != frm:
+                out = build_public(doc)
+                out["ok"] = False
+                out["error"] = f"action '{action}' is not allowed from stage '{stage}'"
+                out["code"] = "invalid_transition"
+                out["expected_action"] = build_next_action(doc)
+                return 409, out
+            target = build_transition_target(doc, action)
+
+        budget = doc.setdefault("budget", {"jobs_max": None, "jobs_used": 0})
+        used = int(budget.get("jobs_used") or 0) + jobs_spent
+        jobs_max = budget.get("jobs_max")
+        if isinstance(jobs_max, int) and used > jobs_max and target != "parked":
+            return build_park(
+                doc,
+                "budget_exhausted",
+                f"{used} jobs requested against a budget of {jobs_max}",
+                event_id,
+                fingerprint,
+                holder,
+            )
+        budget["jobs_used"] = used
+
+        if target == "parked":
+            doc["park_reason"] = str(payload.get("reason") or "requested")
+            doc["park_detail"] = redact_secrets(payload.get("detail"))
+        else:
+            # The head is re-anchored from the live read, so the boundary the
+            # next transition is checked against is where the repository
+            # actually is, not where an earlier caller said it was.
+            doc["head"] = live["head"]
+            build_apply(doc, action, payload, target)
+        doc["stage"] = target
+        doc["lease"] = (
+            None
+            if release_lease or target in BUILD_TERMINAL
+            else {
+                "holder": holder,
+                "acquired_at": utcnow(),
+                "expires_epoch": now + lease_seconds,
+                "expires_at": datetime.fromtimestamp(now + lease_seconds, timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }
+        )
+        receipt = {
+            "event_id": event_id,
+            "action": action,
+            "from": stage,
+            "to": target,
+            "at": utcnow(),
+            "holder": holder,
+            "recovered_lease": recovered_from,
+            "jobs_spent": jobs_spent,
+            "budget_left": build_budget_left(doc),
+            "head": doc.get("head"),
+            "branch": doc.get("branch"),
+        }
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out["replayed"] = False
+        out["receipt"] = receipt
+        return 200, out
+
+
+def build_state_op(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    build_id = first_query(qs, "build_id")
+    if not valid_build_id(build_id):
+        return 400, {"error": "invalid build_id", "code": "bad_build_id"}
+    assert build_id is not None
+    doc, read_err = load_build(build_id)
+    if read_err:
+        return int(read_err["status"]), read_err
+    if doc is None:
+        return 404, {"error": "unknown build", "code": "unknown_build", "build_id": build_id}
+    if doc.get("version") != BUILD_STATE_VERSION:
+        return 409, build_version_park(doc)
+    return 200, build_public(doc)
+
+
 def json_out(status: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
     return status, payload, "application/json"
 
@@ -3426,6 +4748,15 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/e2e":
         status, payload = slice_e2e(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/create":
+        status, payload = build_create(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/advance":
+        status, payload = build_advance(body, repos)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/build/state":
+        status, payload = build_state_op(qs)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":

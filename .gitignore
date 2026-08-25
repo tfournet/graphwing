@@ -11,6 +11,7 @@ state.db
 state.db-shm
 state.db-wal
 jobs/
+builds/
 logs/
 sessions/
 cache/
