@@ -41,7 +41,7 @@
       "id": "03-visual-evidence",
       "path": "slices/issue-52-pre-pr-build/03-visual-evidence.md",
       "kind": "build",
-      "status": "open",
+      "status": "done",
       "blocked_by": [
         "02-mechanical-path"
       ]

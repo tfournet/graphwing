@@ -836,6 +836,97 @@
         }
       }
     },
+    "/v1/build/visual/next": {
+      "get": {
+        "operationId": "buildVisualNext", "tags": ["build"],
+        "summary": "Read durable visual state and return exactly one bounded next step.",
+        "parameters": [{ "name": "build_id", "in": "query", "required": true, "schema": { "type": "string", "minLength": 8, "maxLength": 64 } }],
+        "responses": { "200": { "description": "next visual step", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/preflight": {
+      "post": {
+        "operationId": "buildVisualPreflight", "tags": ["build"],
+        "summary": "Strict read-only proof-contract, preview-stack, browser-recipe, identity, and finite-budget preflight.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualPreflightRequest" } } } },
+        "responses": { "200": { "description": "visual contract is runnable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/preview": {
+      "post": {
+        "operationId": "buildVisualPreview", "tags": ["build"],
+        "summary": "Start or resume the stable preview identity and return its exact URL and instructions; never tear it down.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualEventRequest" } } } },
+        "responses": { "200": { "description": "preview reachable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/scenario": {
+      "post": {
+        "operationId": "buildVisualScenario", "tags": ["build"],
+        "summary": "Run the real browser scenario and record visible, accessibility, console, request, and PNG evidence; synthetic evidence is refused.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualScenarioRequest" } } } },
+        "responses": { "200": { "description": "captured", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "202": { "description": "bounded job accepted, not a capture verdict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" }, "429": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/inspect": {
+      "post": {
+        "operationId": "buildVisualInspect", "tags": ["build"],
+        "summary": "Verify legibility, required labels and values, unobscured UI, route, and visible tenant/project; return exact recapture targets.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualEventRequest" } } } },
+        "responses": { "200": { "description": "inspected", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/review": {
+      "post": {
+        "operationId": "buildVisualReview", "tags": ["build"],
+        "summary": "Run one independent UI/accessibility review over the ticket, round diff, observations, and inspected screenshots.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualReviewRequest" } } } },
+        "responses": { "200": { "description": "reviewed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "202": { "description": "bounded job accepted, not a verdict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" }, "429": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/handoff": {
+      "post": {
+        "operationId": "buildVisualHandoff", "tags": ["build"],
+        "summary": "Persist verified screenshots under durable artifact IDs and mint short-lived single-use fetch grants for Rewst.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualHandoffRequest" } } } },
+        "responses": { "200": { "description": "artifact handoff", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/publish": {
+      "post": {
+        "operationId": "buildVisualPublish", "tags": ["build"],
+        "summary": "Validate durable GitHub upload references and compose the exact issue comment payload for the round.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualPublishRequest" } } } },
+        "responses": { "200": { "description": "comment payload recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/publish-result": {
+      "post": {
+        "operationId": "buildVisualPublishResult", "tags": ["build"],
+        "summary": "Validate the authoritative GitHub comment URL and artifact IDs after Rewst posts the prepared comment.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualPublishResultRequest" } } } },
+        "responses": { "200": { "description": "terminal comment receipt recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/visual/prompt": {
+      "post": {
+        "operationId": "buildVisualPrompt", "tags": ["build"],
+        "summary": "Optionally prompt the exact planning pane with URL, instructions, checklist, screenshots, and actions while preserving pre-commit stack state.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualEventRequest" } } } },
+        "responses": { "200": { "description": "planning prompt recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/artifact/{artifact_id}": {
+      "get": {
+        "operationId": "artifactFetch", "tags": ["build"], "security": [],
+        "summary": "Fetch one durable visual artifact once with its expiring grant token.",
+        "parameters": [
+          { "name": "artifact_id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[a-f0-9]{32}$" } },
+          { "name": "X-Graphwing-Artifact-Token", "in": "header", "required": true, "schema": { "type": "string", "minLength": 16 } }
+        ],
+        "responses": { "200": { "description": "PNG bytes", "content": { "image/png": { "schema": { "type": "string", "contentEncoding": "binary" } } } }, "403": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "410": { "$ref": "#/components/responses/Error" } }
+      }
+    },
     "/v1/gh/pr/list": {
       "get": {
         "operationId": "ghPrList",
@@ -1521,12 +1612,14 @@
       },
       "BuildVerification": {
         "type": "object",
+        "additionalProperties": false,
         "description": "Verification the plan declared for this build. Names are recipes from tests.json, scripts.json, or rr.json, resolved in that order. Every name is validated by buildPreflight before a writer is launched.",
         "properties": {
           "fast": { "type": "array", "items": { "type": "string" } },
           "integration": { "type": "array", "items": { "type": "string" } },
           "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage. A mechanical build that sets this true parks. A sensitive build surfaces step=evidence for the separate visual-evidence path; both sensitive reviews remain required afterward." },
           "human_visual_review": { "type": "boolean" },
+          "visual": { "$ref": "#/components/schemas/BuildVisualContract" },
           "requires_red": { "type": "boolean", "description": "When true the reviewer treats a missing record of the test failing first as a finding. When false or absent the reviewer is told explicitly not to raise its absence." },
           "path_rules": {
             "type": "array",
@@ -1542,6 +1635,35 @@
               }
             }
           }
+        }
+      },
+      "BuildVisualContract": {
+        "type": "object", "additionalProperties": false,
+        "required": ["route", "scenario", "setup", "navigation", "expected", "checklist", "viewports", "human_review", "preview_stack", "browser_recipe", "tenant"],
+        "properties": {
+          "route": { "type": "string", "pattern": "^/", "maxLength": 256 },
+          "scenario": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "setup": { "type": "array", "maxItems": 24, "items": { "type": "string", "minLength": 1, "maxLength": 2048 } },
+          "navigation": { "type": "array", "minItems": 1, "maxItems": 24, "items": { "type": "string", "minLength": 1, "maxLength": 2048 } },
+          "expected": { "type": "array", "minItems": 1, "maxItems": 24, "items": { "type": "string", "minLength": 1, "maxLength": 2048 } },
+          "checklist": { "type": "array", "minItems": 1, "maxItems": 24, "items": { "type": "string", "minLength": 1, "maxLength": 2048 } },
+          "viewports": {
+            "type": "array", "minItems": 1, "maxItems": 6,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["name", "width", "height"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "width": { "type": "integer", "minimum": 320, "maximum": 4096 },
+                "height": { "type": "integer", "minimum": 240, "maximum": 4096 }
+              }
+            }
+          },
+          "human_review": { "type": "boolean", "description": "Required explicitly; there is no default." },
+          "allow_login_redirect": { "type": "boolean", "default": false, "description": "Explicitly permit only a same-origin loopback redirect to a login/sign-in/auth path; probes never follow it." },
+          "preview_stack": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "browser_recipe": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "tenant": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "planning_pane": { "type": ["string", "null"], "minLength": 1, "maxLength": 256, "description": "Required by the server when human_review=true." }
         }
       },
       "BuildRecipeVerdict": {
@@ -1862,6 +1984,103 @@
           "parent": { "type": "string" },
           "author": { "type": "string" },
           "committer": { "type": "string" }
+        }
+      },
+      "BuildVisualEventRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      },
+      "BuildVisualPreflightRequest": {
+        "type": "object", "additionalProperties": false, "required": ["build_id"],
+        "properties": { "build_id": { "type": "string", "minLength": 8, "maxLength": 64 } }
+      },
+      "BuildVisualScenarioRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "role"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "role": { "type": "string", "enum": ["before", "candidate"] },
+          "only": { "type": "array", "minItems": 1, "maxItems": 6, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+          "response_webhook_url": { "type": "string", "format": "uri" },
+          "response_webhook_token": { "type": "string", "minLength": 1 }
+        }
+      },
+      "BuildVisualReviewRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "grok", "codex"] },
+          "response_webhook_url": { "type": "string", "format": "uri" },
+          "response_webhook_token": { "type": "string", "minLength": 1 }
+        }
+      },
+      "BuildVisualHandoffRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "ttl_seconds": { "type": "integer", "minimum": 60, "maximum": 3600 }
+        }
+      },
+      "BuildVisualPublishRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "uploads"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "uploads": {
+            "type": "array", "minItems": 1, "maxItems": 16,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["artifact_id"],
+              "properties": {
+                "artifact_id": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+                "ref": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "url": { "type": "string", "format": "uri", "maxLength": 256 }
+              },
+              "anyOf": [{ "required": ["ref"] }, { "required": ["url"] }]
+            }
+          }
+        }
+      },
+      "BuildVisualPublishResultRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "comment_url", "artifact_ids"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "comment_url": { "type": "string", "format": "uri", "maxLength": 256 },
+          "artifact_ids": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-f0-9]{32}$" } }
+        }
+      },
+      "BuildVisualResponse": {
+        "type": "object", "required": ["ok"], "additionalProperties": true,
+        "properties": {
+          "ok": { "type": "boolean" }, "build_id": { "type": "string" },
+          "step": { "type": "string", "enum": ["preflight", "preview", "scenario", "inspect", "review", "handoff", "publish", "human_review", "done", "parked"] },
+          "round": { "type": ["integer", "null"] }, "replayed": { "type": "boolean" },
+          "queued": { "type": "boolean" }, "pre_commit": { "type": "boolean" },
+          "preview_running": { "type": "boolean" }, "human_review": { "type": "boolean" },
+          "error": { "type": "string" }, "code": { "type": ["string", "null"] }
         }
       },
       "BuildFinalizeRequest": {

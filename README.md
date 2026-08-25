@@ -12,7 +12,7 @@ One chat session that writes code, runs git, judges its own work, and opens a PR
 - **Graphwing** performs each step when Rewst hits a URL (`/v1/git/checkout`, `/v1/test/run`, `/v1/agent/run`, …).
 - **You** still decide what to build, write the ticket files, start the workflow, and merge the PR.
 
-GitHub and Shortcut stay Rewst's integrations. Graphwing does not hold those keys.
+Cloud GitHub and Shortcut stay Rewst's integrations. Graphwing does not hold those keys. Visual evidence uses Rewst's GitHub integration to attach durable artifact references and comment on the issue; the laptop receives no GitHub credential.
 
 ```mermaid
 flowchart LR
@@ -55,6 +55,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 | Workflow | You pass | It does |
 |---|---|---|
 | `graphwing-implement-slice` | repo, branch, ticket path, test | One ticket: code, test, review, commit. Then start the next ticket. |
+| `graphwing-visual-evidence` | build id, event id, optional reviewer | One bounded pre-commit real-browser evidence round: stable preview, capture/inspect/one recapture, automated UI review, durable artifact handoff, GitHub issue comment, and optional planning-pane prompt. The preview stays running. |
 | `graphwing-verify-stack` | stack, ports | Check that a local stack is up. |
 | `graphwing-pr-status` | PR number | Read GitHub checks. No writes. |
 | `graphwing-pr-drive` | repo, PR, test | One fix attempt when CI is red. |

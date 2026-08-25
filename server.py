@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -21,8 +22,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 HOME = Path(os.environ.get("GRAPHWING_HOME", Path.home() / ".graphwing"))
 OPENAPI_PATH = HOME / "openapi.json"
@@ -32,6 +34,7 @@ SCRIPTS_PATH = HOME / "scripts.json"
 STACKS_PATH = HOME / "stacks.json"
 TESTS_PATH = HOME / "tests.json"
 RR_PATH = HOME / "rr.json"
+VISUAL_BROWSERS_PATH = HOME / "visual-browsers.json"
 KEY_PATH = HOME / "api.key"
 JOBS_DIR = HOME / "jobs"
 BUILDS_DIR = HOME / "builds"
@@ -316,6 +319,57 @@ BUILD_GATE_RECORDS_KEPT = 32
 # look like a developer stack, and neither reading had any evidence behind it.
 BUILD_STACK_ROLES = ("clean", "developer", "preview", "unset")
 BUILD_CLEAN_STACK_ROLE = "clean"
+# The stack a visual round drives. `preview` is its own role for the same
+# reason `clean` is: a screenshot taken against the writer's developer stack is
+# a picture of whatever was left running, and a screenshot against the clean
+# integration runner is a picture of a tree with no browser in front of it.
+BUILD_PREVIEW_STACK_ROLE = "preview"
+# One bounded visual round, step by step. Read off the durable round record the
+# same way the mechanical steps are read off the build: an invocation that died
+# after its browser ran comes back and is told `inspect`, not `scenario`.
+BUILD_VISUAL_STEPS = (
+    "preflight",
+    "preview",
+    "scenario",
+    "inspect",
+    "review",
+    "handoff",
+    "publish",
+    "human_review",
+    "done",
+    "parked",
+)
+# What a captured image is evidence *of*. The first round needs both: a
+# candidate with nothing to compare it to is a picture, not proof of a change.
+BUILD_VISUAL_ROLES = ("before", "candidate")
+BUILD_VISUAL_VIEWPORTS_MAX = 6
+BUILD_VISUAL_STEPS_MAX = 24
+BUILD_VISUAL_IMAGES_MAX = 16
+# Public responses summarize history, but the durable build document keeps every
+# round. Supersession pointers are audit references and must never dangle.
+BUILD_EVIDENCE_ROUNDS_KEPT = 32
+BUILD_VISUAL_RECAPTURE_MAX = 1
+# A screenshot smaller than this is a blank or an error card, not a legible
+# view of a UI. The width floor is the narrowest viewport worth reviewing.
+BUILD_IMAGE_MIN_BYTES = 1024
+BUILD_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+BUILD_IMAGE_MIN_WIDTH = 320
+BUILD_IMAGE_MIN_HEIGHT = 240
+BUILD_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# The upload handoff is short-lived by construction: Rewst pulls the bytes once,
+# within the window, and the grant is spent. The durable half is the artifact
+# record, which outlives every grant ever minted for it.
+BUILD_ARTIFACT_TTL_SECONDS = 900
+BUILD_ARTIFACT_TTL_MAX = 3600
+BUILD_ARTIFACT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+BUILD_ARTIFACT_TOKEN_HEADER = "X-Graphwing-Artifact-Token"
+BUILD_ARTIFACT_LOCKS: dict[str, threading.Lock] = {}
+BUILD_ARTIFACT_LOCKS_GUARD = threading.Lock()
+BUILD_ARTIFACT_GRANT_TOKENS: dict[tuple[str, str], str] = {}
+# Where the evidence comment goes. This repository tracks work on GitHub
+# issues, and the comment is posted by Rewst's own GitHub integration — the
+# laptop never holds a GitHub token, an upload capability, or a callback URL.
+BUILD_ISSUE_RE = re.compile(r"^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)$")
 SECRET_KEY_PARTS = frozenset(
     {
         "secret", "secrets", "token", "tokens", "password", "passwd", "pass",
@@ -706,7 +760,7 @@ def list_install_run_stubs(limit: int) -> list[dict[str, Any]]:
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
-    for key in ("implement_slice", "pr_drive", "pr_status", "verify_stack"):
+    for key in ("implement_slice", "visual_evidence", "pr_drive", "pr_status", "verify_stack"):
         item = install.get(key)
         if not isinstance(item, dict):
             continue
@@ -1037,6 +1091,12 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
         role = str(item.get("role") or "").strip().lower()
         if role not in BUILD_STACK_ROLES:
             role = "unset"
+        # Where this stack serves pages, for a preview round to point a browser
+        # at. Loopback only, and dropped rather than rejected when it is not:
+        # a preview round with no reachable URL refuses by name later, which is
+        # a better failure than a whole catalog that will not load.
+        raw_base = str(item.get("base_url") or "").strip().rstrip("/")
+        base_url = raw_base if raw_base and loopback_http_url(raw_base) else None
         stacks[name] = {
             "name": name,
             "cwd": cwd,
@@ -1044,6 +1104,7 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
             "health": health,
             "ports": sport,
             "role": role,
+            "base_url": base_url,
             "runner": str(item.get("runner") or "compose").strip().lower(),
         }
     if not stacks and not ports:
@@ -2444,16 +2505,101 @@ def podman_env() -> dict[str, str]:
     }
 
 
-def probe_loopback(url: str) -> dict[str, Any]:
-    parsed = urlparse(url)
+def strict_url_authority(parsed: Any, host_pattern: str, allowed_ports: set[int | None] | None) -> bool:
+    """Validate the raw authority instead of trusting urllib's normalized hostname."""
+    authority = parsed.netloc
+    if not isinstance(authority, str) or not authority or not authority.isascii():
+        return False
+    match = re.fullmatch(rf"(?P<host>{host_pattern})(?::(?P<port>[0-9]{{1,5}}))?", authority, re.IGNORECASE)
+    if match is None:
+        return False
+    raw_port = match.group("port")
+    port = int(raw_port) if raw_port is not None else None
+    if port is not None and not 1 <= port <= 65535:
+        return False
+    return allowed_ports is None or port in allowed_ports
+
+
+def loopback_http_url(url: str) -> bool:
+    """True for an http(s) URL on this machine's loopback interface.
+
+    The preview stack a visual round drives runs here, so its URL is a laptop
+    URL. Anything else is either a remote environment this build has no claim
+    about or a way to point the browser somewhere the operator never declared.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in ("http", "https")
+        and strict_url_authority(parsed, r"(?:127\.0\.0\.1|localhost|\[::1\])", None)
+        and not parsed.query
+        and not parsed.fragment
+        and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url)
+    )
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _url_origin(parsed: Any) -> tuple[str, str, int | None]:
+    port = parsed.port
+    if port is None:
+        port = 80 if parsed.scheme == "http" else 443 if parsed.scheme == "https" else None
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+
+def probe_loopback(url: str, allow_login: bool = False) -> dict[str, Any]:
+    try:
+        parsed = urlparse(url)
+        origin = _url_origin(parsed)
+    except ValueError:
+        return {"ok": False, "url": url, "error": "health url is malformed"}
     host = (parsed.hostname or "").lower()
-    if parsed.scheme not in ("http", "https") or host not in ("127.0.0.1", "localhost"):
+    if (
+        parsed.scheme not in ("http", "https")
+        or host not in ("127.0.0.1", "localhost", "::1")
+        or parsed.username
+        or parsed.password
+    ):
         return {"ok": False, "url": url, "error": "health url must be loopback http(s)"}
     try:
         req = Request(url, method="GET")
-        with urlopen(req, timeout=2) as resp:
+        with build_opener(_NoRedirect()).open(req, timeout=2) as resp:
             code = getattr(resp, "status", 200)
-            return {"ok": 200 <= code < 500, "url": url, "status": code}
+            return {"ok": 200 <= code < 300, "url": url, "status": code,
+                    "final_location": url}
+    except HTTPError as exc:
+        try:
+            location = str(exc.headers.get("Location") or "")
+            final_location = urljoin(url, location) if location else None
+            try:
+                target = urlparse(final_location or "")
+                same_origin = _url_origin(target) == origin
+            except ValueError:
+                same_origin = False
+                target = urlparse("")
+            login_path = same_origin and any(
+                marker in target.path.lower() for marker in ("login", "signin", "auth")
+            )
+            login = bool(
+                allow_login
+                and exc.code in (301, 302, 303, 307, 308)
+                and same_origin
+                and target.hostname in ("127.0.0.1", "localhost", "::1")
+                and not target.username
+                and not target.password
+                and login_path
+            )
+            return {"ok": login, "url": url, "status": exc.code,
+                    "final_location": final_location,
+                    "login_redirect": final_location if login else None,
+                    "error": None if login else f"HTTP {exc.code}"}
+        finally:
+            exc.close()
     except Exception as exc:
         return {"ok": False, "url": url, "error": str(exc)[:160]}
 
@@ -2588,8 +2734,16 @@ def herdr_cli(args: list[str], timeout: int = 10) -> dict[str, Any] | None:
     return result if isinstance(result, dict) else parsed
 
 
-def herdr_send(pane_id: str, text: str) -> None:
-    run_cmd(["herdr", "--session", HERDR_SESSION, "pane", "send-text", pane_id, text], timeout=8)
+def herdr_send(pane_id: str, text: str) -> dict[str, Any]:
+    return run_cmd(["herdr", "--session", HERDR_SESSION, "pane", "send-text", pane_id, text], timeout=8)
+
+
+def herdr_exact_pane(pane_id: str) -> bool:
+    listed = herdr_cli(["pane", "list"]) or {}
+    return any(
+        isinstance(pane, dict) and str(pane.get("pane_id") or "") == pane_id
+        for pane in listed.get("panes") or []
+    )
 
 
 def herdr_echo(pane_id: str, line: str) -> None:
@@ -4239,7 +4393,11 @@ def build_public(doc: dict[str, Any]) -> dict[str, Any]:
         "writer_session": doc.get("writer_session"),
         "stacks": doc.get("stacks") or [],
         "reviews": doc.get("reviews") or [],
-        "evidence_rounds": doc.get("evidence_rounds") or [],
+        "evidence_rounds": build_visual_history_public(doc),
+        # The round a caller is currently in the middle of, flattened. The full
+        # list stays above as history: a superseded round is never removed, so
+        # "which one is live" cannot be read off the length.
+        "visual_round": build_visual_round_public(doc),
         "budget": doc.get("budget"),
         "budget_left": build_budget_left(doc),
         "verified_boundary": doc.get("verified_boundary"),
@@ -4256,6 +4414,56 @@ def build_public(doc: dict[str, Any]) -> dict[str, Any]:
         "event_count": len(doc.get("event_seen") or {}),
         "event_capacity": BUILD_EVENT_HARD_MAX,
     }
+
+
+def build_visual_round_summary(rnd: dict[str, Any]) -> dict[str, Any]:
+    """Project one durable evidence round onto its path-free public shape."""
+    review = rnd.get("review") or {}
+    inspection = rnd.get("inspection") or {}
+    published = rnd.get("published") or {}
+    captures = rnd.get("captures") if isinstance(rnd.get("captures"), list) else rnd.get("shots")
+    if not isinstance(captures, list):
+        captures = []
+    return {
+        "round": rnd.get("round", rnd.get("n")),
+        "status": rnd.get("status"),
+        "change_id": rnd.get("change_id"),
+        "supersedes": rnd.get("supersedes"),
+        "human_review": rnd.get("human_review"),
+        "preview": {
+            k: (rnd.get("preview") or {}).get(k) for k in ("preview_id", "url", "healthy")
+        }
+        if isinstance(rnd.get("preview"), dict)
+        else None,
+        "captures": len(captures),
+        "verified": len(
+            [c for c in captures if isinstance(c, dict) and c.get("verified")]
+        ),
+        "inspection_ok": inspection.get("ok"),
+        "recapture": inspection.get("recapture") or [],
+        "review_verdict": review.get("verdict"),
+        "review_findings": review.get("findings"),
+        "published_at": published.get("commented_at") or published.get("at"),
+        "comment_url": published.get("comment_url"),
+        "prompted_at": rnd.get("prompted_at"),
+    }
+
+
+def build_visual_history_public(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only the most recent bounded window of compact round summaries."""
+    rounds = [r for r in (doc.get("evidence_rounds") or []) if isinstance(r, dict)]
+    return [build_visual_round_summary(rnd) for rnd in rounds[-BUILD_EVIDENCE_ROUNDS_KEPT:]]
+
+
+def build_visual_round_public(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """A compact view of the latest round, or None when there is none.
+
+    Deliberately small. The stored round carries every image's path, digest and
+    inspection reasons, and putting all of that in every state response is how a
+    poll loop starts moving megabytes to learn a round number.
+    """
+    rounds = [r for r in (doc.get("evidence_rounds") or []) if isinstance(r, dict)]
+    return build_visual_round_summary(rounds[-1]) if rounds else None
 
 
 def build_version_park(doc: dict[str, Any]) -> dict[str, Any]:
@@ -4423,6 +4631,11 @@ def parse_build_verification(container: dict[str, Any]) -> tuple[dict[str, Any] 
         if rules_err:
             return None, rules_err
         out["path_rules"] = rules
+    if "visual" in raw:
+        contract, contract_err = parse_build_visual(raw["visual"])
+        if contract_err:
+            return None, contract_err
+        out["visual"] = contract
     return out, None
 
 
@@ -4473,6 +4686,200 @@ def parse_build_path_rules(raw: Any) -> tuple[list[dict[str, Any]] | None, dict[
             rule["phase"] = phase.strip()
         out.append(rule)
     return out, None
+
+
+def parse_build_visual_steps(
+    raw: Any, field: str, minimum: int
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """One list of human instructions: setup, navigation, expected, checklist.
+
+    Bounded and secret-checked because every one of these is written down and
+    then read out loud — into a browser recipe's arguments, into the GitHub
+    comment, into the planning prompt. A login step that carries the password
+    inline would be republished in all three places.
+    """
+    bad = {"error": f"visual.{field} must be a list of instruction strings", "code": "bad_visual"}
+    if not isinstance(raw, list) or not all(isinstance(s, str) and s.strip() for s in raw):
+        return None, bad
+    if len(raw) < minimum:
+        return None, {
+            "error": f"visual.{field} needs at least {minimum} entr{'y' if minimum == 1 else 'ies'}",
+            "code": "bad_visual",
+        }
+    if len(raw) > BUILD_VISUAL_STEPS_MAX:
+        return None, {"error": f"visual.{field} is too long", "code": "bad_visual"}
+    out: list[str] = []
+    for item in raw:
+        text = item.strip()[:BUILD_REDACT_MAX_STRING]
+        secret = reject_secret_text(text, "visual")
+        if secret:
+            return None, {**secret, "code": "secret_in_visual"}
+        out.append(text)
+    return out, None
+
+
+def parse_build_visual_viewports(raw: Any) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    """The viewports this round is proof at. Named, so an image can claim one."""
+    bad = {"error": "visual.viewports must be a list of {name, width, height}", "code": "bad_visual"}
+    if not isinstance(raw, list) or not raw:
+        return None, bad
+    if len(raw) > BUILD_VISUAL_VIEWPORTS_MAX:
+        return None, {"error": "visual.viewports is too long", "code": "bad_visual"}
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, bad
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or not SLICE_ID_RE.fullmatch(name.strip()):
+            return None, {"error": "visual.viewports[].name must be a short identifier", "code": "bad_visual"}
+        name = name.strip()
+        if name in seen:
+            return None, {"error": f"visual.viewports names a duplicate: {name}", "code": "bad_visual"}
+        seen.add(name)
+        sizes: dict[str, int] = {}
+        for axis, floor in (("width", BUILD_IMAGE_MIN_WIDTH), ("height", BUILD_IMAGE_MIN_HEIGHT)):
+            value = item.get(axis)
+            if not isinstance(value, int) or isinstance(value, bool) or not floor <= value <= 4096:
+                return None, {
+                    "error": f"visual.viewports[].{axis} must be an integer between {floor} and 4096",
+                    "code": "bad_visual",
+                }
+            sizes[axis] = value
+        out.append({"name": name, **sizes})
+    return out, None
+
+
+def parse_build_visual(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The proof contract. Complete or refused; there is no partial form.
+
+    This is the whole reason a visual build can be trusted later. Every field
+    here is something a screenshot round would otherwise decide for itself at
+    capture time — which page, which viewport, what the picture has to show,
+    whether a human looks at it. Deciding any of them later means the evidence
+    is graded against whatever it happens to contain.
+
+    `human_review` is required rather than defaulted. False is a real answer
+    with real consequences (the round publishes and the build walks on to
+    review), and so is true; an omitted key is a planner who never considered
+    the question, and inventing either answer for them is the one outcome that
+    cannot be audited afterwards.
+    """
+    if not isinstance(raw, dict):
+        return None, {"error": "verification.visual must be an object", "code": "bad_visual"}
+    allowed = {
+        "route", "scenario", "setup", "navigation", "expected", "checklist", "viewports",
+        "human_review", "preview_stack", "browser_recipe", "tenant", "planning_pane",
+        "allow_login_redirect",
+    }
+    extra = sorted(set(raw) - allowed)
+    if extra:
+        return None, {"error": f"verification.visual has an unknown field: {extra[0]}", "code": "bad_visual"}
+
+    route = raw.get("route")
+    if not isinstance(route, str) or not route.startswith("/") or len(route) > BUILD_NAME_MAX:
+        return None, {
+            "error": "visual.route must be the served path the proof is taken at, starting with /",
+            "code": "bad_visual",
+        }
+    parsed_route = urlparse(route)
+    if (
+        route.startswith("//")
+        or "://" in route
+        or "\\" in route
+        or "\x00" in route
+        or any(ch.isspace() for ch in route)
+        or parsed_route.scheme
+        or parsed_route.netloc
+        or parsed_route.query
+        or parsed_route.fragment
+        or "@" in route
+        or reject_secret_text(route, "visual.route")
+    ):
+        # A full URL here would let the contract point the browser off the
+        # preview stack entirely, which is the one thing the preview stack
+        # identity exists to pin down.
+        return None, {"error": "visual.route is a path, not a URL", "code": "bad_visual"}
+
+    names: dict[str, str] = {}
+    for field in ("scenario", "preview_stack", "browser_recipe", "tenant"):
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value.strip()) > BUILD_NAME_MAX:
+            return None, {"error": f"visual.{field} is required", "code": "bad_visual"}
+        secret = reject_secret_text(value.strip(), "visual")
+        if secret:
+            return None, {**secret, "code": "secret_in_visual"}
+        names[field] = value.strip()
+
+    steps: dict[str, list[str]] = {}
+    for field, minimum in (("setup", 0), ("navigation", 1), ("expected", 1), ("checklist", 1)):
+        if field not in raw:
+            return None, {"error": f"visual.{field} is required", "code": "bad_visual"}
+        parsed, step_err = parse_build_visual_steps(raw[field], field, minimum)
+        if step_err:
+            return None, step_err
+        steps[field] = parsed or []
+
+    viewports, viewport_err = parse_build_visual_viewports(raw.get("viewports"))
+    if viewport_err:
+        return None, viewport_err
+
+    if "human_review" not in raw:
+        return None, {
+            "error": (
+                "visual.human_review must say yes or no; there is no default, because "
+                "both answers change what the round does"
+            ),
+            "code": "missing_human_review",
+        }
+    human_review, human_err = parse_strict_bool(raw, "human_review", "bad_visual")
+    if human_err:
+        return None, human_err
+    allow_login_redirect = False
+    if "allow_login_redirect" in raw:
+        allow_login_redirect, login_err = parse_strict_bool(raw, "allow_login_redirect", "bad_visual")
+        if login_err:
+            return None, login_err
+
+    pane = raw.get("planning_pane")
+    if human_review:
+        # With review enabled the round ends by prompting a person. A round
+        # that cannot name the pane to prompt would publish and then quietly
+        # tell nobody, which reads exactly like review-disabled.
+        if (
+            not isinstance(pane, str)
+            or not pane.strip()
+            or len(pane.strip()) > BUILD_NAME_MAX
+            or not re.fullmatch(r"[A-Za-z0-9._-]+:[A-Za-z0-9._-]+", pane.strip())
+        ):
+            return None, {
+                "error": "visual.planning_pane must be the exact saved Herdr pane ID",
+                "code": "missing_planning_pane",
+            }
+        pane = pane.strip()
+        secret = reject_secret_text(pane, "visual")
+        if secret:
+            return None, {**secret, "code": "secret_in_visual"}
+    elif pane is not None and (not isinstance(pane, str) or not pane.strip()):
+        return None, {"error": "visual.planning_pane must be a pane name", "code": "bad_visual"}
+    else:
+        pane = pane.strip() if isinstance(pane, str) else None
+
+    return {
+        "route": route[:BUILD_NAME_MAX],
+        "scenario": names["scenario"],
+        "setup": steps["setup"],
+        "navigation": steps["navigation"],
+        "expected": steps["expected"],
+        "checklist": steps["checklist"],
+        "viewports": viewports,
+        "human_review": human_review,
+        "preview_stack": names["preview_stack"],
+        "browser_recipe": names["browser_recipe"],
+        "tenant": names["tenant"],
+        "planning_pane": pane,
+        "allow_login_redirect": bool(allow_login_redirect),
+    }, None
 
 
 def build_rule_phase(rule: dict[str, Any]) -> str:
@@ -5094,6 +5501,19 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
             )
             out["code"] = "gate_op_required"
             return 409, out
+        if action == "evidence_captured" and build_visual_contract(doc) is not None:
+            # A build that carries a proof contract has a real capture path, so
+            # a caller asserting `evidence_captured` here is asserting a round
+            # that no browser took. The round object it posts would be indis-
+            # tinguishable from a captured one at every later step.
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = (
+                "this build declares a verification.visual contract; only the visual round "
+                "operations may record evidence, from images they captured and inspected"
+            )
+            out["code"] = "visual_op_required"
+            return 409, out
 
         now = time.time()
         live = build_lease_live(doc, now)
@@ -5501,6 +5921,48 @@ def build_recipe_catalog(
                 if cwd is not None:
                     entry["cwd"] = cwd
             out[name] = entry
+    return out
+
+
+def build_visual_recipe_catalog() -> dict[str, dict[str, Any]]:
+    """Graphwing-owned browser drivers, pinned to installed bytes by SHA-256."""
+    try:
+        raw = json.loads(VISUAL_BROWSERS_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    items = raw.get("browsers") or [] if isinstance(raw, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        argv = item.get("argv")
+        integrity_rel = str(item.get("integrity_path") or "").strip()
+        expected = str(item.get("sha256") or "").lower()
+        if not name or not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
+            continue
+        integrity_path = resolve_under_home(integrity_rel)
+        try:
+            integrity_path.relative_to(HOME.resolve())
+            data = read_regular_file(integrity_path.parent, integrity_path.name)
+        except (OSError, ValueError):
+            continue
+        actual = hashlib.sha256(data).hexdigest()
+        resolved_argv = [str(resolve_under_home(v[2:])) if v.startswith("./") else v for v in argv]
+        entry = {
+            "name": name,
+            "argv": resolved_argv,
+            "cwd": HOME.resolve(),
+            "timeout_seconds": int(item.get("timeout_seconds") or 120),
+            "integrity_path": str(integrity_path),
+            "integrity_sha256": actual,
+            "unresolvable": None,
+        }
+        if not re.fullmatch(r"[0-9a-f]{64}", expected) or not hmac.compare_digest(actual, expected):
+            entry["unresolvable"] = "browser driver integrity does not match its installed pin"
+        if Path(resolved_argv[0]).resolve() != integrity_path:
+            entry["unresolvable"] = "browser argv does not execute the pinned Graphwing driver"
+        out[name] = entry
     return out
 
 
@@ -6347,8 +6809,13 @@ def build_path_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
             # capture screenshots, so it names the round rather than parking:
             # the visual evidence path owns it, and the two sensitive reviews
             # still have to happen afterwards.
-            return "evidence", "the plan requires visual proof; the visual evidence path owns this round"
-        return "parked", "this workflow does not capture visual evidence"
+            return "evidence", (
+                "the plan requires visual proof; graphwing-visual-evidence owns this round"
+            )
+        return "parked", (
+            "mechanical builds do not capture visual evidence; the round runs on "
+            "graphwing-visual-evidence"
+        )
     if stage == "review":
         # Checks come first even at review. A correction turn that answered a
         # finding produced a new change id, which invalidated the fast phase as
@@ -11182,6 +11649,2583 @@ def supervisor_watch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
     return (202 if record.get("state") == "watching" else 200), out
 
 
+# --- pre-PR visual evidence round -------------------------------------------
+#
+# One visual round is: preflight the contract, bring up the preview stack,
+# drive the real served page, look at the images, have an independent reviewer
+# look at them too, hand the bytes to Rewst under a short-lived grant, publish
+# a GitHub issue comment, and — when the plan asked for it — prompt a person.
+#
+# Everything here fails closed toward "this is not proof". The three ways a
+# screenshot round lies are all cheap to produce and all indistinguishable from
+# success at the far end of a graph: a synthetic server standing in for the
+# app, a DOM probe reported as a picture, and a summary graphic generated from
+# a description of what the change was supposed to do. So the round never asks
+# the capture whether it is real. It probes the URL itself, pins the preview
+# stack's identity, refuses an observation that names another mode, and reads
+# the PNG header of every file before any of it is called evidence.
+#
+# Nothing here holds a GitHub credential, an upload capability, or a browser
+# session's cookies. Rewst owns the tracker integration; this side owns the
+# bytes and hands them over under a grant that expires and is spent once.
+
+
+def build_visual_contract(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """The proof contract this build was opened with, or None."""
+    contract = (doc.get("verification") or {}).get("visual")
+    return contract if isinstance(contract, dict) else None
+
+
+def build_open_visual(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Load a build for the visual round, or say precisely why not.
+
+    Deliberately no class check. Visual proof is independent of routing class:
+    a sensitive UI change still routes to sensitive models for its writing and
+    its reviews, and still has to show a person what it looks like. Gating this
+    on `class == visual` would let exactly the changes that most need a picture
+    skip taking one.
+    """
+    doc, err = build_open(build_id)
+    if err:
+        return None, err
+    assert doc is not None
+    if not build_needs_visual(doc):
+        return None, (
+            409,
+            {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "stage": doc.get("stage"),
+                "step": "no_visual_proof",
+                "error": "this build's plan did not declare needs_visual_proof",
+                "code": "no_visual_proof",
+            },
+        )
+    return doc, None
+
+
+def build_visual_contract_gaps(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Everything missing before a browser is allowed to take a picture.
+
+    Read-only, and every entry names the field a planner edits. The contract is
+    validated once at create; this re-checks it against the world the round is
+    about to run in, because a stack can lose its role and a recipe can leave
+    the catalog between planning and capture.
+    """
+    gaps: list[dict[str, Any]] = []
+    contract = build_visual_contract(doc)
+    if contract is None:
+        gaps.append(
+            {
+                "check": "verification.visual",
+                "code": "missing_contract",
+                "detail": (
+                    "this build declares needs_visual_proof but carries no verification.visual "
+                    "contract; there is nothing that says which page, which viewports, what the "
+                    "picture has to show, or whether a person reviews it"
+                ),
+            }
+        )
+        return gaps
+    if "human_review" not in contract or not isinstance(contract.get("human_review"), bool):
+        gaps.append(
+            {
+                "check": "verification.visual.human_review",
+                "code": "missing_human_review",
+                "detail": "the contract does not answer yes or no on human visual review",
+            }
+        )
+    catalog = build_stack_catalog()
+    name = str(contract.get("preview_stack") or "")
+    entry = catalog.get(name)
+    if entry is None:
+        gaps.append(
+            {
+                "check": "verification.visual.preview_stack",
+                "code": "unknown_stack",
+                "detail": f"preview stack '{name}' is not in stacks.json",
+                "allowed": sorted(catalog),
+            }
+        )
+    else:
+        if entry.get("role") != BUILD_PREVIEW_STACK_ROLE:
+            gaps.append(
+                {
+                    "check": "verification.visual.preview_stack",
+                    "code": "not_a_preview_stack",
+                    "detail": (
+                        f"stack '{name}' is declared role '{entry.get('role')}', not "
+                        f"'{BUILD_PREVIEW_STACK_ROLE}'; a screenshot against a stack nobody "
+                        "declared as the preview is a picture of whatever was left running"
+                    ),
+                }
+            )
+        if not entry.get("base_url"):
+            gaps.append(
+                {
+                    "check": "verification.visual.preview_stack",
+                    "code": "no_preview_url",
+                    "detail": (
+                        f"stack '{name}' declares no loopback base_url, so the round cannot name "
+                        "the exact reachable URL a human would open"
+                    ),
+                }
+            )
+    recipe = str(contract.get("browser_recipe") or "")
+    recipes = build_visual_recipe_catalog()
+    spec = recipes.get(recipe)
+    if spec is None:
+        gaps.append(
+            {
+                "check": "verification.visual.browser_recipe",
+                "code": "unknown_recipe",
+                "detail": f"no such recipe: {recipe}",
+                "allowed": sorted(recipes),
+            }
+        )
+    elif spec.get("unresolvable"):
+        gaps.append(
+            {
+                "check": "verification.visual.browser_recipe",
+                "code": "browser_integrity_failed",
+                "detail": str(spec["unresolvable"]),
+            }
+        )
+    if contract.get("human_review") and not contract.get("planning_pane"):
+        gaps.append(
+            {
+                "check": "verification.visual.planning_pane",
+                "code": "missing_planning_pane",
+                "detail": "human review is enabled but the contract names no planning pane to prompt",
+            }
+        )
+    if build_budget_left(doc) is None:
+        gaps.append(
+            {
+                "check": "budget",
+                "code": "no_job_budget",
+                "detail": "a visual build needs a finite budget.jobs_max; the feedback loop has no other floor",
+            }
+        )
+    return gaps
+
+
+def build_visual_rounds(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    return [r for r in (doc.get("evidence_rounds") or []) if isinstance(r, dict)]
+
+
+def build_visual_round_current(doc: dict[str, Any]) -> dict[str, Any] | None:
+    rounds = build_visual_rounds(doc)
+    return rounds[-1] if rounds else None
+
+
+def build_visual_round_captures(
+    rnd: dict[str, Any], role: str | None = None, verified: bool | None = None
+) -> list[dict[str, Any]]:
+    out = [c for c in (rnd.get("captures") or []) if isinstance(c, dict)]
+    if role is not None:
+        out = [c for c in out if c.get("role") == role]
+    if verified is not None:
+        out = [c for c in out if bool(c.get("verified")) is verified]
+    return out
+
+
+def build_visual_open_round(doc: dict[str, Any], change_id: str) -> dict[str, Any] | None:
+    """The round currently being captured for the change on disk, or None.
+
+    A round whose change id no longer matches is stale by definition: the
+    writer edited files after the pictures were taken, so the pictures are of
+    something else. It is kept as history and superseded rather than reused.
+    """
+    rnd = build_visual_round_current(doc)
+    if rnd is None or rnd.get("status") != "open":
+        return None
+    return rnd if rnd.get("change_id") == change_id else None
+
+
+def build_visual_round_start(doc: dict[str, Any], live: dict[str, str]) -> dict[str, Any]:
+    """Open a round, recording which earlier round it replaces.
+
+    Supersession is a pointer, never a deletion. The comment history on the
+    issue is the audit trail for a UI that changed three times before somebody
+    approved it, and a round that quietly overwrote its predecessor would make
+    the last picture look like the only one there had ever been.
+    """
+    rounds = build_visual_rounds(doc)
+    prior = rounds[-1] if rounds else None
+    entry = {
+        "round": len(rounds) + 1,
+        "opened_at": utcnow(),
+        "head": live["head"],
+        "change_id": live["change_id"],
+        "supersedes": prior.get("round") if isinstance(prior, dict) else None,
+        "status": "open",
+        "human_review": bool((build_visual_contract(doc) or {}).get("human_review")),
+        "preview": None,
+        "captures": [],
+        "observations": {},
+        "inspection": None,
+        "review": None,
+        "handoff": None,
+        "published": None,
+        "planning_prompt": None,
+        "prompted_at": None,
+        "recapture_attempts": {},
+        "inspection_queue": [],
+    }
+    doc["evidence_rounds"] = rounds + [entry]
+    return entry
+
+
+def build_visual_required_roles(rnd: dict[str, Any]) -> list[str]:
+    """Which roles this round has to carry.
+
+    The first round needs a before as well as a candidate: a candidate image
+    with nothing to compare it against shows what the UI looks like, not what
+    the change did to it. Later rounds compare against the round they supersede,
+    which is already published and cannot be edited.
+    """
+    return ["before", "candidate"] if int(rnd.get("round") or 1) == 1 else ["candidate"]
+
+
+def build_visual_missing_roles(rnd: dict[str, Any]) -> list[str]:
+    return [
+        role
+        for role in build_visual_required_roles(rnd)
+        if not build_visual_round_captures(rnd, role=role)
+    ]
+
+
+def build_visual_recapture_queue(
+    failures: list[dict[str, Any]], attempts: dict[str, Any] | Any
+) -> list[dict[str, Any]]:
+    """Group failed viewports into one bounded recapture per role."""
+    spent = attempts if isinstance(attempts, dict) else {}
+    grouped: dict[str, set[str]] = {role: set() for role in BUILD_VISUAL_ROLES}
+    for failure in failures:
+        role = str(failure.get("role") or "")
+        viewport = str(failure.get("viewport") or "")
+        if role in grouped and viewport and int(spent.get(role) or 0) < BUILD_VISUAL_RECAPTURE_MAX:
+            grouped[role].add(viewport)
+    return [
+        {"role": role, "only": sorted(grouped[role])}
+        for role in BUILD_VISUAL_ROLES
+        if grouped[role]
+    ]
+
+
+def build_visual_recapture_target(rnd: dict[str, Any], role: str) -> list[str] | None:
+    attempts = rnd.get("recapture_attempts")
+    spent = attempts if isinstance(attempts, dict) else {}
+    if int(spent.get(role) or 0) >= BUILD_VISUAL_RECAPTURE_MAX:
+        return None
+    for item in rnd.get("inspection_queue") or []:
+        if isinstance(item, dict) and item.get("role") == role:
+            only = item.get("only")
+            if isinstance(only, list) and all(isinstance(v, str) for v in only):
+                return only
+    return None
+
+
+def build_visual_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
+    """Name the one step this invocation may run, and why.
+
+    Same contract as the mechanical stage switch and for the same reason: an
+    invocation that died after its browser finished must come back and be told
+    `inspect`, not run a second capture over the images it already has.
+    """
+    stage = doc.get("stage")
+    if stage == "parked":
+        return "parked", str(doc.get("park_reason") or "parked")
+    if doc.get("pr_ready") or stage in ("ready", "pr_opened"):
+        return "done", "this build is past the evidence stage"
+    if build_budget_left(doc) == 0:
+        return "parked", "budget_exhausted"
+    if stage != "evidence":
+        return "parked", f"the visual round runs at stage 'evidence'; this build is at '{stage}'"
+    gaps = build_visual_contract_gaps(doc)
+    if gaps:
+        return "preflight", str(gaps[0]["detail"])
+
+    rnd = build_visual_round_current(doc)
+    if rnd is not None and rnd.get("status") == "published" and rnd.get("change_id") == change_id:
+        if rnd.get("human_review") and not rnd.get("prompted_at"):
+            return "human_review", "the published round still owes the planning session its prompt"
+        return "done", f"round {rnd.get('round')} is published for this change"
+    open_round = build_visual_open_round(doc, change_id)
+    if open_round is None:
+        why = "no round is open for the change on disk"
+        if rnd is not None and rnd.get("status") == "open":
+            why = (
+                f"round {rnd.get('round')} was captured at another change; a new round supersedes it"
+            )
+        return "preflight", why
+    if not isinstance(open_round.get("preview"), dict):
+        return "preview", "the preview stack has not been resolved for this round"
+    missing = build_visual_missing_roles(open_round)
+    if missing:
+        return "scenario", f"this round still needs a {missing[0]} capture"
+    queue = open_round.get("inspection_queue")
+    if isinstance(queue, list) and queue:
+        roles = [str(item.get("role")) for item in queue if isinstance(item, dict)]
+        return "scenario", "inspection requires targeted recapture for " + ", ".join(roles)
+    inspection = open_round.get("inspection")
+    if not isinstance(inspection, dict) or inspection.get("change_id") != change_id:
+        return "inspect", "the captured images have not been inspected for this change"
+    if inspection.get("recapture"):
+        return "parked", (
+            "targeted recapture budget exhausted for: "
+            + ", ".join(str(n) for n in inspection["recapture"][:4])
+        )
+    if not inspection.get("ok"):
+        return "inspect", str(inspection.get("error") or "image inspection is not clean")
+    if not isinstance(open_round.get("review"), dict):
+        return "review", "no automated UI review has been recorded for this round"
+    if (open_round.get("review") or {}).get("verdict") != "PASS":
+        return "review", "the automated UI review did not return PASS"
+    if not isinstance(open_round.get("handoff"), dict):
+        return "handoff", "the verified images have not been handed off for upload"
+    return "publish", "the round is ready to publish its evidence comment"
+
+
+def build_visual_next(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The visual stage switch. Read durable state, name the next allowed step.
+
+    Read-only, like buildNext: the graph calls this first on every invocation,
+    so it has to be safe to call from a run that is about to be abandoned.
+    """
+    doc, err = build_open_visual(first_query(qs, "build_id"))
+    if err:
+        return err
+    assert doc is not None
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        out = build_public(doc)
+        out["ok"] = False
+        out["step"] = "parked"
+        out["step_reason"] = str(park_detail)
+        out["code"] = "worktree_mismatch"
+        return 409, out
+    step, reason = build_visual_step(doc, live["change_id"])
+    rnd = build_visual_round_current(doc)
+    out = build_public(doc)
+    out["ok"] = step != "parked"
+    out["step"] = step
+    out["step_reason"] = reason
+    out["live_head"] = live["head"]
+    out["live_branch"] = live["branch"]
+    out["change_id"] = live["change_id"]
+    out["class"] = build_class(doc)
+    out["visual"] = build_visual_contract(doc)
+    out["round"] = rnd.get("round") if isinstance(rnd, dict) else None
+    out["round_status"] = rnd.get("status") if isinstance(rnd, dict) else None
+    if step == "parked":
+        out["code"] = doc.get("park_reason") or "parked"
+    return (200 if out["ok"] else 409), out
+
+
+def build_visual_preflight(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Everything that must be true before a browser takes a picture.
+
+    Read-only on purpose, exactly like the mechanical preflight: a stack that
+    lost its role or a recipe that left the catalog is something the operator
+    fixes and retries, not something that burns the build.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    doc, open_err = build_open_visual(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    stage = doc.get("stage")
+    if stage != "evidence":
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "stage": stage,
+            "error": f"the visual round runs at stage 'evidence'; this build is at '{stage}'",
+            "code": "invalid_transition",
+        }
+    failures = build_visual_contract_gaps(doc)
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        failures.append({"check": "worktree", "code": "worktree_mismatch", "detail": str(park_detail)})
+    contract = build_visual_contract(doc) or {}
+    out = {
+        "ok": not failures,
+        "build_id": doc.get("build_id"),
+        "stage": stage,
+        "class": build_class(doc),
+        "change_id": live["change_id"] if live else None,
+        "head": live["head"] if live else doc.get("head"),
+        "human_review": contract.get("human_review"),
+        "contract": contract or None,
+        "failures": failures,
+        "rounds": len(build_visual_rounds(doc)),
+        "budget_left": build_budget_left(doc),
+    }
+    if failures:
+        out["error"] = failures[0]["detail"]
+        out["code"] = failures[0]["code"]
+        return 409, out
+    return 200, out
+
+
+def build_visual_event(
+    data: dict[str, Any], action: str, extra: dict[str, Any], repos: dict[str, str]
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Open one idempotent visual transition, or hand back the refusal.
+
+    Every state-changing visual op needs the same four things established before
+    it does anything: the build exists and wants visual proof, this event id has
+    not already run (and is not being reused for different input), no other
+    caller holds the lease, and the worktree is still the one the build was
+    opened on. Writing that out per op is how one of them ends up missing the
+    replay check and captures a second round for a retried invocation.
+
+    Returns a context on success. The caller finishes with build_visual_commit.
+    """
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return None, (400, {"ok": False, "error": "event_id is required", "code": "bad_event_id"})
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return None, (400, {"ok": False, "error": "holder is required", "code": "missing_holder"})
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return None, (400, holder_err)
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": action, "holder": holder, **extra}
+    )
+
+    doc, open_err = build_open_visual(data.get("build_id"))
+    if open_err:
+        return None, open_err
+    assert doc is not None
+
+    seen = build_event_seen(doc)
+    if event_id in seen:
+        record = seen.get(event_id) or {}
+        out = build_public(doc)
+        out["replayed"] = record.get("fingerprint") == fingerprint
+        if not out["replayed"]:
+            out["ok"] = False
+            out["error"] = "event_id was already used with different input"
+            out["code"] = "idempotency_conflict"
+            return None, (409, out)
+        out["ok"] = int(record.get("status") or 200) == 200
+        out["receipt"] = record.get("receipt")
+        if action == "visual_handoff" and out["ok"]:
+            receipt = record.get("receipt") or {}
+            grants, grant_code = artifact_grant_replay_state(receipt.get("artifacts") or [])
+            if grant_code:
+                out["ok"] = False
+                out["code"] = grant_code
+                out["error"] = "this round's issued upload grant is no longer outstanding"
+                return None, (409, out)
+            out["grants"] = grants
+        return None, (int(record.get("status") or 200), out)
+
+    live, park = build_identity_park(doc, action, data.get("worktree"), None, None, repos)
+    if park is not None:
+        reason, detail = park
+        return None, build_park(doc, reason, detail, event_id, fingerprint, holder)
+    assert live is not None
+    change_id = build_change_id(Path(str(doc.get("worktree"))), live["head"])
+    # Round creation consumes the same live identity object.  Keep the derived
+    # candidate identity beside head/branch so preview can open a round without
+    # trusting a caller-supplied change id.
+    live = {**live, "change_id": change_id}
+
+    lease = build_lease_live(doc, time.time())
+    if lease is not None and lease.get("holder") != holder:
+        out = build_public(doc)
+        out["ok"] = False
+        out["error"] = "another caller holds the build lease"
+        out["code"] = "lease_held"
+        return None, (409, out)
+
+    if doc.get("stage") != "evidence":
+        out = build_public(doc)
+        out["ok"] = False
+        out["error"] = f"the visual round runs at stage 'evidence'; this build is at '{doc.get('stage')}'"
+        out["code"] = "invalid_transition"
+        return None, (409, out)
+
+    return {
+        "doc": doc,
+        "event_id": event_id,
+        "holder": holder,
+        "fingerprint": fingerprint,
+        "action": action,
+        "live": live,
+        "change_id": change_id,
+    }, None
+
+
+def build_visual_commit(
+    ctx: dict[str, Any], receipt: dict[str, Any], status: int, out: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Record the event and persist, so a retry replays instead of repeating."""
+    doc = ctx["doc"]
+    receipt = {
+        "event_id": ctx["event_id"],
+        "action": ctx["action"],
+        "at": utcnow(),
+        "holder": ctx["holder"],
+        "build_id": doc.get("build_id"),
+        "head": ctx["live"]["head"],
+        "change_id": ctx["change_id"],
+        "budget_left": build_budget_left(doc),
+        **receipt,
+    }
+    build_record_event(doc, ctx["event_id"], ctx["fingerprint"], receipt, status)
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
+    payload = build_public(doc)
+    payload.update(out)
+    payload["replayed"] = False
+    payload["receipt"] = receipt
+    payload["change_id"] = ctx["change_id"]
+    return status, payload
+
+
+def build_preview_identity(doc: dict[str, Any], stack: str) -> str:
+    """A preview identity that survives a restart and never collides.
+
+    Derived, not generated. The same build and the same stack must resolve to
+    the same preview across every round and every service restart, or round 4's
+    screenshots would claim to come from a different environment than round 1's
+    and the comparison the reviewer is being asked to make would be meaningless.
+    """
+    digest = hashlib.sha256(f"{doc.get('build_id')}\0{stack}".encode()).hexdigest()[:16]
+    return f"gwpreview-{digest}"
+
+
+def build_preview_stack(doc: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """The preview stack this round drives, or why there is none."""
+    contract = build_visual_contract(doc)
+    if contract is None:
+        return None, "this build carries no verification.visual contract"
+    name = str(contract.get("preview_stack") or "")
+    catalog = build_stack_catalog()
+    entry = catalog.get(name)
+    if entry is None:
+        return None, f"preview stack '{name}' is not in stacks.json"
+    role = str(entry.get("role") or "unset")
+    if role != BUILD_PREVIEW_STACK_ROLE:
+        return None, (
+            f"stack '{name}' is declared role '{role}', not '{BUILD_PREVIEW_STACK_ROLE}'; a "
+            "screenshot against an undeclared stack is a picture of whatever was left running"
+        )
+    if not entry.get("base_url"):
+        return None, f"stack '{name}' declares no loopback base_url to open"
+    return entry, None
+
+
+def stack_ensure_started(entry: dict[str, Any]) -> dict[str, Any]:
+    """Idempotently start the catalogued stack; never stop it after a round."""
+    current = stack_status(str(entry.get("name") or ""))
+    if current.get("healthy"):
+        return {"ok": True, "resumed": True}
+    cwd = entry.get("cwd")
+    if not isinstance(cwd, Path) or not cwd.is_dir():
+        return {"ok": False, "resumed": False, "error": "preview stack has no runnable cwd"}
+    args = ["podman", "compose"]
+    compose = str(entry.get("compose_file") or "")
+    if compose:
+        args += ["-f", compose]
+    args += ["up", "-d"]
+    result = run_cmd(args, cwd=cwd, timeout=120, env=podman_env())
+    return {"ok": bool(result.get("ok")), "resumed": False,
+            "error": None if result.get("ok") else str(result.get("error") or "compose up failed")}
+
+
+def build_visual_preview(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Start or resume the preview stack and report the exact reachable URL.
+
+    Never tears anything down, and never brings up a stack the catalog has not
+    declared as a preview. The identity is derived from the build, so resuming
+    is indistinguishable from starting for every later step — which is what
+    makes an interrupted round resumable rather than restartable.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(data, "visual_preview", {}, repos)
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        gaps = build_visual_contract_gaps(doc)
+        if gaps:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = str(gaps[0]["detail"])
+            out["code"] = str(gaps[0]["code"])
+            out["failures"] = gaps
+            return 409, out
+        entry, gap = build_preview_stack(doc)
+        if entry is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = str(gap)
+            out["code"] = "not_a_preview_stack"
+            return 409, out
+        contract = build_visual_contract(doc) or {}
+        started = stack_ensure_started(entry)
+        if not started.get("ok"):
+            out = build_public(doc)
+            out.update({"ok": False, "code": "preview_start_failed", "error": started.get("error")})
+            return 409, out
+        status = stack_status(entry["name"])
+        url = f"{entry['base_url']}{contract['route']}"
+        probe = probe_loopback(url, allow_login=bool(contract.get("allow_login_redirect")))
+        healthy = bool(status.get("healthy")) and bool(probe.get("ok"))
+        rnd = build_visual_open_round(doc, ctx["change_id"])
+        if rnd is None:
+            current = build_visual_round_current(doc)
+            if (
+                isinstance(current, dict)
+                and current.get("status") == "published"
+                and current.get("change_id") == ctx["change_id"]
+            ):
+                # The change on disk already has a published round. Opening a
+                # second one would post the same pictures under a new number
+                # and make the issue history claim an iteration that never
+                # happened; a real next round begins when the writer edits.
+                out = build_public(doc)
+                out["ok"] = False
+                out["round"] = current.get("round")
+                out["error"] = (
+                    f"round {current.get('round')} is already published for this change"
+                )
+                out["code"] = "round_already_published"
+                return 409, out
+            rnd = build_visual_round_start(doc, ctx["live"])
+        preview = {
+            "preview_id": build_preview_identity(doc, entry["name"]),
+            "stack": entry["name"],
+            "role": entry.get("role"),
+            "base_url": entry["base_url"],
+            "url": url,
+            "route": contract["route"],
+            "healthy": healthy,
+            "http_status": probe.get("status"),
+            "final_location": probe.get("final_location"),
+            "login_redirect": probe.get("login_redirect"),
+            "resumed": bool(started.get("resumed")),
+            "at": utcnow(),
+            "setup": contract.get("setup") or [],
+            "navigation": contract.get("navigation") or [],
+            "tenant": contract.get("tenant"),
+        }
+        if not healthy:
+            # No capture is attempted against an unreachable page. A browser
+            # pointed at a dead port still produces a PNG, and that PNG is an
+            # error card that would sail through every later check.
+            rnd["preview"] = None
+            out = build_public(doc)
+            out["ok"] = False
+            out["preview"] = preview
+            out["error"] = (
+                f"preview stack '{entry['name']}' did not serve {url}: "
+                + str(probe.get("error") or f"HTTP {probe.get('status')}")
+            )
+            out["code"] = "preview_unhealthy"
+            write_err = write_build(doc, doc.get("build_id"))
+            if write_err:
+                return int(write_err["status"]), write_err
+            return 409, out
+        rnd["preview"] = preview
+        return build_visual_commit(
+            ctx,
+            {"preview_id": preview["preview_id"], "url": url, "round": rnd["round"]},
+            200,
+            {
+                "ok": True,
+                "preview": preview,
+                "round": rnd["round"],
+                "supersedes": rnd.get("supersedes"),
+                "instructions": {
+                    "url": url,
+                    "setup": preview["setup"],
+                    "navigation": preview["navigation"],
+                    "expected": contract.get("expected") or [],
+                    "checklist": contract.get("checklist") or [],
+                    "tenant": contract.get("tenant"),
+                },
+            },
+        )
+
+
+def png_geometry(data: bytes) -> tuple[int, int] | None:
+    """Width and height straight out of the IHDR chunk, or None.
+
+    No image library, on purpose: this runs on the seat and the question is
+    small. A file that is not a PNG, or is truncated before its header, has no
+    geometry — and a capture with no geometry is not a screenshot.
+    """
+    if len(data) < 24 or not data.startswith(BUILD_PNG_MAGIC) or data[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def build_visual_round_dir(build_id: str, round_no: int) -> Path:
+    return build_dir(build_id) / "evidence" / f"round-{round_no:03d}"
+
+
+def build_visual_browser_argv(
+    spec: dict[str, Any], contract: dict[str, Any], preview: dict[str, Any],
+    role: str, out_dir: Path, viewports: list[dict[str, Any]]
+) -> list[str]:
+    """The exact arguments the declared browser recipe is run with.
+
+    Composed here rather than baked into the catalog entry so the recipe cannot
+    choose its own target. The URL, the route, the tenant and the output
+    directory are the round's, and the recipe's only job is to drive them.
+    """
+    argv = list(spec["argv"]) + [
+        "--url", str(preview["url"]),
+        "--route", str(contract["route"]),
+        "--scenario", str(contract["scenario"]),
+        "--role", role,
+        "--tenant", str(contract["tenant"]),
+        "--preview-id", str(preview["preview_id"]),
+        "--out", str(out_dir),
+    ]
+    for viewport in viewports:
+        argv += ["--viewport", f"{viewport['name']}:{viewport['width']}x{viewport['height']}"]
+    return argv
+
+
+def build_visual_observation_gaps(
+    obs: Any, contract: dict[str, Any], preview: dict[str, Any]
+) -> list[str]:
+    """Why this observation is not evidence from the real served page.
+
+    The three refusals here are the whole point of the ticket. A synthetic
+    server, a DOM-only probe, and a generated summary graphic all produce a
+    tidy artifact that looks exactly like a passing round from the graph's side,
+    and each one is cheaper to produce than the real thing — so each one is
+    named and refused rather than inferred from a missing field.
+    """
+    if not isinstance(obs, dict):
+        return ["the browser recipe wrote no readable observation document"]
+    gaps: list[str] = []
+    mode = obs.get("mode")
+    if mode != "browser":
+        gaps.append(
+            f"observation declares mode '{mode}', not 'browser'; a DOM-only probe is not a picture "
+            "of what a person would see"
+        )
+    if obs.get("synthetic") is not False:
+        gaps.append(
+            "observation does not declare synthetic=false; a synthetic server standing in for the "
+            "app proves the fixture works, not the change"
+        )
+    if str(obs.get("url") or "") != str(preview.get("url")):
+        gaps.append(
+            f"observation was taken at '{obs.get('url')}', not the preview URL '{preview.get('url')}'"
+        )
+    if str(obs.get("served_by") or "") != str(preview.get("preview_id")):
+        gaps.append("observation does not name this round's preview identity as its server")
+    if str(obs.get("route") or "") != str(contract.get("route")):
+        gaps.append("observation route does not match the route Graphwing assigned")
+    if str(obs.get("tenant") or "") != str(contract.get("tenant")):
+        gaps.append("observation tenant does not match the tenant Graphwing assigned")
+    status = obs.get("http_status")
+    authoritative_status = preview.get("http_status")
+    if status != authoritative_status:
+        gaps.append("observation HTTP status contradicts Graphwing's probe")
+    if "final_location" in obs and str(obs.get("final_location") or "") != str(
+        preview.get("final_location") or ""
+    ):
+        gaps.append("observation final location contradicts Graphwing's no-follow probe")
+    accepted_redirect = bool(preview.get("login_redirect"))
+    if not isinstance(authoritative_status, int) or not (
+        200 <= authoritative_status < 300 or accepted_redirect
+    ):
+        gaps.append(f"the served page answered HTTP {authoritative_status}, so nothing below it is proof")
+    for field in ("accessibility", "console", "requests"):
+        section = obs.get(field)
+        if not isinstance(section, dict) or not isinstance(section.get("ok"), bool):
+            gaps.append(f"observation records no {field} result for this scenario")
+    visible = obs.get("visible")
+    if not isinstance(visible, list) or not all(isinstance(v, str) for v in visible):
+        gaps.append("observation records no visible state for this scenario")
+    images = obs.get("images")
+    if not isinstance(images, list) or not images:
+        gaps.append("observation captured no images")
+        return gaps
+    if len(images) > BUILD_VISUAL_IMAGES_MAX:
+        gaps.append("observation captured more images than a round may carry")
+    names = {str(v["name"]) for v in contract.get("viewports") or []}
+    for image in images:
+        if not isinstance(image, dict):
+            gaps.append("an image entry is not an object")
+            continue
+        if image.get("source") != "browser":
+            gaps.append(
+                f"image '{image.get('file')}' declares source '{image.get('source')}'; a generated "
+                "summary graphic is not primary evidence"
+            )
+        if image.get("viewport") not in names:
+            gaps.append(f"image '{image.get('file')}' claims a viewport the contract never declared")
+    return gaps
+
+
+def build_visual_capture_images(
+    obs: dict[str, Any], contract: dict[str, Any], out_dir: Path, role: str, change_id: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read every declared image off disk and describe it, or say why not.
+
+    The recipe's word for what it captured is never taken. The bytes are read
+    here, the PNG header is parsed here, and an entry whose file is missing,
+    truncated, not a PNG, or smaller than the viewport it claims is a gap — not
+    a capture with a caveat.
+    """
+    viewports = {str(v["name"]): v for v in contract.get("viewports") or []}
+    captures: list[dict[str, Any]] = []
+    gaps: list[str] = []
+    for image in obs.get("images") or []:
+        if not isinstance(image, dict):
+            continue
+        name = str(image.get("file") or "")
+        if not name or "/" in name or "\\" in name or ".." in name:
+            gaps.append(f"image file name '{name}' is not a plain file in the round directory")
+            continue
+        path = out_dir / name
+        try:
+            data = read_regular_file(out_dir, name)
+        except OSError:
+            gaps.append(f"image '{name}' was declared but not written")
+            continue
+        if len(data) < BUILD_IMAGE_MIN_BYTES:
+            gaps.append(f"image '{name}' is {len(data)} bytes, which is a blank or an error card")
+            continue
+        if len(data) > BUILD_IMAGE_MAX_BYTES:
+            gaps.append(f"image '{name}' is larger than a round may carry")
+            continue
+        geometry = png_geometry(data)
+        if geometry is None:
+            gaps.append(f"image '{name}' is not a PNG this service can read")
+            continue
+        width, height = geometry
+        viewport = viewports.get(str(image.get("viewport")))
+        if viewport is None:
+            gaps.append(f"image '{name}' claims a viewport the contract never declared")
+            continue
+        if width < int(viewport["width"]) or height < BUILD_IMAGE_MIN_HEIGHT:
+            gaps.append(
+                f"image '{name}' is {width}x{height}, smaller than the {viewport['name']} viewport "
+                f"it claims ({viewport['width']}x{viewport['height']})"
+            )
+            continue
+        captures.append(
+            {
+                "role": role,
+                "file": name,
+                "path": str(path),
+                "viewport": viewport["name"],
+                "width": width,
+                "height": height,
+                "bytes": len(data),
+                "digest": hashlib.sha256(data).hexdigest(),
+                "label": str(image.get("label") or "")[:BUILD_REDACT_MAX_STRING],
+                "route": str(image.get("route") or ""),
+                "tenant": str(image.get("tenant") or ""),
+                "obscured": image.get("obscured"),
+                "text": [str(t)[:BUILD_NAME_MAX] for t in (image.get("text") or [])][:BUILD_REDACT_MAX_ITEMS],
+                "source": image.get("source"),
+                "change_id": change_id,
+                "at": utcnow(),
+                "verified": None,
+                "reasons": [],
+            }
+        )
+    return captures, gaps
+
+
+def build_visual_scenario_result(
+    ctx: dict[str, Any], role: str, only: list[str] | None, repos: dict[str, str]
+) -> tuple[int, dict[str, Any]]:
+    """Drive the declared scenario on the real served page and record it."""
+    doc = ctx["doc"]
+    contract = build_visual_contract(doc)
+    if contract is None:
+        return 409, {"ok": False, "error": "no verification.visual contract", "code": "missing_contract"}
+    rnd = build_visual_open_round(doc, ctx["change_id"])
+    if rnd is None:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": "no round is open for the change on disk; run buildPreviewStack first",
+            "code": "no_open_round",
+        }
+    preview = rnd.get("preview")
+    if not isinstance(preview, dict):
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "round": rnd.get("round"),
+            "error": "this round has no resolved preview stack",
+            "code": "no_preview",
+        }
+    viewports = [v for v in contract.get("viewports") or []]
+    if only:
+        viewports = [v for v in viewports if v["name"] in only]
+        if not viewports:
+            return 400, {
+                "ok": False,
+                "error": "only names no viewport this contract declares",
+                "code": "unknown_viewport",
+                "allowed": [v["name"] for v in contract.get("viewports") or []],
+            }
+    inspection = rnd.get("inspection")
+    requested_only = build_visual_recapture_target(rnd, role)
+    if isinstance(inspection, dict) and (inspection.get("recapture") or rnd.get("inspection_queue")):
+        requested = {f"{role}/{name}" for name in (requested_only or [])}
+        actual = {f"{role}/{v['name']}" for v in viewports}
+        if not requested or actual != requested:
+            return 409, {
+                "ok": False,
+                "code": "recapture_target_mismatch",
+                "error": "recapture must name exactly the failed role and viewport set",
+                "requested": sorted(requested),
+            }
+        attempts = rnd.get("recapture_attempts")
+        if not isinstance(attempts, dict):
+            attempts = {}
+            rnd["recapture_attempts"] = attempts
+        if int(attempts.get(role) or 0) >= BUILD_VISUAL_RECAPTURE_MAX:
+            return 409, {
+                "ok": False,
+                "code": "recapture_exhausted",
+                "error": "this round has exhausted its targeted recapture budget",
+            }
+        attempts[role] = int(attempts.get(role) or 0) + 1
+    recipes = build_visual_recipe_catalog()
+    spec = recipes.get(str(contract.get("browser_recipe")))
+    if spec is None:
+        return 409, {
+            "ok": False,
+            "error": f"no such recipe: {contract.get('browser_recipe')}",
+            "code": "unknown_recipe",
+        }
+    if spec.get("unresolvable"):
+        return 409, {"ok": False, "error": str(spec["unresolvable"]), "code": "browser_integrity_failed"}
+
+    # Probed here as well as at preview time. The stack was up when the round
+    # opened; this is the moment before the picture is taken, and a page that
+    # died in between would still yield a PNG.
+    probe = probe_loopback(
+        str(preview.get("url")), allow_login=bool(contract.get("allow_login_redirect"))
+    )
+    status = stack_status(str(preview.get("stack") or ""))
+    if not status.get("healthy") or not probe.get("ok"):
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "round": rnd.get("round"),
+            "url": preview.get("url"),
+            "error": f"the preview no longer serves {preview.get('url')}: {probe.get('error') or probe.get('status')}",
+            "code": "preview_unhealthy",
+        }
+    preview["healthy"] = True
+    preview["http_status"] = probe.get("status")
+    preview["probed_url"] = probe.get("url")
+    preview["final_location"] = probe.get("final_location")
+    preview["login_redirect"] = probe.get("login_redirect")
+    preview["probed_at"] = utcnow()
+
+    park = build_charge(doc, 1)
+    if park:
+        return park
+
+    out_dir = build_visual_round_dir(str(doc.get("build_id")), int(rnd["round"]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(out_dir, 0o700)
+    argv = build_visual_browser_argv(spec, contract, preview, role, out_dir, viewports)
+    result = run_cmd(argv, cwd=spec["cwd"], timeout=int(spec["timeout_seconds"]))
+    obs_path = out_dir / f"observation-{role}.json"
+    try:
+        observation = json.loads(obs_path.read_text())
+    except (OSError, ValueError):
+        observation = None
+
+    gaps = build_visual_observation_gaps(observation, contract, preview)
+    captures: list[dict[str, Any]] = []
+    if not gaps:
+        assert isinstance(observation, dict)
+        captures, image_gaps = build_visual_capture_images(
+            observation, contract, out_dir, role, ctx["change_id"]
+        )
+        gaps.extend(image_gaps)
+        if not captures:
+            gaps.append("no readable screenshot survived capture")
+    if not result.get("ok") and not gaps:
+        gaps.append(f"the browser recipe exited {result.get('returncode')}")
+
+    entry = {
+        "role": role,
+        "at": utcnow(),
+        "change_id": ctx["change_id"],
+        "url": preview.get("url"),
+        "scenario": contract.get("scenario"),
+        "viewports": [v["name"] for v in viewports],
+        "recipe": spec.get("name"),
+        "returncode": result.get("returncode"),
+        "compact": compact_cmd_signal(result),
+        "ok": not gaps,
+        "gaps": gaps[:8],
+        "visible": [str(v)[:BUILD_NAME_MAX] for v in ((observation or {}).get("visible") or [])][:16]
+        if isinstance(observation, dict) else [],
+        "accessibility": (observation or {}).get("accessibility") if isinstance(observation, dict) else None,
+        "console": (observation or {}).get("console") if isinstance(observation, dict) else None,
+        "requests": (observation or {}).get("requests") if isinstance(observation, dict) else None,
+    }
+    rnd.setdefault("observations", {})[role] = redact_secrets(entry)
+    if gaps:
+        # Nothing is recorded as a capture. A round that kept an unverifiable
+        # image would carry it to publication with a caveat nobody reads.
+        write_err = write_build(doc, doc.get("build_id"))
+        if write_err:
+            return int(write_err["status"]), write_err
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "round": rnd.get("round"),
+            "role": role,
+            "observation": entry,
+            "error": gaps[0],
+            "code": "not_served_evidence",
+            "budget_left": build_budget_left(doc),
+        }
+    kept = [
+        c
+        for c in build_visual_round_captures(rnd)
+        if not (c.get("role") == role and c.get("viewport") in [v["name"] for v in viewports])
+    ]
+    rnd["captures"] = kept + captures
+    # Wait to reinspect until every failed role has been replaced.
+    if requested_only is not None:
+        rnd["inspection_queue"] = [
+            item for item in (rnd.get("inspection_queue") or [])
+            if not isinstance(item, dict) or item.get("role") != role
+        ]
+        if not rnd["inspection_queue"]:
+            rnd["inspection"] = None
+    else:
+        rnd["inspection"] = None
+    return 200, {
+        "ok": True,
+        "build_id": doc.get("build_id"),
+        "round": rnd.get("round"),
+        "role": role,
+        "url": preview.get("url"),
+        "observation": entry,
+        "captures": [{k: c[k] for k in ("role", "file", "viewport", "width", "height", "digest")} for c in captures],
+        "budget_left": build_budget_left(doc),
+    }
+
+
+def build_visual_scenario_job(job_id: str) -> None:
+    job = read_job(job_id)
+    if not job:
+        return
+    job["status"] = "running"
+    job["started_at"] = utcnow()
+    write_job(job)
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(
+            job["request"], "visual_scenario", {"role": job["role"], "only": job.get("only")}, load_repos()
+        )
+        if refusal:
+            status, payload = refusal
+        else:
+            assert ctx is not None
+            status, payload = build_visual_scenario_result(ctx, job["role"], job.get("only"), load_repos())
+            if payload.get("ok") or payload.get("code") == "not_served_evidence":
+                status, payload = build_visual_commit(
+                    ctx,
+                    {"role": job["role"], "round": payload.get("round"), "ok": payload.get("ok")},
+                    status,
+                    payload,
+                )
+    receipt = {
+        "status": "ok" if payload.get("ok") else "nack",
+        "job_id": job_id,
+        "build_id": job["build_id"],
+        "http_status": status,
+        **{k: payload.get(k) for k in ("ok", "round", "role", "url", "code", "error")},
+    }
+    job = read_job(job_id) or job
+    job["finished_at"] = utcnow()
+    job["receipt"] = receipt
+    job["result"] = payload
+    job["status"] = "completed"
+    hook = deliver_webhook(job, receipt)
+    if hook is not None:
+        job["webhook"] = hook
+    write_job(job)
+    herdr_job_done(job)
+
+
+def build_visual_scenario(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Run the declared scenario against the real served page.
+
+    Synchronous by default and webhook-delivered when asked, on the same terms
+    as buildChecks: the 202 is an acknowledgement of accepted work and says
+    ok=false, because a queue receipt read as a captured round is exactly how a
+    build reaches review with no picture in it.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    role = data.get("role")
+    if role not in BUILD_VISUAL_ROLES:
+        return 400, {
+            "ok": False,
+            "error": "role must be before or candidate",
+            "code": "bad_role",
+            "allowed": list(BUILD_VISUAL_ROLES),
+        }
+    only = data.get("only")
+    if only is not None:
+        if isinstance(only, str):
+            only = [only]
+        if not isinstance(only, list) or not all(isinstance(n, str) and n.strip() for n in only):
+            return 400, {"ok": False, "error": "only must be a list of viewport names", "code": "bad_only"}
+        only = [n.strip()[:BUILD_NAME_MAX] for n in only]
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+
+    if not webhook_url:
+        with BUILD_LOCK:
+            ctx, refusal = build_visual_event(data, "visual_scenario", {"role": role, "only": only}, repos)
+            if refusal:
+                return refusal
+            assert ctx is not None
+            status, payload = build_visual_scenario_result(ctx, role, only, repos)
+            if payload.get("ok") or payload.get("code") == "not_served_evidence":
+                return build_visual_commit(
+                    ctx,
+                    {"role": role, "round": payload.get("round"), "ok": payload.get("ok")},
+                    status,
+                    payload,
+                )
+            return status, payload
+
+    doc, open_err = build_open_visual(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "kind": "build_visual_scenario",
+            "status": "queued",
+            "build_id": doc.get("build_id"),
+            "role": role,
+            "only": only,
+            "request": {k: data.get(k) for k in ("build_id", "event_id", "holder", "worktree")},
+            "cwd": str(doc.get("worktree")),
+            "response_webhook_url": webhook_url,
+            "response_webhook_token": webhook_token,
+            "resume_url": webhook_url,
+            "created_at": utcnow(),
+            "started_at": None,
+            "finished_at": None,
+            "receipt": None,
+            "log_ref": str(job_dir(job_id) / "stdout.log"),
+            "error": None,
+            "webhook": None,
+        }
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        write_job(job)
+    herdr_follow_job(job)
+    threading.Thread(
+        target=build_visual_scenario_job, args=(job_id,), name=f"graphwing-shot-{job_id[:8]}", daemon=True
+    ).start()
+    return 202, {
+        "ok": False,
+        "queued": True,
+        "captured": False,
+        "code": "queued",
+        "error": "queued: this is a receipt for accepting the work, not for a captured round",
+        "job_id": job_id,
+        "kind": "build_visual_scenario",
+        "status": "queued",
+        "build_id": doc.get("build_id"),
+        "role": role,
+        "poll": f"/v1/agent/jobs/{job_id}",
+    }
+
+
+def build_visual_image_reasons(capture: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    """Why this image is not publishable, in the words a recapture needs.
+
+    Everything here is a way an image can pass every mechanical check and still
+    be worthless to the person it is for: a modal over the thing it is meant to
+    show, the wrong route in the address bar, another tenant's data on screen,
+    or the label the ticket promised simply absent.
+    """
+    reasons: list[str] = []
+    if capture.get("obscured") is not False:
+        reasons.append("the target UI is obscured or the capture does not say it is not")
+    route = str(contract.get("route") or "")
+    if str(capture.get("route") or "") != route:
+        reasons.append(f"the image was taken at '{capture.get('route')}', not '{route}'")
+    tenant = str(contract.get("tenant") or "")
+    if str(capture.get("tenant") or "") != tenant:
+        reasons.append(
+            f"the visible tenant or project context is '{capture.get('tenant')}', not '{tenant}'"
+        )
+    text = [str(t).lower() for t in (capture.get("text") or [])]
+    for expected in contract.get("expected") or []:
+        needle = str(expected).lower()
+        if not any(needle in line for line in text):
+            reasons.append(f"the required label or value is not legible in the image: {expected}")
+    viewport = next(
+        (v for v in contract.get("viewports") or [] if v["name"] == capture.get("viewport")), None
+    )
+    if viewport is None:
+        reasons.append("the image claims a viewport the contract never declared")
+    elif int(capture.get("width") or 0) < int(viewport["width"]):
+        reasons.append("the image is narrower than the viewport it claims, so it is not legible at it")
+    return reasons
+
+
+def build_visual_inspect(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Grade every captured image against the contract before anything uploads.
+
+    A failed image names the viewport and role to recapture rather than
+    disqualifying the round: the fix for an obscured screenshot is another
+    screenshot, and the round has already paid for its preview stack.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(data, "visual_inspect", {}, repos)
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        contract = build_visual_contract(doc) or {}
+        rnd = build_visual_open_round(doc, ctx["change_id"])
+        if rnd is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "no round is open for the change on disk"
+            out["code"] = "no_open_round"
+            return 409, out
+        captures = build_visual_round_captures(rnd)
+        if not captures:
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "this round has captured nothing to inspect"
+            out["code"] = "no_captures"
+            return 409, out
+        results: list[dict[str, Any]] = []
+        recapture: list[dict[str, Any]] = []
+        for capture in captures:
+            reasons = build_visual_image_reasons(capture, contract)
+            # Re-read the bytes. The digest recorded at capture is what the
+            # upload will carry, so an image edited or truncated between capture
+            # and inspection must not inherit the earlier verdict.
+            try:
+                root = build_visual_round_dir(str(doc.get("build_id")), int(rnd.get("round") or 0))
+                data_bytes = read_regular_file(root, str(capture.get("file") or ""))
+            except OSError:
+                reasons.append("the image file is no longer readable")
+                data_bytes = b""
+            if data_bytes and hashlib.sha256(data_bytes).hexdigest() != capture.get("digest"):
+                reasons.append("the image on disk no longer matches the digest recorded at capture")
+            capture["verified"] = not reasons
+            capture["reasons"] = reasons[:6]
+            capture["inspected_at"] = utcnow()
+            results.append(
+                {
+                    "role": capture.get("role"),
+                    "file": capture.get("file"),
+                    "viewport": capture.get("viewport"),
+                    "verified": capture["verified"],
+                    "reasons": capture["reasons"],
+                }
+            )
+            if reasons:
+                recapture.append({"role": capture.get("role"), "viewport": capture.get("viewport")})
+        missing = build_visual_missing_roles(rnd)
+        ok = not recapture and not missing
+        inspection = {
+            "at": utcnow(),
+            "change_id": ctx["change_id"],
+            "ok": ok,
+            "results": results,
+            "recapture": [f"{r['role']}/{r['viewport']}" for r in recapture],
+            "missing_roles": missing,
+            "error": None
+            if ok
+            else (
+                f"missing {', '.join(missing)} capture" if missing
+                else f"{len(recapture)} image(s) failed inspection"
+            ),
+        }
+        rnd["inspection"] = inspection
+        rnd["inspection_queue"] = build_visual_recapture_queue(
+            recapture, rnd.get("recapture_attempts")
+        )
+        recapture_by_role = {
+            str(item["role"]): item["only"] for item in rnd["inspection_queue"]
+        }
+        recapture_roles = {
+            role: role in recapture_by_role for role in BUILD_VISUAL_ROLES
+        }
+        status = 200 if ok else 409
+        return build_visual_commit(
+            ctx,
+            {"round": rnd.get("round"), "ok": ok, "recapture": inspection["recapture"]},
+            status,
+            {
+                "ok": ok,
+                "round": rnd.get("round"),
+                "inspection": inspection,
+                "recapture": recapture,
+                "recapture_by_role": recapture_by_role,
+                "recapture_roles": recapture_roles,
+                "error": inspection["error"],
+                "code": None if ok else ("missing_capture" if missing else "image_rejected"),
+            },
+        )
+
+
+def build_visual_review_prompt(doc: dict[str, Any], rnd: dict[str, Any]) -> str:
+    """What the automated UI reviewer is asked, by lens.
+
+    It receives the ticket, the diff for this round, what the browser observed,
+    and the screenshot paths. A reviewer given only the diff grades the code —
+    which the behavior-and-test review already did — and never looks at the
+    thing the round exists to show.
+    """
+    contract = build_visual_contract(doc) or {}
+    worktree = Path(str(doc.get("worktree")))
+    diff = git_diff(worktree, str(doc.get("base_head") or "HEAD"), None)
+    lines = [
+        "Automated UI and accessibility review of one visual evidence round.",
+        "You did not write this change. Answer each lens, then give one verdict.",
+        "",
+        "1. LAYOUT: does the captured UI hold together at every viewport, or is something",
+        "   clipped, overlapping, or off-screen?",
+        "2. ACCESSIBILITY: read the recorded accessibility result. Name any violation that",
+        "   would stop a keyboard or screen-reader user.",
+        "3. CONSOLE AND REQUESTS: read the recorded console and request results. A failed",
+        "   request behind a page that looks fine is still a finding.",
+        "4. PROMISE: does the visible state actually show what the ticket says it would?",
+        "",
+        f"Route: {contract.get('route')}",
+        f"Scenario: {contract.get('scenario')}",
+        f"Preview URL: {github_markdown_url((rnd.get('preview') or {}).get('url'))}",
+        f"Expected visible state: {'; '.join(contract.get('expected') or []) or '(none declared)'}",
+        f"Proof checklist: {'; '.join(contract.get('checklist') or []) or '(none declared)'}",
+        "",
+        "Screenshots (read them; they are the primary evidence):",
+    ]
+    for index, capture in enumerate(build_visual_round_captures(rnd, verified=True), start=1):
+        lines.append(
+            f"  {index}. [{capture.get('role')}/{capture.get('viewport')}] {capture.get('path')}"
+        )
+    lines.extend(
+        [
+            "",
+            "Browser observations:",
+            json.dumps(rnd.get("observations") or {}, indent=2)[:4000],
+            "",
+            "Ticket:",
+            str(doc.get("ticket") or "(none)"),
+            "",
+            "Diff for this round:",
+            str(diff.get("diff") or "")[:8000],
+            "",
+            "End with exactly one line: VERDICT: PASS (acknowledged) or VERDICT: NACK (findings).",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_visual_review_result(
+    ctx: dict[str, Any], reviewer: str, repos: dict[str, str]
+) -> tuple[int, dict[str, Any]]:
+    """Run the independent UI review for this round and record it.
+
+    Silence and disagreement stay apart here for the same reason they do on the
+    mechanical path: a reviewer that lost its connection has not found anything,
+    and writing that down as findings would send the writer to fix a problem
+    nobody reported.
+    """
+    doc = ctx["doc"]
+    rnd = build_visual_open_round(doc, ctx["change_id"])
+    if rnd is None:
+        return 409, {"ok": False, "error": "no round is open for the change on disk", "code": "no_open_round"}
+    inspection = rnd.get("inspection")
+    if not isinstance(inspection, dict) or not inspection.get("ok"):
+        return 409, {
+            "ok": False,
+            "round": rnd.get("round"),
+            "error": "the round's images have not passed inspection, so there is nothing to review",
+            "code": "not_inspected",
+        }
+    gap = build_review_authority_gap(doc, reviewer)
+    if gap:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "error": gap,
+            "code": "reviewer_is_writer" if "own vendor" in gap else "no_review_authority",
+        }
+    park = build_charge(doc, 1)
+    if park:
+        return park
+    prompt = build_visual_review_prompt(doc, rnd)
+    worktree = Path(str(doc.get("worktree")))
+    attempts: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+    for _ in range(BUILD_REVIEW_SILENCE_RETRIES + 1):
+        result = build_review_round_result(reviewer, prompt, worktree)
+        attempts.append({"no_verdict": bool(result.get("no_verdict")), "code": result.get("code")})
+        if not result.get("no_verdict"):
+            break
+    if result.get("no_verdict"):
+        write_err = write_build(doc, doc.get("build_id"))
+        if write_err:
+            return int(write_err["status"]), write_err
+        return 200, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "round": rnd.get("round"),
+            "reviewer": reviewer,
+            "verdict": None,
+            "no_verdict": True,
+            "findings": False,
+            "attempts": len(attempts),
+            "error": f"{reviewer} returned no verdict after {len(attempts)} attempts",
+            "code": "no_verdict",
+            "budget_left": build_budget_left(doc),
+        }
+    entry = {
+        "reviewer": reviewer,
+        "at": utcnow(),
+        "change_id": ctx["change_id"],
+        "verdict": result.get("verdict"),
+        "findings": result.get("verdict") != "PASS",
+        "summary": str(result.get("summary") or "")[:BUILD_REDACT_MAX_STRING],
+        "compact": str(result.get("compact") or "")[:COMPACT_MAX_CHARS],
+        "attempts": len(attempts),
+    }
+    rnd["review"] = entry
+    passed = entry["verdict"] == "PASS"
+    return (200 if passed else 409), {
+        "ok": passed,
+        "recorded": True,
+        "build_id": doc.get("build_id"),
+        "round": rnd.get("round"),
+        "reviewer": reviewer,
+        "verdict": entry["verdict"],
+        "no_verdict": False,
+        "findings": entry["findings"],
+        "summary": entry["summary"],
+        "compact": entry["compact"],
+        "attempts": len(attempts),
+        "budget_left": build_budget_left(doc),
+    }
+
+
+def build_visual_review_job(job_id: str) -> None:
+    job = read_job(job_id)
+    if not job:
+        return
+    job["status"] = "running"
+    job["started_at"] = utcnow()
+    write_job(job)
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(
+            job["request"], "visual_review", {"reviewer": job["reviewer"]}, load_repos()
+        )
+        if refusal:
+            status, payload = refusal
+        else:
+            assert ctx is not None
+            status, payload = build_visual_review_result(ctx, job["reviewer"], load_repos())
+            if payload.get("ok") or payload.get("recorded"):
+                status, payload = build_visual_commit(
+                    ctx,
+                    {"reviewer": job["reviewer"], "round": payload.get("round"),
+                     "verdict": payload.get("verdict")},
+                    status,
+                    payload,
+                )
+    receipt = {
+        "status": "ok" if payload.get("ok") else "nack",
+        "job_id": job_id,
+        "build_id": job["build_id"],
+        "http_status": status,
+        **{k: payload.get(k) for k in ("ok", "round", "verdict", "no_verdict", "findings", "summary", "code", "error")},
+    }
+    job = read_job(job_id) or job
+    job["finished_at"] = utcnow()
+    job["receipt"] = receipt
+    job["result"] = payload
+    job["status"] = "completed"
+    hook = deliver_webhook(job, receipt)
+    if hook is not None:
+        job["webhook"] = hook
+    write_job(job)
+    herdr_job_done(job)
+
+
+def build_visual_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The independent automated UI and accessibility review for one round."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    doc, open_err = build_open_visual(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    route = doc.get("route") or {}
+    reviewer = data.get("reviewer") or route.get("reviewer1")
+    if not isinstance(reviewer, str) or reviewer.strip() not in BUILD_REVIEWER_VENDOR:
+        return 400, {
+            "ok": False,
+            "error": "reviewer must be one of " + ", ".join(sorted(BUILD_REVIEWER_VENDOR)),
+            "code": "bad_reviewer",
+        }
+    reviewer = reviewer.strip()
+    gap = build_review_authority_gap(doc, reviewer)
+    if gap:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "error": gap,
+            "code": "reviewer_is_writer" if "own vendor" in gap else "no_review_authority",
+        }
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+
+    if not webhook_url:
+        with BUILD_LOCK:
+            ctx, refusal = build_visual_event(data, "visual_review", {"reviewer": reviewer}, repos)
+            if refusal:
+                return refusal
+            assert ctx is not None
+            status, payload = build_visual_review_result(ctx, reviewer, repos)
+            if payload.get("ok") or payload.get("recorded"):
+                return build_visual_commit(
+                    ctx,
+                    {"reviewer": reviewer, "round": payload.get("round"), "verdict": payload.get("verdict")},
+                    status,
+                    payload,
+                )
+            return status, payload
+
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "kind": "build_visual_review",
+            "status": "queued",
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "request": {k: data.get(k) for k in ("build_id", "event_id", "holder", "worktree")},
+            "cwd": str(doc.get("worktree")),
+            "response_webhook_url": webhook_url,
+            "response_webhook_token": webhook_token,
+            "resume_url": webhook_url,
+            "created_at": utcnow(),
+            "started_at": None,
+            "finished_at": None,
+            "receipt": None,
+            "log_ref": str(job_dir(job_id) / "stdout.log"),
+            "error": None,
+            "webhook": None,
+        }
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        write_job(job)
+    herdr_follow_job(job)
+    threading.Thread(
+        target=build_visual_review_job, args=(job_id,), name=f"graphwing-vreview-{job_id[:8]}", daemon=True
+    ).start()
+    return 202, {
+        "ok": False,
+        "queued": True,
+        "code": "queued",
+        "error": "queued: this is a receipt for accepting the work, not a review verdict",
+        "job_id": job_id,
+        "kind": "build_visual_review",
+        "status": "queued",
+        "build_id": doc.get("build_id"),
+        "reviewer": reviewer,
+        "poll": f"/v1/agent/jobs/{job_id}",
+    }
+
+
+def artifact_root() -> Path:
+    """Where durable artifact records live.
+
+    Derived from BUILDS_DIR rather than from HOME directly so a service under
+    a relocated home — or a test — keeps its artifacts beside its builds.
+    """
+    return BUILDS_DIR.parent / "artifacts"
+
+
+def artifact_dir(artifact_id: str) -> Path:
+    return artifact_root() / artifact_id
+
+
+def artifact_lock(artifact_id: str) -> threading.Lock:
+    with BUILD_ARTIFACT_LOCKS_GUARD:
+        return BUILD_ARTIFACT_LOCKS.setdefault(artifact_id, threading.Lock())
+
+
+def read_regular_file(root: Path, name: str) -> bytes:
+    """Read one direct child without following a symlink or escaping root."""
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise OSError("invalid file name")
+    resolved_root = root.resolve(strict=True)
+    candidate = root / name
+    if candidate.parent.resolve(strict=True) != resolved_root:
+        raise OSError("file escapes output directory")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(str(resolved_root), os.O_RDONLY)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("file is not regular")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                return stream.read(BUILD_IMAGE_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def artifact_read(artifact_id: str) -> dict[str, Any] | None:
+    if not BUILD_ARTIFACT_ID_RE.fullmatch(artifact_id or ""):
+        return None
+    try:
+        data = json.loads((artifact_dir(artifact_id) / "meta.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def artifact_write(meta: dict[str, Any]) -> dict[str, Any] | None:
+    path = artifact_dir(str(meta["artifact_id"]))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(artifact_root(), 0o700)
+        os.chmod(path, 0o700)
+        tmp = path / "meta.json.tmp"
+        tmp.write_text(json.dumps(meta, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path / "meta.json")
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"could not persist artifact record: {exc}",
+            "code": "artifact_write_failed",
+            "status": 500,
+        }
+    return None
+
+
+def artifact_store(capture: dict[str, Any], doc: dict[str, Any], rnd: dict[str, Any], number: int
+                   ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Copy one verified image into a durable artifact record.
+
+    Durable is the point. The grant that lets Rewst fetch these bytes expires
+    in minutes; the record does not, because the GitHub comment it produces
+    will outlive every one of them and the digest here is the only way to
+    answer "is that image still the image this round captured".
+    """
+    round_dir = build_visual_round_dir(str(doc.get("build_id")), int(rnd.get("round") or 0))
+    try:
+        data = read_regular_file(round_dir, str(capture.get("file") or ""))
+    except OSError as exc:
+        return None, {"ok": False, "error": f"image is unreadable: {exc}", "code": "artifact_unreadable"}
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != capture.get("digest"):
+        return None, {
+            "ok": False,
+            "error": f"image '{capture.get('file')}' no longer matches its capture digest",
+            "code": "artifact_digest_mismatch",
+        }
+    artifact_id = hashlib.sha256(
+        f"{doc.get('build_id')}\0{rnd.get('round')}\0{capture.get('role')}\0{capture.get('viewport')}\0{digest}".encode()
+    ).hexdigest()[:32]
+    path = artifact_dir(artifact_id)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(artifact_root(), 0o700)
+        os.chmod(path, 0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path / "image.png"), flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("artifact target is not regular")
+            with os.fdopen(fd, "wb", closefd=False) as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return None, {"ok": False, "error": f"could not store artifact: {exc}", "code": "artifact_write_failed"}
+    meta = {
+        "artifact_id": artifact_id,
+        "build_id": doc.get("build_id"),
+        "round": rnd.get("round"),
+        "number": number,
+        "role": capture.get("role"),
+        "viewport": capture.get("viewport"),
+        "label": capture.get("label"),
+        "media_type": "image/png",
+        "bytes": len(data),
+        "digest": digest,
+        "width": capture.get("width"),
+        "height": capture.get("height"),
+        "change_id": capture.get("change_id"),
+        "created_at": utcnow(),
+        # Never the token itself. A grant is a hash plus an expiry, so a copy of
+        # this file is not a copy of the capability.
+        "grant": None,
+    }
+    err = artifact_write(meta)
+    if err:
+        return None, err
+    return meta, None
+
+
+def artifact_mint_grant(meta: dict[str, Any], ttl: int) -> tuple[str, dict[str, Any]]:
+    """One short-lived, single-use fetch capability for one artifact."""
+    token = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    grant = {
+        "digest": hashlib.sha256(token.encode()).hexdigest(),
+        "expires_epoch": time.time() + ttl,
+        "expires_at": datetime.fromtimestamp(time.time() + ttl, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "consumed_at": None,
+        "minted_at": utcnow(),
+    }
+    BUILD_ARTIFACT_GRANT_TOKENS[(str(meta.get("artifact_id")), grant["digest"])] = token
+    return token, grant
+
+
+def artifact_outstanding_grants(artifact_ids: list[Any]) -> list[dict[str, Any]]:
+    return artifact_grant_replay_state(artifact_ids)[0]
+
+
+def artifact_grant_replay_state(
+    artifact_ids: list[Any],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return every still-live grant, or one stable reason no replay is possible."""
+    base = public_base_url() or f"http://{LISTEN_HOST}:{LISTEN_PORT}"
+    out: list[dict[str, Any]] = []
+    states: set[str] = set()
+    for raw_id in artifact_ids:
+        artifact_id = str(raw_id)
+        meta = artifact_read(artifact_id)
+        if not isinstance(meta, dict):
+            states.add("grant_missing")
+            continue
+        grant = meta.get("grant")
+        if not isinstance(grant, dict) or not grant.get("digest"):
+            states.add("grant_missing")
+            continue
+        if grant.get("consumed_at"):
+            states.add("grant_spent")
+            continue
+        try:
+            if float(grant.get("expires_epoch") or 0) <= time.time():
+                states.add("grant_expired")
+                continue
+        except (TypeError, ValueError):
+            states.add("grant_missing")
+            continue
+        token = BUILD_ARTIFACT_GRANT_TOKENS.get((artifact_id, str(grant.get("digest") or "")))
+        if not token:
+            states.add("grant_missing")
+            continue
+        out.append({
+            "artifact_id": artifact_id,
+            "number": meta.get("number"),
+            "role": meta.get("role"),
+            "viewport": meta.get("viewport"),
+            "media_type": meta.get("media_type"),
+            "digest": meta.get("digest"),
+            "fetch_url": f"{base}/v1/artifact/{artifact_id}",
+            "fetch_header": BUILD_ARTIFACT_TOKEN_HEADER,
+            "fetch_token": token,
+            "expires_at": grant.get("expires_at"),
+        })
+    if states:
+        for code in ("grant_spent", "grant_expired", "grant_missing"):
+            if code in states:
+                return [], code
+    if len(out) != len(artifact_ids) or not artifact_ids:
+        return [], "grant_missing"
+    return out, None
+
+
+def artifact_fetch(artifact_id: str, headers: Any) -> tuple[int, dict[str, Any] | bytes, str]:
+    """Serve artifact bytes once, to the holder of an unexpired grant.
+
+    Three separate refusals, all fail-closed: no grant, an expired grant, and a
+    grant that has already been spent. The token is compared by digest with a
+    constant-time check — the plaintext exists exactly once, in the handoff
+    response, and is never written down on this side.
+    """
+    with artifact_lock(artifact_id):
+        meta = artifact_read(artifact_id)
+        if meta is None:
+            return json_out(404, {"ok": False, "error": "unknown artifact", "code": "unknown_artifact"})
+        presented = _request_header(headers, BUILD_ARTIFACT_TOKEN_HEADER)
+        grant = meta.get("grant")
+        if not isinstance(grant, dict) or not grant.get("digest"):
+            return json_out(403, {"ok": False, "error": "no upload grant is outstanding for this artifact",
+                                  "code": "no_grant"})
+        if not presented or not hmac.compare_digest(
+            hashlib.sha256(presented.encode()).hexdigest(), str(grant.get("digest"))
+        ):
+            return json_out(403, {"ok": False, "error": "invalid artifact token", "code": "bad_artifact_token"})
+        if grant.get("consumed_at"):
+            return json_out(410, {"ok": False, "error": "this upload grant has already been used",
+                                  "code": "grant_consumed"})
+        try:
+            expires = float(grant.get("expires_epoch") or 0)
+        except (TypeError, ValueError):
+            expires = 0.0
+        if expires <= time.time():
+            return json_out(410, {"ok": False, "error": "this upload grant has expired",
+                                  "code": "grant_expired"})
+        try:
+            data = read_regular_file(artifact_dir(artifact_id), "image.png")
+        except OSError:
+            return json_out(410, {"ok": False, "error": "artifact bytes are no longer readable",
+                                  "code": "artifact_gone"})
+        grant["consumed_at"] = utcnow()
+        err = artifact_write(meta)
+        if err:
+            return json_out(int(err["status"]), err)
+        BUILD_ARTIFACT_GRANT_TOKENS.pop((artifact_id, str(grant.get("digest"))), None)
+        return 200, data, str(meta.get("media_type") or "image/png")
+
+
+def build_visual_handoff_gap(rnd: dict[str, Any]) -> str | None:
+    inspection = rnd.get("inspection")
+    if not isinstance(inspection, dict) or not inspection.get("ok"):
+        return "not_inspected"
+    review = rnd.get("review")
+    if not isinstance(review, dict) or review.get("no_verdict") or review.get("verdict") != "PASS":
+        return "review_not_passed"
+    return None
+
+
+def build_visual_handoff(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Hand the round's verified images to Rewst under short-lived grants.
+
+    This is the whole reason the laptop never holds a tracker credential. The
+    bytes stay here in a durable record; what crosses is a fetch capability that
+    expires in minutes and is spent on first use. Rewst pulls each image with
+    its own integration and uploads it under its own GitHub auth.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    ttl, ttl_err = parse_optional_int(data, "ttl_seconds", 60, BUILD_ARTIFACT_TTL_MAX)
+    if ttl_err:
+        return 400, ttl_err
+    ttl = ttl or BUILD_ARTIFACT_TTL_SECONDS
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(data, "visual_handoff", {"ttl_seconds": ttl}, repos)
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        rnd = build_visual_open_round(doc, ctx["change_id"])
+        if rnd is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "no round is open for the change on disk"
+            out["code"] = "no_open_round"
+            return 409, out
+        handoff_gap = build_visual_handoff_gap(rnd)
+        if handoff_gap:
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "only a clean inspection and explicit PASS review may be handed off"
+            out["code"] = handoff_gap
+            return 409, out
+        existing = rnd.get("handoff")
+        if isinstance(existing, dict):
+            ids = [str(item.get("artifact_id")) for item in existing.get("artifacts") or []]
+            outstanding, grant_code = artifact_grant_replay_state(ids)
+            if grant_code:
+                out = build_public(doc)
+                out.update({
+                    "ok": False,
+                    "round": rnd.get("round"),
+                    "code": grant_code,
+                    "error": "this round's issued upload grant is no longer outstanding; open a new visual round",
+                })
+                return 409, out
+            if outstanding:
+                status, payload = build_visual_commit(
+                    ctx,
+                    {"round": rnd.get("round"), "artifacts": ids, "reused_grants": True},
+                    200,
+                    {"ok": True, "round": rnd.get("round"), "handoff": existing},
+                )
+                if status == 200:
+                    payload["grants"] = outstanding
+                return status, payload
+        inspection = rnd.get("inspection")
+        if not isinstance(inspection, dict) or not inspection.get("ok"):
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "only images that passed inspection may be handed off"
+            out["code"] = "not_inspected"
+            return 409, out
+        captures = build_visual_round_captures(rnd, verified=True)
+        if not captures:
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "this round has no verified image to hand off"
+            out["code"] = "no_captures"
+            return 409, out
+        issue, issue_gap = build_issue_target(doc)
+        if issue is None:
+            out = build_public(doc)
+            out.update({"ok": False, "code": "no_issue_target", "error": str(issue_gap)})
+            return 409, out
+        base = public_base_url() or f"http://{LISTEN_HOST}:{LISTEN_PORT}"
+        # Numbered here, once, in a stable order. The comment, the artifact
+        # records and the planning prompt all refer to "image 3" and have to
+        # mean the same picture.
+        ordered = sorted(captures, key=lambda c: (str(c.get("role")), str(c.get("viewport"))))
+        grants: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        for number, capture in enumerate(ordered, start=1):
+            meta, store_err = artifact_store(capture, doc, rnd, number)
+            if store_err:
+                out = build_public(doc)
+                out.update(store_err)
+                out["ok"] = False
+                return 409, out
+            assert meta is not None
+            token, grant = artifact_mint_grant(meta, ttl)
+            meta["grant"] = grant
+            write_err = artifact_write(meta)
+            if write_err:
+                return int(write_err["status"]), write_err
+            capture["artifact_id"] = meta["artifact_id"]
+            capture["number"] = number
+            records.append(
+                {k: meta[k] for k in ("artifact_id", "number", "role", "viewport", "label",
+                                      "digest", "bytes", "width", "height", "media_type")}
+            )
+            grants.append(
+                {
+                    "artifact_id": meta["artifact_id"],
+                    "number": number,
+                    "role": meta["role"],
+                    "viewport": meta["viewport"],
+                    "media_type": meta["media_type"],
+                    "digest": meta["digest"],
+                    "fetch_url": f"{base}/v1/artifact/{meta['artifact_id']}",
+                    "fetch_header": BUILD_ARTIFACT_TOKEN_HEADER,
+                    # The only time this value exists outside the caller's hands.
+                    # Nothing on this side stores it; the record keeps its digest.
+                    "fetch_token": token,
+                    "expires_at": grant["expires_at"],
+                }
+            )
+        handoff = {
+            "at": utcnow(),
+            "change_id": ctx["change_id"],
+            "ttl_seconds": ttl,
+            "expires_at": grants[0]["expires_at"],
+            "artifacts": records,
+        }
+        rnd["handoff"] = handoff
+        status, payload = build_visual_commit(
+            ctx,
+            {"round": rnd.get("round"), "artifacts": [r["artifact_id"] for r in records]},
+            200,
+            {"ok": True, "round": rnd.get("round"), "handoff": handoff, "issue": issue},
+        )
+        # Attached after the state write, deliberately: the tokens are the one
+        # part of this response that must never reach disk.
+        if status == 200:
+            payload["grants"] = grants
+        return status, payload
+
+
+def github_markdown_text(value: Any) -> str:
+    """One untrusted value rendered as inert single-line GitHub markdown."""
+    text = str(value or "").replace("\r", " ").replace("\n", "<br>").replace("@", "@\u200b")
+    return re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", text)[:BUILD_REDACT_MAX_STRING]
+
+
+def github_markdown_url(value: Any) -> str:
+    """Render an accepted durable or preview URL as one inert GitHub autolink."""
+    raw = str(value or "")
+    if not (durable_github_url(raw) or loopback_http_url(raw)):
+        return github_markdown_text("[invalid URL]")
+    parsed = urlsplit(raw)
+    encoded = urlunsplit((
+        parsed.scheme,
+        quote(parsed.netloc, safe="[]:."),
+        quote(parsed.path, safe="/%:-._~"),
+        quote(parsed.query, safe="=&%/:?-._~"),
+        quote(parsed.fragment, safe="%/:?-._~"),
+    ))
+    return f"<{encoded}>"
+
+
+def durable_github_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value or reject_secret_text(value, "upload.url"):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    github_host = (
+        r"(?:github\.com|"
+        r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+githubusercontent\.com)"
+    )
+    return (
+        parsed.scheme == "https"
+        and strict_url_authority(parsed, github_host, {None, 443})
+        and not parsed.query
+        and not parsed.fragment
+        and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    )
+
+
+def durable_upload_ref(value: Any) -> bool:
+    """Accept an opaque upload id, but validate anything shaped like a URL."""
+    if not isinstance(value, str) or not value or reject_secret_text(value, "upload.ref"):
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return False
+    url_shaped = re.match(r"(?i)^(?:https?(?::|%3a)|//|\\\\)", value) is not None
+    return not url_shaped or durable_github_url(value)
+
+
+def github_comment_url_gap(value: Any, issue: dict[str, Any]) -> str | None:
+    if not isinstance(value, str):
+        return "comment_url is required"
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return "comment_url does not belong to this issue"
+    expected_path = (
+        f"/{issue.get('owner')}/{issue.get('repo')}/issues/{int(issue.get('number') or 0)}"
+    )
+    valid = (
+        parsed.scheme == "https"
+        and strict_url_authority(parsed, r"github\.com", {None, 443})
+        and parsed.path == expected_path
+        and not parsed.params
+        and not parsed.query
+        and re.fullmatch(r"issuecomment-[0-9]+", parsed.fragment or "") is not None
+        and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    )
+    return None if valid else "comment_url does not belong to this issue"
+
+
+def build_issue_target(doc: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """The GitHub issue this build's evidence belongs to, or why there is none.
+
+    The story is the issue URL. Parsed rather than passed in so a caller cannot
+    aim a round's evidence at somebody else's issue, and named as owner, repo
+    and number so Rewst's GitHub integration has the three fields it needs
+    without this side ever holding a token.
+    """
+    story = str(doc.get("story") or "")
+    match = BUILD_ISSUE_RE.fullmatch(story.strip())
+    if match is None:
+        return None, (
+            f"story '{story}' is not a GitHub issue URL; the evidence comment has nowhere to go"
+        )
+    return {
+        "owner": match.group(1),
+        "repo": match.group(2),
+        "number": int(match.group(3)),
+        "url": story.strip(),
+    }, None
+
+
+def build_evidence_comment(doc: dict[str, Any], rnd: dict[str, Any], uploads: list[dict[str, Any]]) -> str:
+    """The exact comment body Rewst posts on the GitHub issue.
+
+    Composed here so every round says the same things in the same order: which
+    round this is and what it replaces, where the picture was taken, what the
+    scenario did, what is visibly true, what the automated checks found, and
+    whether a person is looking at it. A body assembled in the graph drifts one
+    convenient interpolation at a time until the numbered images no longer match
+    the numbered claims.
+    """
+    contract = build_visual_contract(doc) or {}
+    preview = rnd.get("preview") or {}
+    review = rnd.get("review") or {}
+    observations = rnd.get("observations") or {}
+    safe = github_markdown_text
+    lines = [
+        f"### Visual evidence — round {rnd.get('round')}",
+        "",
+        f"- **Build**: `{safe(doc.get('build_id'))}` on `{safe(doc.get('branch'))}` at `{safe(rnd.get('head'))}`",
+        f"- **Route**: `{safe(contract.get('route'))}`",
+        f"- **Scenario**: {safe(contract.get('scenario'))}",
+        f"- **Preview**: `{safe(preview.get('preview_id'))}` at {github_markdown_url(preview.get('url'))}",
+        f"- **Tenant / project shown**: {safe(contract.get('tenant'))}",
+        f"- **Supersedes**: "
+        + (f"round {rnd.get('supersedes')} (kept above, not deleted)" if rnd.get("supersedes") else "nothing; this is the first round"),
+        f"- **Human visual review**: {'requested' if rnd.get('human_review') else 'not requested'}",
+        "",
+        "**Images**",
+    ]
+    for upload in uploads:
+        durable = (
+            github_markdown_url(upload.get("url"))
+            if upload.get("url")
+            else safe(upload.get("ref"))
+        )
+        lines.append(
+            f"{upload['number']}. [{safe(upload['role'])} / {safe(upload['viewport'])}] {safe(upload.get('label'))} "
+            f"— `{upload['artifact_id']}` {durable}".rstrip()
+        )
+    lines += ["", "**Visible proof**"]
+    for item in contract.get("expected") or []:
+        lines.append(f"- {safe(item)}")
+    seen: list[str] = []
+    for role in ("before", "candidate"):
+        entry = observations.get(role)
+        if isinstance(entry, dict):
+            seen.extend(str(v) for v in (entry.get("visible") or []))
+    if seen:
+        lines += ["", "**Observed on the served page**"] + [f"- {safe(item)}" for item in seen[:12]]
+    candidate = observations.get("candidate") or {}
+    lines += [
+        "",
+        "**Automated checks**",
+        f"- accessibility: {safe(json.dumps(candidate.get('accessibility')))}",
+        f"- console: {safe(json.dumps(candidate.get('console')))}",
+        f"- requests: {safe(json.dumps(candidate.get('requests')))}",
+        f"- UI review ({safe(review.get('reviewer'))}): "
+        + (
+            f"findings — {safe(review.get('summary'))}"
+            if review.get("findings")
+            else f"acknowledged — {safe(review.get('summary'))}"
+        ),
+        "",
+        "**Review status**: "
+        + (
+            "awaiting human visual review in the planning session"
+            if rnd.get("human_review")
+            else "automated only; the plan did not request human visual review"
+        ),
+        "",
+        "_Pre-commit: nothing has been committed or pushed for this round. The preview stack stays up._",
+    ]
+    return "\n".join(lines)
+
+
+def build_evidence_publish(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Record the uploaded images and compose the round's evidence comment.
+
+    Every round publishes, whether or not a human was asked to look. The
+    comment is the durable record on the issue; the planning prompt is a
+    convenience for the person who happens to be at the seat right now.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if "comment_url" in data:
+        return 400, {
+            "ok": False,
+            "error": "comment_url is recorded only by buildVisualPublishResult after GitHub posts",
+            "code": "comment_not_posted",
+        }
+    raw_uploads = data.get("uploads")
+    if not isinstance(raw_uploads, list) or not raw_uploads:
+        return 400, {
+            "ok": False,
+            "error": "uploads must list one {artifact_id, ref|url} per handed-off image",
+            "code": "bad_uploads",
+        }
+    if len(raw_uploads) > BUILD_VISUAL_IMAGES_MAX:
+        return 400, {"ok": False, "error": "too many uploads", "code": "bad_uploads"}
+    parsed: dict[str, dict[str, Any]] = {}
+    for item in raw_uploads:
+        if not isinstance(item, dict):
+            return 400, {"ok": False, "error": "each upload must be an object", "code": "bad_uploads"}
+        artifact_id = item.get("artifact_id")
+        if not isinstance(artifact_id, str) or not BUILD_ARTIFACT_ID_RE.fullmatch(artifact_id):
+            return 400, {"ok": False, "error": "upload.artifact_id is required", "code": "bad_uploads"}
+        ref = item.get("ref")
+        url = item.get("url")
+        if not any(isinstance(v, str) and v.strip() for v in (ref, url)):
+            # A durable link or a durable file id. Without one the comment
+            # would name a picture nobody outside this laptop can open.
+            return 400, {
+                "ok": False,
+                "error": "each upload needs the durable ref or url the tracker gave it back",
+                "code": "bad_uploads",
+            }
+        if isinstance(url, str) and not durable_github_url(url):
+            return 400, {
+                "ok": False,
+                "error": "upload.url must be an HTTPS GitHub durable URL without credentials or query data",
+                "code": "bad_upload_url",
+            }
+        if isinstance(ref, str) and not durable_upload_ref(ref):
+            return 400, {"ok": False, "error": "upload.ref is unsafe", "code": "bad_uploads"}
+        parsed[artifact_id] = {
+            "artifact_id": artifact_id,
+            "ref": str(ref).strip()[:BUILD_NAME_MAX] if isinstance(ref, str) else None,
+            "url": str(url).strip()[:BUILD_NAME_MAX] if isinstance(url, str) else None,
+        }
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(
+            data, "visual_publish", {"uploads": sorted(parsed)}, repos
+        )
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        rnd = build_visual_open_round(doc, ctx["change_id"])
+        if rnd is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "no round is open for the change on disk"
+            out["code"] = "no_open_round"
+            return 409, out
+        handoff = rnd.get("handoff")
+        if not isinstance(handoff, dict):
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "this round has not handed off its images"
+            out["code"] = "no_handoff"
+            return 409, out
+        if not isinstance(rnd.get("review"), dict):
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "the automated UI review has not run for this round"
+            out["code"] = "no_ui_review"
+            return 409, out
+        if (rnd.get("review") or {}).get("verdict") != "PASS":
+            out = build_public(doc)
+            out.update({"ok": False, "round": rnd.get("round"), "code": "review_not_passed",
+                        "error": "NACK or no-verdict review cannot be published"})
+            return 409, out
+        issue, issue_gap = build_issue_target(doc)
+        if issue is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = str(issue_gap)
+            out["code"] = "no_issue_target"
+            return 409, out
+        records = [r for r in (handoff.get("artifacts") or []) if isinstance(r, dict)]
+        expected = {str(r["artifact_id"]) for r in records}
+        missing = sorted(expected - set(parsed))
+        stray = sorted(set(parsed) - expected)
+        if missing or stray:
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = (
+                f"uploads do not cover this round's handoff; missing {missing}, unknown {stray}"
+            )
+            out["code"] = "upload_mismatch"
+            return 409, out
+        uploads = [
+            {
+                "number": record["number"],
+                "artifact_id": record["artifact_id"],
+                "role": record["role"],
+                "viewport": record["viewport"],
+                "label": record.get("label"),
+                "digest": record["digest"],
+                **parsed[str(record["artifact_id"])],
+            }
+            for record in sorted(records, key=lambda r: int(r.get("number") or 0))
+        ]
+        comment = build_evidence_comment(doc, rnd, uploads)
+        published = {
+            "prepared_at": utcnow(),
+            "issue": issue,
+            "uploads": uploads,
+            "comment": comment,
+            "comment_url": None,
+            "round": rnd.get("round"),
+            "supersedes": rnd.get("supersedes"),
+            "publish_id": hashlib.sha256(
+                f"{doc.get('build_id')}\0{rnd.get('round')}\0{ctx['change_id']}".encode()
+            ).hexdigest()[:24],
+        }
+        rnd["published"] = published
+        return build_visual_commit(
+            ctx,
+            {"round": rnd.get("round"), "issue": issue["url"], "publish_id": published["publish_id"]},
+            200,
+            {
+                "ok": True,
+                "prepared": True,
+                "round": rnd.get("round"),
+                "supersedes": rnd.get("supersedes"),
+                "issue": issue,
+                "uploads": uploads,
+                "comment": comment,
+                "publish_id": published["publish_id"],
+                "human_review": bool(rnd.get("human_review")),
+                "pre_commit": not doc.get("pr_ready"),
+            },
+        )
+
+
+def build_evidence_publish_result(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Authoritatively record the GitHub comment result after Rewst posts it."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    comment_url = data.get("comment_url")
+    artifact_ids = data.get("artifact_ids")
+    if not isinstance(artifact_ids, list) or not all(
+        isinstance(value, str) and BUILD_ARTIFACT_ID_RE.fullmatch(value) for value in artifact_ids
+    ):
+        return 400, {"ok": False, "code": "bad_artifact_ids", "error": "artifact_ids are required"}
+    extra = {"comment_url": comment_url, "artifact_ids": sorted(artifact_ids)}
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(data, "visual_publish_result", extra, repos)
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        rnd = build_visual_open_round(doc, ctx["change_id"])
+        if rnd is None:
+            return 409, {"ok": False, "code": "no_open_round", "error": "no round awaits a comment result"}
+        prepared = rnd.get("published")
+        if not isinstance(prepared, dict) or not prepared.get("comment"):
+            return 409, {"ok": False, "code": "not_prepared", "error": "publish payload was not prepared"}
+        issue = prepared.get("issue") or {}
+        gap = github_comment_url_gap(comment_url, issue)
+        if gap:
+            return 400, {"ok": False, "code": "bad_comment_url", "error": gap}
+        expected = {str(item.get("artifact_id")) for item in prepared.get("uploads") or []}
+        if set(artifact_ids) != expected:
+            return 409, {"ok": False, "code": "artifact_result_mismatch",
+                         "error": "comment result artifact IDs do not match the prepared round"}
+        prepared["comment_url"] = str(comment_url)
+        prepared["commented_at"] = utcnow()
+        rnd["status"] = "published"
+        gate = None
+        if not rnd.get("human_review"):
+            record = build_gate_transition(
+                doc, "evidence_captured", ctx["change_id"], "buildEvidencePublishResult",
+                f"round {rnd.get('round')} comment recorded without human visual review",
+            )
+            gate = record["to"] if record else None
+        return build_visual_commit(
+            ctx,
+            {"round": rnd.get("round"), "comment_url": comment_url,
+             "artifact_ids": sorted(artifact_ids), "gate": gate},
+            200,
+            {"ok": True, "round": rnd.get("round"), "comment_url": comment_url,
+             "artifact_ids": sorted(artifact_ids), "gate": gate,
+             "human_review": bool(rnd.get("human_review")), "pre_commit": not doc.get("pr_ready")},
+        )
+
+
+def build_visual_planning_prompt(doc: dict[str, Any], rnd: dict[str, Any]) -> str:
+    """The exact text the planning agent is handed, saved verbatim on the round.
+
+    Saved because it is the thing a person answered. A prompt reconstructed
+    later from state would drift from what was actually on screen, and the
+    feedback turn that follows would be answering a question nobody asked.
+    """
+    contract = build_visual_contract(doc) or {}
+    preview = rnd.get("preview") or {}
+    published = rnd.get("published") or {}
+    review = rnd.get("review") or {}
+    safe = github_markdown_text
+    lines = [
+        f"Visual review — round {rnd.get('round')} of build {safe(doc.get('build_id'))}.",
+        "",
+        f"Open: {github_markdown_url(preview.get('url'))}",
+        f"Route: {safe(contract.get('route'))}   Scenario: {safe(contract.get('scenario'))}",
+        f"Tenant / project shown: {safe(contract.get('tenant'))}",
+        "",
+        "How to view it:",
+    ]
+    lines += [f"  - {safe(step)}" for step in (contract.get("setup") or [])]
+    lines += [f"  - {safe(step)}" for step in (contract.get("navigation") or [])]
+    lines += ["", "Proof checklist:"] + [f"  [ ] {safe(item)}" for item in (contract.get("checklist") or [])]
+    lines += ["", "Screenshots:"]
+    for upload in published.get("uploads") or []:
+        durable = (
+            github_markdown_url(upload.get("url"))
+            if upload.get("url")
+            else safe(upload.get("ref"))
+        )
+        lines.append(
+            f"  {upload.get('number')}. [{safe(upload.get('role'))}/{safe(upload.get('viewport'))}] "
+            f"{durable}"
+        )
+    lines += [
+        "",
+        f"Automated UI review ({review.get('reviewer')}): "
+        + ("findings" if review.get("findings") else "acknowledged")
+        + f" — {safe(review.get('summary'))}",
+        f"Evidence comment: {github_markdown_url(published.get('comment_url'))}",
+        "",
+        "Nothing is committed and the preview stack stays up.",
+        "Reply with one of: approve, change <what to change>, split, park.",
+    ]
+    return "\n".join(lines)
+
+
+def build_visual_prompt(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Prompt the saved planning agent, pre-commit, with the preview still up.
+
+    Refuses when the contract did not ask for human review: sending the prompt
+    anyway would put a question in front of a person that the plan already
+    answered, and their reply would have nowhere to go.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    with BUILD_LOCK:
+        ctx, refusal = build_visual_event(data, "visual_prompt", {}, repos)
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        contract = build_visual_contract(doc) or {}
+        rnd = build_visual_round_current(doc)
+        if not isinstance(rnd, dict) or rnd.get("change_id") != ctx["change_id"] or rnd.get("status") != "published":
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "the round for the change on disk has not published its evidence yet"
+            out["code"] = "not_published"
+            return 409, out
+        if not rnd.get("human_review"):
+            out = build_public(doc)
+            out["ok"] = False
+            out["round"] = rnd.get("round")
+            out["error"] = "this build's contract did not request human visual review"
+            out["code"] = "human_review_disabled"
+            return 409, out
+        if doc.get("pr_ready"):
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "human visual review happens before any commit; this build is past it"
+            out["code"] = "not_pre_commit"
+            return 409, out
+        pane = str(contract.get("planning_pane") or "")
+        if not pane:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "the contract names no planning pane to prompt"
+            out["code"] = "missing_planning_pane"
+            return 409, out
+        prompt = build_visual_planning_prompt(doc, rnd)
+        preview = rnd.get("preview") or {}
+        # Checked, never touched. The whole point of the round staying open is
+        # that the person can open the URL themselves; a teardown here would
+        # leave them reading about a page that no longer exists.
+        status = stack_status(str(preview.get("stack") or ""))
+        probe = probe_loopback(
+            str(preview.get("url") or ""),
+            allow_login=bool(contract.get("allow_login_redirect")),
+        )
+        if not status.get("healthy") or not probe.get("ok"):
+            out = build_public(doc)
+            out.update({"ok": False, "code": "preview_unhealthy",
+                        "error": "the saved preview is not healthy for human review"})
+            return 409, out
+        if not herdr_enabled() or not herdr_exact_pane(pane):
+            out = build_public(doc)
+            out.update({"ok": False, "code": "planning_pane_missing",
+                        "error": "the exact saved planning pane is not live"})
+            return 409, out
+        sent = herdr_send(pane, prompt)
+        delivered = bool(sent.get("ok"))
+        if not delivered:
+            out = build_public(doc)
+            out.update({"ok": False, "code": "planning_send_failed",
+                        "error": str(sent.get("error") or "Herdr send failed")})
+            return 409, out
+        rnd["planning_prompt"] = prompt
+        rnd["prompted_at"] = utcnow()
+        rnd["prompted_pane"] = pane
+        rnd["prompt_delivered"] = delivered
+        return build_visual_commit(
+            ctx,
+            {"round": rnd.get("round"), "pane": pane, "delivered": delivered},
+            200,
+            {
+                "ok": True,
+                "round": rnd.get("round"),
+                "pane": pane,
+                "delivered": delivered,
+                "prompt": prompt,
+                "url": preview.get("url"),
+                "actions": ["approve", "change", "split", "park"],
+                "pre_commit": not doc.get("pr_ready"),
+                "preview_running": bool(status.get("healthy")),
+                "preview": {k: preview.get(k) for k in ("preview_id", "stack", "url")},
+            },
+        )
+
+
 def json_out(status: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
     return status, payload, "application/json"
 
@@ -11210,6 +14254,10 @@ def dispatch_inner(
         return json_out(200, {"ok": True, "service": "graphwing", "repos": sorted(repos)})
     if method == "GET" and path in ("/openapi.json", "/v1/openapi.json"):
         return 200, openapi_bytes(), "application/json"
+    if method == "GET" and path.startswith("/v1/artifact/"):
+        # The one-time artifact grant is the authorization for this route.
+        # Rewst's GitHub integration does not receive the catalog-wide API key.
+        return artifact_fetch(path.removeprefix("/v1/artifact/").strip("/"), headers)
 
     if not authed:
         return json_out(401, {"error": "invalid or missing X-Graphwing-Key", "code": "unauthorized"})
@@ -11329,6 +14377,36 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "GET" and path == "/v1/supervisor/report":
         status, payload = supervisor_report_op(qs)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/build/visual/next":
+        status, payload = build_visual_next(qs, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/preflight":
+        status, payload = build_visual_preflight(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/preview":
+        status, payload = build_visual_preview(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/scenario":
+        status, payload = build_visual_scenario(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/inspect":
+        status, payload = build_visual_inspect(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/review":
+        status, payload = build_visual_review(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/handoff":
+        status, payload = build_visual_handoff(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/publish":
+        status, payload = build_evidence_publish(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/publish-result":
+        status, payload = build_evidence_publish_result(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/visual/prompt":
+        status, payload = build_visual_prompt(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":
