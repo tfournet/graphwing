@@ -477,7 +477,7 @@
       "post": {
         "operationId": "reviewRun",
         "tags": ["review"],
-        "summary": "Opposing-vendor spec-review of git diff HEAD. Plan-mode Claude for sonnet/opus; Hermes for sol. Does not commit.",
+        "summary": "Opposing-vendor review of git diff HEAD through an explicit direct Codex, Claude, or Grok launcher. Does not commit.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunRequest" } } }
@@ -1130,6 +1130,11 @@
           "test": { "type": "string" },
           "commit_message": { "type": "string" },
           "iters_left": { "type": "string" },
+          "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
+          "size": { "type": "string", "enum": ["S", "M", "L"] },
+          "ac_count": { "type": ["integer", "string"] },
+          "seams": { "type": ["integer", "string"] },
           "kick_url": { "type": "string", "format": "uri", "description": "https Rewst webhook to start the next slice. Omitted: return frontier only." },
           "kick_token": { "type": "string" }
         }
@@ -1146,6 +1151,7 @@
         "type": "object",
         "properties": {
           "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
           "size": { "type": "string", "enum": ["S", "M", "L"] },
           "ac_count": { "type": "integer" },
           "seams": { "type": "integer" }
@@ -1156,14 +1162,22 @@
         "properties": {
           "ok": { "type": "boolean" },
           "class": { "type": "string" },
+          "work_kind": { "type": "string" },
           "size": { "type": "string" },
           "size_floor": { "type": "string" },
-          "launcher": { "type": "string" },
-          "model": { "type": "string" },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
+          "model": { "type": "string", "description": "Explicit model paired with launcher/provider. Codex runs pin model_reasoning_effort=high." },
           "max_turns": { "type": "integer" },
           "run_budget_seconds": { "type": "integer" },
           "reviewer1": { "type": "string" },
+          "reviewer1_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
+          "reviewer1_provider": { "type": "string" },
+          "reviewer1_model": { "type": "string" },
           "reviewer2": { "type": "string" },
+          "reviewer2_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
+          "reviewer2_provider": { "type": "string" },
+          "reviewer2_model": { "type": "string" },
           "review": { "type": "string" }
         }
       },
@@ -1214,10 +1228,12 @@
       },
       "ReviewRunRequest": {
         "type": "object",
-        "required": ["repo", "reviewer", "prompt"],
+        "required": ["repo", "launcher", "provider", "model", "prompt"],
         "properties": {
           "repo": { "type": "string" },
-          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "sol"] },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"], "description": "Must belong to the selected launcher/provider; mismatches fail with bad_model_identity." },
           "prompt": { "type": "string" },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
@@ -1229,6 +1245,9 @@
           "ok": { "type": "boolean" },
           "verdict": { "type": "string" },
           "reviewer": { "type": "string" },
+          "launcher": { "type": "string" },
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
           "summary": { "type": "string" },
           "compact": { "type": "string" }
         }
