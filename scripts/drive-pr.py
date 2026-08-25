@@ -11,6 +11,13 @@ passes inputs properly; it is how implement-slice has always been fired.
   python3 scripts/drive-pr.py 3526 [--repo riftwing] [--test riftwing-local-gates]
                                    [--auto-merge] [--wait 900]
 
+Budget it end to end before wrapping this in anything with its own timeout. One
+attempt is a graph run (up to --wait) plus a review wait (up to
+GRAPHWING_REVIEW_WAIT, default 2700s because a full review can take 30 minutes).
+Three attempts is therefore on the order of three hours. Every timeout in the
+chain has to clear that: an outer wrapper that expires mid-loop kills the run
+after the writer has already done the work.
+
 Needs the Rewst MCP token: GRAPHWING_REWST_MCP_TOKEN, or mcp_bws_key in
 rewst-install.json plus BWS_ACCESS_TOKEN.
 """
@@ -61,26 +68,41 @@ def findings(mcp: str, repo: str, pr: str):
         return None
 
 
-def wait_for_fresh_review(mcp, repo, pr, previous, tries: int = 40, gap: int = 30) -> None:
+# A full review can take 30 minutes. Waiting less than that does not fail
+# loudly: the driver reads the previous round's findings, hands the writer work
+# it already did, and burns an attempt. Budget past the worst case, not the
+# typical one.
+REVIEW_WAIT_SECONDS = int(os.environ.get("GRAPHWING_REVIEW_WAIT", "2700"))
+REVIEW_POLL_SECONDS = 30
+
+
+def wait_for_fresh_review(mcp, repo, pr, previous, tries: int = 0, gap: int = 0) -> bool:
     """Block until the audit has produced a verdict for the new commit.
 
     Fingerprints are stable per defect, so a changed set means the reviewer has
     looked again. A returning hold:pm-review means it is still looking.
+
+    Returns True if a fresh verdict arrived, False on timeout, so the caller
+    can stop rather than act on a stale read.
     """
+    gap = gap or REVIEW_POLL_SECONDS
+    tries = tries or max(1, REVIEW_WAIT_SECONDS // gap)
     import time
     before = {f.get("fingerprint") for f in (previous.get("findings") or [])}
     for _ in range(tries):
         time.sleep(gap)
         now = findings(mcp, repo, pr)
         if now is None:
-            return
+            return False
         if now.get("holds"):
             continue
         after = {f.get("fingerprint") for f in (now.get("findings") or [])}
         if after != before or not now.get("blocking"):
             print("review re-ran: grade=%s blocking=%s" % (now.get("grade"), now.get("blocking")))
-            return
-    print("review did not settle in time; continuing anyway")
+            return True
+    print("review did not settle within %ds; stopping rather than acting on a stale read"
+          % REVIEW_WAIT_SECONDS)
+    return False
 
 
 def main() -> int:
@@ -146,8 +168,10 @@ def main() -> int:
         # The audit re-runs against the new sha. Reading findings before it
         # finishes returns the previous round and burns an attempt fixing what
         # is already fixed.
-        print("waiting for the review to re-run against the new commit...")
-        wait_for_fresh_review(mcp, args.repo, args.pr, state)
+        print("waiting up to %ds for the review to re-run against the new commit..."
+              % REVIEW_WAIT_SECONDS)
+        if not wait_for_fresh_review(mcp, args.repo, args.pr, state):
+            return 1
     return last
 
 
