@@ -644,7 +644,7 @@
       "post": {
         "operationId": "agentRun",
         "tags": ["agent"],
-        "summary": "Queue one bounded Hermes loop. Returns 202 + job_id; does not block.",
+        "summary": "Queue one bounded writer run. Mechanical Codex jobs fail closed without a valid final receipt and stable structured session identity.",
         "requestBody": {
           "required": true,
           "content": {
@@ -666,7 +666,7 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/Error" },
           "501": {
-            "description": "spawn failed closed (hermes binary missing)",
+            "description": "spawn failed closed (writer binary missing)",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" }
@@ -1279,13 +1279,20 @@
         "properties": {
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
-          "launcher": { "type": "string", "enum": ["hermes", "claude"], "default": "hermes" },
+          "launcher": { "type": "string", "enum": ["hermes", "claude", "codex"], "default": "hermes" },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string" },
           "max_turns": { "type": "integer" },
           "run_budget_seconds": { "type": "integer" },
           "hermes_session": {
             "type": "string",
-            "description": "Named Hermes session gwslice-<32 hex>. Omit to mint one. Retry passes the receipt value to resume the same session."
+            "description": "Named Hermes session gwslice-<32 hex>. Used by Hermes jobs only."
+          },
+          "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
+          "resume_job_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "description": "Required with Codex session_identity resume. Must reference a prior completed successful Graphwing Codex job whose receipt session_identity exactly matches."
           },
           "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
           "response_webhook_url": {
@@ -1312,7 +1319,11 @@
           "status": { "type": "string" },
           "profile": { "type": "string" },
           "repo": { "type": "string" },
-          "hermes_session": { "type": "string" },
+          "hermes_session": { "type": ["string", "null"] },
+          "launcher": { "type": "string" },
+          "provider": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
           "poll": { "type": "string" }
         }
       },
@@ -1336,12 +1347,26 @@
           }
         }
       },
+      "SessionIdentity": {
+        "type": "object",
+        "required": ["launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"],
+        "properties": {
+          "launcher": { "type": "string", "enum": ["codex"] },
+          "provider": { "type": "string", "enum": ["openai"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol"] },
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "starting_head": { "type": "string" },
+          "native_session_id": { "type": ["string", "null"], "description": "Parsed from Codex thread.started JSONL; required non-null for success and resume." }
+        }
+      },
       "AgentReceipt": {
         "type": "object",
         "properties": {
           "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
           "job_id": { "type": "string" },
           "profile": { "type": "string" },
+          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
           "log_ref": { "type": "string" },
@@ -1358,6 +1383,10 @@
           "repo": { "type": "string" },
           "cwd": { "type": "string" },
           "prompt": { "type": "string" },
+          "launcher": { "type": "string" },
+          "provider": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
           "created_at": { "type": "string" },
           "started_at": { "type": ["string", "null"] },
           "finished_at": { "type": ["string", "null"] },

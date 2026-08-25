@@ -67,6 +67,7 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
 
 
 HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
+CODEX_BIN = resolve_executable("codex", "GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex")
 CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
 HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
@@ -76,6 +77,7 @@ AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
+NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
@@ -1474,7 +1476,7 @@ def slice_route_lookup(
     sized = bump_slice_size(size_floor, class_name, ac_count, seams)
     turns, wait = SLICE_BUDGET[(class_name, sized)]
     if class_name == "mechanical":
-        launcher, model = "hermes", "grok-4.6"
+        launcher, provider, model = "codex", "openai", "gpt-5.6-sol"
         reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
     elif class_name == "visual":
         # Every review crosses vendors, and all three vendors are in the loop:
@@ -1482,12 +1484,12 @@ def slice_route_lookup(
         # and OpenAI grades them. Sol is excluded because it is the planning
         # session, so Terra carries OpenAI here — same vendor, different model,
         # so the spec's author is never in the review chain.
-        launcher, model = "claude", "claude-opus-5"
+        launcher, provider, model = "claude", "anthropic", "claude-opus-5"
         reviewer1, reviewer2 = "terra", "none"
     else:
         # Sensitive needs two acks, and both from vendors that are not the
         # writer's: OpenAI and xAI grade what Anthropic wrote.
-        launcher, model = "claude", "claude-opus-5"
+        launcher, provider, model = "claude", "anthropic", "claude-opus-5"
         reviewer1, reviewer2 = "terra", "grok"
     return {
         "ok": True,
@@ -1495,6 +1497,7 @@ def slice_route_lookup(
         "size_floor": size_floor,
         "size": sized,
         "launcher": launcher,
+        "provider": provider,
         "model": model,
         "max_turns": turns,
         "run_budget_seconds": wait,
@@ -2431,6 +2434,10 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "cwd",
         "prompt",
         "hermes_session",
+        "launcher",
+        "provider",
+        "model",
+        "session_identity",
         "created_at",
         "started_at",
         "finished_at",
@@ -2754,6 +2761,82 @@ def parse_hermes_session(data: dict[str, Any]) -> tuple[str | None, dict[str, An
     return name, None
 
 
+def current_branch_head(repo: Path) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    branch = run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+    head = run_git(repo, ["rev-parse", "HEAD"])
+    if not branch.get("ok") or not head.get("ok"):
+        return None, None, {"error": "could not read current git identity", "code": "git_state_unavailable"}
+    return str(branch["stdout"]).strip(), str(head["stdout"]).strip(), None
+
+
+def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if raw in (None, ""):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, {"error": "session_identity must be an object", "code": "bad_session_identity"}
+    out: dict[str, Any] = {}
+    for key in ("launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"):
+        value = raw.get(key)
+        if value is None and key == "native_session_id":
+            out[key] = None
+        elif not isinstance(value, str) or not value.strip():
+            return None, {"error": f"session_identity.{key} is required", "code": "bad_session_identity"}
+        else:
+            out[key] = value.strip()
+    session_id = out["native_session_id"]
+    if session_id is not None and not NATIVE_SESSION_RE.fullmatch(session_id):
+        return None, {"error": "session_identity.native_session_id is invalid", "code": "bad_session_identity"}
+    return out, None
+
+
+def validate_codex_resume_provenance(data: dict[str, Any], requested_identity: dict[str, Any]) -> dict[str, Any] | None:
+    resume_job_id = data.get("resume_job_id")
+    if resume_job_id in (None, ""):
+        return {"error": "resume_job_id is required for Codex resume", "code": "missing_resume_job_id"}
+    if not isinstance(resume_job_id, str) or not JOB_ID_RE.fullmatch(resume_job_id):
+        return {"error": "resume_job_id must be 32 lowercase hex characters", "code": "bad_resume_job_id"}
+    prior = read_job(resume_job_id)
+    receipt = prior.get("receipt") if isinstance(prior, dict) else None
+    if not (
+        isinstance(prior, dict)
+        and prior.get("launcher") == "codex"
+        and prior.get("status") == "completed"
+        and isinstance(receipt, dict)
+        and receipt.get("status") == "ok"
+        and receipt.get("session_identity") == requested_identity
+    ):
+        return {"error": "resume session_identity is not traceable to a successful Codex job", "code": "untraceable_resume_session"}
+    return None
+
+
+def parse_native_session_id(text: str) -> str | None:
+    for line in (text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        session_id = event.get("thread_id")
+        if isinstance(session_id, str) and NATIVE_SESSION_RE.fullmatch(session_id.strip()):
+            return session_id.strip()
+    return None
+
+
+def record_codex_session(job: dict[str, Any], session_id: str | None) -> str | None:
+    if job.get("launcher") != "codex":
+        return None
+    identity = job.get("session_identity")
+    if not session_id:
+        return "missing structured Codex session identity"
+    expected = identity.get("native_session_id") if isinstance(identity, dict) else None
+    if expected and session_id != expected:
+        return "Codex session identity changed during resume"
+    if isinstance(identity, dict):
+        identity["native_session_id"] = session_id
+    return None
+
+
 def compact_cmd_signal(result: dict[str, Any]) -> str:
     if result.get("ok"):
         return "ok"
@@ -2800,6 +2883,14 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
     if not raw:
         return None
     candidates: list[str] = [raw]
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) and event.get("type") == "item.completed" else None
+        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            candidates.append(item["text"].strip())
     if "```" in raw:
         for part in raw.split("```"):
             p = part.strip()
@@ -2830,18 +2921,30 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
 
 
 def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, returncode: int, timed_out: bool) -> dict[str, Any]:
-    status = "timeout" if timed_out else ("ok" if returncode == 0 else "error")
-    if parsed and parsed.get("status") in ("ok", "error", "timeout") and not timed_out:
-        status = str(parsed["status"])
+    failure: str | None = None
+    if timed_out:
+        status, failure = "timeout", "agent run budget exceeded"
+    elif returncode != 0:
+        status, failure = "error", f"{job.get('launcher') or 'agent'} exited {returncode}"
+    elif parsed is None:
+        status, failure = "error", "missing or invalid final receipt"
+    else:
+        status = str(parsed.get("status") or "error")
+    identity = job.get("session_identity")
+    if status == "ok" and job.get("launcher") == "codex" and (
+        not isinstance(identity, dict) or not identity.get("native_session_id")
+    ):
+        status, failure = "error", "missing structured Codex session identity"
     rec = {
         "status": status,
         "job_id": job["job_id"],
         "profile": job["profile"],
         "hermes_session": job.get("hermes_session"),
+        "session_identity": identity,
         "sha": None,
         "pr_url": None,
         "log_ref": job["log_ref"],
-        "summary": None,
+        "summary": failure,
     }
     if parsed:
         sha = parsed.get("sha")
@@ -2851,7 +2954,7 @@ def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, return
             rec["sha"] = str(sha)[:64]
         if pr_url not in (None, ""):
             rec["pr_url"] = str(pr_url)[:500]
-        if summary not in (None, ""):
+        if failure is None and summary not in (None, ""):
             rec["summary"] = str(summary)[:500]
     return rec
 
@@ -2989,7 +3092,48 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     return proc, None
 
 
+def codex_command(job: dict[str, Any], prompt_path: Path, cwd: str) -> list[str]:
+    command = [
+        str(CODEX_BIN), "exec", "--json", "--model", str(job["model"]),
+        "-C", cwd, "--sandbox", "workspace-write",
+        "--output-last-message", str(prompt_path.parent / "last-message.txt"),
+    ]
+    session_id = (job.get("session_identity") or {}).get("native_session_id")
+    if session_id:
+        command.extend(["resume", str(session_id)])
+    command.append("-")
+    return command
+
+
+def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    if not CODEX_BIN.is_file():
+        return None, {"error": f"missing codex binary: {CODEX_BIN}", "code": "missing_binary"}
+    prompt_path = job_dir(job["job_id"]) / "prompt.txt"
+    stdout_path = job_dir(job["job_id"]) / "stdout.log"
+    stderr_path = job_dir(job["job_id"]) / "stderr.log"
+    cwd = str(Path(job["cwd"]).resolve())
+    stdin_f = prompt_path.open("rb")
+    stdout_f = stdout_path.open("wb")
+    stderr_f = stderr_path.open("wb")
+    try:
+        proc = subprocess.Popen(
+            codex_command(job, prompt_path, cwd), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
+            cwd=cwd, env=hermes_job_env(job), start_new_session=True,
+        )
+    except OSError as exc:
+        stdin_f.close()
+        stdout_f.close()
+        stderr_f.close()
+        return None, {"error": f"spawn failed: {exc}", "code": "spawn_failed"}
+    stdin_f.close()
+    stdout_f.close()
+    stderr_f.close()
+    return proc, None
+
+
 def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    if job.get("launcher") == "codex":
+        return spawn_codex(job)
     if job.get("launcher") == "claude":
         return spawn_claude(job)
     return spawn_hermes(job)
@@ -3010,6 +3154,22 @@ def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=5)
 
 
+def read_bounded_output(path: Path) -> str:
+    try:
+        with path.open("rb") as fh:
+            first = fh.read(FILE_MAX_BYTES)
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size <= len(first):
+                data = first
+            else:
+                fh.seek(max(len(first), size - CMD_MAX_BYTES))
+                data = first + b"\n" + fh.read(CMD_MAX_BYTES)
+    except OSError:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
 def run_agent_job(job_id: str) -> None:
     job = read_job(job_id)
     if not job:
@@ -3023,6 +3183,7 @@ def run_agent_job(job_id: str) -> None:
         job["finished_at"] = utcnow()
         job["error"] = err.get("error")
         job["receipt"] = normalize_receipt(job, {"status": "error", "summary": err.get("error")}, 1, False)
+        job["receipt"]["summary"] = err.get("error")
         hook = deliver_webhook(job, job["receipt"])
         if hook is not None:
             job["webhook"] = hook
@@ -3040,15 +3201,18 @@ def run_agent_job(job_id: str) -> None:
         timed_out = True
         _kill_proc(proc)
         returncode = proc.returncode if proc.returncode is not None else -9
-    stdout = ""
-    stdout_path = job_dir(job_id) / "stdout.log"
-    try:
-        stdout = stdout_path.read_text(errors="replace")[-CMD_MAX_BYTES:]
-    except OSError:
-        stdout = ""
-    parsed = parse_receipt_text(stdout)
+    stdout = read_bounded_output(job_dir(job_id) / "stdout.log")
+    final_message = read_bounded_output(job_dir(job_id) / "last-message.txt")
+    parsed = parse_receipt_text(final_message) or parse_receipt_text(stdout)
+    session_id = parse_native_session_id(stdout)
+    session_error = record_codex_session(job, session_id)
     receipt = normalize_receipt(job, parsed, returncode, timed_out)
+    if session_error:
+        receipt["status"] = "error"
+        receipt["summary"] = session_error
     job = read_job(job_id) or job
+    if session_id and not session_error and isinstance(job.get("session_identity"), dict):
+        job["session_identity"]["native_session_id"] = session_id
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
     job["receipt"] = receipt
@@ -3056,7 +3220,7 @@ def run_agent_job(job_id: str) -> None:
     if timed_out:
         job["error"] = "agent run budget exceeded"
     elif receipt["status"] != "ok" and not job.get("error"):
-        job["error"] = receipt.get("summary") or f"hermes exited {returncode}"
+        job["error"] = receipt.get("summary") or f"agent exited {returncode}"
     hook = deliver_webhook(job, receipt)
     if hook is not None:
         job["webhook"] = hook
@@ -3272,8 +3436,19 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if session_err:
         return 400, session_err
     launcher = str(data.get("launcher") or "hermes").strip()
-    if launcher not in {"hermes", "claude"}:
-        return 400, {"error": "launcher must be hermes or claude", "code": "bad_launcher"}
+    if launcher not in {"hermes", "claude", "codex"}:
+        return 400, {"error": "launcher must be hermes, claude, or codex", "code": "bad_launcher"}
+    if launcher == "codex" and session is not None:
+        return 400, {"error": "codex launcher cannot use hermes_session", "code": "launcher_state_mismatch"}
+    raw_session_identity = data.get("session_identity")
+    if launcher != "codex" and raw_session_identity not in (None, ""):
+        return 400, {"error": "session_identity is only valid for codex launcher", "code": "launcher_state_mismatch"}
+    raw_resume_job_id = data.get("resume_job_id")
+    if raw_resume_job_id not in (None, ""):
+        if launcher == "codex" and raw_session_identity in (None, ""):
+            return 400, {"error": "codex resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
+        if launcher != "codex" and session is None:
+            return 400, {"error": "resume_job_id requires launcher resume state", "code": "launcher_state_mismatch"}
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
@@ -3282,21 +3457,52 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, budget_err
     model = data.get("model")
     if model in ("", None):
-        model = None
+        model = "gpt-5.6-sol" if launcher == "codex" else None
     elif not isinstance(model, str) or not model.strip() or len(model) > 80:
         return 400, {"error": "model is invalid", "code": "bad_model"}
     else:
         model = model.strip()
-    if launcher == "hermes" and not HERMES_BIN.is_file():
-        return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
-    if launcher == "claude" and not CLAUDE_BIN.is_file():
-        return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
+    provider = data.get("provider")
+    if provider in ("", None):
+        provider = "openai" if launcher == "codex" else None
+    elif not isinstance(provider, str):
+        return 400, {"error": "provider is invalid", "code": "bad_provider"}
+    else:
+        provider = provider.strip()
+    if launcher == "codex" and (provider != "openai" or model != "gpt-5.6-sol"):
+        return 400, {"error": "codex mechanical writer requires openai/gpt-5.6-sol", "code": "bad_model_identity"}
+    binary = {"hermes": HERMES_BIN, "claude": CLAUDE_BIN, "codex": CODEX_BIN}[launcher]
+    if not binary.is_file():
+        code = "provider_unavailable" if launcher == "codex" else "not_implemented"
+        return 501, {"error": f"{launcher} binary missing: {binary}", "code": code}
+    session_identity = None
+    if launcher == "codex":
+        branch, head, git_err = current_branch_head(resolved)
+        if git_err:
+            return 400, git_err
+        requested_identity, identity_err = parse_session_identity(data.get("session_identity"))
+        if identity_err:
+            return 400, identity_err
+        session_identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
+        }
+        if requested_identity is not None:
+            if requested_identity.get("native_session_id") is None:
+                return 400, {"error": "resume session_identity requires native_session_id", "code": "missing_native_session"}
+            expected = dict(session_identity, native_session_id=requested_identity.get("native_session_id"))
+            if requested_identity != expected:
+                return 400, {"error": "session_identity does not match the current Codex job", "code": "session_identity_mismatch"}
+            provenance_err = validate_codex_resume_provenance(data, requested_identity)
+            if provenance_err:
+                return 400, provenance_err
+            session_identity = requested_identity
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
         log_ref = str(job_dir(job_id) / "stdout.log")
-        hermes_session = session or f"gwslice-{job_id}"
+        hermes_session = None if launcher == "codex" else (session or f"gwslice-{job_id}")
         job = {
             "job_id": job_id,
             "status": "queued",
@@ -3306,7 +3512,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "prompt": prompt,
             "hermes_session": hermes_session,
             "launcher": launcher,
+            "provider": provider,
             "model": model,
+            "session_identity": session_identity,
             "max_turns": turns or AGENT_MAX_TURNS,
             "run_budget_seconds": budget or AGENT_RUN_BUDGET,
             "response_webhook_url": webhook_url,
@@ -3332,6 +3540,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "repo": repo_name,
         "hermes_session": hermes_session,
         "launcher": launcher,
+        "provider": provider,
+        "model": model,
+        "session_identity": session_identity,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
 
