@@ -80,7 +80,9 @@ cd graphwing
 
 Optional flags: `--yes --with-hermes`, `--no-start`, `--daemon`.
 
-The API listens on `127.0.0.1:8645`. Send `X-Graphwing-Key` from `$GRAPHWING_HOME/api.key`. `/v1/health` and `/openapi.json` need no key.
+The API listens on `127.0.0.1:8645`. Send `X-Graphwing-Key` from `$GRAPHWING_HOME/api.key`. `/v1/health` and `/openapi.json` need no key. `GET /v1/watch` is the bar snapshot (units + jobs); it needs the key.
+
+On Omarchy, `install.py` copies `plugins/graphwing.watch/` onto the right side of the bar. The widget polls that endpoint.
 
 ```bash
 GRAPHWING_HOME=. python3 test_server.py

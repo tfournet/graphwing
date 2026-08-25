@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "graphwing.watch",
+  "name": "Graphwing",
+  "version": "1.1.0",
+  "author": "graphwing",
+  "license": "MIT",
+  "description": "Graphwing daemon health and in-flight workflow jobs in the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Graphwing",
+    "description": "Watch the local graphwing daemon: units, running jobs, recent failures.",
+    "category": "AI",
+    "aliases": ["graphwing", "workflows", "jobs"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5,
+      "port": 8645,
+      "home": "",
+      "notifyOnFail": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "port",
+        "type": "integer",
+        "label": "Daemon port",
+        "min": 1,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 8645
+      },
+      {
+        "key": "home",
+        "type": "path",
+        "label": "GRAPHWING_HOME",
+        "defaultValue": "",
+        "description": "Empty means $GRAPHWING_HOME or ~/.graphwing. The plugin reads api.key from here."
+      },
+      {
+        "key": "notifyOnFail",
+        "type": "boolean",
+        "label": "Notify on new failures",
+        "defaultValue": true
+      }
+    ]
+  }
+}

@@ -32,6 +32,7 @@ TESTS_PATH = HOME / "tests.json"
 RR_PATH = HOME / "rr.json"
 KEY_PATH = HOME / "api.key"
 JOBS_DIR = HOME / "jobs"
+RUNS_PATH = HOME / "workflow-runs.jsonl"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GRAPHWING_PORT", "8645"))
 CMD_TIMEOUT = 30
@@ -107,6 +108,7 @@ SLICE_BUDGET = {
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
+RUNS_LOCK = threading.Lock()
 HERDR_LINGER_LOCK = threading.Lock()
 HERDR_LINGER: dict[str, float] = {}
 JWKS_LOCK = threading.Lock()
@@ -221,6 +223,145 @@ REWST_HOOK_URL_KEYS = {
     "implement-slice": "implement_slice_hook_url",
     "pr-drive": "pr_drive_hook_url",
 }
+WATCH_RUN_INPUT_KEYS = ("repo", "pr", "ticket", "branch", "index", "test", "class", "size")
+WATCH_WORKFLOW_RECENT = 8
+
+
+def sanitize_run_input(inp: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in WATCH_RUN_INPUT_KEYS:
+        val = inp.get(key)
+        if val in (None, ""):
+            continue
+        if isinstance(val, str):
+            out[key] = val[:80]
+        elif isinstance(val, (int, float, bool)):
+            out[key] = val
+        else:
+            out[key] = str(val)[:80]
+    return out
+
+
+def extract_run_id(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    for key in ("id", "run_id", "runId"):
+        val = body.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:80]
+    nested = body.get("data")
+    if isinstance(nested, dict):
+        return extract_run_id(nested)
+    return None
+
+
+def workflow_run_title(workflow: str, inp: dict[str, Any]) -> str:
+    ticket = str(inp.get("ticket") or "").strip()
+    if ticket:
+        name = Path(ticket).name
+        if name.endswith(".md"):
+            name = name[:-3]
+        return f"{workflow} {name}"
+    pr = inp.get("pr")
+    if pr not in (None, ""):
+        return f"{workflow} PR {pr}"
+    repo = str(inp.get("repo") or "").strip()
+    if repo:
+        return f"{workflow} {repo}"
+    return workflow
+
+
+def public_workflow_run(row: dict[str, Any]) -> dict[str, Any]:
+    inp = row.get("input") if isinstance(row.get("input"), dict) else {}
+    workflow = str(row.get("workflow") or "workflow")
+    return {
+        "kind": workflow,
+        "title": str(row.get("title") or workflow_run_title(workflow, inp)),
+        "status": str(row.get("status") or "fired"),
+        "repo": inp.get("repo"),
+        "tab": "graph",
+        "created_at": row.get("created_at"),
+        "started_at": row.get("created_at"),
+        "finished_at": None,
+        "summary": workflow_run_title(workflow, inp),
+        "run_id": row.get("run_id"),
+        "source": row.get("source"),
+        "error": None,
+        "job_id": "",
+    }
+
+
+def record_workflow_run(row: dict[str, Any]) -> None:
+    payload = {
+        "workflow": str(row.get("workflow") or ""),
+        "status": str(row.get("status") or "fired"),
+        "source": str(row.get("source") or "fire"),
+        "input": row.get("input") if isinstance(row.get("input"), dict) else {},
+        "run_id": row.get("run_id"),
+        "created_at": str(row.get("created_at") or utcnow()),
+    }
+    payload["title"] = workflow_run_title(payload["workflow"], payload["input"])
+    try:
+        with RUNS_LOCK:
+            RUNS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with RUNS_PATH.open("a") as fh:
+                fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        return
+
+
+def list_install_run_stubs(limit: int) -> list[dict[str, Any]]:
+    try:
+        install = load_rewst_install()
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for key in ("implement_slice", "pr_drive", "pr_status", "verify_stack"):
+        item = install.get(key)
+        if not isinstance(item, dict):
+            continue
+        if not item.get("run_id"):
+            continue
+        slug = str(item.get("slug") or key.replace("_", "-"))
+        inp: dict[str, Any] = {}
+        rows.append(
+            public_workflow_run(
+                {
+                    "workflow": slug,
+                    "status": str(item.get("status") or "recorded"),
+                    "source": "install",
+                    "input": inp,
+                    "run_id": item.get("run_id"),
+                    "created_at": None,
+                }
+            )
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def list_workflow_runs(limit: int) -> list[dict[str, Any]]:
+    if not RUNS_PATH.is_file():
+        return list_install_run_stubs(limit)
+    try:
+        lines = RUNS_PATH.read_text().splitlines()
+    except OSError:
+        return list_install_run_stubs(limit)
+    rows: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or not item.get("workflow"):
+            continue
+        rows.append(public_workflow_run(item))
+        if len(rows) >= limit:
+            break
+    return rows or list_install_run_stubs(limit)
 
 
 def rewst_fire(body: bytes) -> tuple[int, dict[str, Any]]:
@@ -277,6 +418,16 @@ def rewst_fire(body: bytes) -> tuple[int, dict[str, Any]]:
         out["body"] = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
         out["body"] = {"raw": raw}
+    record_workflow_run(
+        {
+            "workflow": workflow,
+            "status": "fired" if out["ok"] else "failed",
+            "source": "fire",
+            "input": sanitize_run_input(payload),
+            "run_id": extract_run_id(out.get("body")),
+            "created_at": utcnow(),
+        }
+    )
     return (200 if out["ok"] else 502), out
 
 
@@ -2423,6 +2574,7 @@ def watch_snapshot() -> dict[str, Any]:
         "ok": True,
         "service": "graphwing",
         "units": units.get("units") or {},
+        # herdr and the tunnel are optional. The bar's traffic light is the API.
         "units_healthy": api_active,
         "api_active": api_active,
         "counts": {
@@ -2433,6 +2585,7 @@ def watch_snapshot() -> dict[str, Any]:
         },
         "active": active,
         "recent": recent,
+        "workflows": {"recent": list_workflow_runs(WATCH_WORKFLOW_RECENT)},
     }
 
 
@@ -2547,6 +2700,15 @@ def doorbell_pr_drive(body: bytes, headers: Any) -> tuple[int, dict[str, Any]]:
         return 502, {"error": "pr-drive hook failed", "code": "hook_failed"}
     if not 200 <= rewst_status < 300:
         return 502, {"error": "pr-drive hook failed", "code": "hook_failed"}
+    record_workflow_run(
+        {
+            "workflow": "pr-drive",
+            "status": "fired",
+            "source": "doorbell",
+            "input": sanitize_run_input(hook_payload),
+            "created_at": utcnow(),
+        }
+    )
     return 200, {
         "ok": True,
         "mapped_repo": mapped_repo,

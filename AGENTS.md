@@ -19,12 +19,13 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. First run: `docs/USING.md`. Do not duplicate them here. |
 | Herdr idea spaces | `scripts/herdr-idea.sh` (`graphwing-idea` after install) |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
+| Omarchy bar | `plugins/graphwing.watch/` then `install.py` (copies into `~/.config/omarchy/plugins/`) |
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.
 
 ## Git (tfournet/graphwing)
 
-Work on a branch. Open a PR. Rebase onto current `main` before merge. Merge the PR as part of finishing the task (`gh pr merge --rebase --delete-branch`). Do not wait for Tim to merge. Do not push commits straight to `main`.
+Work in a git worktree (`/home/tim/work/gw-<short>`), not the primary clone. Branch from `origin/main`. Open a PR. Rebase onto current `main` before merge. Merge the PR as part of finishing the task (`gh pr merge --rebase --delete-branch`). Do not wait for Tim to merge. Do not push commits straight to `main`. After merge, `git worktree remove` the tree. If merge cannot check out `main` because another worktree holds it, still merge the PR and skip the local checkout.
 
 ## Tests
 
