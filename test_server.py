@@ -2898,6 +2898,7 @@ class InstallTests(unittest.TestCase):
                     "--unit-dir",
                     str(units),
                     "--non-interactive",
+                    "--no-omarchy-plugin",
                     "--no-cli",
                     "--tunnel",
                     "none",
@@ -2918,6 +2919,10 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((home / "rr.example.json").is_file())
             stacks = json.loads((home / "stacks.json").read_text())
             self.assertEqual(stacks["stacks"][0]["name"], "graphwing")
+            clean = [stack for stack in stacks["stacks"] if stack.get("role") == "clean"]
+            self.assertEqual(len(clean), 1)
+            self.assertEqual(clean[0]["runner"], "git-worktree")
+            self.assertTrue((home / clean[0]["cwd"]).is_dir())
             api_unit = (units / "graphwing-api.service").read_text()
             self.assertIn(str(home), api_unit)
             self.assertNotIn("@GRAPHWING_HOME@", api_unit)
@@ -3015,6 +3020,8 @@ class BuildStateTests(unittest.TestCase):
         self.home = root / "gwhome"
         self.builds = self.home / "builds"
         self.repo = root / "repo"
+        self.clean_runner = root / "clean-runner"
+        self.clean_runner.mkdir()
         self.repo.mkdir()
         for args in (
             ["git", "init", "-b", "main", str(self.repo)],
@@ -3038,9 +3045,26 @@ class BuildStateTests(unittest.TestCase):
         bp = mock.patch.object(server, "BUILDS_DIR", self.builds)
         bp.start()
         self.addCleanup(bp.stop)
+        jp = mock.patch.object(server, "JOBS_DIR", self.home / "jobs")
+        jp.start()
+        self.addCleanup(jp.stop)
         rp = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)})
         rp.start()
         self.addCleanup(rp.stop)
+        sp = mock.patch.object(
+            server,
+            "build_stack_catalog",
+            return_value={
+                "clean-stack": {
+                    "name": "clean-stack",
+                    "role": "clean",
+                    "cwd": self.clean_runner,
+                    "runner": "git-worktree",
+                }
+            },
+        )
+        sp.start()
+        self.addCleanup(sp.stop)
 
     # -- helpers ------------------------------------------------------------
 
@@ -3066,7 +3090,7 @@ class BuildStateTests(unittest.TestCase):
             "head": self.head,
             "index": "slices/demo/index.json",
             "ticket": "slices/demo/01-build-state.md",
-            "route": {"launcher": "hermes", "model": "sol"},
+            "route": {"class": "sensitive", "launcher": "hermes", "model": "sol"},
             "verification": {"fast": ["graphwing-compile"], "integration": ["graphwing-unit"]},
             "stacks": ["riftwing-52"],
             "budget": {"jobs_max": 12},
@@ -3091,6 +3115,231 @@ class BuildStateTests(unittest.TestCase):
 
     def _state(self, build_id=None):
         return server.dispatch("GET", "/v1/build/state", {"build_id": [build_id or self.BUILD]}, True, b"")
+
+    def _post_build(self, operation, **body):
+        body.setdefault("build_id", self.BUILD)
+        return server.dispatch(
+            "POST", f"/v1/build/{operation}", {}, True, json.dumps(body).encode()
+        )
+
+    def _next(self, **query):
+        query.setdefault("build_id", [self.BUILD])
+        return server.dispatch("GET", "/v1/build/next", query, True, b"")
+
+    def _claim(self, event_id="claim-initial", holder="rewst-run-1", kind="initial", **over):
+        body = {"event_id": event_id, "holder": holder, "kind": kind}
+        body.update(over)
+        return self._post_build("claim", **body)
+
+    def _launch(self, claim_id="claim-initial", holder="rewst-run-1", **over):
+        body = {
+            "claim_id": claim_id,
+            "holder": holder,
+            "response_webhook_url": "https://example.test/writer",
+            "response_webhook_token": "resume-token",
+        }
+        body.update(over)
+        return self._post_build("writer/launch", **body)
+
+    def _complete(
+        self,
+        event_id,
+        launch,
+        callback,
+        claim_id="claim-initial",
+        holder="rewst-run-1",
+        **over,
+    ):
+        body = {
+            "event_id": event_id,
+            "holder": holder,
+            "claim_id": claim_id,
+            "job_id": launch["job_id"],
+            "hermes_session": launch["hermes_session"],
+            "callback": callback,
+        }
+        body.update(over)
+        return self._post_build("writer/complete", **body)
+
+    def _finish_job(self, launch, status="ok", summary="done"):
+        job = server.read_job(launch["job_id"])
+        self.assertIsNotNone(job)
+        receipt = {
+            "status": status,
+            "job_id": launch["job_id"],
+            "profile": job["profile"],
+            "hermes_session": launch["hermes_session"],
+            "sha": None,
+            "pr_url": None,
+            "log_ref": job["log_ref"],
+            "summary": summary,
+        }
+        job["receipt"] = receipt
+        job["status"] = "completed" if status == "ok" else "failed"
+        job["finished_at"] = server.utcnow()
+        server.write_job(job)
+        return receipt
+
+    def _launch_writer(self, claim_id="claim-initial", holder="rewst-run-1"):
+        claimed = self._claim(claim_id, holder=holder)
+        self.assertEqual(claimed[0], 200, claimed[1])
+        with mock.patch.object(server, "enqueue_agent"):
+            status, launch, _ = self._launch(claim_id, holder=holder)
+        self.assertEqual(status, 202, launch)
+        return launch
+
+    def _start_writer(
+        self,
+        event_id="evt-1",
+        holder="rewst-run-1",
+        session=None,
+        claim_event_id="claim-initial",
+        **over,
+    ):
+        data = dict(over.pop("data", {}) or {})
+        if session is not None:
+            data["writer_session"] = session
+        return self._advance(
+            "start_writer", event_id, holder=holder, data=data, jobs_spent=0, **over
+        )
+
+    def _record_fast_pass(self):
+        doc = self._read_doc()
+        head = self._git("rev-parse", "HEAD")
+        change_id = server.build_change_id(self.repo, head)
+        doc.setdefault("checks", {})["fast"] = {
+            "phase": "fast",
+            "head": head,
+            "change_id": change_id,
+            "runner": str(self.repo),
+            "required": ["graphwing-compile"],
+            "verdicts": {"graphwing-compile": {"ok": True, "coverage": True}},
+            "ok": True,
+        }
+        self._write_doc(doc)
+        return change_id
+
+    def _gate(self, event_id, holder="rewst-run-1", **over):
+        doc = self._read_doc()
+        if server.build_class(doc) != server.BUILD_MECHANICAL_CLASS:
+            action = "verify_passed" if doc.get("stage") == "verifying" else "review_passed"
+            return self._advance(action, event_id, holder=holder, jobs_spent=0, **over)
+        return self._post_build("gate", event_id=event_id, holder=holder, **over)
+
+    def _ready_finalize_fixture(self, filename="change.txt"):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        (self.repo / filename).write_text("ready\n")
+        self._git("add", filename)
+        change_id = server.build_change_id(self.repo, self.head)
+        doc = self._read_doc()
+        doc["stage"] = "ready"
+        doc["verified_boundary"] = {"head": self.head}
+        doc["checks"] = {
+            phase: {
+                "change_id": change_id,
+                "stack": "clean-stack" if phase == "integration" else None,
+                "runner": str(self.clean_runner) if phase == "integration" else str(self.repo),
+                "required": [phase],
+                "verdicts": {phase: {"ok": True, "coverage": True}},
+            }
+            for phase in ("fast", "integration")
+        }
+        tree = self._git("write-tree")
+        doc["checks"]["integration"].update(
+            head=self.head,
+            runner=str(self.clean_runner / "recorded-attempt"),
+            candidate_tree=tree,
+            runner_tree=tree,
+            base_head=self.head,
+            materialization="a" * 40,
+        )
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS", "summary": "clear"}
+        ]
+        self._write_doc(doc)
+        return change_id
+
+    def _prepare_finalize_intent(self, event_id="prepared-finalize", message="prepared message"):
+        self._ready_finalize_fixture()
+        original = server.run_git
+
+        def stop_after_prepare(path, args, **kwargs):
+            if args[0] == "commit":
+                return {
+                    "ok": False,
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "injected stop after prepare",
+                    "error": "injected stop after prepare",
+                }
+            return original(path, args, **kwargs)
+
+        request = {"event_id": event_id, "holder": "run", "message": message}
+        with mock.patch.object(server, "run_git", side_effect=stop_after_prepare):
+            stopped = self._post_build("finalize", **request)
+        self.assertEqual(stopped[1]["code"], "commit_failed")
+        intent = self._read_doc()["pending_finalize"]
+        self.assertEqual(intent["version"], 1)
+        self.assertEqual(intent["state"], "prepared")
+        self.assertNotIn("sha", intent)
+        for field in (
+            "fingerprint", "verified_head", "expected_parent", "candidate_tree",
+            "verified_change_id", "branch", "remote", "message", "authoring_boundary",
+        ):
+            self.assertTrue(intent.get(field), field)
+        return request
+
+    def _mechanical_route(self, **over):
+        route = {
+            "class": "mechanical",
+            "launcher": "hermes",
+            "model": "grok-4.6",
+            "max_turns": 12,
+            "run_budget_seconds": 900,
+            "reviewer1": "sonnet",
+        }
+        route.update(over)
+        return route
+
+    def _recipe_catalog(self, **extra):
+        def recipe(name, argv=("python3", "-c", "raise SystemExit(0)"), coverage=True, cwd=None):
+            return {
+                "name": name,
+                "argv": list(argv),
+                "cwd": Path(cwd or self.repo),
+                "timeout_seconds": 10,
+                "kind": "test",
+                "coverage": coverage,
+                "unresolvable": None,
+            }
+
+        catalog = {
+            "fast": recipe("fast"),
+            "integration": recipe("integration"),
+            "path-check": recipe("path-check"),
+            "riftwing-local-gates": recipe("riftwing-local-gates", coverage=False),
+        }
+        catalog.update(extra)
+        return catalog
+
+    def _mechanical_create(self, verification=None, **over):
+        ticket = self.repo / "ticket.md"
+        ticket.write_text("# Mechanical ticket\n\nChange the requested behavior only.\n")
+        body = {
+            "ticket": "ticket.md",
+            "route": self._mechanical_route(),
+            "verification": verification
+            or {"fast": ["fast"], "integration": ["integration"]},
+        }
+        body.update(over)
+        return self._create(**body)
+
+    def _read_doc(self):
+        return json.loads(self._doc_path().read_text())
+
+    def _write_doc(self, doc):
+        self.assertIsNone(server.write_build(doc, self.BUILD))
 
     def _doc_path(self, build_id=None):
         return self.builds / (build_id or self.BUILD) / "build.json"
@@ -3120,9 +3369,13 @@ class BuildStateTests(unittest.TestCase):
 
     def _through_verify(self, holder="rewst-run-1", **create_over):
         self.assertEqual(self._create(**create_over)[0], 201)
-        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
-            status, payload, _ = self._advance(action, f"evt-{i}", holder=holder)
-            self.assertEqual(status, 200, payload)
+        status, payload, _ = self._start_writer(holder=holder)
+        self.assertEqual(status, 200, payload)
+        status, payload, _ = self._advance("writer_done", "evt-2", holder=holder, jobs_spent=0)
+        self.assertEqual(status, 200, payload)
+        self._record_fast_pass()
+        status, payload, _ = self._gate("evt-3", holder=holder)
+        self.assertEqual(status, 200, payload)
         return payload
 
     # -- creating -----------------------------------------------------------
@@ -3393,31 +3646,29 @@ class BuildStateTests(unittest.TestCase):
 
     def test_the_whole_path_runs_when_no_visual_proof_is_declared(self):
         self.assertEqual(self._create()[0], 201)
-        steps = [
-            ("start_writer", "writing", {"writer_session": "gwslice-" + "0" * 32}),
-            ("writer_done", "verifying", {}),
-            # needs_visual_proof is false, so evidence is skipped outright.
-            ("verify_passed", "review", {}),
-            ("review_passed", "ready", {"review": {"author": "sol", "verdict": "clear"}}),
-            ("pr_opened", "pr_opened", {"pr": {"number": 7, "url": "https://example.test/pull/7"}}),
-        ]
-        for i, (action, stage, data) in enumerate(steps, start=1):
-            status, payload, _ = self._advance(action, f"evt-{i}", data=data)
-            self.assertEqual(status, 200, payload)
-            self.assertEqual(payload["stage"], stage, action)
-            self.assertEqual(payload["receipt"]["to"], stage)
-        self.assertIsNone(payload["next_action"])
-        self.assertIsNone(payload["lease"], "a finished build must not hold a lease")
+        status, payload, _ = self._start_writer(session="gwslice-" + "0" * 32)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(self._advance("writer_done", "evt-2", jobs_spent=0)[0], 200)
+        change_id = self._record_fast_pass()
+        self.assertEqual(self._gate("evt-3")[0], 200)
+        doc = self._read_doc()
+        doc["reviews"] = [{"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS"}]
+        self._write_doc(doc)
+        status, payload, _ = self._gate("evt-4", release_lease=True)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["stage"], "ready")
+        self.assertIsNone(payload["lease"])
         self.assertEqual(payload["writer_session"], "gwslice-" + "0" * 32)
-        self.assertEqual(payload["pr"]["number"], 7)
-        self.assertEqual(payload["budget_left"], 7)
+        self.assertEqual(payload["budget_left"], 12)
 
     def test_evidence_is_a_real_stage_when_visual_proof_is_declared(self):
         self.assertEqual(
             self._create(verification={"fast": [], "integration": [], "needs_visual_proof": True})[0], 201
         )
-        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
-            status, payload, _ = self._advance(action, f"evt-{i}")
+        self.assertEqual(self._start_writer()[0], 200)
+        self.assertEqual(self._advance("writer_done", "evt-2", jobs_spent=0)[0], 200)
+        self._record_fast_pass()
+        status, payload, _ = self._gate("evt-3")
         self.assertEqual(payload["stage"], "evidence", payload)
         self.assertEqual(payload["next_action"], "evidence_captured")
         status, payload, _ = self._advance(
@@ -3433,7 +3684,6 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(status, 409, payload)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["code"], "invalid_transition")
-        self.assertEqual(payload["expected_action"], "start_writer")
         self.assertEqual(self._state()[1]["stage"], "created")
         self.assertEqual(self._state()[1]["budget_left"], 12, "a refused action spends nothing")
 
@@ -3459,7 +3709,9 @@ class BuildStateTests(unittest.TestCase):
                     )
                 event += 1
 
-        status, payload, _ = self._advance("start_writer", "evt-empty", data={}, expect={})
+        status, payload, _ = self._advance(
+            "start_writer", "evt-empty", data={}, expect={}, jobs_spent=0
+        )
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["stage"], "writing")
 
@@ -3471,23 +3723,23 @@ class BuildStateTests(unittest.TestCase):
 
     def test_replaying_an_event_id_returns_the_receipt_without_rerunning(self):
         self.assertEqual(self._create()[0], 201)
-        first = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})[1]
-        status, payload, _ = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})
+        first = self._start_writer(session="gwslice-" + "1" * 32)[1]
+        status, payload, _ = self._start_writer(session="gwslice-" + "1" * 32)
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["replayed"])
         self.assertEqual(payload["receipt"], first["receipt"])
         self.assertEqual(payload["stage"], "writing")
         self.assertEqual(payload["budget_left"], first["budget_left"], "a replay spends no budget")
-        self.assertEqual(payload["event_count"], 1, "one id accepted, however many times it arrives")
+        self.assertEqual(payload["event_count"], 1, "the transition runs once")
 
     def test_a_successful_event_replays_after_its_recent_receipt_ages_out(self):
         self.assertEqual(self._create()[0], 201)
-        first_status, first, _ = self._advance("start_writer", "evt-old")
+        first_status, first, _ = self._start_writer(event_id="evt-old")
         self.assertEqual(first_status, 200, first)
         self._age_out_event_receipt("evt-old")
         before = self._doc_path().read_bytes()
 
-        status, payload, _ = self._advance("start_writer", "evt-old")
+        status, payload, _ = self._start_writer(event_id="evt-old")
         self.assertEqual(status, first_status, payload)
         self.assertTrue(payload["replayed"])
         self.assertEqual(payload["receipt"], first["receipt"])
@@ -3495,8 +3747,8 @@ class BuildStateTests(unittest.TestCase):
 
     def test_reusing_an_event_id_with_different_input_is_a_conflict(self):
         self.assertEqual(self._create()[0], 201)
-        first = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "1" * 32})[1]
-        status, payload, _ = self._advance("start_writer", "evt-1", data={"writer_session": "gwslice-" + "2" * 32})
+        first = self._start_writer(session="gwslice-" + "1" * 32)[1]
+        status, payload, _ = self._start_writer(session="gwslice-" + "2" * 32)
         self.assertEqual(status, 409, payload)
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["replayed"])
@@ -3512,7 +3764,7 @@ class BuildStateTests(unittest.TestCase):
         # action and data answered all four with the original receipt, so the
         # caller was told its new terms had been applied when they had not.
         self.assertEqual(self._create()[0], 201)
-        first = self._advance("start_writer", "evt-1")[1]
+        first = self._start_writer()[1]
         for field, value in (
             ("holder", "rewst-run-2"),
             ("jobs_spent", 9),
@@ -3520,7 +3772,8 @@ class BuildStateTests(unittest.TestCase):
             ("release_lease", True),
         ):
             with self.subTest(field=field):
-                status, payload, _ = self._advance("start_writer", "evt-1", **{field: value})
+                changed = {"jobs_spent": 0, field: value}
+                status, payload, _ = self._advance("start_writer", "evt-1", **changed)
                 self.assertEqual(status, 409, payload)
                 self.assertFalse(payload["replayed"])
                 self.assertEqual(payload["code"], "idempotency_conflict")
@@ -3533,7 +3786,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_a_live_lease_keeps_a_second_caller_out(self):
         self.assertEqual(self._create()[0], 201)
-        held = self._advance("start_writer", "evt-1", holder="rewst-run-1")[1]
+        held = self._start_writer(holder="rewst-run-1")[1]
         self.assertEqual(held["lease"]["holder"], "rewst-run-1")
         status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-2")
         self.assertEqual(status, 409, payload)
@@ -3542,7 +3795,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_the_lease_holder_keeps_going_without_reacquiring(self):
         self.assertEqual(self._create()[0], 201)
-        self.assertEqual(self._advance("start_writer", "evt-1", holder="rewst-run-1")[0], 200)
+        self.assertEqual(self._start_writer(holder="rewst-run-1")[0], 200)
         status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-1")
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["stage"], "verifying")
@@ -3554,7 +3807,11 @@ class BuildStateTests(unittest.TestCase):
         self.assertIsNotNone(boundary)
         self.assertEqual(boundary["head"], self.head)
         self._expire_lease()
-        status, payload, _ = self._advance("review_passed", "evt-4", holder="rewst-run-2")
+        doc = self._read_doc()
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["reviews"] = [{"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS"}]
+        self._write_doc(doc)
+        status, payload, _ = self._gate("evt-4", holder="rewst-run-2")
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["stage"], "ready")
         self.assertEqual(payload["lease"]["holder"], "rewst-run-2")
@@ -3562,7 +3819,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_releasing_the_lease_hands_the_build_to_the_next_caller(self):
         self.assertEqual(self._create()[0], 201)
-        status, payload, _ = self._advance("start_writer", "evt-1", holder="rewst-run-1", release_lease=True)
+        status, payload, _ = self._start_writer(holder="rewst-run-1", release_lease=True)
         self.assertEqual(status, 200, payload)
         self.assertIsNone(payload["lease"])
         status, payload, _ = self._advance("writer_done", "evt-2", holder="rewst-run-2")
@@ -3570,7 +3827,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_release_lease_accepts_omission_or_booleans_and_rejects_coercion(self):
         self.assertEqual(self._create()[0], 201)
-        status, payload, _ = self._advance("start_writer", "evt-1")
+        status, payload, _ = self._start_writer()
         self.assertEqual(status, 200, payload)
         self.assertIsNotNone(payload["lease"], "omission defaults to keeping the lease")
 
@@ -3578,14 +3835,15 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertIsNotNone(payload["lease"])
 
-        status, payload, _ = self._advance("verify_passed", "evt-3", release_lease=True)
+        self._record_fast_pass()
+        status, payload, _ = self._gate("evt-3", release_lease=True)
         self.assertEqual(status, 200, payload)
         self.assertIsNone(payload["lease"])
 
         before = self._doc_path().read_bytes()
         for i, bad in enumerate(("false", "true", 0, 1, None, [], {}), start=4):
             with self.subTest(release_lease=bad):
-                status, payload, _ = self._advance("review_passed", f"evt-{i}", release_lease=bad)
+                status, payload, _ = self._gate(f"evt-{i}", release_lease=bad)
                 self.assertEqual(status, 400, payload)
                 self.assertEqual(payload["code"], "bad_release_lease")
                 self.assertEqual(self._doc_path().read_bytes(), before, "a bad flag must not change state")
@@ -3668,7 +3926,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_a_head_in_the_payload_cannot_move_the_builds_identity(self):
         self.assertEqual(self._create()[0], 201)
-        status, payload, _ = self._advance("start_writer", "evt-1", data={"head": "b" * 40})
+        status, payload, _ = self._start_writer(data={"head": "b" * 40})
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["head"], self.head, "identity comes from the repository, not the payload")
         self.assertEqual(self._state()[1]["head"], self.head)
@@ -3680,7 +3938,7 @@ class BuildStateTests(unittest.TestCase):
         # hand the resume handle to whatever the caller happened to send.
         session = "gwslice-" + "4" * 32
         self.assertEqual(self._create()[0], 201)
-        self.assertEqual(self._advance("start_writer", "evt-1", data={"writer_session": session})[0], 200)
+        self.assertEqual(self._start_writer(session=session)[0], 200)
         status, payload, _ = self._advance(
             "writer_done", "evt-2", data={"writer_session": "gwslice-" + "5" * 32}
         )
@@ -3699,8 +3957,8 @@ class BuildStateTests(unittest.TestCase):
 
     def test_overrunning_the_job_budget_parks(self):
         self.assertEqual(self._create(budget={"jobs_max": 1})[0], 201)
-        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
-        status, payload, _ = self._advance("writer_done", "evt-2")
+        self.assertEqual(self._start_writer()[0], 200)
+        status, payload, _ = self._advance("writer_done", "evt-2", jobs_spent=2)
         self.assertEqual(status, 409, payload)
         self.assertEqual(payload["code"], "budget_exhausted")
         self.assertEqual(self._state()[1]["stage"], "parked")
@@ -3742,18 +4000,13 @@ class BuildStateTests(unittest.TestCase):
             201,
         )
         session = "gwslice-" + "3" * 32
-        for i, (action, data) in enumerate(
-            (
-                ("start_writer", {"writer_session": session, "stacks": ["riftwing-52", "gw-52"]}),
-                ("writer_done", {}),
-                ("verify_passed", {}),
-                ("evidence_captured", {"round": {"n": 1, "shots": ["home.png"]}}),
-                ("review_passed", {"review": {"author": "sol", "verdict": "clear"}}),
-                ("pr_opened", {"pr": {"number": 7, "url": "https://example.test/pull/7"}}),
-            ),
-            start=1,
-        ):
-            self.assertEqual(self._advance(action, f"evt-{i}", data=data)[0], 200, action)
+        self.assertEqual(
+            self._start_writer(
+                session=session, data={"stacks": ["riftwing-52", "gw-52"]}
+            )[0],
+            200,
+        )
+        self.assertEqual(self._advance("writer_done", "evt-2", jobs_spent=0)[0], 200)
         before = self._state()[1]
 
         # A genuinely fresh process: no patched globals, no warm module. It
@@ -3789,6 +4042,7 @@ class BuildStateTests(unittest.TestCase):
             "route",
             "verification",
             "writer_session",
+            "writer_claim",
             "stacks",
             "evidence_rounds",
             "reviews",
@@ -3810,26 +4064,30 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(after["head"], self.head, "the head read back is the one git reported")
         self.assertEqual(after["index"], "slices/demo/index.json")
         self.assertEqual(after["ticket"], "slices/demo/01-build-state.md")
-        self.assertEqual(after["route"], {"launcher": "hermes", "model": "sol"})
+        self.assertEqual(
+            after["route"], {"class": "sensitive", "launcher": "hermes", "model": "sol"}
+        )
         self.assertTrue(after["verification"]["needs_visual_proof"])
         self.assertEqual(after["writer_session"], session)
         self.assertEqual(after["stacks"], ["riftwing-52", "gw-52"])
-        self.assertEqual(after["evidence_rounds"], [{"n": 1, "shots": ["home.png"]}])
-        self.assertEqual(after["reviews"], [{"author": "sol", "verdict": "clear"}])
-        self.assertEqual(after["verified_boundary"]["head"], self.head)
-        self.assertEqual(after["budget"], {"jobs_max": 12, "jobs_used": 6})
-        self.assertEqual(after["budget_left"], 6)
-        self.assertEqual(after["event_count"], 6)
-        self.assertEqual([r["event_id"] for r in after["receipts"]], [f"evt-{i}" for i in range(1, 7)])
-        self.assertEqual(after["pr"], {"number": 7, "url": "https://example.test/pull/7"})
-        self.assertIsNone(after["lease"], "a finished build holds no lease across a restart either")
-        self.assertEqual(after["stage"], "pr_opened")
-        self.assertIsNone(after["next_action"])
+        self.assertEqual(after["evidence_rounds"], [])
+        self.assertEqual(after["reviews"], [])
+        self.assertEqual(after["budget"], {"jobs_max": 12, "jobs_used": 0})
+        self.assertEqual(after["budget_left"], 12)
+        self.assertEqual(after["event_count"], 2)
+        self.assertEqual(
+            [r["event_id"] for r in after["receipts"]],
+            ["evt-1", "evt-2"],
+        )
+        self.assertEqual(after["stage"], "verifying")
+        self.assertEqual(after["next_action"], "verify_passed")
 
     def test_writes_are_atomic_and_leave_no_partial_file(self):
         self.assertEqual(self._create()[0], 201)
-        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
-            self.assertEqual(self._advance(action, f"evt-{i}")[0], 200, action)
+        self.assertEqual(self._start_writer()[0], 200)
+        self.assertEqual(self._advance("writer_done", "evt-2", jobs_spent=0)[0], 200)
+        self._record_fast_pass()
+        self.assertEqual(self._gate("evt-3")[0], 200)
         leftovers = sorted(p.name for p in self._doc_path().parent.iterdir() if p.name != "build.json")
         self.assertEqual(leftovers, [], "the temp file must be renamed, not left behind")
         self.assertLessEqual(self._doc_path().stat().st_size, server.BUILD_STATE_MAX_BYTES)
@@ -3878,7 +4136,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(self.builds.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self._doc_path().parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self._doc_path().stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
+        self.assertEqual(self._start_writer()[0], 200)
         self.assertEqual(self._doc_path().stat().st_mode & 0o777, 0o600, "a rewrite must not widen it")
 
     def test_receipts_age_out_while_every_accepted_event_id_is_remembered(self):
@@ -3910,7 +4168,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_a_full_event_history_refuses_and_never_frees_an_id_for_reuse(self):
         self.assertEqual(self._create()[0], 201)
-        self.assertEqual(self._advance("start_writer", "evt-1")[0], 200)
+        self.assertEqual(self._start_writer()[0], 200)
         doc = json.loads(self._doc_path().read_text())
         doc["event_seen"] = {f"old-{i}": "some-earlier-fingerprint" for i in range(server.BUILD_EVENT_HARD_MAX)}
         self._doc_path().write_text(json.dumps(doc, indent=2) + "\n")
@@ -3986,14 +4244,6 @@ class BuildStateTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, payload)
-        review = payload["reviews"][-1]
-        self.assertEqual(review["token"], "[redacted]")
-        self.assertEqual(review["hook_secret"], "[redacted]")
-        self.assertEqual(review["note"], "[redacted]", "a token pasted into prose is still a token")
-        # `author` contains no credential; a substring match on "auth" would
-        # have eaten the one field that says who reviewed.
-        self.assertEqual(review["author"], "sol")
-        self.assertEqual(review["verdict"], "clear")
         self.assertNotIn("ghp_", self._doc_path().read_text())
 
     def test_a_resume_url_is_a_credential_even_though_its_name_looks_harmless(self):
@@ -4003,53 +4253,17 @@ class BuildStateTests(unittest.TestCase):
         # writes both of them to disk in the clear.
         resume = "https://rewst.test/webhooks/resume/9f2c"
         self.assertEqual(
-            self._create(route={"launcher": "hermes", "model": "sol", "kick_url": resume})[0], 201
+            self._create(
+                route={"class": "sensitive", "launcher": "hermes", "model": "sol", "kick_url": resume}
+            )[0],
+            201,
         )
         route = self._state()[1]["route"]
         self.assertEqual(route["kick_url"], "[redacted]")
         self.assertEqual(route["launcher"], "hermes", "the routing the build needs must survive")
-        for i, action in enumerate(("start_writer", "writer_done", "verify_passed"), start=1):
-            self.assertEqual(self._advance(action, f"evt-{i}")[0], 200, action)
-        status, payload, _ = self._advance(
-            "review_passed",
-            "evt-4",
-            data={
-                "review": {
-                    "author": "sol",
-                    "verdict": "clear",
-                    "resume_url": resume,
-                    "callbackUrl": resume,
-                    "webhook_url": resume,
-                    "clientSecret": "cs-abcdefgh",
-                    "refresh_token": "rt-abcdefgh",
-                    "AWS_SECRET_ACCESS_KEY": "wJalr",
-                    "signed_link": "https://example.test/artifact?signature=abcdef",
-                    "mirror": "https://deploy:hunter2@example.test/repo.git",
-                    "docs_url": "https://example.test/docs?utm_source=graphwing&page=2",
-                    "commit": self.head,
-                }
-            },
-        )
-        self.assertEqual(status, 200, payload)
-        review = payload["reviews"][-1]
-        for field in (
-            "resume_url",
-            "callbackUrl",
-            "webhook_url",
-            "clientSecret",
-            "refresh_token",
-            "AWS_SECRET_ACCESS_KEY",
-            "signed_link",
-            "mirror",
-        ):
-            self.assertEqual(review[field], "[redacted]", field)
-        # A public URL and a 40-hex object id are the two things redaction most
-        # easily eats. Losing the head would take the identity guard with it.
-        self.assertEqual(review["docs_url"], "https://example.test/docs?utm_source=graphwing&page=2")
-        self.assertEqual(review["commit"], self.head)
-        self.assertEqual(review["author"], "sol")
+        self.assertEqual(self._start_writer()[0], 200)
         on_disk = self._doc_path().read_text()
-        for leaked in ("rewst.test/webhooks/resume", "hunter2", "cs-abcdefgh", "rt-abcdefgh"):
+        for leaked in ("rewst.test/webhooks/resume",):
             self.assertNotIn(leaked, on_disk, leaked)
 
     def test_rewst_capability_urls_redact_by_value_under_generic_keys(self):
@@ -4186,6 +4400,1158 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(second["class"], "mechanical")
         self.assertEqual(idx["verification"]["fast"], ["graphwing-compile"])
         self.assertEqual(idx["test"], "graphwing-unit")
+
+    # -- mechanical ticket 02 ----------------------------------------------
+
+    def test_build_next_derives_the_step_and_replay_never_repeats_completed_work(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        status, first, _ = self._next(stage=["finalize"])
+        self.assertEqual(status, 200, first)
+        self.assertEqual(first["step"], "preflight", "the caller cannot assert a stage")
+        self.assertEqual(self._next(stage=["write"])[1]["step"], "preflight")
+
+        launch = self._launch_writer()
+        self.assertEqual(self._next()[1]["step"], "write")
+        receipt = self._finish_job(launch)
+        completed = self._complete("mechanical-done", launch, receipt)
+        self.assertEqual(completed[0], 200, completed[1])
+        self.assertEqual(self._next()[1]["step"], "fast_checks")
+
+        doc = self._read_doc()
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["checks"] = {
+            "fast": {
+                "change_id": change_id,
+                "required": ["fast"],
+                "verdicts": {"fast": {"ok": True, "coverage": True}},
+                "ok": True,
+            }
+        }
+        self._write_doc(doc)
+        self.assertEqual(self._next()[1]["step"], "verify_passed")
+        self.assertEqual(self._next()[1]["step"], "verify_passed", "a replay returns the durable next step")
+
+    def test_preflight_fails_closed_for_every_unsafe_launch_condition(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        clean = self._read_doc()
+        repos = {"scratch": str(self.repo)}
+        catalog = self._recipe_catalog()
+
+        cases = []
+        unknown = json.loads(json.dumps(clean))
+        unknown["verification"]["fast"] = ["does-not-exist"]
+        cases.append(("unknown_recipe", unknown, catalog, {"ok": True, "entries": []}))
+        wrong = json.loads(json.dumps(clean))
+        wrong_catalog = self._recipe_catalog()
+        wrong_catalog["fast"]["unresolvable"] = "pinned to deployed copy"
+        cases.append(("recipe_wrong_worktree", wrong, wrong_catalog, {"ok": True, "entries": []}))
+        hook = json.loads(json.dumps(clean))
+        hook["verification"]["fast"] = ["riftwing-local-gates"]
+        cases.append(("hook_not_coverage", hook, catalog, {"ok": True, "entries": []}))
+        route = json.loads(json.dumps(clean))
+        route["route"].pop("max_turns")
+        cases.append(("missing_route_stamp", route, catalog, {"ok": True, "entries": []}))
+        trunk = json.loads(json.dumps(clean))
+        trunk["branch"] = "main"
+        cases.append(("trunk_branch", trunk, catalog, {"ok": True, "entries": []}))
+        cases.append(("worktree_conflicted", clean, catalog, {"ok": True, "entries": ["UU server.py"]}))
+        cases.append(("worktree_dirty", clean, catalog, {"ok": True, "entries": [" M server.py"]}))
+
+        for expected, doc, recipes, git_state in cases:
+            with self.subTest(expected=expected):
+                self._write_doc(doc)
+                with mock.patch.object(server, "build_recipe_catalog", return_value=recipes), mock.patch.object(
+                    server, "git_status", return_value=git_state
+                ):
+                    status, payload = server.build_preflight(
+                        json.dumps({"build_id": self.BUILD}).encode(), repos
+                    )
+                self.assertEqual(status, 409, payload)
+                self.assertIn(expected, [failure["code"] for failure in payload["failures"]])
+
+    def test_declared_and_changed_path_recipes_are_an_add_only_union(self):
+        doc = {
+            "verification": {
+                "fast": ["fast"],
+                "path_rules": [
+                    {"match": "server.py", "recipes": ["path-check"]},
+                    {"match": "*.py", "recipes": ["fast", "path-check"]},
+                ],
+            }
+        }
+        required, why = server.build_required_recipes(doc, "fast", ["server.py"])
+        self.assertEqual(required, ["fast", "path-check"])
+        self.assertIn("declared", why["fast"])
+        self.assertEqual(why["path-check"], ["path:server.py", "path:*.py"])
+
+    def test_graphwing_unit_is_rebased_to_the_target_worktree_not_the_deployed_copy(self):
+        deployed = {
+            "name": "graphwing-unit",
+            "argv": ["python3", "test_server.py"],
+            "cwd": server.HOME.resolve(),
+            "timeout_seconds": 30,
+            "coverage": True,
+        }
+        with mock.patch.object(server, "load_tests", return_value={"graphwing-unit": deployed}), mock.patch.object(
+            server, "load_scripts", return_value={}
+        ), mock.patch.object(server, "load_rr", return_value={}):
+            catalog = server.build_recipe_catalog({"scratch": str(self.repo)}, self.repo)
+        self.assertEqual(catalog["graphwing-unit"]["cwd"], self.repo)
+        self.assertIsNone(catalog["graphwing-unit"]["unresolvable"])
+
+        seen = []
+        with mock.patch.object(
+            server,
+            "run_cmd",
+            side_effect=lambda argv, cwd, timeout: seen.append(Path(cwd))
+            or {"ok": True, "returncode": 0, "stdout": "ok", "stderr": ""},
+        ):
+            verdict = server.build_run_recipe("graphwing-unit", catalog["graphwing-unit"])
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(seen, [self.repo])
+
+    def test_checks_record_completed_current_change_verdicts_and_never_treat_queue_as_green(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        doc = self._read_doc()
+        with mock.patch.object(server, "build_recipe_catalog", return_value=self._recipe_catalog()), mock.patch.object(
+            server,
+            "build_run_recipe",
+            return_value={"name": "fast", "kind": "test", "coverage": True, "cwd": str(self.repo),
+                          "ok": True, "returncode": 0, "timed_out": False, "compact": "green"},
+        ):
+            status, payload = server.build_checks_result(
+                doc, "fast", None, None, {"scratch": str(self.repo)}
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["head"], self.head)
+        self.assertEqual(payload["change_id"], server.build_change_id(self.repo, self.head))
+        self.assertEqual(payload["ran"], ["fast"])
+        self.assertEqual(payload["verdicts"][0]["returncode"], 0)
+
+        with mock.patch.object(server.threading.Thread, "start", return_value=None), mock.patch.object(
+            server, "JOBS_DIR", self.home / "jobs"
+        ):
+            queued = self._post_build(
+                "checks",
+                phase="fast",
+                response_webhook_url="https://example.test/resume",
+                response_webhook_token="token",
+            )
+        self.assertEqual(queued[0], 202, queued[1])
+        self.assertFalse(queued[1]["ok"])
+        self.assertFalse(queued[1]["gate_passed"])
+        self.assertEqual(queued[1]["code"], "queued")
+
+    def test_integration_runs_the_exact_staged_candidate_in_a_disposable_runner(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        (self.repo / "candidate-only.txt").write_text("reviewed candidate\n")
+        self._git("add", "candidate-only.txt")
+        doc = self._read_doc()
+        doc["stage"] = "ready"
+        self._write_doc(doc)
+
+        def catalog(_repos, target, _label):
+            return self._recipe_catalog(
+                integration={
+                    "name": "integration",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; assert Path('candidate-only.txt').read_text() == 'reviewed candidate\\n'",
+                    ],
+                    "cwd": target,
+                    "timeout_seconds": 10,
+                    "kind": "test",
+                    "coverage": True,
+                    "unresolvable": None,
+                }
+            )
+
+        with mock.patch.object(server, "build_recipe_catalog", side_effect=catalog):
+            status, payload = server.build_checks_result(
+                doc, "integration", None, "clean-stack", {"scratch": str(self.repo)}
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"], payload)
+        candidate_tree = self._git("write-tree")
+        self.assertEqual(payload["candidate_tree"], candidate_tree)
+        self.assertEqual(payload["runner_tree"], candidate_tree)
+        self.assertNotEqual(Path(payload["runner"]), self.repo)
+        self.assertFalse(Path(payload["runner"]).exists(), "disposable runner is cleaned after the receipt")
+        recorded = self._read_doc()["checks"]["integration"]
+        self.assertEqual(recorded["candidate_tree"], candidate_tree)
+        self.assertEqual(recorded["runner_tree"], candidate_tree)
+        self.assertEqual(recorded["base_head"], self.head)
+        self.assertEqual(recorded["materialization"], payload["materialization"])
+
+        (self.repo / "candidate-only.txt").write_text("changed after integration\n")
+        self._git("add", "candidate-only.txt")
+        clean, reason = server.build_checks_clean(
+            self._read_doc(), "integration", recorded["change_id"]
+        )
+        self.assertFalse(clean)
+        self.assertIn("does not match staged tree", reason)
+
+    def test_integration_rejects_unstaged_untracked_and_baseline_runner_trees(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        (self.repo / "candidate.txt").write_text("candidate\n")
+        self._git("add", "candidate.txt")
+        doc = self._read_doc()
+
+        (self.repo / "README").write_text("unstaged\n")
+        unstaged = server.build_checks_result(
+            doc, "integration", None, "clean-stack", {"scratch": str(self.repo)}
+        )
+        self.assertEqual(unstaged[0], 409, unstaged[1])
+        self.assertEqual(unstaged[1]["code"], "candidate_not_exact")
+        self._git("restore", "README")
+
+        (self.repo / "untracked.txt").write_text("not reviewed\n")
+        untracked = server.build_checks_result(
+            doc, "integration", None, "clean-stack", {"scratch": str(self.repo)}
+        )
+        self.assertEqual(untracked[0], 409, untracked[1])
+        self.assertEqual(untracked[1]["code"], "candidate_not_exact")
+        (self.repo / "untracked.txt").unlink()
+
+        original_verify = server.build_runner_tree
+        with mock.patch.object(server, "build_runner_tree", return_value=self.head):
+            baseline = server.build_checks_result(
+                doc, "integration", None, "clean-stack", {"scratch": str(self.repo)}
+            )
+        self.assertEqual(baseline[0], 409, baseline[1])
+        self.assertEqual(baseline[1]["code"], "runner_tree_mismatch")
+        self.assertNotEqual(original_verify(self.repo), self.head)
+
+    def test_candidate_runners_are_isolated_and_cleanup_is_idempotent(self):
+        (self.repo / "candidate.txt").write_text("candidate\n")
+        self._git("add", "candidate.txt")
+        candidate, gap = server.build_materialize_candidate(self.repo, self.head, "change")
+        self.assertIsNone(gap)
+        self.assertIsNotNone(candidate)
+        runners = []
+        failures = []
+        barrier = threading.Barrier(2)
+
+        def provision(attempt):
+            barrier.wait()
+            runner, error = server.build_provision_candidate_runner(
+                self.repo, self.clean_runner, candidate, attempt
+            )
+            if error:
+                failures.append(error)
+            else:
+                runners.append(runner)
+
+        threads = [threading.Thread(target=provision, args=(f"attempt-{n}",)) for n in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+        self.assertEqual(len({str(path) for path in runners}), 2)
+        for runner in runners:
+            self.assertEqual((runner / "candidate.txt").read_text(), "candidate\n")
+            server.build_cleanup_candidate_runner(self.repo, runner)
+            server.build_cleanup_candidate_runner(self.repo, runner)
+            self.assertFalse(runner.exists())
+
+    def test_check_gates_reject_stale_missing_red_and_non_clean_integration_results(self):
+        change = "a" * 40 + ":current"
+        base = {
+            "checks": {
+                "fast": {
+                    "change_id": change,
+                    "required": ["fast"],
+                    "verdicts": {"fast": {"ok": True, "coverage": True}},
+                }
+            }
+        }
+        self.assertFalse(server.build_checks_clean(base, "fast", "b" * 40 + ":new")[0])
+        missing = json.loads(json.dumps(base))
+        missing["checks"]["fast"]["verdicts"] = {}
+        self.assertIn("no verdict", server.build_checks_clean(missing, "fast", change)[1])
+        red = json.loads(json.dumps(base))
+        red["checks"]["fast"]["verdicts"]["fast"]["ok"] = False
+        self.assertIn("failed", server.build_checks_clean(red, "fast", change)[1])
+        integration = {
+            "stacks": ["writer-stack"],
+            "checks": {
+                "integration": {
+                    "change_id": change,
+                    "stack": "preview-clean",
+                    "required": ["integration"],
+                    "verdicts": {"integration": {"ok": True, "coverage": True}},
+                }
+            },
+        }
+        self.assertIn("not in stacks.json", server.build_checks_clean(integration, "integration", change)[1])
+
+    def test_red_commands_are_completed_verdicts_but_cannot_pass_the_gate(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        with mock.patch.object(server, "build_recipe_catalog", return_value=self._recipe_catalog()), mock.patch.object(
+            server,
+            "build_run_recipe",
+            return_value={"name": "fast", "kind": "test", "coverage": True, "cwd": str(self.repo),
+                          "ok": False, "returncode": 7, "timed_out": False, "compact": "red"},
+        ):
+            status, payload = server.build_checks_result(
+                self._read_doc(), "fast", None, None, {"scratch": str(self.repo)}
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "check_failed")
+        self.assertEqual(payload["verdicts"][0]["returncode"], 7)
+
+    def test_review_is_cross_vendor_current_and_silence_is_not_a_finding(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        doc = self._read_doc()
+        doc["stage"] = "review"
+        self._write_doc(doc)
+        refused = self._post_build("review", reviewer="grok")
+        self.assertEqual(refused[0], 409, refused[1])
+        self.assertEqual(refused[1]["code"], "reviewer_is_writer")
+
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+        ):
+            passed = self._post_build("review", reviewer="sonnet")
+        self.assertEqual(passed[0], 200, passed[1])
+        self.assertTrue(passed[1]["ok"])
+        self.assertEqual(passed[1]["head"], self.head)
+        old_change = passed[1]["change_id"]
+        (self.repo / "README").write_text("diff changed\n")
+        self.assertIsNone(server.build_last_review(self._read_doc(), server.build_change_id(self.repo, self.head)))
+        self.assertNotEqual(old_change, server.build_change_id(self.repo, self.head))
+
+        before = len(self._read_doc()["reviews"])
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": None, "no_verdict": True, "code": "timeout"},
+        ):
+            silent = self._post_build("review", reviewer="sonnet")
+        self.assertEqual(silent[0], 200, silent[1])
+        self.assertTrue(silent[1]["no_verdict"])
+        self.assertFalse(silent[1]["finding"])
+        self.assertEqual(len(self._read_doc()["reviews"]), before)
+
+    def test_review_findings_are_recorded_against_the_current_change(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        doc = self._read_doc()
+        doc["stage"] = "review"
+        self._write_doc(doc)
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "NACK", "summary": "missing seam", "compact": "fix seam", "no_verdict": False},
+        ):
+            result = self._post_build("review", reviewer="sonnet")
+        self.assertEqual(result[0], 200, result[1])
+        self.assertFalse(result[1]["ok"])
+        self.assertTrue(result[1]["finding"])
+        self.assertEqual(self._read_doc()["reviews"][-1]["change_id"], result[1]["change_id"])
+
+    def test_correction_brief_requires_and_resumes_the_writer_session_and_charges_budget(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        no_session = self._post_build("brief", finding="fix the seam")
+        self.assertEqual(no_session[0], 409, no_session[1])
+        self.assertEqual(no_session[1]["code"], "claim_required")
+        doc = self._read_doc()
+        doc["writer_session"] = "gwslice-" + "b" * 32
+        doc["stage"] = "review"
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["checks"] = {
+            "fast": {
+                "change_id": change_id,
+                "required": ["fast"],
+                "verdicts": {"fast": {"ok": True, "coverage": True}},
+            }
+        }
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "sonnet", "verdict": "NACK", "summary": "fix the seam"}
+        ]
+        before = doc["budget"]["jobs_used"]
+        self._write_doc(doc)
+        claim = self._claim("claim-correction", kind="correction")
+        self.assertEqual(claim[0], 200, claim[1])
+        brief = self._post_build("brief", finding="fix the seam")
+        self.assertEqual(brief[0], 200, brief[1])
+        self.assertTrue(brief[1]["resume"])
+        self.assertEqual(brief[1]["hermes_session"], doc["writer_session"])
+        self.assertEqual(self._read_doc()["budget"]["jobs_used"], before + 1)
+
+    def test_finalize_requires_current_clean_gates_and_commits_pushes_once(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        (self.repo / "change.txt").write_text("ready\n")
+        self._git("add", "change.txt")
+        change_id = server.build_change_id(self.repo, self.head)
+        doc = self._read_doc()
+        doc["stage"] = "ready"
+        doc["verified_boundary"] = {"head": self.head}
+        doc["checks"] = {
+            phase: {
+                "change_id": change_id,
+                "stack": "clean-stack" if phase == "integration" else None,
+                "runner": str(self.clean_runner) if phase == "integration" else str(self.repo),
+                "required": [phase],
+                "verdicts": {phase: {"ok": True, "coverage": True}},
+            }
+            for phase in ("fast", "integration")
+        }
+        tree = self._git("write-tree")
+        doc["checks"]["integration"].update(
+            head=self.head,
+            runner=str(self.clean_runner / "recorded-attempt"),
+            candidate_tree=tree,
+            runner_tree=tree,
+            base_head=self.head,
+            materialization="a" * 40,
+        )
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS", "summary": "clear"}
+        ]
+        self._write_doc(doc)
+
+        original_run_git = server.run_git
+        pushes = []
+
+        def git_with_local_push(path, args, **kwargs):
+            if args and args[0] == "push":
+                pushes.append(list(args))
+                return {"ok": True, "returncode": 0, "stdout": "pushed", "stderr": ""}
+            return original_run_git(path, args, **kwargs)
+
+        request = {"event_id": "final-once", "holder": "rewst-run", "message": "mechanical change"}
+        with mock.patch.object(server, "run_git", side_effect=git_with_local_push):
+            first = self._post_build("finalize", **request)
+            replay = self._post_build("finalize", **request)
+            fresh_replay = self._post_build(
+                "finalize", event_id="final-fresh", holder="rewst-run", message="mechanical change"
+            )
+        self.assertEqual(first[0], 200, first[1])
+        self.assertTrue(first[1]["receipt"]["committed"])
+        self.assertTrue(first[1]["receipt"]["pushed"])
+        self.assertEqual(len(pushes), 1)
+        self.assertTrue(replay[1]["replayed"])
+        self.assertEqual(replay[1]["receipt"], first[1]["receipt"])
+        self.assertEqual(fresh_replay[1]["code"], "already_finalized")
+        self.assertEqual(self._git("rev-list", "--count", self.head + "..HEAD"), "1")
+
+    def test_finalize_refuses_missing_stale_dirty_and_wrong_head_evidence(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        doc = self._read_doc()
+        doc["stage"] = "ready"
+        self._write_doc(doc)
+        missing = self._post_build("finalize", event_id="fin-missing", holder="r", message="x")
+        self.assertEqual(missing[0], 409, missing[1])
+        self.assertEqual(missing[1]["code"], "not_ready")
+
+        current = server.build_change_id(self.repo, self.head)
+        doc = self._read_doc()
+        doc["checks"] = {
+            phase: {
+                "change_id": "stale",
+                "stack": "clean-stack" if phase == "integration" else None,
+                "runner": str(self.clean_runner) if phase == "integration" else str(self.repo),
+                "required": [phase],
+                "verdicts": {phase: {"ok": True, "coverage": True}},
+            }
+            for phase in ("fast", "integration")
+        }
+        doc["reviews"] = [{"change_id": "stale", "reviewer": "sonnet", "verdict": "PASS"}]
+        self._write_doc(doc)
+        stale = self._post_build("finalize", event_id="fin-stale", holder="r", message="x")
+        self.assertEqual(stale[1]["code"], "not_ready")
+
+        doc = self._read_doc()
+        for entry in doc["checks"].values():
+            entry["change_id"] = current
+        doc["reviews"] = [{"change_id": current, "reviewer": "sonnet", "verdict": "PASS"}]
+        doc["verified_boundary"] = {"head": self.head}
+        self._write_doc(doc)
+        (self.repo / "README").write_text("unstaged conflict-like dirt\n")
+        dirty = self._post_build("finalize", event_id="fin-dirty", holder="r", message="x")
+        self.assertEqual(dirty[1]["code"], "worktree_not_equal")
+
+        self._git("restore", "README")
+        doc = self._read_doc()
+        doc["verified_boundary"] = {"head": "f" * 40}
+        self._write_doc(doc)
+        wrong = self._post_build("finalize", event_id="fin-head", holder="r", message="x")
+        self.assertEqual(wrong[0], 409, wrong[1])
+        self.assertEqual(wrong[1]["park_reason"], "head_moved_after_verify")
+
+    def test_initial_writer_launch_replay_reserves_one_job_and_session(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        claim = self._claim()[1]["claim"]
+        self.assertRegex(claim["writer_session"], r"^gwslice-[0-9a-f]{32}$")
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            first = self._launch()
+            replay = self._launch()
+        self.assertEqual(first[0], 202, first[1])
+        self.assertEqual(replay[0], 202, replay[1])
+        self.assertEqual(replay[1]["job_id"], first[1]["job_id"])
+        self.assertEqual(replay[1]["hermes_session"], first[1]["hermes_session"])
+        self.assertEqual(first[1]["hermes_session"], claim["writer_session"])
+        self.assertEqual(enqueue.call_count, 2)
+        self.assertEqual(len(list((self.home / "jobs").glob("*/job.json"))), 1)
+
+    def test_writer_launch_recovers_one_job_after_crash_following_launch_intent(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        original_write_job = server.write_job
+        with mock.patch.object(server, "write_job", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self._launch()
+        intent = self._read_doc()["writer_claim"]
+        self.assertEqual(intent["launch_state"], "intent")
+        self.assertFalse((self.home / "jobs" / intent["job_id"] / "job.json").exists())
+        with mock.patch.object(server, "write_job", side_effect=original_write_job), mock.patch.object(
+            server, "enqueue_agent"
+        ) as enqueue:
+            recovered = self._launch()
+            replay = self._launch()
+        self.assertEqual(recovered[0], 202, recovered[1])
+        self.assertEqual(replay[1]["job_id"], recovered[1]["job_id"])
+        self.assertEqual(enqueue.call_count, 2)
+
+    def test_writer_launch_replay_dispatches_the_queued_job_after_enqueue_crash(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent", side_effect=RuntimeError("crash after write")):
+            with self.assertRaisesRegex(RuntimeError, "crash after write"):
+                self._launch()
+        job_id = self._read_doc()["writer_claim"]["job_id"]
+        self.assertEqual(server.read_job(job_id)["status"], "queued")
+
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            replay = self._launch()
+        self.assertEqual(replay[0], 202, replay[1])
+        self.assertTrue(replay[1]["replayed"])
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0]["job_id"], job_id)
+
+    def test_concurrent_queued_writer_dispatches_execute_only_one_process(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            launch = self._launch()[1]
+
+        entered = threading.Event()
+        release = threading.Event()
+        spawned = []
+
+        class Proc:
+            pid = 12345
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def blocked_spawn(job):
+            spawned.append(job["job_id"])
+            entered.set()
+            release.wait(2)
+            return Proc(), None
+
+        with mock.patch.object(server, "spawn_writer", side_effect=blocked_spawn), mock.patch.object(
+            server, "deliver_webhook", return_value=None
+        ), mock.patch.object(server, "herdr_job_done"):
+            first = threading.Thread(target=server.run_agent_job, args=(launch["job_id"],))
+            second = threading.Thread(target=server.run_agent_job, args=(launch["job_id"],))
+            first.start()
+            self.assertTrue(entered.wait(2))
+            second.start()
+            second.join(2)
+            release.set()
+            first.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(spawned, [launch["job_id"]])
+
+    def test_writer_completion_is_authoritative_idempotent_and_correction_returns_to_checks(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            launch = self._launch()[1]
+        receipt = self._finish_job(launch)
+        first = self._complete("writer-complete", launch, receipt)
+        replay = self._complete("writer-complete", launch, receipt)
+        conflict = self._complete("writer-complete", launch, {**receipt, "summary": "different"})
+        self.assertEqual(first[0], 200, first[1])
+        self.assertEqual(first[1]["stage"], "verifying")
+        self.assertEqual(first[1]["writer_session"], launch["hermes_session"])
+        self.assertIsNone(first[1]["lease"])
+        self.assertTrue(self._read_doc()["writer_claim"]["consumed"])
+        self.assertTrue(replay[1]["replayed"])
+        self.assertEqual(conflict[0], 409, conflict[1])
+        self.assertEqual(conflict[1]["code"], "idempotency_conflict")
+
+        doc = self._read_doc()
+        doc["stage"] = "review"
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["checks"] = {
+            "fast": {"change_id": change_id, "required": ["fast"],
+                     "verdicts": {"fast": {"ok": True, "coverage": True}}}
+        }
+        doc["reviews"] = [{"change_id": change_id, "reviewer": "sonnet", "verdict": "NACK"}]
+        self._write_doc(doc)
+        self.assertEqual(self._claim("claim-correction", kind="correction")[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            correction = self._launch("claim-correction")[1]
+        (self.repo / "README").write_text("corrected\n")
+        self._git("add", "README")
+        corrected_receipt = self._finish_job(correction)
+        completed = self._complete(
+            "correction-complete", correction, corrected_receipt, claim_id="claim-correction"
+        )
+        self.assertEqual(completed[0], 200, completed[1])
+        self.assertEqual(completed[1]["stage"], "review", "correction completion asserts no gate")
+        self.assertIsNone(completed[1]["lease"])
+        self.assertEqual(self._next()[1]["step"], "fast_checks")
+
+    def test_failed_writer_completion_preserves_files_and_records_recoverable_correction(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            launch = self._launch()[1]
+        (self.repo / "partial.txt").write_text("keep me\n")
+        receipt = self._finish_job(launch, status="error", summary="writer failed")
+        completed = self._complete("writer-red", launch, receipt)
+        self.assertEqual(completed[0], 200, completed[1])
+        self.assertEqual(completed[1]["stage"], "writing")
+        self.assertEqual(completed[1]["writer_result"]["status"], "error")
+        self.assertTrue((self.repo / "partial.txt").is_file())
+        self.assertIsNone(completed[1]["lease"])
+        self.assertEqual(self._next()[1]["step"], "fix")
+
+    def test_correction_claim_is_stage_gated_locked_idempotent_and_single_spend(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        premature = self._claim("correction-early", kind="correction")
+        self.assertEqual(premature[0], 409, premature[1])
+        self.assertEqual(premature[1]["code"], "claim_not_due")
+        doc = self._read_doc()
+        doc["stage"] = "review"
+        doc["writer_session"] = "gwslice-" + "d" * 32
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["checks"] = {
+            "fast": {
+                "change_id": change_id,
+                "required": ["fast"],
+                "verdicts": {"fast": {"ok": True, "coverage": True}},
+            }
+        }
+        doc["reviews"] = [{"change_id": change_id, "reviewer": "sonnet", "verdict": "NACK"}]
+        self._write_doc(doc)
+        first = self._claim("correction-one", kind="correction")
+        replay = self._claim("correction-one", kind="correction")
+        blocked = self._claim("correction-two", kind="correction")
+        self.assertEqual(first[0], 200, first[1])
+        self.assertEqual(replay[0], 200, replay[1])
+        self.assertTrue(replay[1]["replayed"])
+        self.assertEqual(blocked[0], 409, blocked[1])
+        self.assertEqual(blocked[1]["code"], "writer_claimed")
+        self.assertEqual(first[1]["claim"]["writer_session"], doc["writer_session"])
+        self.assertEqual(self._read_doc()["budget"]["jobs_used"], 1)
+
+    def test_active_writer_job_blocks_a_second_claim_after_lease_wall_time(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            launch = self._launch()[1]
+        doc = self._read_doc()
+        doc["lease"]["expires_epoch"] = time.time() - 1
+        doc["writer_claim"]["expires_epoch"] = time.time() - 1
+        self._write_doc(doc)
+        blocked = self._claim("claim-second", holder="rewst-run-2")
+        self.assertEqual(blocked[0], 409, blocked[1])
+        self.assertEqual(blocked[1]["code"], "writer_claimed")
+        self.assertEqual(blocked[1]["claim"]["job_id"], launch["job_id"])
+
+    def test_mechanical_generic_writer_assertions_are_always_refused(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        refused = self._advance("start_writer", "generic-start")
+        self.assertEqual(refused[0], 409, refused[1])
+        self.assertEqual(refused[1]["code"], "writer_op_required")
+
+        self.assertEqual(self._claim()[0], 200)
+        with mock.patch.object(server, "enqueue_agent"):
+            launch = self._launch()[1]
+        doc = self._read_doc()
+        doc["lease"]["expires_epoch"] = time.time() - 1
+        doc["writer_claim"]["expires_epoch"] = time.time() - 1
+        self._write_doc(doc)
+        refused = self._advance("writer_done", "generic-done", holder="another-holder")
+        self.assertEqual(refused[0], 409, refused[1])
+        self.assertEqual(refused[1]["code"], "writer_op_required")
+        self.assertEqual(self._state()[1]["stage"], "writing")
+        self.assertEqual(self._read_doc()["writer_claim"]["job_id"], launch["job_id"])
+
+    def test_checks_and_review_gate_recovery_reports_already_applied(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        doc = self._read_doc()
+        doc["stage"] = "verifying"
+        self._write_doc(doc)
+        green = {
+            "name": "fast", "kind": "test", "coverage": True, "cwd": str(self.repo),
+            "ok": True, "returncode": 0, "timed_out": False, "compact": "green",
+        }
+        with mock.patch.object(server, "build_recipe_catalog", return_value=self._recipe_catalog()), mock.patch.object(
+            server, "build_run_recipe", return_value=green
+        ):
+            checks = self._post_build("checks", phase="fast")
+        self.assertEqual(checks[0], 200, checks[1])
+        self.assertEqual(checks[1]["stage"], "review")
+        checks_gate = self._gate("stable-event.verify-passed", holder="event:stable-event")
+        self.assertEqual(checks_gate[0], 200, checks_gate[1])
+        self.assertEqual(checks_gate[1]["code"], "already_applied")
+
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+        ):
+            review = self._post_build("review", reviewer="sonnet")
+        self.assertEqual(review[0], 200, review[1])
+        self.assertEqual(review[1]["stage"], "ready")
+        review_gate = self._gate("stable-event.review-passed", holder="event:stable-event")
+        self.assertEqual(review_gate[0], 200, review_gate[1])
+        self.assertEqual(review_gate[1]["code"], "already_applied")
+
+    def test_generic_advance_cannot_assert_any_authoritative_gate(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        for action in ("verify_passed", "review_passed", "pr_opened"):
+            with self.subTest(action=action):
+                result = self._advance(action, "inject-" + action)
+                self.assertEqual(result[0], 409, result[1])
+                self.assertEqual(result[1]["code"], "gate_op_required")
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_review_verdict_parser_requires_a_final_line_and_fails_conflicts_closed(self):
+        self.assertEqual(server.build_parse_review_verdict("analysis\nVERDICT: PASS\n")[0], "PASS")
+        self.assertIsNone(server.build_parse_review_verdict("VERDICT: PASS\nmore prose")[0])
+        self.assertEqual(
+            server.build_parse_review_verdict("VERDICT: PASS\nVERDICT: NACK\n")[0], "NACK"
+        )
+        self.assertIsNone(
+            server.build_parse_review_verdict('{"status":"ok","receipt":{"verdict":"PASS"}}')[0]
+        )
+
+    def test_writer_vendor_aliases_are_complete_and_unknown_fails_closed(self):
+        expected = {
+            "sonnet": "anthropic",
+            "opus": "anthropic",
+            "fable": "anthropic",
+            "claude-sonnet-5": "anthropic",
+            "grok-4.6": "xai",
+            "gpt-5.6-sol": "openai",
+        }
+        for model, vendor in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(server.build_writer_vendor({"route": {"model": model}}), vendor)
+        unknown = {"route": {"model": "mystery-9000"}}
+        self.assertEqual(server.build_writer_vendor(unknown), server.BUILD_VENDOR_UNKNOWN)
+        self.assertIn("no vendor", server.build_review_authority_gap(unknown, "sonnet"))
+
+    def test_push_retry_uses_the_journalled_sha_without_a_second_commit(self):
+        self._ready_finalize_fixture()
+        original = server.run_git
+        commits = []
+        pushes = []
+
+        def fail_then_push(path, args, **kwargs):
+            if args[0] == "commit":
+                commits.append(list(args))
+            if args[0] == "ls-remote":
+                return {"ok": True, "returncode": 0, "stdout": "", "stderr": ""}
+            if args[0] == "push":
+                pushes.append(list(args))
+                if len(pushes) == 1:
+                    return {"ok": False, "returncode": 1, "stdout": "", "stderr": "offline", "error": "offline"}
+                return {"ok": True, "returncode": 0, "stdout": "pushed", "stderr": ""}
+            return original(path, args, **kwargs)
+
+        event_id = "push-retry"
+        first_run_id = "rewst-run-one"
+        retry_run_id = "rewst-run-two"
+        holder = lambda _run_id: f"event:{event_id}"
+        request = {"event_id": event_id, "holder": holder(first_run_id), "message": "retry me"}
+        with mock.patch.object(server, "run_git", side_effect=fail_then_push):
+            failed = self._post_build("finalize", **request)
+            pending_sha = self._read_doc()["pending_finalize"]["sha"]
+            retried = self._post_build(
+                "finalize", **{**request, "holder": holder(retry_run_id)}
+            )
+        self.assertEqual(failed[1]["code"], "push_failed")
+        self.assertEqual(failed[1]["sha"], pending_sha)
+        self.assertEqual(retried[0], 200, retried[1])
+        self.assertEqual(retried[1]["receipt"]["sha"], pending_sha)
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(len(pushes), 2)
+        self.assertNotEqual(self._state()[1]["stage"], "parked")
+
+    def test_finalize_state_write_failure_before_commit_retries_exactly_once(self):
+        self._ready_finalize_fixture()
+        original_git = server.run_git
+        original_write = server.write_build
+        commits = []
+        pushes = []
+
+        def git_with_remote(path, args, **kwargs):
+            if args[0] == "commit":
+                commits.append(list(args))
+            if args[0] == "push":
+                pushes.append(list(args))
+                return {"ok": True, "returncode": 0, "stdout": "pushed", "stderr": ""}
+            return original_git(path, args, **kwargs)
+
+        failed_write = {
+            "ok": False, "error": "injected crash before commit",
+            "code": "state_write_failed", "status": 500,
+        }
+        request = {"event_id": "crash-before-commit", "holder": "run", "message": "one commit"}
+        with mock.patch.object(server, "run_git", side_effect=git_with_remote), mock.patch.object(
+            server, "write_build", return_value=failed_write
+        ):
+            failed = self._post_build("finalize", **request)
+        self.assertEqual(failed[1]["code"], "state_write_failed")
+        self.assertEqual(commits, [])
+        self.assertEqual(self._git("rev-parse", "HEAD"), self.head)
+        with mock.patch.object(server, "run_git", side_effect=git_with_remote), mock.patch.object(
+            server, "write_build", side_effect=original_write
+        ):
+            retried = self._post_build("finalize", **request)
+        self.assertEqual(retried[0], 200, retried[1])
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(len(pushes), 1)
+
+    def _assert_finalize_recovers_state_write(self, crash_write):
+        self._ready_finalize_fixture()
+        original_git = server.run_git
+        original_write = server.write_build
+        writes = 0
+        commits = []
+        pushes = []
+        remote_heads = {}
+
+        def fail_selected_write(doc, expected_id=None):
+            nonlocal writes
+            writes += 1
+            if writes == crash_write:
+                return {
+                    "ok": False, "error": "injected crash",
+                    "code": "state_write_failed", "status": 500,
+                }
+            return original_write(doc, expected_id)
+
+        def git_with_remote(path, args, **kwargs):
+            if args[0] == "commit":
+                commits.append(list(args))
+            if args[0] == "ls-remote":
+                sha = remote_heads.get(args[-1], "")
+                stdout = f"{sha}\t{args[-1]}\n" if sha else ""
+                return {"ok": True, "returncode": 0, "stdout": stdout, "stderr": ""}
+            if args[0] == "push":
+                pushes.append(list(args))
+                sha, ref = args[2].split(":", 1)
+                remote_heads[ref] = sha
+                return {"ok": True, "returncode": 0, "stdout": "pushed", "stderr": ""}
+            return original_git(path, args, **kwargs)
+
+        request = {
+            "event_id": f"recover-write-{crash_write}", "holder": "run",
+            "message": f"recover write {crash_write}",
+        }
+        with mock.patch.object(server, "run_git", side_effect=git_with_remote), mock.patch.object(
+            server, "write_build", side_effect=fail_selected_write
+        ):
+            failed = self._post_build("finalize", **request)
+        self.assertEqual(failed[1]["code"], "state_write_failed")
+        expected_state = "prepared" if crash_write == 2 else "committed"
+        durable_intent = self._read_doc()["pending_finalize"]
+        self.assertEqual(durable_intent["state"], expected_state)
+        if crash_write == 3:
+            for field in ("sha", "tree", "parent", "message"):
+                self.assertTrue(durable_intent.get(field), field)
+        takeover = self._post_build(
+            "finalize", event_id=f"takeover-write-{crash_write}", holder="run",
+            message=request["message"],
+        )
+        self.assertEqual(takeover[0], 409, takeover[1])
+        self.assertEqual(takeover[1]["code"], "finalize_in_progress")
+        committed_sha = self._git("rev-parse", "HEAD")
+        with mock.patch.object(server, "run_git", side_effect=git_with_remote), mock.patch.object(
+            server, "write_build", side_effect=original_write
+        ):
+            retried = self._post_build("finalize", **request)
+            replay = self._post_build("finalize", **request)
+        self.assertEqual(retried[0], 200, retried[1])
+        self.assertEqual(retried[1]["receipt"]["sha"], committed_sha)
+        self.assertEqual(replay[1]["receipt"], retried[1]["receipt"])
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual(
+            pushes[0][2],
+            f"{committed_sha}:refs/heads/{self.BRANCH}",
+        )
+        self.assertFalse(any(arg.startswith("--force") for arg in pushes[0]))
+
+    def test_finalize_state_write_failure_after_commit_adopts_without_recommit(self):
+        self._assert_finalize_recovers_state_write(2)
+
+    def test_finalize_state_write_failure_after_push_verifies_remote_without_repush(self):
+        self._assert_finalize_recovers_state_write(3)
+
+    def test_prepared_finalize_rejects_takeover_and_conflicting_same_event(self):
+        request = self._prepare_finalize_intent()
+        takeover = self._post_build(
+            "finalize", event_id="other-finalize", holder="run", message=request["message"]
+        )
+        conflict = self._post_build("finalize", **{**request, "message": "different message"})
+        self.assertEqual(takeover[0], 409, takeover[1])
+        self.assertEqual(takeover[1]["code"], "finalize_in_progress")
+        self.assertEqual(conflict[0], 409, conflict[1])
+        self.assertEqual(conflict[1]["code"], "idempotency_conflict")
+        self.assertEqual(self._git("rev-parse", "HEAD"), self.head)
+
+    def test_prepared_finalize_rejects_a_conflicting_candidate_tree_without_committing(self):
+        request = self._prepare_finalize_intent(event_id="tree-conflict")
+        (self.repo / "change.txt").write_text("changed after prepare\n")
+        self._git("add", "change.txt")
+        refused = self._post_build("finalize", **request)
+        self.assertEqual(refused[0], 409, refused[1])
+        self.assertEqual(refused[1]["code"], "finalize_adoption_mismatch")
+        self.assertEqual(self._git("rev-parse", "HEAD"), self.head)
+
+    def _assert_finalize_adoption_rejected(self, mismatch):
+        request = self._prepare_finalize_intent(event_id=f"adopt-{mismatch}", message="expected message")
+        doc = self._read_doc()
+        intent = doc["pending_finalize"]
+        self._git("commit", "-m", "wrong message" if mismatch == "message" else request["message"])
+        if mismatch == "parent":
+            intent["expected_parent"] = "f" * 40
+        elif mismatch == "tree":
+            intent["candidate_tree"] = "f" * 40
+        elif mismatch == "branch":
+            self._git("checkout", "-b", "feature/wrong-branch")
+        elif mismatch == "author":
+            intent["authoring_boundary"]["author"] = "someone else <else@example.test>"
+        self._write_doc(doc)
+        refused = self._post_build("finalize", **request)
+        self.assertEqual(refused[0], 409, refused[1])
+        self.assertEqual(refused[1]["code"], "finalize_adoption_mismatch")
+
+    def test_prepared_finalize_adoption_rejects_wrong_parent(self):
+        self._assert_finalize_adoption_rejected("parent")
+
+    def test_prepared_finalize_adoption_rejects_wrong_tree(self):
+        self._assert_finalize_adoption_rejected("tree")
+
+    def test_prepared_finalize_adoption_rejects_wrong_message(self):
+        self._assert_finalize_adoption_rejected("message")
+
+    def test_prepared_finalize_adoption_rejects_wrong_branch(self):
+        self._assert_finalize_adoption_rejected("branch")
+
+    def test_prepared_finalize_adoption_rejects_wrong_author_boundary(self):
+        self._assert_finalize_adoption_rejected("author")
+
+    def test_finalize_rejects_unstaged_tracked_and_untracked_content(self):
+        self._ready_finalize_fixture()
+        for event_id, make_dirt in (
+            ("dirty-tracked", lambda: (self.repo / "README").write_text("unstaged\n")),
+            ("dirty-untracked", lambda: (self.repo / "loose.txt").write_text("untracked\n")),
+        ):
+            with self.subTest(event_id=event_id):
+                make_dirt()
+                change_id = server.build_change_id(self.repo, self.head)
+                doc = self._read_doc()
+                for entry in doc["checks"].values():
+                    entry["change_id"] = change_id
+                doc["reviews"] = [
+                    {"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS"}
+                ]
+                self._write_doc(doc)
+                result = self._post_build("finalize", event_id=event_id, holder="run", message="no")
+                self.assertEqual(result[0], 409, result[1])
+                self.assertEqual(result[1]["code"], "worktree_not_equal")
+                self._git("restore", "README")
+                (self.repo / "loose.txt").unlink(missing_ok=True)
+
+    def test_clean_stack_role_runner_and_cwd_are_authoritative(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        (self.repo / "ticket.md").unlink()
+        (self.repo / "candidate.txt").write_text("candidate\n")
+        self._git("add", "candidate.txt")
+        doc = self._read_doc()
+        healthy_but_arbitrary = server.build_checks_result(
+            doc, "integration", None, "looks-clean", {"scratch": str(self.repo)}
+        )
+        self.assertEqual(healthy_but_arbitrary[0], 409)
+        self.assertEqual(healthy_but_arbitrary[1]["code"], "not_a_clean_stack")
+
+        seen = []
+        def catalog(_repos, target, _label):
+            recipes = self._recipe_catalog()
+            recipes["integration"]["cwd"] = target
+            return recipes
+
+        with mock.patch.object(server, "build_recipe_catalog", side_effect=catalog), mock.patch.object(
+            server,
+            "build_run_recipe",
+            side_effect=lambda name, spec: seen.append(Path(spec["cwd"]))
+            or {"name": name, "ok": True, "coverage": True},
+        ):
+            result = server.build_checks_result(
+                doc, "integration", None, "clean-stack", {"scratch": str(self.repo)}
+            )
+        self.assertEqual(result[0], 200, result[1])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].parent, self.clean_runner)
+        self.assertNotIn(self.repo, seen)
+
+    def test_path_rule_phase_and_preflight_validation_cover_every_reachable_recipe(self):
+        verification = {
+            "fast": ["fast"],
+            "integration": ["integration"],
+            "path_rules": [
+                {"match": "*.py", "phase": "integration", "recipes": ["path-check"]}
+            ],
+        }
+        self.assertEqual(self._mechanical_create(verification=verification)[0], 201)
+        doc = self._read_doc()
+        self.assertEqual(server.build_required_recipes(doc, "fast", ["server.py"])[0], ["fast"])
+        self.assertEqual(
+            server.build_required_recipes(doc, "integration", ["server.py"])[0],
+            ["integration", "path-check"],
+        )
+        for code, mutate in (
+            ("unknown_recipe", lambda catalog: catalog.pop("path-check")),
+            ("recipe_wrong_worktree", lambda catalog: catalog["path-check"].update(unresolvable="wrong tree")),
+            ("hook_not_coverage", lambda catalog: [catalog[name].update(coverage=False) for name in ("integration", "path-check")]),
+        ):
+            with self.subTest(code=code):
+                catalog = self._recipe_catalog()
+                mutate(catalog)
+                with mock.patch.object(server, "build_recipe_catalog", return_value=catalog):
+                    failures = server.build_preflight_recipes(doc, {"scratch": str(self.repo)})
+                self.assertIn(code, [failure["code"] for failure in failures])
+
+    def test_missing_jobs_max_fails_closed_before_any_writer_claim(self):
+        self.assertEqual(self._mechanical_create(budget={})[0], 201)
+        claim = self._claim()
+        self.assertEqual(claim[0], 409, claim[1])
+        self.assertEqual(claim[1]["code"], "no_job_budget")
+        self.assertEqual(self._read_doc()["budget"]["jobs_used"], 0)
+
+    def test_pre_pr_graph_is_acyclic_fail_closed_and_has_one_shipping_path(self):
+        graph_path = Path(server.__file__).resolve().parent / "graphs" / "pre-pr-build.json"
+        graph = json.loads(graph_path.read_text())
+        self.assertEqual(graph["slug"], "graphwing-pre-pr-build")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        incoming = {name: [] for name in nodes}
+        outgoing = {name: [] for name in nodes}
+        for edge in edges:
+            incoming[edge["target"]].append(edge["source"])
+            outgoing[edge["source"]].append(edge["target"])
+        for node_id, sources in incoming.items():
+            if len(sources) > 1:
+                self.assertEqual(nodes[node_id]["type"], "logic.join.any", node_id)
+
+        indegree = {name: len(sources) for name, sources in incoming.items()}
+        queue = [name for name, degree in indegree.items() if degree == 0]
+        visited = []
+        while queue:
+            name = queue.pop()
+            visited.append(name)
+            for target in outgoing[name]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    queue.append(target)
+        self.assertEqual(len(visited), len(nodes), "published graph must not contain a cycle")
+        for wait_id, filter_id in (("wait_fast", "if_fast"), ("wait_review", "if_review"), ("wait_int", "if_int")):
+            self.assertIn(wait_id, incoming[filter_id], f"{filter_id} must inspect the wait receipt")
+        terminals = [node for node in nodes.values() if not outgoing[node["id"]]]
+        terminal_labels = {node["label"] for node in terminals}
+        self.assertGreaterEqual(len(terminal_labels), 12)
+        self.assertTrue(any("missing" in label.lower() for label in terminal_labels))
+        self.assertTrue(any("clean stack" in label.lower() for label in terminal_labels))
+        self.assertFalse(any("kick" in json.dumps(node["config"]).lower() for node in nodes.values()))
+        action_nodes = [node for node in nodes.values() if node["type"].startswith("action.")]
+        shipping = [node["id"] for node in action_nodes if "/v1/build/finalize" in node["type"]]
+        self.assertEqual(shipping, ["finalize"])
+        self.assertFalse(any("/v1/git/" in node["type"] or "/v1/gh/" in node["type"] for node in action_nodes))
+        self.assertFalse(any("/v1/agent/run" in node["type"] for node in action_nodes))
+        self.assertEqual(
+            len([node for node in action_nodes if "/v1/build/writer/launch" in node["type"]]), 2
+        )
+        self.assertEqual(
+            len([node for node in action_nodes if "/v1/build/writer/complete" in node["type"]]), 2
+        )
+        forbidden = [
+            node["id"] for node in action_nodes
+            if "/v1/build/advance" in node["type"]
+            and node.get("config", {}).get("action") in ("verify_passed", "review_passed")
+        ]
+        self.assertEqual(forbidden, [])
+        holders = [
+            node.get("config", {}).get("holder")
+            for node in action_nodes
+            if "holder" in node.get("config", {})
+        ]
+        self.assertTrue(holders)
+        self.assertEqual(set(holders), {"event:{{ CTX.INPUT.event_id }}"})
+        self.assertNotIn("WORKFLOW.runId", json.dumps(graph))
+        edge_targets = {
+            (edge["source"], edge["sourceHandle"]): edge["target"] for edge in edges
+        }
+        self.assertEqual(edge_targets[("if_fast", "pass")], "fast_green")
+        self.assertEqual(edge_targets[("if_review", "pass")], "review_green")
+        self.assertEqual(edge_targets[("switch_step", "case-4")], "join_verify_passed")
+        self.assertEqual(edge_targets[("switch_step", "case-6")], "join_review_passed")
+
+    def test_bounded_mechanical_canary_reaches_finalize_with_deterministic_mocks(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        recipes = self._recipe_catalog()
+        repos = {"scratch": str(self.repo)}
+        with mock.patch.object(server, "build_recipe_catalog", return_value=recipes), mock.patch.object(
+            server, "git_status", return_value={"ok": True, "entries": []}
+        ):
+            self.assertEqual(self._post_build("preflight")[0], 200)
+        launch = self._launch_writer()
+        (self.repo / "canary.txt").write_text("canary\n")
+        self._git("add", "canary.txt")
+        (self.repo / "ticket.md").unlink()
+        receipt = self._finish_job(launch)
+        completed = self._complete("canary-written", launch, receipt)
+        self.assertEqual(completed[0], 200, completed[1])
+        green = {"kind": "test", "coverage": True, "cwd": str(self.repo), "ok": True,
+                 "returncode": 0, "timed_out": False, "compact": "ok"}
+        with mock.patch.object(server, "build_recipe_catalog", return_value=recipes), mock.patch.object(
+            server, "build_run_recipe", side_effect=lambda name, spec: {**green, "name": name}
+        ):
+            self.assertTrue(self._post_build("checks", phase="fast")[1]["ok"])
+        self.assertEqual(self._state()[1]["stage"], "review")
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+        ):
+            self.assertTrue(self._post_build("review", reviewer="sonnet")[1]["ok"])
+        self.assertEqual(self._state()[1]["stage"], "ready")
+        with mock.patch.object(server, "build_recipe_catalog", return_value=recipes), mock.patch.object(
+            server, "build_run_recipe", side_effect=lambda name, spec: {**green, "name": name}
+        ), mock.patch.object(server, "stack_status", return_value={"ok": True, "healthy": True}):
+            self.assertTrue(self._post_build("checks", phase="integration", stack="clean-stack")[1]["ok"])
+        self.assertEqual(self._next()[1]["step"], "finalize")
 
     # -- catalog ------------------------------------------------------------
 

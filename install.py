@@ -201,6 +201,8 @@ def ensure_stacks(home: Path, port: int) -> None:
     path = home / "stacks.json"
     if path.is_file():
         return
+    runners = home / "integration-runners"
+    runners.mkdir(parents=True, exist_ok=True)
     write_json(
         path,
         {
@@ -212,6 +214,15 @@ def ensure_stacks(home: Path, port: int) -> None:
                     "compose_file": "",
                     "ports": [port],
                     "health": [{"name": "api", "url": f"http://127.0.0.1:{port}/v1/health"}],
+                },
+                {
+                    "name": "clean-integration",
+                    "cwd": "integration-runners",
+                    "compose_file": "",
+                    "ports": [],
+                    "health": [],
+                    "role": "clean",
+                    "runner": "git-worktree",
                 }
             ],
         },
@@ -303,8 +314,8 @@ def install_claude_plugin(non_interactive: bool, opt_in: bool | None) -> None:
 def install_omarchy_plugin(non_interactive: bool, opt_in: bool | None) -> None:
     """Copy the bar watcher into ~/.config/omarchy/plugins and enable it.
 
-    Omarchy refuses plugin ids in the omarchy.* namespace and refuses
-    symlinks, so this is a real copy, refreshed on each install.
+    Noninteractive installs skip this. Omarchy watches that directory and
+    a rewrite unloads the whole shell.
     """
     src = REPO / "plugins" / OMARCHY_PLUGIN_ID
     dest = Path.home() / ".config/omarchy/plugins" / OMARCHY_PLUGIN_ID
@@ -314,7 +325,7 @@ def install_omarchy_plugin(non_interactive: bool, opt_in: bool | None) -> None:
             return
         if omarchy is None and not (Path.home() / ".config/omarchy").is_dir():
             return
-        opt_in = True if non_interactive else yes("Install the Omarchy bar watcher?", True, False)
+        opt_in = False if non_interactive else yes("Install the Omarchy bar watcher?", True, False)
     if not opt_in:
         print(f"skipped {OMARCHY_PLUGIN_ID}")
         return
@@ -322,9 +333,16 @@ def install_omarchy_plugin(non_interactive: bool, opt_in: bool | None) -> None:
         print(f"missing plugin source {src}")
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    files = [p for p in src.iterdir() if p.is_file() and p.suffix != ".pyc"]
+    if dest.is_dir() and files and all(
+        (dest / p.name).is_file() and (dest / p.name).read_bytes() == p.read_bytes()
+        for p in files
+    ):
+        print(f"unchanged {OMARCHY_PLUGIN_ID}")
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in files:
+        shutil.copy2(path, dest / path.name)
     print(f"copied {OMARCHY_PLUGIN_ID} -> {dest}")
     if omarchy is None:
         print(f"enable later with: omarchy plugin enable {OMARCHY_PLUGIN_ID} --section right --before omarchy.agents")
@@ -339,7 +357,6 @@ def install_omarchy_plugin(non_interactive: bool, opt_in: bool | None) -> None:
         print("omarchy plugin validate failed")
         print((check.stderr or check.stdout).strip()[:400])
         return
-    subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], check=False, capture_output=True, text=True)
     discovered = False
     for _ in range(40):
         listing = subprocess.run(

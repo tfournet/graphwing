@@ -9,6 +9,15 @@
       "health": [
         {"name": "api", "url": "http://127.0.0.1:8645/v1/health"}
       ]
+    },
+    {
+      "name": "clean-integration",
+      "cwd": "integration-runners",
+      "compose_file": "",
+      "ports": [],
+      "health": [],
+      "role": "clean",
+      "runner": "git-worktree"
     }
   ]
 }

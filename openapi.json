@@ -544,6 +544,80 @@
         }
       }
     },
+    "/v1/build/claim": {
+      "post": {
+        "operationId": "buildClaim",
+        "tags": ["build"],
+        "summary": "Reserve one initial or correction writer turn before an agent exists. The event id makes the claim idempotent, the holder takes the build lease, and the job budget is charged atomically with the durable reservation. A replay returns the original claim; malformed input, conflicting reuse, held leases, wrong stage, exhausted budget, and persistence failure all fail closed without launching a writer.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildClaimRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "claim reserved, or the same claim replayed with replayed=true", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildClaimResponse" } } } },
+          "400": { "description": "malformed JSON, unknown fields, or invalid build_id, event_id, holder, kind, or lease_seconds; no claim is written", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "idempotency_conflict, lease_held, writer_claimed, claim_not_due, no_writer_session, no_job_budget, budget_exhausted, identity mismatch, or a parked build; no new writer is launched", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildClaimResponse" } } } },
+          "500": { "description": "the durable claim could not be persisted; the operation fails closed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/build/writer/launch": {
+      "post": {
+        "operationId": "buildWriterLaunch",
+        "tags": ["build"],
+        "summary": "Create or recover the one deterministic local Hermes writer job owned by build_id plus claim_id. The initial claim already reserves its stable session; correction claims resume the bound session. Replays attach their webhook to the same job and never launch another.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildWriterLaunchRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "the one writer job is queued, running, or already terminal", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildWriterLaunchAccepted" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/writer/complete": {
+      "post": {
+        "operationId": "buildWriterComplete",
+        "tags": ["build"],
+        "summary": "Validate one terminal local writer receipt against the current claim, deterministic job, bound session, and worktree boundary. Initial success transitions writing to verifying once. Correction success consumes the claim and returns to deterministic checks without asserting a gate. Error and timeout preserve files and record recoverable correction state.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildWriterCompleteRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "completion consumed, or replayed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/gate": {
+      "post": {
+        "operationId": "buildGate",
+        "tags": ["build"],
+        "summary": "Apply only the pending gate transition justified by authoritative check or review receipts already stored for the current change. The caller cannot name an outcome or target.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildGateRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "gate transition applied, or replayed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/build/state": {
       "get": {
         "operationId": "buildState",
@@ -558,6 +632,118 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "$ref": "#/components/responses/Error" },
           "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/next": {
+      "get": {
+        "operationId": "buildNext",
+        "tags": ["build"],
+        "summary": "The mechanical stage switch. Reads durable state and the change currently on disk, and names the one step this invocation is allowed to run. Read-only: safe to call from a run that is about to be abandoned. The caller never asserts a stage; a step it did not ask for is the correct answer to a replay. 409 means parked or not on the mechanical path.",
+        "parameters": [
+          { "name": "build_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "next allowed step", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildNext" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "parked, worktree_mismatch, or not_mechanical", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildNext" } } } }
+        }
+      }
+    },
+    "/v1/build/preflight": {
+      "post": {
+        "operationId": "buildPreflight",
+        "tags": ["build"],
+        "summary": "Everything that must be true before a writer is allowed to exist: every declared recipe name resolves, resolves to this build's worktree, and is not hook-only; the route carries every launch stamp; the branch is not trunk; the worktree has no unmerged paths and no pre-existing tracked changes. Read-only — a failure is a 409 the caller can fix and retry, not a park.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildPreflightRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "clear to launch a writer", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildPreflight" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "one or more preflight failures; see failures[]", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildPreflight" } } } }
+        }
+      }
+    },
+    "/v1/build/brief": {
+      "post": {
+        "operationId": "buildBrief",
+        "tags": ["build"],
+        "summary": "The writer's whole world: the approved ticket text, the named recipes that will judge it, and the instruction to stage but never commit. Composed server-side so 'only the approved ticket' is a property of the code rather than of a graph template. Read-only and available only behind the current writer claim; claim owns the budget charge.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildBriefRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "brief", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildBrief" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "missing_ticket, missing_route_stamp, no_writer_session, or a budget park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildBrief" } } } }
+        }
+      }
+    },
+    "/v1/build/checks": {
+      "post": {
+        "operationId": "buildChecks",
+        "tags": ["build"],
+        "summary": "The deterministic gate. Fast checks run in the build worktree. Integration first requires an exactly staged candidate, freezes its tree as an unreferenced deterministic commit, provisions a per-attempt detached worktree under a declared clean git-worktree runner root, verifies the checked-out tree, and runs every recipe there. Never treats a queue acknowledgement as a pass.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildChecksRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "every required recipe reached a verdict; ok says whether they passed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildChecks" } } } },
+          "202": { "description": "queued for webhook delivery. ok is false: this is a receipt for accepting the work, not for passing the gate.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildChecks" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "no_recipes, unknown_recipe, recipe_wrong_worktree, hook_not_coverage, not_a_clean_stack, stack_unhealthy, or a park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildChecks" } } } },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/review": {
+      "post": {
+        "operationId": "buildReview",
+        "tags": ["build"],
+        "summary": "The independent behavior-and-test micro-review: scope, behavior, RED evidence where the ticket requires it, production-path coverage, and the declared integration seam. Refuses a reviewer from the writer's own vendor. Provider silence is retried and recorded as no_verdict with finding=false — it is not a finding, and no review round is written for it. With response_webhook_url the delivery is async and answers 202 with ok=false.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReviewRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "the reviewer finished. ok=true is PASS; ok=false with finding=true is a correction turn; ok=false with no_verdict=true is provider silence.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReview" } } } },
+          "202": { "description": "queued for webhook delivery. ok is false: an acknowledgement is not a verdict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReview" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "invalid_transition, reviewer_is_writer, or a park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReview" } } } },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/build/finalize": {
+      "post": {
+        "operationId": "buildFinalize",
+        "tags": ["build"],
+        "summary": "Commit and push exactly once from a durable, versioned finalization intent. After every current-candidate gate passes, the operation persists state=prepared with the event fingerprint, verified parent, candidate tree/change id, branch, remote, exact message, and git authoring boundary before invoking git commit. It then persists state=committed with the verified SHA and immutable commit fields before pushing that SHA as an explicit refspec. A retry may adopt live HEAD only when every prepared field matches; after an uncertain push it verifies the remote branch and completes without recommitting or force-pushing. state=pushed and pr_ready are written together, and replay returns that exact receipt.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildFinalizeRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "committed and pushed, or replayed when replayed=true", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "description": "invalid_transition, not_ready, lease_held, idempotency_conflict, finalize_in_progress, finalize_adoption_mismatch, nothing_staged, commit_failed, push_failed, remote_unreadable, or another fail-closed park", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "500": { "description": "A prepared, committed, or pushed receipt state write could not be made durable. The same event_id is safe to retry; a pre-commit failure creates no commit, a post-commit failure adopts only an exact match, and a post-push failure verifies the remote before completing.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -1245,12 +1431,352 @@
       },
       "BuildVerification": {
         "type": "object",
-        "description": "Verification the plan declared for this build. Names are tests.json recipes.",
+        "description": "Verification the plan declared for this build. Names are recipes from tests.json, scripts.json, or rr.json, resolved in that order. Every name is validated by buildPreflight before a writer is launched.",
         "properties": {
           "fast": { "type": "array", "items": { "type": "string" } },
           "integration": { "type": "array", "items": { "type": "string" } },
-          "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage: verify_passed goes straight to review." },
-          "human_visual_review": { "type": "boolean" }
+          "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage: verify_passed goes straight to review. A mechanical build that sets this true parks, because the mechanical path has no way to capture a screenshot round." },
+          "human_visual_review": { "type": "boolean" },
+          "requires_red": { "type": "boolean", "description": "When true the reviewer treats a missing record of the test failing first as a finding. When false or absent the reviewer is told explicitly not to raise its absence." },
+          "path_rules": {
+            "type": "array",
+            "maxItems": 16,
+            "description": "Changed-path rules. Add-only by construction: a rule contributes recipe names to the required set for a phase and has no shape that removes a declared one, so a plan cannot use a rule to drop a check it promised.",
+            "items": {
+              "type": "object",
+              "required": ["match", "recipes"],
+              "properties": {
+                "match": { "type": "string", "description": "fnmatch glob against repo-relative changed paths." },
+                "recipes": { "type": "array", "items": { "type": "string" } },
+                "phase": { "type": "string", "enum": ["fast", "integration"] }
+              }
+            }
+          }
+        }
+      },
+      "BuildRecipeVerdict": {
+        "type": "object",
+        "description": "One recipe run to completion. There is no shape here for 'queued' or 'skipped': a command that never ran comes back ok=false with a code, because the alternative is a gate that reads an acknowledgement as green.",
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["test", "script", "rr"] },
+          "coverage": { "type": "boolean", "description": "False for a recipe that may run but can never make a phase covered, such as a pre-commit hook." },
+          "cwd": { "type": "string", "description": "Where it actually ran. A verdict that cannot name its own directory cannot be audited for the failure that looks exactly like success." },
+          "ok": { "type": "boolean" },
+          "returncode": { "type": ["integer", "null"] },
+          "timed_out": { "type": "boolean" },
+          "at": { "type": "string" },
+          "compact": { "type": "string" },
+          "code": { "type": "string", "enum": ["missing_binary", "timeout"], "description": "Present only when the command did not produce an ordinary exit: missing_binary is the skipped case, timeout is the ran-too-long case. Neither is a pass." }
+        }
+      },
+      "BuildNext": {
+        "type": "object",
+        "description": "BuildState plus the one step this invocation may run.",
+        "properties": {
+          "ok": { "type": "boolean", "description": "False when the step is parked." },
+          "build_id": { "type": "string" },
+          "stage": { "type": "string" },
+          "step": {
+            "type": "string",
+            "enum": ["preflight", "write", "fast_checks", "fix", "verify_passed", "review", "review_passed", "integration", "finalize", "done", "parked"],
+            "description": "Read off the durable document and the change on disk, never from the caller. That is what makes a replay safe: a run that died after its writer finished comes back, is told fast_checks, and does not start a second writer."
+          },
+          "step_reason": { "type": "string", "description": "Why this step and not another, in a sentence a human can act on." },
+          "finding": { "type": "string", "description": "Non-empty only on step=fix: the exact correction text to pass to buildBrief. Composed from durable state, so a resumed writer sees the same finding whether the run that produced it is alive or died an hour ago." },
+          "class": { "type": "string", "description": "The routed class. Anything but mechanical is refused with not_mechanical: a visual or sensitive build has stages this workflow does not run." },
+          "live_head": { "type": "string" },
+          "live_branch": { "type": "string" },
+          "change_id": { "type": "string", "description": "head plus a hash of the staged and unstaged diff. The writer stages and never commits, so HEAD alone cannot tell one round of the correction loop from the next; every check and review receipt is keyed on this instead." },
+          "budget_left": { "type": ["integer", "null"] },
+          "code": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "BuildClaimRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "holder": { "type": "string" },
+          "kind": { "type": "string", "enum": ["initial", "correction"], "default": "initial" },
+          "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 }
+        }
+      },
+      "BuildClaimResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/BuildState" },
+          {
+            "type": "object",
+            "properties": {
+              "replayed": { "type": "boolean" },
+              "change_id": { "type": "string" },
+              "step": { "type": "string", "enum": ["preflight", "fix"] },
+              "claim": {
+                "type": ["object", "null"],
+                "properties": {
+                  "claim_id": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["initial", "correction"] },
+                  "holder": { "type": "string" },
+                  "at": { "type": "string" },
+                  "stage": { "type": "string" },
+                  "step": { "type": "string", "enum": ["preflight", "fix"] },
+                  "head": { "type": "string" },
+                  "change_id": { "type": "string" },
+                  "writer_session": { "type": ["string", "null"] },
+                  "jobs_spent": { "type": "integer" },
+                  "consumed": { "type": "boolean" },
+                  "superseded": { "type": ["string", "null"] },
+                  "expires_epoch": { "type": "number" },
+                  "expires_at": { "type": "string" }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "BuildWriterLaunchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["build_id", "claim_id", "holder", "response_webhook_url"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "claim_id": { "type": "string" },
+          "holder": { "type": "string" },
+          "response_webhook_url": { "type": "string", "format": "uri" },
+          "response_webhook_token": { "type": "string" }
+        }
+      },
+      "BuildWriterLaunchAccepted": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "replayed": { "type": "boolean" },
+          "build_id": { "type": "string" },
+          "claim_id": { "type": "string" },
+          "job_id": { "type": "string" },
+          "status": { "type": "string" },
+          "hermes_session": { "type": "string" },
+          "poll": { "type": "string" }
+        }
+      },
+      "BuildWriterCompleteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "claim_id", "job_id", "hermes_session", "callback"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "holder": { "type": "string" },
+          "claim_id": { "type": "string" },
+          "job_id": { "type": "string" },
+          "hermes_session": { "type": "string" },
+          "callback": { "$ref": "#/components/schemas/AgentReceipt" }
+        }
+      },
+      "BuildGateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "holder": { "type": "string" },
+          "release_lease": { "type": "boolean" },
+          "worktree": { "type": "string", "description": "Optional assertion; compared with the build's allowlisted worktree." }
+        }
+      },
+      "BuildPreflightRequest": {
+        "type": "object",
+        "required": ["build_id"],
+        "properties": { "build_id": { "type": "string" } }
+      },
+      "BuildPreflight": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "build_id": { "type": "string" },
+          "stage": { "type": "string" },
+          "branch": { "type": ["string", "null"] },
+          "head": { "type": ["string", "null"] },
+          "declared": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+          "known_recipes": { "type": "array", "items": { "type": "string" } },
+          "budget_left": { "type": ["integer", "null"] },
+          "failures": {
+            "type": "array",
+            "description": "Every failure, not just the first, so one round-trip tells the caller everything to fix.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "check": { "type": "string" },
+                "code": {
+                  "type": "string",
+                  "enum": ["missing_route_stamp", "no_recipes", "unknown_recipe", "recipe_wrong_worktree", "hook_not_coverage", "trunk_branch", "branch_mismatch", "worktree_mismatch", "worktree_conflicted", "worktree_dirty", "identity_unreadable"]
+                },
+                "detail": { "type": "string" }
+              }
+            }
+          },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "BuildBriefRequest": {
+        "type": "object",
+        "required": ["build_id"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "finding": { "type": "string", "description": "Correction text from buildNext. Present makes this a correction turn and requires the build's recorded writer session; the claim already charged the job budget." }
+        }
+      },
+      "BuildBrief": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "build_id": { "type": "string" },
+          "repo": { "type": "string" },
+          "ticket": { "type": "string" },
+          "prompt": { "type": "string", "description": "The approved ticket, the named recipes that judge it, and the instruction to stage but never commit. The slice index and the neighbouring tickets are deliberately absent: a prompt assembled from templates acquires them one convenient interpolation at a time, and the writer starts solving the epic." },
+          "resume": { "type": "boolean" },
+          "hermes_session": { "type": ["string", "null"] },
+          "launcher": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "max_turns": { "type": ["integer", "null"] },
+          "run_budget_seconds": { "type": ["integer", "null"] },
+          "budget_left": { "type": ["integer", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "BuildChecksRequest": {
+        "type": "object",
+        "required": ["build_id", "phase"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "phase": { "type": "string", "enum": ["fast", "integration"] },
+          "only": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Narrows what is executed, never what is required. A correction turn that touched one file reruns that file's recipes and inherits the rest from verdicts already recorded against this same change; a recipe with no verdict at all still runs, whatever only said. Naming a recipe the phase does not require is 400 not_required."
+          },
+          "stack": { "type": "string", "description": "Required for phase=integration. Must declare role=clean and runner=git-worktree; arbitrary healthy developer stacks are rejected." },
+          "response_webhook_url": { "type": "string" },
+          "response_webhook_token": { "type": "string" }
+        }
+      },
+      "BuildChecks": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "The gate. True only when every required recipe reached a passing verdict against this change and at least one of them is coverage. False on a 202." },
+          "queued": { "type": "boolean", "description": "202 only." },
+          "gate_passed": { "type": "boolean", "description": "202 only, always false." },
+          "job_id": { "type": "string" },
+          "poll": { "type": "string" },
+          "build_id": { "type": "string" },
+          "phase": { "type": "string" },
+          "head": { "type": "string" },
+          "change_id": { "type": "string" },
+          "stack": { "type": ["string", "null"] },
+          "runner": { "type": ["string", "null"], "description": "Exact cwd where recipes executed; integration uses an attempt-owned disposable worktree." },
+          "attempt_id": { "type": ["string", "null"] },
+          "candidate_tree": { "type": ["string", "null"] },
+          "runner_tree": { "type": ["string", "null"] },
+          "base_head": { "type": ["string", "null"] },
+          "materialization": { "type": ["string", "null"], "description": "Unreferenced synthetic commit whose tree is candidate_tree." },
+          "required": { "type": "array", "items": { "type": "string" } },
+          "required_because": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "Per recipe, why it is required: 'declared', or 'path:<glob>' for one a changed path mandated." },
+          "ran": { "type": "array", "items": { "type": "string" } },
+          "ran_in": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Per recipe, the directory it ran in. A catalog default of '.' resolves to $GRAPHWING_HOME, the deployed service rather than the branch under test, so the build re-points it at its own worktree and reports where it landed." },
+          "verdicts": { "type": "array", "items": { "$ref": "#/components/schemas/BuildRecipeVerdict" } },
+          "missing": { "type": "array", "items": { "type": "string" }, "description": "Required recipes with no verdict against this change. A non-empty list is never a pass." },
+          "failed": { "type": "array", "items": { "type": "string" } },
+          "compact": { "type": "string" },
+          "budget_left": { "type": ["integer", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string", "enum": ["queued", "missing_verdict", "check_failed", "no_recipes", "unknown_recipe", "recipe_wrong_worktree", "hook_not_coverage", "not_required", "not_a_clean_stack", "candidate_not_exact", "candidate_unreadable", "runner_provision_failed", "runner_tree_mismatch", "bad_phase", "bad_only", "bad_stack", "busy"] }
+        }
+      },
+      "BuildReviewRequest": {
+        "type": "object",
+        "required": ["build_id"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "terra", "grok"], "description": "Defaults to route.reviewer1. Refused with reviewer_is_writer when it shares a vendor with the writer's model: the review is independent or it is the writer grading its own homework in a second window." },
+          "response_webhook_url": { "type": "string" },
+          "response_webhook_token": { "type": "string" }
+        }
+      },
+      "BuildReview": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "True only on PASS. False on a 202 and false on silence." },
+          "queued": { "type": "boolean" },
+          "gate_passed": { "type": "boolean" },
+          "job_id": { "type": "string" },
+          "poll": { "type": "string" },
+          "build_id": { "type": "string" },
+          "reviewer": { "type": "string" },
+          "head": { "type": "string" },
+          "change_id": { "type": "string" },
+          "round": { "type": "integer" },
+          "verdict": { "type": ["string", "null"], "enum": ["PASS", "NACK", null] },
+          "no_verdict": { "type": "boolean", "description": "The reviewer ran out of turns or lost its connection. Nothing is recorded and finding stays false: treating silence as a finding resumes the writer to fix a problem nobody reported, spends a round of budget, and does it again next time." },
+          "finding": { "type": "boolean", "description": "A reviewer that finished and still said no. This is a correction turn, not a terminal failure." },
+          "attempts": { "type": "integer" },
+          "summary": { "type": "string" },
+          "compact": { "type": "string" },
+          "budget_left": { "type": ["integer", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string", "enum": ["queued", "no_verdict", "invalid_transition", "bad_reviewer", "reviewer_is_writer", "busy"] }
+        }
+      },
+      "BuildFinalizeIntent": {
+        "type": "object",
+        "description": "Versioned durable journal for the one finalization this build permits. prepared exists before git commit and has no SHA; committed adds the inspected commit identity before push; pushed is persisted atomically with pr_ready. A different event cannot take over any state.",
+        "required": ["version", "state", "event_id", "fingerprint", "branch", "remote", "verified_head", "expected_parent", "candidate_tree", "verified_change_id", "message", "authoring_boundary"],
+        "properties": {
+          "version": { "type": "integer", "enum": [1] },
+          "state": { "type": "string", "enum": ["prepared", "committed", "pushed"] },
+          "event_id": { "type": "string" },
+          "fingerprint": { "type": "string" },
+          "prepared_at": { "type": "string" },
+          "committed_at": { "type": "string" },
+          "pushed_at": { "type": "string" },
+          "holder": { "type": "string" },
+          "branch": { "type": "string" },
+          "remote": { "type": "string" },
+          "verified_head": { "type": "string" },
+          "expected_parent": { "type": "string" },
+          "candidate_tree": { "type": "string" },
+          "verified_change_id": { "type": "string" },
+          "message": { "type": "string", "maxLength": 256 },
+          "authoring_boundary": {
+            "type": "object",
+            "required": ["author", "committer"],
+            "properties": {
+              "author": { "type": "string" },
+              "committer": { "type": "string" }
+            }
+          },
+          "sha": { "type": "string", "description": "Absent in prepared; required by committed and pushed state." },
+          "tree": { "type": "string" },
+          "parent": { "type": "string" },
+          "author": { "type": "string" },
+          "committer": { "type": "string" }
+        }
+      },
+      "BuildFinalizeRequest": {
+        "type": "object",
+        "required": ["build_id", "event_id", "holder", "message"],
+        "properties": {
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string", "description": "Names this one finalization. Reuse it to retry safely; the recorded receipt comes back and no second commit is made." },
+          "holder": { "type": "string", "description": "Lease owner, normally the Rewst run id. Rejected with secret_in_holder if it carries a credential." },
+          "message": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Persisted and compared exactly. Conflicting reuse is idempotency_conflict; overlong input is message_too_long." },
+          "remote": { "type": "string", "default": "origin", "description": "A named remote. A URL or a flag is refused with bad_remote." },
+          "worktree": { "type": "string", "description": "Optional assertion; a mismatch parks." }
         }
       },
       "BuildCreateRequest": {
@@ -1300,7 +1826,7 @@
           "data": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Transition payload. Secret-shaped keys and values are redacted before the write. Branch and head identity come from the live Git read of the allowlisted checkout, so no payload field can move them: a data.head is ignored. Unknown keys are dropped. The fields that fold into state are writer_session (a gwslice-<32 hex> session id, bound by start_writer only), stacks, review (review_passed), round (evidence_captured), pr (pr_opened), and reason/detail (park)."
+            "description": "Transition payload. Secret-shaped keys and values are redacted before the write. Branch and head identity come from the live Git read of the allowlisted checkout, so no payload field can move them: a data.head is ignored. Unknown keys are dropped. The fields that fold into state are writer_session (a gwslice-<32 hex> session id, bound by start_writer only), stacks, round (evidence_captured), pr (pr_opened), and reason/detail (park). Review authority comes only from buildReview plus buildGate, never data.review."
           }
         }
       },
@@ -1328,6 +1854,20 @@
           "worktree": { "type": ["string", "null"] },
           "branch": { "type": ["string", "null"] },
           "head": { "type": ["string", "null"] },
+          "base_head": { "type": ["string", "null"], "description": "Where this build started. head moves when finalization commits, so it cannot answer 'what has this build changed'; the changed-path rules need a fixed floor to diff against." },
+          "checks": {
+            "type": "object",
+            "description": "The last recorded run of each phase, keyed fast and integration. Each entry carries the change_id it was recorded against, so a correction turn's new diff leaves it visibly stale rather than silently reusable.",
+            "additionalProperties": { "type": "object", "additionalProperties": true }
+          },
+          "pr_ready": { "type": ["object", "null"], "additionalProperties": true, "description": "The finalization receipt: one per build, forever. Its presence is what makes a second finalize impossible regardless of event_id, so the id is not what makes replay safe." },
+          "pending_finalize": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/BuildFinalizeIntent" },
+              { "type": "null" }
+            ],
+            "description": "The durable prepared/committed/pushed finalization intent exposed for recovery and operator diagnosis."
+          },
           "index": { "type": ["string", "null"] },
           "ticket": { "type": ["string", "null"] },
           "route": { "type": ["object", "null"], "additionalProperties": true },

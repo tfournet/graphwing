@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -130,6 +131,13 @@ BUILD_TRANSITIONS: dict[str, tuple[str, str]] = {
     "pr_opened": ("ready", "pr_opened"),
 }
 BUILD_TERMINAL = frozenset({"pr_opened", "parked"})
+# The three transitions that assert a gate was satisfied. On the mechanical
+# path an API caller may not perform them at all: buildChecks, buildReview,
+# buildGate, and buildFinalize record them from the receipts they just wrote,
+# after re-verifying that those receipts belong to the change now on disk.
+# A caller that could post `action: review_passed` could ship an unreviewed
+# change with one HTTP call, which is the whole failure the path exists to stop.
+BUILD_GATE_ACTIONS = frozenset({"verify_passed", "review_passed", "pr_opened"})
 BUILD_LEASE_MAX_SECONDS = 3600
 
 
@@ -167,6 +175,93 @@ BUILD_REDACT_MAX_DEPTH = 6
 BUILD_REDACT_MAX_KEYS = 64
 BUILD_REDACT_MAX_ITEMS = 64
 BUILD_REDACT_MAX_STRING = 512
+# The mechanical path. One bounded Rewst invocation runs exactly one of these
+# steps; which one is read off the durable document, never asserted by the
+# caller. `fix` covers both ways a change comes back for correction -- a red
+# deterministic check and a reviewer finding -- because the writer's turn is
+# the same either way: here is what went wrong, the files are on disk.
+BUILD_MECHANICAL_STEPS = (
+    "preflight",
+    "write",
+    "fast_checks",
+    "fix",
+    "verify_passed",
+    "review",
+    "review_passed",
+    "integration",
+    "finalize",
+    "done",
+    "parked",
+)
+BUILD_MECHANICAL_CLASS = "mechanical"
+# The two ways a writer is launched, and the two things a reservation can be
+# taken for. `initial` opens the session, `correction` resumes the one already
+# recorded. Both charge a job before the agent exists, so a run that dies
+# between the claim and the launch has already paid for the turn it started.
+BUILD_CLAIM_KINDS = ("initial", "correction")
+# A story branch is never one of these. A build that finds itself on trunk is
+# about to commit and push straight to it, which is the one outcome the whole
+# pre-PR path exists to prevent.
+BUILD_TRUNK_BRANCHES = frozenset({"main", "master", "trunk", "develop", "HEAD"})
+# The routing stamps a writer cannot be launched without. Each one is a real
+# launch argument: an absent max_turns is not "use the default", it is a
+# writer that runs until something else kills it.
+BUILD_ROUTE_STAMPS = ("launcher", "model", "max_turns", "run_budget_seconds", "reviewer1")
+# The recipe the pre-PR plan calls out by name: it is a pre-commit hook, so it
+# may run, but it can never be the thing that makes a phase covered. Catalog
+# entries can say "coverage": false for themselves; this is the backstop for
+# when they forget.
+BUILD_HOOK_ONLY_RECIPES = frozenset({"riftwing-local-gates"})
+BUILD_CHECK_PHASES = ("fast", "integration")
+BUILD_PATH_RULES_MAX = 16
+BUILD_CHANGED_PATHS_MAX = 256
+# Silence is a provider blip, not an opinion. Retry it; only a reviewer that
+# finished and still said no is a finding.
+BUILD_REVIEW_SILENCE_RETRIES = 2
+BUILD_REVIEW_ROUNDS_KEPT = 32
+# Which vendor answers to which reviewer name. A reviewer from the writer's own
+# vendor is not an independent review, so the two are compared before a review
+# is allowed to run.
+BUILD_REVIEWER_VENDOR = {
+    "sonnet": "anthropic",
+    "opus": "anthropic",
+    "fable": "anthropic",
+    "sol": "openai",
+    "terra": "openai",
+    "grok": "xai",
+}
+# Which vendor a writer model belongs to. The route names a model the way an
+# operator says it out loud -- "sonnet", "grok-4.6", "gpt-5.6-terra" -- so a
+# prefix table over full model ids alone left every seat alias unmapped, and an
+# unmapped writer meant the independence check never ran: a sonnet writer and
+# an opus reviewer both passed as "independent". Longest alias first so
+# `claude-sonnet-5` is not decided by a shorter substring.
+BUILD_WRITER_VENDOR_ALIASES = (
+    ("claude", "anthropic"),
+    ("sonnet", "anthropic"),
+    ("haiku", "anthropic"),
+    ("opus", "anthropic"),
+    ("fable", "anthropic"),
+    ("grok", "xai"),
+    ("gpt", "openai"),
+    ("terra", "openai"),
+    ("sol", "openai"),
+    ("o4", "openai"),
+)
+# A model that matches no alias. Named rather than None so the two cases stay
+# apart: no model at all is a route gap the planner can fix, an unrecognised
+# model is a writer whose independence cannot be established and fails closed.
+BUILD_VENDOR_UNKNOWN = "unknown"
+BUILD_GATE_RECORDS_KEPT = 32
+# What a stack is for, declared by the catalog entry rather than guessed from
+# its name. Only `clean` may carry a build's final integration run: it is a
+# disposable stack brought up from its own checkout, so a pass on it is a claim
+# about a clean tree instead of a claim about whatever the writer left running.
+# An entry that declares nothing is `unset`, which is never clean -- the name
+# substrings this replaced made `riftwing-ci` look isolated and `dev-clean`
+# look like a developer stack, and neither reading had any evidence behind it.
+BUILD_STACK_ROLES = ("clean", "developer", "preview", "unset")
+BUILD_CLEAN_STACK_ROLE = "clean"
 SECRET_KEY_PARTS = frozenset(
     {
         "secret", "secrets", "token", "tokens", "password", "passwd", "pass",
@@ -696,6 +791,12 @@ def load_recipes(path: Path, key: str, repos: dict[str, str] | None = None) -> d
             "cwd": cwd,
             "timeout_seconds": timeout,
             "async": bool(item.get("async")),
+            # A recipe is coverage unless it says otherwise. A pre-commit hook
+            # runs real commands and exits 0, so nothing downstream can tell it
+            # apart from a unit suite by looking at the result — the catalog
+            # entry is the only place that knows, so it is where the answer
+            # lives. See BUILD_HOOK_ONLY_RECIPES for the backstop.
+            "coverage": item.get("coverage") is not False,
         }
     return out
 
@@ -754,12 +855,20 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
             if 1 <= p <= 65535:
                 sport.append(p)
                 ports.add(p)
+        # An unreadable or unknown role is `unset`, not a rejection: a typo in
+        # the catalog must not take every other stack down with it, and `unset`
+        # already fails every check that asks for a clean stack.
+        role = str(item.get("role") or "").strip().lower()
+        if role not in BUILD_STACK_ROLES:
+            role = "unset"
         stacks[name] = {
             "name": name,
             "cwd": cwd,
             "compose_file": str(item.get("compose_file") or "docker-compose.yml"),
             "health": health,
             "ports": sport,
+            "role": role,
+            "runner": str(item.get("runner") or "compose").strip().lower(),
         }
     if not stacks and not ports:
         raise RuntimeError(f"stacks.json has no stacks or ports: {STACKS_PATH}")
@@ -1946,6 +2055,10 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         "verdict": verdict,
         "no_verdict": review_said_nothing(text),
         "reviewer": reviewer,
+        # The raw transcript, so a caller that needs a stricter reading than
+        # this one can do it without running the reviewer twice. Never stored:
+        # build_review_result keeps only the bounded summary and compact.
+        "text": text,
         "summary": summary,
         "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
         "returncode": proc.returncode,
@@ -2222,6 +2335,10 @@ def stack_status(name: str | None) -> dict[str, Any]:
         "ok": True,
         "stack": key,
         "cwd": str(cwd),
+        # Reported so a caller can see what the catalog declares this stack is
+        # for. Health says a stack is up; only the role says whether a pass on
+        # it is evidence about a clean checkout.
+        "role": spec.get("role") or "unset",
         "healthy": bool(running) and health_ok,
         "containers": containers,
         "health": health,
@@ -3143,12 +3260,17 @@ def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
 
 
 def run_agent_job(job_id: str) -> None:
-    job = read_job(job_id)
-    if not job:
-        return
-    job["status"] = "running"
-    job["started_at"] = utcnow()
-    write_job(job)
+    # A launch replay may schedule the same durable queued job again after the
+    # original process died between write_job and enqueue_agent. Claim the job
+    # under the same lock that guards creation so only one scheduled thread can
+    # cross into the process spawn.
+    with JOB_LOCK:
+        job = read_job(job_id)
+        if not job or job.get("status") != "queued":
+            return
+        job["status"] = "running"
+        job["started_at"] = utcnow()
+        write_job(job)
     proc, err = spawn_writer(job)
     if err:
         job["status"] = "failed"
@@ -3782,6 +3904,13 @@ def build_public(doc: dict[str, Any]) -> dict[str, Any]:
         "worktree": doc.get("worktree"),
         "branch": doc.get("branch"),
         "head": doc.get("head"),
+        "base_head": doc.get("base_head"),
+        "checks": doc.get("checks") or {},
+        "pr_ready": doc.get("pr_ready"),
+        "pending_finalize": doc.get("pending_finalize"),
+        "writer_claim": doc.get("writer_claim"),
+        "writer_result": doc.get("writer_result"),
+        "gates": doc.get("gates") or [],
         "index": doc.get("index"),
         "ticket": doc.get("ticket"),
         "route": doc.get("route"),
@@ -3958,7 +4087,89 @@ def parse_build_verification(container: dict[str, Any]) -> tuple[dict[str, Any] 
         if flag_err:
             return None, flag_err
         out[key] = flag
+    # `requires_red` and `path_rules` are folded in only when the caller
+    # declared them. Defaulting them into every parsed block would change the
+    # dict that build_create fingerprints, and a build opened before they
+    # existed would answer its own retried create with an idempotency
+    # conflict rather than the receipt it already has.
+    if "requires_red" in raw:
+        red, red_err = parse_strict_bool(raw, "requires_red", "bad_verification")
+        if red_err:
+            return None, red_err
+        out["requires_red"] = red
+    if "path_rules" in raw:
+        rules, rules_err = parse_build_path_rules(raw["path_rules"])
+        if rules_err:
+            return None, rules_err
+        out["path_rules"] = rules
     return out, None
+
+
+def parse_build_path_rules(raw: Any) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    """Changed-path rules: a glob, and the recipes it makes mandatory.
+
+    Add-only by construction. A rule contributes names to the required set
+    and has no way to name one for removal, so a plan cannot use a path rule
+    to quietly drop a check it declared -- which is the whole reason the rule
+    is a list of recipes rather than a replacement verification block.
+    """
+    bad = {"error": "verification.path_rules must be a list of {match, recipes}", "code": "bad_verification"}
+    if not isinstance(raw, list):
+        return None, bad
+    if len(raw) > BUILD_PATH_RULES_MAX:
+        return None, {"error": "verification.path_rules is too long", "code": "bad_verification"}
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, bad
+        match = item.get("match")
+        recipes = item.get("recipes")
+        if not isinstance(match, str) or not match.strip():
+            return None, bad
+        if not isinstance(recipes, list) or not recipes:
+            return None, bad
+        if not all(isinstance(n, str) and n.strip() for n in recipes):
+            return None, bad
+        if len(recipes) > BUILD_VERIFICATION_MAX:
+            return None, {"error": "verification.path_rules has too many recipes", "code": "bad_verification"}
+        rule = {
+            "match": match.strip()[:BUILD_NAME_MAX],
+            "recipes": [n.strip()[:BUILD_NAME_MAX] for n in recipes],
+        }
+        # The phase is preserved when the caller declared one and validated
+        # here, but never defaulted into the stored rule. Writing a default in
+        # would change the verification dict build_create fingerprints, so a
+        # build opened before this field existed would answer its own retried
+        # create with an idempotency conflict instead of its receipt. Absent is
+        # read as `fast` at the point of use, by build_rule_phase.
+        if "phase" in item:
+            phase = item["phase"]
+            if not isinstance(phase, str) or phase.strip() not in BUILD_CHECK_PHASES:
+                return None, {
+                    "error": "verification.path_rules[].phase must be fast or integration",
+                    "code": "bad_verification",
+                }
+            rule["phase"] = phase.strip()
+        out.append(rule)
+    return out, None
+
+
+def build_rule_phase(rule: dict[str, Any]) -> str:
+    """The one phase a changed-path rule applies to. Absent means fast.
+
+    Before this, a rule applied to whichever phase happened to be asking. A
+    rule that meant "touching migrations mandates the integration seam" also
+    made the fast gate require an integration recipe, and a rule that meant a
+    unit check ran again at integration — in both directions the plan got a
+    phase it never declared.
+
+    Fast is the default because it is the gate every mechanical build has to
+    pass. An integration recipe wrongly required by the fast gate is slow and
+    visible; a fast recipe wrongly deferred to integration would let the writer
+    reach review with the check its plan mandated never having run.
+    """
+    phase = rule.get("phase")
+    return phase if isinstance(phase, str) and phase in BUILD_CHECK_PHASES else "fast"
 
 
 def parse_strict_bool(container: dict[str, Any], key: str, code: str) -> tuple[bool, dict[str, Any] | None]:
@@ -4305,6 +4516,10 @@ def build_create(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "worktree": worktree,
             "branch": branch,
             "head": head,
+            # Where this build started. `head` moves as the writer commits, so
+            # it cannot answer "what has this build changed" — the changed-path
+            # rules need a fixed floor to diff against.
+            "base_head": head,
             # Already validated to a bounded repo-relative path, so it goes
             # in as itself. Running it through redact_secrets would let a
             # 64-hex path segment turn the ticket into "[redacted]", and the
@@ -4360,13 +4575,26 @@ def build_apply(doc: dict[str, Any], action: str, data: dict[str, Any], target: 
         # Only start_writer binds it, and the caller has already been told off
         # if it tried to rebind an existing one.
         doc["writer_session"] = session.strip()
+        claim = build_claim(doc)
+        if claim is not None and not claim.get("consumed"):
+            # The reservation is spent the moment the session it was holding
+            # open exists. Recording the session on it is what makes the
+            # journal answer "which run launched this writer" after a restart.
+            claim["writer_session"] = session.strip()
+            claim["consumed"] = True
+            claim["consumed_at"] = utcnow()
     stacks, _ = parse_build_stacks(data)
     if stacks:
         doc["stacks"] = stacks
     # data.head is deliberately not folded in. Identity comes from the live
     # repository read, so a payload field cannot move the build's head.
-    if action == "review_passed" and isinstance(data.get("review"), dict):
-        doc["reviews"] = (doc.get("reviews") or [])[-(BUILD_LIST_MAX - 1):] + [redact_secrets(data["review"])]
+    #
+    # data.review is not folded either, and there is no key here that writes
+    # `reviews`. It used to: a caller could post a review blob carrying the
+    # current change_id and verdict PASS, and every gate that asks "has this
+    # change been reviewed" -- build_last_review, build_finalize_gaps -- would
+    # answer yes for a review that never ran. Only build_review_result writes
+    # a review round now, from a reviewer it actually launched.
     if action == "evidence_captured" and isinstance(data.get("round"), dict):
         rounds = (doc.get("evidence_rounds") or [])[-(BUILD_LIST_MAX - 1):]
         doc["evidence_rounds"] = rounds + [redact_secrets(data["round"])]
@@ -4522,6 +4750,30 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
                 "event_capacity": BUILD_EVENT_HARD_MAX,
             }
 
+        mechanical = build_class(doc) == BUILD_MECHANICAL_CLASS
+        if mechanical and action in ("start_writer", "writer_done"):
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = (
+                f"'{action}' asserts writer state; on the mechanical path only "
+                "buildWriterLaunch and buildWriterComplete may change it"
+            )
+            out["code"] = "writer_op_required"
+            return 409, out
+        if mechanical and action in BUILD_GATE_ACTIONS:
+            # Answered after the replay check so a recorded gate receipt still
+            # replays, and before anything is written so a rejected caller
+            # spends no budget and moves no stage.
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = (
+                f"'{action}' asserts a gate was satisfied; on the mechanical path only "
+                "buildChecks, buildReview, buildGate, and buildFinalize record it, from "
+                "receipts they verified against the change on disk"
+            )
+            out["code"] = "gate_op_required"
+            return 409, out
+
         now = time.time()
         live = build_lease_live(doc, now)
         if live is not None and live.get("holder") != holder:
@@ -4583,6 +4835,26 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
                 out["expected_action"] = build_next_action(doc)
                 return 409, out
             target = build_transition_target(doc, action)
+
+        if mechanical and action == "start_writer":
+            claim = build_claim_live(doc, now)
+            if claim is None:
+                # The writer is already running by the time this transition is
+                # posted, so refusing here cannot un-launch it. What it does
+                # stop is the launch: buildBrief will not compose a prompt
+                # without a live reservation, so a graph that skipped buildClaim
+                # never gets as far as an agent.
+                out = build_public(doc)
+                out["ok"] = False
+                out["error"] = "no live writer reservation; buildClaim must run before a writer"
+                out["code"] = "claim_required"
+                return 409, out
+            if claim.get("kind") != "initial":
+                out = build_public(doc)
+                out["ok"] = False
+                out["error"] = f"the live reservation is a '{claim.get('kind')}' claim, not an initial one"
+                out["code"] = "claim_mismatch"
+                return 409, out
 
         budget = doc.setdefault("budget", {"jobs_max": None, "jobs_used": 0})
         used = int(budget.get("jobs_used") or 0) + jobs_spent
@@ -4656,6 +4928,3215 @@ def build_state_op(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
     if doc.get("version") != BUILD_STATE_VERSION:
         return 409, build_version_park(doc)
     return 200, build_public(doc)
+
+
+# --- pre-PR mechanical path -------------------------------------------------
+#
+# One bounded Rewst invocation runs exactly one step. Which step is read off
+# the durable document by build_mechanical_step, never asserted by the caller:
+# an invocation that arrives twice with the same intent finds the build has
+# already moved and is given the next step instead of repeating the last one.
+#
+# The graph holds edges. Every judgment lives here, on this side of the
+# tunnel, because each one is a place a plausible-looking answer would ship
+# unverified work: whether a check produced a verdict or only a queue
+# acknowledgement, whether a reviewer disagreed or merely went quiet, whether
+# a stack was the clean one, whether this build has already been pushed.
+
+
+def build_open(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Load a build for a mechanical-path op, or say precisely why not."""
+    if not valid_build_id(build_id):
+        return None, (400, {"ok": False, "error": "invalid build_id", "code": "bad_build_id"})
+    doc, read_err = load_build(str(build_id))
+    if read_err:
+        return None, (int(read_err["status"]), read_err)
+    if doc is None:
+        return None, (404, {"ok": False, "error": "unknown build", "code": "unknown_build",
+                            "build_id": build_id})
+    if doc.get("version") != BUILD_STATE_VERSION:
+        return None, (409, build_version_park(doc))
+    return doc, None
+
+
+def build_class(doc: dict[str, Any]) -> str:
+    """The routed class this build was opened as.
+
+    Absent means mechanical: the route row is the planner's stamp, and a build
+    that never got one has not been routed anywhere else.
+    """
+    route = doc.get("route")
+    if not isinstance(route, dict):
+        return BUILD_MECHANICAL_CLASS
+    raw = route.get("class")
+    return raw if isinstance(raw, str) and raw in SLICE_CLASSES else BUILD_MECHANICAL_CLASS
+
+
+def build_open_mechanical(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Load a build and refuse it if this is not its path.
+
+    A visual or sensitive build has extra stages this workflow does not run.
+    Letting one through here would take it past evidence capture and the
+    second reviewer without either having happened.
+    """
+    doc, err = build_open(build_id)
+    if err:
+        return None, err
+    assert doc is not None
+    found = build_class(doc)
+    if found != BUILD_MECHANICAL_CLASS:
+        return None, (
+            409,
+            {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "stage": doc.get("stage"),
+                "step": "not_mechanical",
+                "error": f"build is routed '{found}', not mechanical",
+                "code": "not_mechanical",
+            },
+        )
+    return doc, None
+
+
+def build_recipe_cwd(
+    spec: dict[str, Any], target: Path, label: str
+) -> tuple[Path | None, str | None]:
+    """Where this recipe runs for this phase, or why it cannot run at all.
+
+    A catalog entry that says `"cwd": "."` means "the checkout this catalog
+    ships with", and `resolve_under_home` turns that into $GRAPHWING_HOME — the
+    deployed service, not the tree under test. Running `graphwing-unit` there
+    for a build on the `graphwing-pre-pr` worktree produces a green verdict for
+    code the build has never touched: the gate reports a pass for a change it
+    did not measure. So the catalog default is rebased onto the target.
+
+    The target is the phase's, not the build's. Fast checks measure the
+    writer's worktree; final integration measures the declared clean stack's
+    checkout, and rebasing its recipes onto `doc.worktree` would run the
+    "clean" phase over the writer's half-finished files with a clean stack's
+    name on the receipt.
+
+    A recipe pinned somewhere that is neither is run nowhere. It measures a
+    tree this change does not appear in, and passing it would be the same lie
+    in a different directory, so it fails closed with a reason instead.
+    """
+    declared = Path(str(spec.get("cwd")))
+    if declared == target:
+        return target, None
+    if declared == HOME.resolve():
+        if not target.is_dir():
+            return None, f"{label} {target} is not a directory"
+        return target, None
+    return None, (
+        f"recipe '{spec.get('name')}' is pinned to {declared}, which is not {label} "
+        f"{target}; it would measure a tree this change is not verified in"
+    )
+
+
+def build_recipe_catalog(
+    repos: dict[str, str],
+    target: Path | None = None,
+    label: str = "this build's worktree",
+) -> dict[str, dict[str, Any]]:
+    """Every named recipe a build may declare, and where the name came from.
+
+    tests.json is read first and wins a duplicate name, because that is the
+    order the existing testRun / scriptRun ops resolve in. A recipe that means
+    two different things depending on which op ran it is worse than a name
+    collision that is decided once, here.
+
+    With a target, every entry is also re-pointed at that directory or marked
+    `unresolvable` with a reason. Without one the catalog is just the list of
+    names, which is all "is this name real" needs.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for kind, loader in (("test", load_tests), ("script", load_scripts), ("rr", load_rr)):
+        try:
+            catalog = loader(repos)
+        except (OSError, ValueError, RuntimeError):
+            # A malformed or absent catalog file is not this build's fault and
+            # must not take the whole gate down with a traceback. The names it
+            # would have supplied simply do not resolve, which the caller is
+            # told about by name.
+            continue
+        for name, spec in catalog.items():
+            if name in out:
+                continue
+            entry = {**spec, "kind": kind, "coverage": build_recipe_is_coverage(name, spec)}
+            entry["declared_cwd"] = str(spec.get("cwd"))
+            entry["unresolvable"] = None
+            if target is not None:
+                cwd, why = build_recipe_cwd(entry, target, label)
+                entry["unresolvable"] = why
+                if cwd is not None:
+                    entry["cwd"] = cwd
+            out[name] = entry
+    return out
+
+
+def build_recipe_is_coverage(name: str, spec: dict[str, Any]) -> bool:
+    """False when a recipe must never be presented as unit, type, or integration coverage."""
+    if name in BUILD_HOOK_ONLY_RECIPES:
+        return False
+    return spec.get("coverage") is not False
+
+
+def build_changed_paths(worktree: Path, base_head: str | None) -> list[str]:
+    """Repo-relative paths this build has touched, committed or not.
+
+    Both halves are needed. The worktree status is the writer's staged and
+    unstaged work, which is where a mechanical change spends its whole life
+    before finalization. The diff against base_head catches anything an
+    earlier round already committed.
+    """
+    paths: set[str] = set()
+    status = run_git(worktree, ["status", "--porcelain=v1"])
+    if status.get("ok"):
+        for line in (status.get("stdout") or "").splitlines():
+            rel = line[3:].strip()
+            if " -> " in rel:
+                rel = rel.split(" -> ", 1)[1]
+            rel = rel.strip().strip('"')
+            if rel:
+                paths.add(rel)
+    if base_head:
+        diff = run_git(worktree, ["diff", "--name-only", f"{base_head}..HEAD"])
+        if diff.get("ok"):
+            for line in (diff.get("stdout") or "").splitlines():
+                rel = line.strip()
+                if rel:
+                    paths.add(rel)
+    return sorted(paths)[:BUILD_CHANGED_PATHS_MAX]
+
+
+def build_change_id(worktree: Path, head: str) -> str:
+    """Identify the change as it exists right now, committed or not.
+
+    `head` cannot answer this on the mechanical path. The writer stages its
+    files and never commits — finalization is the only thing that does — so
+    HEAD is the same object id from the moment the build opens until the moment
+    it ends. A gate keyed on HEAD alone would accept a fast-check verdict
+    recorded before a correction turn rewrote every file that verdict covered,
+    which is precisely what the correction turn exists to invalidate.
+
+    Staged and unstaged diffs are hashed in full; untracked files contribute
+    their names only. That boundary is deliberate: finalization commits what
+    the writer staged, so content the writer never staged is not part of the
+    change being gated.
+    """
+    parts = [head]
+    for args in (["diff", "--cached"], ["diff"], ["ls-files", "--others", "--exclude-standard"]):
+        out = run_git(worktree, args)
+        if not out.get("ok"):
+            # Unreadable gets its own identity rather than falling back to the
+            # last one. Reusing it would let a broken worktree inherit a green
+            # verdict recorded when git could still be read.
+            return f"{head}:unreadable"
+        parts.append(str(out.get("stdout") or ""))
+    digest = hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+    return f"{head}:{digest[:16]}"
+
+
+def build_runner_tree(worktree: Path) -> str | None:
+    """The tree checked out by a runner, never merely its commit label."""
+    result = run_git(worktree, ["rev-parse", "HEAD^{tree}"])
+    if not result.get("ok"):
+        return None
+    tree = str(result.get("stdout") or "").strip()
+    return tree if re.fullmatch(r"[0-9a-f]{40,64}", tree) else None
+
+
+def build_materialize_candidate(
+    worktree: Path, base_head: str, change_id: str
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Freeze the exact index as a deterministic, unreferenced Git commit."""
+    status = git_status(worktree)
+    if not status.get("ok"):
+        return None, {
+            "code": "candidate_unreadable",
+            "error": str(status.get("error") or "git status failed")[:BUILD_REDACT_MAX_STRING],
+        }
+    dirt = build_commit_dirt(list(status.get("entries") or []))
+    if dirt:
+        return None, {
+            "code": "candidate_not_exact",
+            "error": "candidate must be exactly staged; unstaged or untracked paths: " + ", ".join(dirt[:8]),
+            "entries": dirt[:8],
+        }
+    tree_result = run_git(worktree, ["write-tree"])
+    if not tree_result.get("ok"):
+        return None, {"code": "candidate_unreadable", "error": "git write-tree failed"}
+    tree = str(tree_result.get("stdout") or "").strip()
+    env = {
+        "GIT_AUTHOR_NAME": "graphwing integration",
+        "GIT_AUTHOR_EMAIL": "graphwing@localhost",
+        "GIT_AUTHOR_DATE": "Thu, 01 Jan 1970 00:00:00 +0000",
+        "GIT_COMMITTER_NAME": "graphwing integration",
+        "GIT_COMMITTER_EMAIL": "graphwing@localhost",
+        "GIT_COMMITTER_DATE": "Thu, 01 Jan 1970 00:00:00 +0000",
+    }
+    commit_result = run_cmd(
+        ["git", "-C", str(worktree), "commit-tree", tree, "-p", base_head, "-m", "graphwing integration candidate"],
+        cwd=worktree,
+        env=env,
+    )
+    if not commit_result.get("ok"):
+        return None, {"code": "candidate_unreadable", "error": "git commit-tree failed"}
+    commit = str(commit_result.get("stdout") or "").strip()
+    return {
+        "candidate_tree": tree,
+        "base_head": base_head,
+        "change_id": change_id,
+        "materialization": commit,
+    }, None
+
+
+def build_provision_candidate_runner(
+    worktree: Path, runner_root: Path, candidate: dict[str, str], attempt_id: str
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Create one attempt-owned detached worktree at the synthetic candidate."""
+    runner_root.mkdir(parents=True, exist_ok=True)
+    safe_attempt = re.sub(r"[^A-Za-z0-9_.-]", "-", attempt_id)[:96]
+    runner = runner_root / safe_attempt
+    build_cleanup_candidate_runner(worktree, runner)
+    result = run_git(
+        worktree, ["worktree", "add", "--detach", str(runner), candidate["materialization"]]
+    )
+    if not result.get("ok"):
+        build_cleanup_candidate_runner(worktree, runner)
+        return None, {
+            "code": "runner_provision_failed",
+            "error": str(result.get("stderr") or result.get("error") or "git worktree add failed")[:BUILD_REDACT_MAX_STRING],
+        }
+    return runner, None
+
+
+def build_cleanup_candidate_runner(worktree: Path, runner: Path) -> None:
+    """Remove an attempt runner; safe after partial setup and safe to repeat."""
+    run_git(worktree, ["worktree", "remove", "--force", str(runner)])
+    if runner.exists():
+        shutil.rmtree(runner, ignore_errors=True)
+    run_git(worktree, ["worktree", "prune"])
+
+
+def build_live_change(
+    doc: dict[str, Any], repos: dict[str, str]
+) -> tuple[dict[str, str] | None, str | None]:
+    """Live branch, head, and change id for a build, or why they cannot be read."""
+    live, detail = build_resolve_identity(doc, repos)
+    if live is None:
+        return None, detail
+    worktree = Path(str(doc.get("worktree")))
+    return {**live, "change_id": build_change_id(worktree, live["head"])}, None
+
+
+def build_required_recipes(
+    doc: dict[str, Any], phase: str, changed: list[str]
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Declared recipes for a phase, plus whatever the changed paths mandate.
+
+    Union, always. A path rule can only add: there is no shape it can take
+    that removes a declared name, so a rule cannot be used to talk a build out
+    of a check its plan promised.
+
+    Returns the ordered names and, for each, why it is required — the graph
+    shows that to a human deciding whether a park is the plan's fault or the
+    diff's.
+    """
+    verification = doc.get("verification") or {}
+    declared = [n for n in (verification.get(phase) or []) if isinstance(n, str)]
+    why: dict[str, list[str]] = {}
+    required: list[str] = []
+    for name in declared:
+        if name not in why:
+            required.append(name)
+        why.setdefault(name, []).append("declared")
+    for rule in verification.get("path_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        if build_rule_phase(rule) != phase:
+            # A rule belongs to the phase it declared and to no other. Applying
+            # it everywhere made "this path needs the integration seam" also
+            # mean "and the fast gate must run it first".
+            continue
+        match = str(rule.get("match") or "")
+        hits = [p for p in changed if fnmatch.fnmatch(p, match)]
+        if not hits:
+            continue
+        for name in rule.get("recipes") or []:
+            if not isinstance(name, str):
+                continue
+            if name not in why:
+                required.append(name)
+            why.setdefault(name, []).append(f"path:{match}")
+    return required, why
+
+
+def build_route_stamp_gaps(doc: dict[str, Any]) -> list[str]:
+    route = doc.get("route")
+    if not isinstance(route, dict):
+        return list(BUILD_ROUTE_STAMPS)
+    return [k for k in BUILD_ROUTE_STAMPS if route.get(k) in (None, "")]
+
+
+def build_worktree_conflicts(entries: list[str]) -> list[str]:
+    """Porcelain lines for paths git itself cannot resolve.
+
+    An unmerged path is not dirt a writer can be asked to work around: the
+    file on disk has conflict markers in it, and every check run against it is
+    measuring the conflict rather than the change.
+    """
+    out = []
+    for line in entries:
+        xy = line[:2]
+        if "U" in xy or xy in ("AA", "DD"):
+            out.append(line[:BUILD_NAME_MAX])
+    return out
+
+
+def build_tracked_dirt(entries: list[str]) -> list[str]:
+    """Porcelain lines for tracked modifications, ignoring untracked files."""
+    return [line[:BUILD_NAME_MAX] for line in entries if not line.startswith("??")]
+
+
+def build_checks_entry(doc: dict[str, Any], phase: str) -> dict[str, Any] | None:
+    entry = (doc.get("checks") or {}).get(phase)
+    return entry if isinstance(entry, dict) else None
+
+
+def build_checks_clean(doc: dict[str, Any], phase: str, change_id: str) -> tuple[bool, str]:
+    """True only when every required recipe passed against this exact change.
+
+    Three different things read the same to a caller that only looks at a
+    boolean, so each gets its own sentence: nothing has been run here, part of
+    it was run, or it was run and something failed. The first is the dangerous
+    one — a phase with no verdicts at all is indistinguishable from a green
+    phase if the gate only asks "any failures?".
+    """
+    entry = build_checks_entry(doc, phase)
+    if entry is None:
+        return False, f"no {phase} checks have been run for this build"
+    if entry.get("change_id") != change_id:
+        return False, (
+            f"{phase} checks were recorded against {entry.get('change_id')}, the worktree now "
+            f"holds {change_id}"
+        )
+    required = [n for n in (entry.get("required") or []) if isinstance(n, str)]
+    if not required:
+        return False, f"{phase} checks recorded no required recipes"
+    verdicts = entry.get("verdicts") or {}
+    missing = [n for n in required if not isinstance(verdicts.get(n), dict)]
+    if missing:
+        return False, f"{phase} checks have no verdict for: {', '.join(missing)}"
+    failed = [n for n in required if not verdicts[n].get("ok")]
+    if failed:
+        return False, f"{phase} checks failed: {', '.join(failed)}"
+    if not any(verdicts[n].get("coverage") for n in required):
+        return False, f"{phase} checks ran only hooks, which are not coverage"
+    if phase == "integration":
+        named = entry.get("stack")
+        stack_entry, stack_err = build_integration_stack(doc, named)
+        if stack_err:
+            return False, stack_err
+        assert stack_entry is not None
+        # The stack name on the record is a label; the runner is where the
+        # recipes actually executed. An entry that names a clean stack and ran
+        # somewhere else — including one written before the runner was
+        # recorded at all — is not evidence about a clean checkout.
+        recorded = entry.get("runner")
+        try:
+            runner_path = Path(str(recorded)).resolve()
+            runner_root = Path(str(stack_entry["cwd"])).resolve()
+            runner_path.relative_to(runner_root)
+            if runner_path == runner_root:
+                raise ValueError("runner root is not an attempt worktree")
+        except (ValueError, OSError):
+            return False, (
+                f"integration checks ran in {recorded or 'a directory the record does not name'}, "
+                f"outside clean runner root '{named}' at {stack_entry['cwd']}"
+            )
+        worktree = Path(str(doc.get("worktree")))
+        status = git_status(worktree)
+        dirt = build_commit_dirt(list(status.get("entries") or [])) if status.get("ok") else ["unreadable"]
+        tree_result = run_git(worktree, ["write-tree"]) if not dirt else {"ok": False}
+        current_tree = str(tree_result.get("stdout") or "").strip() if tree_result.get("ok") else None
+        candidate_tree = entry.get("candidate_tree")
+        runner_tree = entry.get("runner_tree")
+        if dirt or not current_tree:
+            return False, "current candidate is not exactly staged"
+        if candidate_tree != current_tree:
+            return False, f"integration candidate tree {candidate_tree} does not match staged tree {current_tree}"
+        if runner_tree != candidate_tree:
+            return False, f"integration runner tree {runner_tree} does not match candidate tree {candidate_tree}"
+        if not entry.get("materialization") or entry.get("base_head") != entry.get("head"):
+            return False, "integration receipt does not identify its candidate materialization and base head"
+    return True, "ok"
+
+
+def build_stack_catalog() -> dict[str, dict[str, Any]]:
+    """Every declared stack, or nothing when the catalog cannot be read.
+
+    An unreadable stacks.json is answered as "no stacks", not as a traceback.
+    Every caller here is asking whether a *clean* stack exists, and the honest
+    answer when the catalog is broken is no.
+    """
+    try:
+        stacks, _ports = load_stacks()
+    except (OSError, ValueError, RuntimeError):
+        return {}
+    return stacks
+
+
+def build_clean_stack_names(catalog: dict[str, dict[str, Any]]) -> list[str]:
+    """Stacks the catalog declares as clean, in name order."""
+    return sorted(
+        name for name, spec in catalog.items() if spec.get("role") == BUILD_CLEAN_STACK_ROLE
+    )
+
+
+def build_stack_isolation_gap(doc: dict[str, Any], entry: dict[str, Any]) -> str | None:
+    """Why this stack is not a different tree from the build's, or None.
+
+    A catalog entry can declare itself clean and still be pointed at the
+    worktree the writer has been editing all afternoon, at which point the role
+    is a label rather than a fact. Symlinks are resolved before the comparison,
+    and containment is checked both ways: a stack running in a parent of the
+    build's worktree is running over the build's files too.
+    """
+    name = entry.get("name")
+    cwd = entry.get("cwd")
+    if not isinstance(cwd, Path):
+        return f"stack '{name}' does not resolve to a directory"
+    try:
+        runner = cwd.resolve()
+        build_tree = Path(str(doc.get("worktree") or "")).resolve()
+    except OSError as exc:
+        return f"stack '{name}' could not be resolved against this build's worktree: {exc}"
+    if not runner.is_dir():
+        return f"stack '{name}' runs in {runner}, which is not a directory"
+    if entry.get("role") == BUILD_CLEAN_STACK_ROLE and entry.get("runner") != "git-worktree":
+        return (
+            f"stack '{name}' does not declare runner 'git-worktree'; a healthy mutable stack "
+            "cannot materialize the reviewed candidate"
+        )
+    if runner == build_tree or runner in build_tree.parents or build_tree in runner.parents:
+        return (
+            f"stack '{name}' runs in {runner}, which is the tree this build is being written in "
+            f"({build_tree}); a stack over the writer's own files is the developer stack under "
+            "another name"
+        )
+    return None
+
+
+def build_integration_stack(
+    doc: dict[str, Any], stack: Any
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The clean stack this build's final integration may run on, or why none.
+
+    Fails closed on every axis. Health is not isolation: a healthy stack with
+    no declared role is the developer stack that happens to be up, and it
+    carries the writer's half-applied migrations and whatever was left running
+    from the round before. So the catalog has to say `"role": "clean"` out
+    loud, the named stack has to be one of those, it cannot be a stack this
+    build declared for its own use, and it cannot run in the build's worktree.
+
+    With no clean stack declared anywhere, there is no answer that is not a
+    guess, and the refusal names that rather than accepting whatever was
+    passed.
+    """
+    catalog = build_stack_catalog()
+    clean = build_clean_stack_names(catalog)
+    if not clean:
+        return None, (
+            'no stack in stacks.json declares "role": "clean"; final integration has nowhere '
+            "isolated to run, and a build's own stack cannot stand in for one"
+        )
+    if not isinstance(stack, str) or not stack.strip():
+        return None, (
+            "final integration did not name the stack it ran on; stacks declared clean: "
+            + ", ".join(clean)
+        )
+    name = stack.strip()
+    entry = catalog.get(name)
+    if entry is None:
+        return None, (
+            f"stack '{name}' is not in stacks.json; stacks declared clean: " + ", ".join(clean)
+        )
+    role = str(entry.get("role") or "unset")
+    if role != BUILD_CLEAN_STACK_ROLE:
+        return None, (
+            f"stack '{name}' is declared role '{role}', not '{BUILD_CLEAN_STACK_ROLE}'; final "
+            "integration needs a disposable clean stack and being healthy is not a substitute"
+        )
+    if name in [s for s in (doc.get("stacks") or []) if isinstance(s, str)]:
+        return None, f"stack '{name}' is one of this build's own stacks, not a separate clean stack"
+    gap = build_stack_isolation_gap(doc, entry)
+    if gap:
+        return None, gap
+    return entry, None
+
+
+def build_integration_stack_gap(doc: dict[str, Any], stack: Any) -> str | None:
+    """Why this stack cannot stand in for the final integration run, or None."""
+    _entry, gap = build_integration_stack(doc, stack)
+    return gap
+
+
+def build_phase_runner(
+    doc: dict[str, Any], phase: str, stack: Any
+) -> tuple[Path | None, str, str | None]:
+    """The directory a phase's recipes run in, what to call it, or why there is none.
+
+    Fast checks measure what the writer wrote, so they run in the build's
+    worktree. Final integration measures a clean checkout, so it runs where the
+    declared clean stack runs. Binding integration to `doc.worktree` is how a
+    run labelled with a clean stack's name ends up executing over the writer's
+    tree and reporting a clean-checkout pass.
+    """
+    if phase != "integration":
+        return Path(str(doc.get("worktree"))), "this build's worktree", None
+    entry, gap = build_integration_stack(doc, stack)
+    if entry is None:
+        return None, "the clean integration stack", gap
+    return Path(str(entry["cwd"])), f"clean runner root '{entry['name']}'", None
+
+
+def build_red_fast_checks(doc: dict[str, Any], change_id: str) -> list[str]:
+    """Declared fast recipes that ran against this change and did not pass.
+
+    Empty when the phase has never run here, which is deliberately the same
+    answer as "nothing is red": a phase with no verdicts has not failed, it
+    simply has not happened, and `build_checks_clean` is the one that refuses
+    to call that a pass.
+    """
+    entry = build_checks_entry(doc, "fast")
+    if not isinstance(entry, dict) or entry.get("change_id") != change_id or entry.get("ok"):
+        return []
+    named = [n for n in (entry.get("failed") or []) if isinstance(n, str)]
+    named += [n for n in (entry.get("missing") or []) if isinstance(n, str) and n not in named]
+    return named
+
+
+def build_step_finding(doc: dict[str, Any], step: str, change_id: str) -> str:
+    """The exact text a `fix` invocation hands back to the writer.
+
+    Composed here so a resumed writer sees the same finding whether the run
+    that produced it is still alive or died an hour ago. A graph that read the
+    finding out of its own task history could only correct a failure it had
+    personally witnessed, which is every case except the one that matters.
+    """
+    if step != "fix":
+        return ""
+    review = build_last_review(doc, change_id)
+    if review is not None and review.get("verdict") != "PASS":
+        text = str(review.get("compact") or review.get("summary") or "")
+        return f"The behavior-and-test review returned findings.\n{text}"[:COMPACT_MAX_CHARS]
+    red = build_red_fast_checks(doc, change_id)
+    if not red:
+        return ""
+    entry = build_checks_entry(doc, "fast") or {}
+    verdicts = entry.get("verdicts") or {}
+    detail = "\n".join(
+        str(verdicts[n].get("compact") or "") for n in red if isinstance(verdicts.get(n), dict)
+    )
+    return f"These declared fast checks are red: {', '.join(red)}\n{detail}"[:COMPACT_MAX_CHARS]
+
+
+def build_last_review(doc: dict[str, Any], change_id: str) -> dict[str, Any] | None:
+    """The most recent micro-review recorded against this exact change.
+
+    A review of the diff the writer has since rewritten is not a review of what
+    would be committed, so it does not answer here at all — the caller sees the
+    same "nobody has reviewed this" it would see if no review had ever run.
+    """
+    for entry in reversed(doc.get("reviews") or []):
+        if isinstance(entry, dict) and entry.get("change_id") == change_id and entry.get("verdict"):
+            return entry
+    return None
+
+
+def build_charge(doc: dict[str, Any], jobs: int) -> tuple[int, dict[str, Any]] | None:
+    """Spend job budget, or park the build when there is none left.
+
+    The correction loop is what this bounds. A reviewer that keeps finding
+    things resumes the writer, reruns the checks, and reviews again; without a
+    charge on each round the loop has no floor and the only thing that ever
+    ends it is somebody noticing. Parking here preserves the files on disk and
+    hands the decision back to planning, which is the point.
+    """
+    budget = doc.setdefault("budget", {"jobs_max": None, "jobs_used": 0})
+    used = int(budget.get("jobs_used") or 0) + jobs
+    jobs_max = budget.get("jobs_max")
+    if isinstance(jobs_max, int) and used > jobs_max:
+        return build_park(
+            doc,
+            "budget_exhausted",
+            f"{used} jobs requested against a budget of {jobs_max}; files are on disk",
+        )
+    budget["jobs_used"] = used
+    return None
+
+
+def build_claim(doc: dict[str, Any]) -> dict[str, Any] | None:
+    claim = doc.get("writer_claim")
+    return claim if isinstance(claim, dict) else None
+
+
+def build_claim_live(doc: dict[str, Any], now: float) -> dict[str, Any] | None:
+    """The reservation that currently owns the writer, or None.
+
+    A consumed claim is spent and an expired one is abandoned. Both let the
+    next invocation reserve the writer again; neither lets a *concurrent* one
+    do it, which is the difference between recovering a dead run and running
+    two writers over the same worktree.
+    """
+    claim = build_claim(doc)
+    if claim is None or claim.get("consumed"):
+        return None
+    try:
+        expires = float(claim.get("expires_epoch") or 0)
+    except (TypeError, ValueError):
+        return None
+    return claim if expires > now else None
+
+
+def build_claim_has_launch(claim: dict[str, Any] | None) -> bool:
+    """True once a claim owns a durable launch intent or local job.
+
+    Wall-clock lease expiry may transfer an idle reservation, but it cannot
+    make a queued/running writer disappear. Completion is the only operation
+    that consumes a launched claim, so a slow writer never gains a concurrent
+    replacement merely because its original Rewst invocation timed out.
+    """
+    if not isinstance(claim, dict) or claim.get("consumed"):
+        return False
+    return claim.get("launch_state") in ("intent", "queued") or bool(claim.get("job_id"))
+
+
+def build_writer_ids(build_id: str, claim_id: str) -> tuple[str, str]:
+    digest = hashlib.sha256(f"{build_id}\0{claim_id}".encode()).hexdigest()[:32]
+    return digest, f"gwslice-{digest}"
+
+
+def build_gate_record(doc: dict[str, Any], action: str, target: str, change_id: str, by: str, why: str) -> dict[str, Any]:
+    entry = {
+        "action": action,
+        "from": doc.get("stage"),
+        "to": target,
+        "at": utcnow(),
+        "change_id": change_id,
+        "by": by,
+        "why": why,
+    }
+    gates = [g for g in (doc.get("gates") or []) if isinstance(g, dict)]
+    doc["gates"] = gates[-(BUILD_GATE_RECORDS_KEPT - 1):] + [entry]
+    return entry
+
+
+def build_gate_transition(
+    doc: dict[str, Any], action: str, change_id: str, by: str, why: str
+) -> dict[str, Any] | None:
+    """Move the build across a gate on the authority of a receipt just verified.
+
+    The caller is an operation that has already established the evidence --
+    buildChecks with a green phase, buildReview with an independent PASS,
+    buildFinalize with a pushed commit. Nothing here reads a request field, so
+    there is no shape a caller can send that reaches this function without the
+    receipt existing first.
+
+    Returns the gate record, or None when the build is not at the stage this
+    transition leaves (a replay that already moved).
+    """
+    frm, _to = BUILD_TRANSITIONS[action]
+    if doc.get("stage") != frm:
+        return None
+    target = build_transition_target(doc, action)
+    entry = build_gate_record(doc, action, target, change_id, by, why)
+    if action == "verify_passed":
+        # Same boundary buildAdvance recorded, for the same reason: a later
+        # lease takeover must not roll back where verified work ended.
+        doc["verified_boundary"] = {
+            "stage": target,
+            "head": doc.get("head"),
+            "at": utcnow(),
+            "verification": doc.get("verification"),
+        }
+    doc["stage"] = target
+    if target in BUILD_TERMINAL:
+        doc["lease"] = None
+    return entry
+
+
+def build_pending_gate(doc: dict[str, Any], change_id: str) -> tuple[str | None, str]:
+    """The one gate transition this build's own receipts already justify.
+
+    Read entirely from durable state at the change now on disk. This is what a
+    run that died between recording a green phase and recording the transition
+    comes back to: the evidence is there, so the transition is owed, and
+    re-running the phase would spend a round of budget to learn it again.
+    """
+    stage = doc.get("stage")
+    if stage == "verifying":
+        clean, why = build_checks_clean(doc, "fast", change_id)
+        if not clean:
+            return None, why
+        return "verify_passed", "the declared fast checks are clean for this change"
+    if stage == "review":
+        clean, why = build_checks_clean(doc, "fast", change_id)
+        if not clean:
+            return None, why
+        review = build_last_review(doc, change_id)
+        if review is None:
+            return None, "no behavior-and-test review has been recorded for this change"
+        if review.get("verdict") != "PASS":
+            return None, f"the last review returned findings: {review.get('summary')}"
+        gap = build_review_authority_gap(doc, review.get("reviewer"))
+        if gap:
+            return None, gap
+        return "review_passed", "the review is clean and independent for this change"
+    return None, f"stage '{stage}' has no gate waiting on a recorded receipt"
+
+
+def build_mechanical_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
+    """Name the one step this invocation may run, and why.
+
+    Reading the step off the document rather than taking it from the caller is
+    what makes the workflow replayable. A Rewst run that timed out after its
+    writer finished comes back, is told the build is at `fast_checks`, and
+    does not start a second writer.
+
+    Every answer is a function of the durable document and the change currently
+    on disk. Nothing here consults the caller, and nothing here writes, so an
+    invocation that dies immediately after asking costs the build nothing.
+    """
+    stage = doc.get("stage")
+    if stage == "parked":
+        return "parked", str(doc.get("park_reason") or "parked")
+    if stage == "pr_opened" or doc.get("pr_ready"):
+        return "done", "this build has already produced its PR-ready commit"
+    if build_budget_left(doc) == 0:
+        return "parked", "budget_exhausted"
+    if stage == "created":
+        return "preflight", "no writer has been launched yet"
+    if stage == "writing":
+        result = doc.get("writer_result")
+        if isinstance(result, dict) and result.get("status") in ("error", "timeout"):
+            return "fix", "the writer stopped before success; its files and session are recoverable"
+        return "write", "the writer holds the build"
+    if stage == "verifying":
+        red = build_red_fast_checks(doc, change_id)
+        if red:
+            # Rerunning a red phase unchanged is the loop that never ends. The
+            # only thing that moves a red check is the writer, so say so.
+            return "fix", "fast checks are red for this change: " + ", ".join(red)
+        clean, why = build_checks_clean(doc, "fast", change_id)
+        if clean:
+            # Green and still at `verifying` means the run that got the verdict
+            # did not survive to record the transition. Re-running the whole
+            # phase to learn the same thing is a round of budget spent on an
+            # answer already on disk.
+            return "verify_passed", "the declared fast checks are clean for this change"
+        return "fast_checks", why
+    if stage == "evidence":
+        # Only reachable if a build declared visual proof and was still routed
+        # here. Saying so is better than running a screenshot round the
+        # mechanical path has no way to capture.
+        return "parked", "mechanical builds do not capture visual evidence"
+    if stage == "review":
+        # Checks come first even at review. A correction turn that answered a
+        # finding produced a new change id, which invalidated the fast phase as
+        # well as the review, and reviewing a diff whose own declared checks
+        # have not run is reviewing something that may not even compile.
+        clean, why = build_checks_clean(doc, "fast", change_id)
+        if not clean:
+            red = build_red_fast_checks(doc, change_id)
+            if red:
+                return "fix", "fast checks are red for this change: " + ", ".join(red)
+            return "fast_checks", why
+        last = build_last_review(doc, change_id)
+        if last is None:
+            return "review", "no behavior-and-test review for this change"
+        if last.get("verdict") != "PASS":
+            return "fix", "the last review returned findings"
+        gap = build_review_authority_gap(doc, last.get("reviewer"))
+        if gap:
+            # A recorded PASS from a reviewer that cannot be independent is not
+            # a review. Re-reviewing is the only thing that moves it, and the
+            # route has to name a reviewer that can.
+            return "review", gap
+        # Not "review" again: a clean review that re-ran itself would spend a
+        # round of budget to be told the same thing, and could only ever change
+        # its mind for the worse.
+        return "review_passed", "the review is clean for this change"
+    if stage == "ready":
+        clean, why = build_checks_clean(doc, "integration", change_id)
+        if not clean:
+            return "integration", why
+        return "finalize", "final checks and review are clean"
+    return "parked", f"stage '{stage}' is not on the mechanical path"
+
+
+def build_next_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The stage switch. Read durable state, name the next allowed step.
+
+    Deliberately read-only. The graph calls this first on every invocation, so
+    it must be safe to call from a run that is about to be abandoned.
+    """
+    build_id = first_query(qs, "build_id")
+    doc, err = build_open_mechanical(build_id)
+    if err:
+        return err
+    assert doc is not None
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        # Not a park: this call did not ask to change anything, and parking on
+        # a read would let a monitoring poll kill a build.
+        out = build_public(doc)
+        out["ok"] = False
+        out["step"] = "parked"
+        out["step_reason"] = str(park_detail)
+        out["code"] = "worktree_mismatch"
+        return 409, out
+    step, reason = build_mechanical_step(doc, live["change_id"])
+    out = build_public(doc)
+    out["ok"] = step != "parked"
+    out["step"] = step
+    out["step_reason"] = reason
+    out["live_head"] = live["head"]
+    out["live_branch"] = live["branch"]
+    out["change_id"] = live["change_id"]
+    out["class"] = build_class(doc)
+    # The correction text travels with the step, not with the run that produced
+    # it. A graph that read the finding out of its own task history could only
+    # correct a failure it had personally witnessed, which is every case except
+    # the one this workflow exists for: the run before it died.
+    out["finding"] = build_step_finding(doc, step, live["change_id"])
+    if step == "parked":
+        out["code"] = doc.get("park_reason") or "parked"
+    return (200 if out["ok"] else 409), out
+
+
+def build_reachable_recipes(doc: dict[str, Any], phase: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Every recipe this phase could ever be asked to run, and why.
+
+    Reachable, not required: a changed-path rule's recipes are only *required*
+    when a path matches, but they are reachable the moment the rule exists, and
+    a preflight that only looked at the declared list let a rule name a
+    hook-only or wrong-tree recipe and discover it the first time a diff
+    happened to match — after the writer had already spent its turn.
+    """
+    verification = doc.get("verification") or {}
+    names: list[str] = []
+    why: dict[str, list[str]] = {}
+    for name in verification.get(phase) or []:
+        if not isinstance(name, str):
+            continue
+        if name not in why:
+            names.append(name)
+        why.setdefault(name, []).append("declared")
+    for rule in verification.get("path_rules") or []:
+        if not isinstance(rule, dict) or build_rule_phase(rule) != phase:
+            continue
+        for name in rule.get("recipes") or []:
+            if not isinstance(name, str):
+                continue
+            if name not in why:
+                names.append(name)
+            why.setdefault(name, []).append(f"path:{rule.get('match')}")
+    return names, why
+
+
+def build_preflight_recipes(doc: dict[str, Any], repos: dict[str, str]) -> list[dict[str, Any]]:
+    """Check every reachable recipe against the directory it will really run in.
+
+    Three separate questions, per phase, and the phase decides where the answer
+    comes from. Fast checks resolve against the build's worktree. Integration
+    resolves against each stack the catalog declares clean, because that is
+    where those recipes will execute — resolving them against the worktree
+    would pass a recipe that cannot run on a clean checkout at all.
+
+    Strict across clean stacks on purpose: the graph picks which one to use at
+    check time, so a recipe that fails to bind on any of them is a gap the
+    operator fixes now rather than a coin toss later.
+    """
+    failures: list[dict[str, Any]] = []
+    worktree = Path(str(doc.get("worktree")))
+    stacks = build_stack_catalog()
+    clean = build_clean_stack_names(stacks)
+
+    for rule in (doc.get("verification") or {}).get("path_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        declared = rule.get("phase")
+        if declared is not None and declared not in BUILD_CHECK_PHASES:
+            failures.append(
+                {
+                    "check": "verification.path_rules",
+                    "code": "bad_rule_phase",
+                    "detail": (
+                        f"path rule '{rule.get('match')}' declares phase '{declared}', which is "
+                        "neither fast nor integration"
+                    ),
+                }
+            )
+
+    for phase in BUILD_CHECK_PHASES:
+        names, _why = build_reachable_recipes(doc, phase)
+        if not names:
+            failures.append(
+                {
+                    "check": f"verification.{phase}",
+                    "code": "no_recipes",
+                    "detail": (
+                        f"the plan declared no {phase} checks and no path rule can add one; "
+                        "finalization requires a clean verdict for every phase, so this build "
+                        "could never reach a commit"
+                    ),
+                }
+            )
+            continue
+        if phase == "integration":
+            for name in clean:
+                gap = build_stack_isolation_gap(doc, stacks[name])
+                if gap:
+                    failures.append(
+                        {
+                            "check": "verification.integration",
+                            "code": "not_a_clean_stack",
+                            "detail": gap,
+                        }
+                    )
+            targets = [(Path(str(stacks[n]["cwd"])), f"clean stack '{n}'") for n in clean]
+            if not targets:
+                failures.append(
+                    {
+                        "check": "verification.integration",
+                        "code": "no_clean_stack",
+                        "detail": (
+                            f"this build reaches integration recipes ({', '.join(names)}) but no "
+                            'stack in stacks.json declares "role": "clean"'
+                        ),
+                        "recipes": names,
+                    }
+                )
+                continue
+        else:
+            targets = [(worktree, "this build's worktree")]
+
+        for target, label in targets:
+            catalog = build_recipe_catalog(repos, target, label)
+            unknown = [n for n in names if n not in catalog]
+            if unknown:
+                failures.append(
+                    {
+                        "check": f"verification.{phase}",
+                        "code": "unknown_recipe",
+                        "detail": f"no such recipe: {', '.join(unknown)}",
+                        "unknown": unknown,
+                        "allowed": sorted(catalog),
+                    }
+                )
+            known = [n for n in names if n in catalog]
+            stray = [n for n in known if catalog[n].get("unresolvable")]
+            if stray:
+                # The one that reads as a pass and is not. A recipe pinned to
+                # the deployed $GRAPHWING_HOME copy runs green against code the
+                # phase never touched, and the gate believes it.
+                failures.append(
+                    {
+                        "check": f"verification.{phase}",
+                        "code": "recipe_wrong_worktree",
+                        "detail": "; ".join(str(catalog[n]["unresolvable"]) for n in stray[:4]),
+                        "unresolvable": stray,
+                    }
+                )
+            if known and not any(catalog[n]["coverage"] for n in known):
+                failures.append(
+                    {
+                        "check": f"verification.{phase}",
+                        "code": "hook_not_coverage",
+                        "detail": (
+                            f"{phase} reaches only hook recipes ({', '.join(known)}) on {label}; "
+                            "a pre-commit hook is not unit, type, or integration coverage"
+                        ),
+                    }
+                )
+    return failures
+
+
+def build_preflight(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Everything that must be true before a writer is allowed to exist.
+
+    Read-only on purpose. A failure here is not a park — the graph decides
+    whether the build parks, because a caller with a stale recipe name should
+    be able to fix tests.json and try again without having burned the build.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    doc, open_err = build_open_mechanical(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    stage = doc.get("stage")
+    if stage not in ("created", "writing"):
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "stage": stage,
+            "error": f"preflight runs before the writer; build is at '{stage}'",
+            "code": "invalid_transition",
+        }
+
+    failures: list[dict[str, Any]] = []
+
+    gaps = build_route_stamp_gaps(doc)
+    if gaps:
+        failures.append(
+            {
+                "check": "route",
+                "code": "missing_route_stamp",
+                "detail": f"route is missing {', '.join(gaps)}",
+                "missing": gaps,
+            }
+        )
+
+    if build_budget_left(doc) is None:
+        # The correction loop is what this bounds. Without a ceiling a reviewer
+        # that keeps finding things resumes the writer forever, and the only
+        # thing that ever ends the run is somebody noticing.
+        failures.append(
+            {
+                "check": "budget",
+                "code": "no_job_budget",
+                "detail": "a mechanical build needs a finite budget.jobs_max; the correction loop has no other floor",
+            }
+        )
+
+    # Names only: this is the list the response reports, and "is the name real"
+    # is answered per phase against the directory that phase runs in.
+    catalog = build_recipe_catalog(repos)
+    verification = doc.get("verification") or {}
+    failures.extend(build_preflight_recipes(doc, repos))
+
+    branch = doc.get("branch")
+    if isinstance(branch, str) and branch.split("/")[-1] in BUILD_TRUNK_BRANCHES:
+        failures.append(
+            {
+                "check": "branch",
+                "code": "trunk_branch",
+                "detail": f"'{branch}' is a trunk branch; a pre-PR build needs a story branch",
+            }
+        )
+
+    live, park_detail = build_resolve_identity(doc, repos)
+    worktree_entries: list[str] = []
+    if live is None:
+        failures.append({"check": "worktree", "code": "worktree_mismatch", "detail": str(park_detail)})
+    else:
+        if live["branch"] != doc.get("branch"):
+            failures.append(
+                {
+                    "check": "branch",
+                    "code": "branch_mismatch",
+                    "detail": f"worktree is on '{live['branch']}', build was opened on '{doc.get('branch')}'",
+                }
+            )
+        status = git_status(Path(str(doc.get("worktree"))))
+        if not status.get("ok"):
+            failures.append(
+                {
+                    "check": "worktree",
+                    "code": "identity_unreadable",
+                    "detail": str(status.get("error") or "git status failed")[:BUILD_REDACT_MAX_STRING],
+                }
+            )
+        else:
+            worktree_entries = list(status.get("entries") or [])
+            conflicts = build_worktree_conflicts(worktree_entries)
+            if conflicts:
+                failures.append(
+                    {
+                        "check": "worktree",
+                        "code": "worktree_conflicted",
+                        "detail": "unmerged paths: " + ", ".join(conflicts[:8]),
+                        "entries": conflicts[:8],
+                    }
+                )
+            elif stage == "created":
+                # Once the writer is running its own edits are the point. Before
+                # it starts there is nobody those edits could belong to, and
+                # committing them later would ship somebody else's work under
+                # this build's ticket.
+                dirt = build_tracked_dirt(worktree_entries)
+                if dirt:
+                    failures.append(
+                        {
+                            "check": "worktree",
+                            "code": "worktree_dirty",
+                            "detail": "tracked changes are already present: " + ", ".join(dirt[:8]),
+                            "entries": dirt[:8],
+                        }
+                    )
+
+    out = {
+        "ok": not failures,
+        "build_id": doc.get("build_id"),
+        "stage": stage,
+        "branch": doc.get("branch"),
+        "head": live["head"] if live else doc.get("head"),
+        "declared": {phase: list(verification.get(phase) or []) for phase in BUILD_CHECK_PHASES},
+        "known_recipes": sorted(catalog),
+        "failures": failures,
+        "budget_left": build_budget_left(doc),
+    }
+    if failures:
+        out["error"] = failures[0]["detail"]
+        out["code"] = failures[0]["code"]
+        return 409, out
+    return 200, out
+
+
+def build_claim_request(data: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate a reservation request without touching the build."""
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return None, {"ok": False, "error": "event_id is required", "code": "bad_event_id"}
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return None, {"ok": False, "error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return None, holder_err
+    kind = data.get("kind") if data.get("kind") not in ("", None) else "initial"
+    if kind not in BUILD_CLAIM_KINDS:
+        return None, {
+            "ok": False,
+            "error": "kind must be initial or correction",
+            "code": "bad_claim_kind",
+            "allowed": list(BUILD_CLAIM_KINDS),
+        }
+    seconds, seconds_err = parse_optional_int(data, "lease_seconds", 1, BUILD_LEASE_MAX_SECONDS)
+    if seconds_err:
+        return None, seconds_err
+    return {"event_id": event_id, "holder": holder, "kind": kind,
+            "lease_seconds": seconds or BUILD_LEASE_SECONDS}, None
+
+
+def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Reserve the one writer slot, durably, before any agent is launched.
+
+    This is the line the whole path was missing. buildBrief composed a prompt
+    and the graph launched an agent off it, and nothing had been written down
+    yet -- so a Rewst retry, or two invocations arriving together, each got a
+    brief and each started a writer on the same worktree. The second one is
+    invisible: it edits the same files, the checks measure whatever the two of
+    them left behind, and the budget records one turn.
+
+    Reserving first inverts that. The claim is the side effect, taken under the
+    build lock and keyed on the event id, so a replay gets the same reservation
+    back and a concurrent call gets `writer_claimed`. The budget is charged
+    here rather than at the transition after the writer finished, because an
+    invocation that dies mid-writer has still spent the turn.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    request, bad = build_claim_request(data)
+    if bad:
+        return 400, bad
+    assert request is not None
+    event_id = str(request["event_id"])
+    holder = str(request["holder"])
+    kind = str(request["kind"])
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": "claim", "kind": kind, "holder": holder}
+    )
+
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        build_id = str(doc.get("build_id"))
+
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            record = seen.get(event_id) or {}
+            if record.get("fingerprint") != fingerprint:
+                out = build_public(doc)
+                out["ok"] = False
+                out["replayed"] = False
+                out["error"] = "event_id was already used with different input"
+                out["code"] = "idempotency_conflict"
+                return 409, out
+            out = build_public(doc)
+            out["ok"] = int(record.get("status") or 200) == 200
+            out["replayed"] = True
+            out["receipt"] = record.get("receipt")
+            out["claim"] = build_claim(doc)
+            return int(record.get("status") or 200), out
+
+        live, park = build_identity_park(doc, "claim", data.get("worktree"), None, None, repos)
+        if park is not None:
+            reason, detail = park
+            return build_park(doc, reason, detail, event_id, fingerprint, holder)
+        assert live is not None
+        change_id = build_change_id(Path(str(doc.get("worktree"))), live["head"])
+
+        now = time.time()
+        lease = build_lease_live(doc, now)
+        if lease is not None and lease.get("holder") != holder:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "another caller holds the build lease"
+            out["code"] = "lease_held"
+            return 409, out
+
+        if build_budget_left(doc) is None:
+            # An unbounded correction loop has no floor: a reviewer that keeps
+            # finding things resumes the writer forever and the only thing that
+            # ends it is somebody noticing. Refuse the launch, not the build.
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "a mechanical build needs a finite budget.jobs_max before a writer is launched"
+            out["code"] = "no_job_budget"
+            return 409, out
+
+        launched = build_claim(doc)
+        if build_claim_has_launch(launched):
+            out = build_public(doc)
+            out["ok"] = False
+            out["claim"] = launched
+            out["error"] = "the current writer claim already owns a launch intent or job"
+            out["code"] = "writer_claimed"
+            return 409, out
+
+        step, reason = build_mechanical_step(doc, change_id)
+        wanted = "preflight" if kind == "initial" else "fix"
+        if step != wanted:
+            # The document, not the caller, says which turn is due. A
+            # correction claim on a build whose review is clean is a graph
+            # that read its own history instead of asking.
+            out = build_public(doc)
+            out["ok"] = False
+            out["step"] = step
+            out["step_reason"] = reason
+            out["error"] = f"a '{kind}' claim runs at step '{wanted}'; this build is at '{step}'"
+            out["code"] = "claim_not_due"
+            return 409, out
+
+        held = build_claim_live(doc, now)
+        if held is not None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["claim"] = held
+            out["error"] = (
+                f"'{held.get('holder')}' already holds the writer reservation for this build "
+                f"until {held.get('expires_at')}"
+            )
+            out["code"] = "writer_claimed"
+            return 409, out
+
+        session = doc.get("writer_session")
+        if kind == "correction" and not (isinstance(session, str) and session.strip()):
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "a correction turn must resume the writer that made the change"
+            out["code"] = "no_writer_session"
+            return 409, out
+
+        charged = build_charge(doc, 1)
+        if charged:
+            return charged
+
+        stale = build_claim(doc)
+        superseded = (
+            stale.get("claim_id")
+            if isinstance(stale, dict) and stale.get("claim_id") != event_id
+            else None
+        )
+        _job_id, reserved_session = build_writer_ids(build_id, event_id)
+        claim = {
+            "claim_id": event_id,
+            "kind": kind,
+            "holder": holder,
+            "at": utcnow(),
+            "stage": doc.get("stage"),
+            "step": step,
+            "head": live["head"],
+            "change_id": change_id,
+            # Initial reservations open the session; correction reservations
+            # bind the one already recorded, so a resumed turn can never be
+            # pointed at a different agent than the one that wrote the files.
+            "writer_session": session if kind == "correction" else reserved_session,
+            "jobs_spent": 1,
+            "consumed": False,
+            "superseded": superseded,
+            "expires_epoch": now + int(request["lease_seconds"]),
+            "expires_at": datetime.fromtimestamp(
+                now + int(request["lease_seconds"]), timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        doc["writer_claim"] = claim
+        doc["lease"] = {
+            "holder": holder,
+            "acquired_at": utcnow(),
+            "expires_epoch": now + int(request["lease_seconds"]),
+            "expires_at": claim["expires_at"],
+        }
+        receipt = {
+            "event_id": event_id,
+            "action": "claim",
+            "kind": kind,
+            "at": utcnow(),
+            "holder": holder,
+            "build_id": build_id,
+            "stage": doc.get("stage"),
+            "step": step,
+            "head": live["head"],
+            "change_id": change_id,
+            "writer_session": claim["writer_session"],
+            "jobs_spent": 1,
+            "budget_left": build_budget_left(doc),
+            "superseded": superseded,
+        }
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out["ok"] = True
+        out["replayed"] = False
+        out["receipt"] = receipt
+        out["claim"] = claim
+        out["change_id"] = change_id
+        out["step"] = step
+        return 200, out
+
+
+def build_gate_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Record the gate transition this build's own receipts already justify.
+
+    The transition buildAdvance is no longer allowed to perform on this path.
+    Nothing here reads an outcome from the request: the pending gate is derived
+    from the checks and reviews on disk, at the change on disk, and a build
+    with no such evidence gets `not_ready` rather than a stage move.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "release_lease", "worktree"}
+    extra = sorted(set(data) - allowed)
+    if extra:
+        return 400, {"ok": False, "error": f"unknown field: {extra[0]}", "code": "extra_field"}
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"ok": False, "error": "event_id is required", "code": "bad_event_id"}
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return 400, {"ok": False, "error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return 400, holder_err
+    release_lease, release_err = parse_strict_bool(data, "release_lease", "bad_release_lease")
+    if release_err:
+        return 400, release_err
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": "gate", "holder": holder,
+         "release_lease": release_lease}
+    )
+
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        build_id = str(doc.get("build_id"))
+
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            record = seen.get(event_id) or {}
+            if record.get("fingerprint") != fingerprint:
+                out = build_public(doc)
+                out["ok"] = False
+                out["replayed"] = False
+                out["error"] = "event_id was already used with different input"
+                out["code"] = "idempotency_conflict"
+                return 409, out
+            out = build_public(doc)
+            out["ok"] = int(record.get("status") or 200) == 200
+            out["replayed"] = True
+            out["receipt"] = record.get("receipt")
+            return int(record.get("status") or 200), out
+
+        live, park = build_identity_park(doc, "gate", data.get("worktree"), None, None, repos)
+        if park is not None:
+            reason, detail = park
+            return build_park(doc, reason, detail, event_id, fingerprint, holder)
+        assert live is not None
+        change_id = build_change_id(Path(str(doc.get("worktree"))), live["head"])
+
+        now = time.time()
+        lease = build_lease_live(doc, now)
+        if lease is not None and lease.get("holder") != holder:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = "another caller holds the build lease"
+            out["code"] = "lease_held"
+            return 409, out
+
+        expected_applied = None
+        for suffix, candidate in (
+            (".verify-passed", "verify_passed"),
+            (".review-passed", "review_passed"),
+        ):
+            if event_id.endswith(suffix):
+                expected_applied = candidate
+                break
+        applied = next(
+            (
+                gate
+                for gate in reversed(doc.get("gates") or [])
+                if isinstance(gate, dict)
+                and gate.get("action") == expected_applied
+                and gate.get("change_id") == change_id
+                and gate.get("to") == doc.get("stage")
+            ),
+            None,
+        )
+        if applied is not None:
+            if release_lease:
+                doc["lease"] = None
+            receipt = {
+                "event_id": event_id,
+                "action": expected_applied,
+                "from": applied.get("from"),
+                "to": applied.get("to"),
+                "at": applied.get("at"),
+                "holder": holder,
+                "build_id": build_id,
+                "change_id": change_id,
+                "head": live["head"],
+                "jobs_spent": 0,
+                "budget_left": build_budget_left(doc),
+                "already_applied": True,
+                "applied_by": applied.get("by"),
+            }
+            build_record_event(doc, event_id, fingerprint, receipt, 200)
+            write_err = write_build(doc, build_id)
+            if write_err:
+                return int(write_err["status"]), write_err
+            out = build_public(doc)
+            out["ok"] = True
+            out["replayed"] = False
+            out["receipt"] = receipt
+            out["change_id"] = change_id
+            out["code"] = "already_applied"
+            return 200, out
+
+        action, why = build_pending_gate(doc, change_id)
+        if action is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = why
+            out["code"] = "not_ready"
+            return 409, out
+        boundary = doc.get("verified_boundary")
+        if action in BUILD_POST_VERIFY_ACTIONS and isinstance(boundary, dict):
+            verified_head = boundary.get("head")
+            if verified_head and verified_head != live["head"]:
+                return build_park(
+                    doc,
+                    "head_moved_after_verify",
+                    f"verification passed at {verified_head}, worktree HEAD is now {live['head']}",
+                    event_id,
+                    fingerprint,
+                    holder,
+                )
+        stage = doc.get("stage")
+        entry = build_gate_transition(doc, action, change_id, "buildGate", why)
+        if entry is None:
+            out = build_public(doc)
+            out["ok"] = False
+            out["error"] = f"action '{action}' is not allowed from stage '{stage}'"
+            out["code"] = "invalid_transition"
+            return 409, out
+        if release_lease:
+            doc["lease"] = None
+        receipt = {
+            "event_id": event_id,
+            "action": action,
+            "from": entry["from"],
+            "to": entry["to"],
+            "at": entry["at"],
+            "holder": holder,
+            "build_id": build_id,
+            "change_id": change_id,
+            "head": live["head"],
+            "jobs_spent": 0,
+            "budget_left": build_budget_left(doc),
+            "why": why,
+        }
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out["ok"] = True
+        out["replayed"] = False
+        out["receipt"] = receipt
+        out["change_id"] = change_id
+        return 200, out
+
+
+def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The writer's whole world: one approved ticket and how it will be judged.
+
+    Composed here rather than in the graph so "only the approved ticket" is a
+    property of the code. A prompt assembled out of template strings acquires
+    the slice index, the neighbouring tickets, and the route internals one
+    convenient interpolation at a time, and the writer starts solving the
+    epic.
+
+    Read-only, and that is load-bearing. This used to charge a job of budget on
+    a correction turn, which made composing a prompt a side effect: a caller
+    that asked for the same brief twice paid twice, and the charge landed after
+    the point where a second writer could already have been launched. The
+    charge moved to buildClaim, which happens before any agent exists, and this
+    op now refuses outright unless that reservation is live.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    finding = data.get("finding")
+    if finding is not None and not isinstance(finding, str):
+        return 400, {"error": "finding must be a string", "code": "bad_finding"}
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        claim = build_claim_live(doc, time.time())
+        wanted = "correction" if finding else "initial"
+        if claim is None:
+            return 409, {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "error": (
+                    "no live writer reservation; buildClaim must run before a brief is composed"
+                ),
+                "code": "claim_required",
+            }
+        if claim.get("kind") != wanted:
+            return 409, {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "error": (
+                    f"the live reservation is a '{claim.get('kind')}' claim; this is a "
+                    f"'{wanted}' brief"
+                ),
+                "code": "claim_mismatch",
+            }
+    ticket = doc.get("ticket")
+    if not isinstance(ticket, str) or not ticket.strip():
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": "build has no approved ticket to hand the writer",
+            "code": "missing_ticket",
+        }
+    gaps = build_route_stamp_gaps(doc)
+    if gaps:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": f"route is missing {', '.join(gaps)}",
+            "code": "missing_route_stamp",
+        }
+    head = file_head(Path(str(doc.get("worktree"))), ticket)
+    if not head.get("ok"):
+        return int(head.get("status", 400)), {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": head.get("error") or f"could not read ticket {ticket}",
+            "code": head.get("code") or "ticket_unreadable",
+        }
+
+    session = doc.get("writer_session")
+    if finding and not session:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": "a correction turn must resume the writer that made the change",
+            "code": "no_writer_session",
+        }
+
+    verification = doc.get("verification") or {}
+    lines = [
+        str(head.get("text") or ""),
+        "",
+        "VERIFICATION",
+        "These named recipes decide whether this change is done. Each one runs to a",
+        "real verdict; a queued job or a skipped command does not count as a pass.",
+    ]
+    for phase in BUILD_CHECK_PHASES:
+        names = [n for n in (verification.get(phase) or []) if isinstance(n, str)]
+        lines.append(f"- {phase}: {', '.join(names) if names else 'none declared'}")
+    if verification.get("requires_red"):
+        lines.append(
+            "- This change requires RED evidence: write the failing test first and leave "
+            "the run that failed in your summary."
+        )
+    lines.append(
+        "Stage the files you changed. Do not commit, do not push, do not open a PR: "
+        "finalization is a separate step and runs only after the review is clean."
+    )
+    if finding:
+        # The finding is the whole reason for the resumed turn, so it goes last
+        # and is named as a correction. Restating the ticket above it is what
+        # keeps a writer that has been resumed three times from drifting into
+        # fixing the review instead of the change.
+        lines.extend(
+            [
+                "",
+                "REVIEW FINDINGS. The files are on disk. Continue this change in the same",
+                "session; do not start over.",
+                redact_secrets(finding.strip())[:COMPACT_MAX_CHARS],
+            ]
+        )
+
+    route = doc.get("route") or {}
+    return 200, {
+        "ok": True,
+        "build_id": doc.get("build_id"),
+        "repo": doc.get("repo"),
+        "ticket": ticket,
+        "prompt": "\n".join(lines)[:PROMPT_MAX_CHARS],
+        "resume": bool(finding),
+        "claim_id": claim.get("claim_id"),
+        "hermes_session": session,
+        "launcher": route.get("launcher"),
+        "model": route.get("model"),
+        "max_turns": route.get("max_turns"),
+        "run_budget_seconds": route.get("run_budget_seconds"),
+        "budget_left": build_budget_left(doc),
+    }
+
+
+def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Materialize one deterministic local writer job for an exact build claim."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {
+        "build_id", "claim_id", "holder", "response_webhook_url", "response_webhook_token"
+    }
+    extra = sorted(set(data) - allowed)
+    if extra:
+        return 400, {"ok": False, "error": f"unknown field: {extra[0]}", "code": "extra_field"}
+    claim_id = data.get("claim_id")
+    if not isinstance(claim_id, str) or not BUILD_EVENT_ID_RE.fullmatch(claim_id):
+        return 400, {"ok": False, "error": "claim_id is required", "code": "bad_claim_id"}
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return 400, {"ok": False, "error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return 400, holder_err
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+    if not webhook_url:
+        return 400, {"ok": False, "error": "response_webhook_url is required", "code": "missing_webhook_url"}
+
+    # Compose from the durable build and claim rather than accepting a prompt,
+    # cwd, session, model, or budget from the graph.
+    preview, preview_err = build_open_mechanical(data.get("build_id"))
+    if preview_err:
+        return preview_err
+    assert preview is not None
+    preview_claim = build_claim(preview)
+    if not isinstance(preview_claim, dict) or preview_claim.get("claim_id") != claim_id:
+        return 409, {"ok": False, "error": "claim is not current for this build", "code": "claim_mismatch"}
+    finding = (
+        build_step_finding(preview, "fix", str(preview_claim.get("change_id") or ""))
+        if preview_claim.get("kind") == "correction"
+        else ""
+    )
+    brief_status, brief = build_brief(
+        json.dumps({"build_id": data.get("build_id"), "finding": finding}).encode(), repos
+    )
+    if brief_status != 200:
+        return brief_status, brief
+    if brief.get("launcher") != "hermes":
+        return 409, {
+            "ok": False,
+            "error": "the build writer must use Hermes so correction turns can resume one session",
+            "code": "writer_not_resumable",
+        }
+
+    created = False
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        build_id = str(doc.get("build_id"))
+        claim = build_claim(doc)
+        if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
+            return 409, {"ok": False, "error": "claim is not current for this build", "code": "claim_mismatch"}
+        if claim.get("holder") != holder:
+            return 409, {"ok": False, "error": "claim belongs to another holder", "code": "claim_held"}
+        if claim.get("consumed"):
+            return 409, {"ok": False, "error": "claim was already completed", "code": "claim_consumed"}
+        live, detail = build_live_change(doc, repos)
+        if live is None:
+            return build_park(doc, "worktree_mismatch", str(detail))
+        if live["head"] != claim.get("head"):
+            return build_park(
+                doc, "head_moved", f"claim reserved {claim.get('head')}, worktree is {live['head']}"
+            )
+
+        job_id, reserved_session = build_writer_ids(build_id, claim_id)
+        session = claim.get("writer_session")
+        if (
+            claim.get("job_id") not in (None, job_id)
+            or not isinstance(session, str)
+            or not HERMES_SESSION_RE.fullmatch(session)
+            or (claim.get("kind") == "initial" and session != reserved_session)
+        ):
+            return 409, {"ok": False, "error": "claim launch identity conflicts", "code": "launch_conflict"}
+        if not claim.get("job_id"):
+            claim["job_id"] = job_id
+            claim["launch_state"] = "intent"
+            claim["launch_intent_at"] = utcnow()
+            claim["launch_stage"] = doc.get("stage")
+            claim["launch_change_id"] = claim.get("change_id")
+            if claim.get("kind") == "initial":
+                if doc.get("stage") != "created":
+                    return 409, {"ok": False, "error": "initial writer is not due", "code": "claim_not_due"}
+                doc["stage"] = "writing"
+            write_err = write_build(doc, build_id)
+            if write_err:
+                return int(write_err["status"]), write_err
+
+        with JOB_LOCK:
+            job = read_job(job_id)
+            if job is None:
+                if active_job_count() >= AGENT_MAX_CONCURRENT:
+                    return 429, {"ok": False, "error": "too many in-flight agent jobs", "code": "busy"}
+                log_ref = str(job_dir(job_id) / "stdout.log")
+                job = {
+                    "job_id": job_id,
+                    "kind": "build_writer",
+                    "status": "queued",
+                    "profile": HOME_PROFILE,
+                    "repo": doc.get("repo"),
+                    "cwd": doc.get("worktree"),
+                    "prompt": brief["prompt"],
+                    "hermes_session": session,
+                    "launcher": "hermes",
+                    "model": brief.get("model"),
+                    "max_turns": brief.get("max_turns") or AGENT_MAX_TURNS,
+                    "run_budget_seconds": brief.get("run_budget_seconds") or AGENT_RUN_BUDGET,
+                    "build_id": build_id,
+                    "claim_id": claim_id,
+                    "claim_kind": claim.get("kind"),
+                    "launch_head": claim.get("head"),
+                    "launch_change_id": claim.get("change_id"),
+                    "response_webhook_url": webhook_url,
+                    "response_webhook_token": webhook_token,
+                    "resume_url": webhook_url,
+                    "created_at": utcnow(),
+                    "started_at": None,
+                    "finished_at": None,
+                    "receipt": None,
+                    "log_ref": log_ref,
+                    "error": None,
+                    "webhook": None,
+                }
+                job_dir(job_id).mkdir(parents=True, exist_ok=True)
+                (job_dir(job_id) / "prompt.txt").write_text(
+                    wrap_prompt(job_id, str(brief["prompt"]), str(doc.get("worktree")))
+                )
+                write_job(job)
+                created = True
+            else:
+                if (
+                    job.get("build_id") != build_id
+                    or job.get("claim_id") != claim_id
+                    or job.get("hermes_session") != session
+                ):
+                    return 409, {"ok": False, "error": "deterministic job id conflicts", "code": "job_conflict"}
+                job["response_webhook_url"] = webhook_url
+                job["response_webhook_token"] = webhook_token
+                job["resume_url"] = webhook_url
+                write_job(job)
+
+        claim["launch_state"] = "queued"
+        claim["queued_at"] = claim.get("queued_at") or utcnow()
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+
+    if created or job.get("status") == "queued":
+        enqueue_agent(job)
+    elif job.get("status") in ("completed", "failed") and isinstance(job.get("receipt"), dict):
+        # A replay may attach a fresh Rewst wait to the one completed job. It
+        # receives the stored receipt; the writer is never launched again.
+        threading.Thread(
+            target=deliver_webhook, args=(job, job["receipt"]),
+            name=f"graphwing-redeliver-{job_id[:8]}", daemon=True,
+        ).start()
+    return 202, {
+        "ok": True,
+        "replayed": not created,
+        "build_id": build_id,
+        "claim_id": claim_id,
+        "job_id": job_id,
+        "status": job.get("status"),
+        "hermes_session": session,
+        "poll": f"/v1/agent/jobs/{job_id}",
+    }
+
+
+def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Consume one local writer result and apply only its authorized transition."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "claim_id", "job_id", "hermes_session", "callback"}
+    extra = sorted(set(data) - allowed)
+    if extra:
+        return 400, {"ok": False, "error": f"unknown field: {extra[0]}", "code": "extra_field"}
+    event_id = data.get("event_id")
+    claim_id = data.get("claim_id")
+    job_id = data.get("job_id")
+    session = data.get("hermes_session")
+    holder = data.get("holder")
+    callback = data.get("callback")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"ok": False, "error": "event_id is required", "code": "bad_event_id"}
+    if not isinstance(claim_id, str) or not BUILD_EVENT_ID_RE.fullmatch(claim_id):
+        return 400, {"ok": False, "error": "claim_id is required", "code": "bad_claim_id"}
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"ok": False, "error": "job_id is invalid", "code": "bad_job_id"}
+    if not isinstance(session, str) or not HERMES_SESSION_RE.fullmatch(session):
+        return 400, {"ok": False, "error": "hermes_session is invalid", "code": "bad_hermes_session"}
+    if not isinstance(holder, str) or not holder.strip():
+        return 400, {"ok": False, "error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return 400, holder_err
+    if not isinstance(callback, dict) or callback.get("status") not in ("ok", "error", "timeout"):
+        return 400, {"ok": False, "error": "callback must be a terminal writer receipt", "code": "bad_callback"}
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": "writer_complete", "holder": holder,
+         "claim_id": claim_id, "job_id": job_id, "hermes_session": session, "callback": callback}
+    )
+
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            record = seen.get(event_id) or {}
+            if record.get("fingerprint") != fingerprint:
+                out = build_public(doc)
+                out.update(ok=False, replayed=False, error="event_id was already used with different input",
+                           code="idempotency_conflict")
+                return 409, out
+            out = build_public(doc)
+            out["replayed"] = True
+            out["receipt"] = record.get("receipt")
+            return int(record.get("status") or 200), out
+
+        claim = build_claim(doc)
+        if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
+            return 409, {"ok": False, "error": "claim is not current for this build", "code": "claim_mismatch"}
+        if claim.get("holder") != holder:
+            return 409, {"ok": False, "error": "claim belongs to another holder", "code": "claim_held"}
+        if claim.get("job_id") != job_id or claim.get("writer_session") != session:
+            return 409, {"ok": False, "error": "claim, job, and session do not match", "code": "completion_mismatch"}
+        if claim.get("consumed"):
+            return 409, {"ok": False, "error": "claim was already completed", "code": "claim_consumed"}
+        expected_job_id, reserved_session = build_writer_ids(str(doc.get("build_id")), claim_id)
+        if job_id != expected_job_id or (claim.get("kind") == "initial" and session != reserved_session):
+            return 409, {"ok": False, "error": "writer identity is not deterministic", "code": "completion_mismatch"}
+        live, detail = build_live_change(doc, repos)
+        if live is None:
+            return build_park(doc, "worktree_mismatch", str(detail))
+        if live["head"] != claim.get("head"):
+            return build_park(
+                doc, "head_moved", f"writer launched at {claim.get('head')}, worktree is {live['head']}"
+            )
+        job = read_job(job_id)
+        if not isinstance(job, dict):
+            return 409, {"ok": False, "error": "writer job is missing", "code": "job_missing"}
+        if (
+            job.get("build_id") != doc.get("build_id")
+            or job.get("claim_id") != claim_id
+            or job.get("hermes_session") != session
+        ):
+            return 409, {"ok": False, "error": "job does not belong to this claim", "code": "completion_mismatch"}
+        authoritative = job.get("receipt")
+        if job.get("status") not in ("completed", "failed") or not isinstance(authoritative, dict):
+            return 409, {"ok": False, "error": "writer job has no terminal result", "code": "job_not_complete"}
+        if canonical_json(authoritative) != canonical_json(callback):
+            return 409, {"ok": False, "error": "callback does not match the local job result", "code": "callback_conflict"}
+
+        status = str(authoritative.get("status"))
+        result = {
+            "claim_id": claim_id,
+            "job_id": job_id,
+            "hermes_session": session,
+            "kind": claim.get("kind"),
+            "status": status,
+            "summary": str(authoritative.get("summary") or "")[:500],
+            "log_ref": authoritative.get("log_ref"),
+            "launch_change_id": claim.get("launch_change_id") or claim.get("change_id"),
+            "completed_change_id": live["change_id"],
+            "at": utcnow(),
+        }
+        doc["writer_result"] = result
+        doc["writer_session"] = session
+        claim["consumed"] = True
+        claim["consumed_at"] = utcnow()
+        claim["launch_state"] = "completed"
+        doc["lease"] = None
+        frm = doc.get("stage")
+        to = frm
+        action = "writer_error"
+        if status == "ok" and claim.get("kind") == "initial":
+            if frm != "writing":
+                return 409, {"ok": False, "error": "initial writer is not at writing", "code": "invalid_transition"}
+            action = "writer_done"
+            to = build_transition_target(doc, "writer_done")
+            doc["stage"] = to
+            doc["head"] = live["head"]
+        elif status == "ok":
+            action = "correction_done"
+
+        receipt = {
+            "event_id": event_id,
+            "action": action,
+            "from": frm,
+            "to": to,
+            "at": utcnow(),
+            "holder": holder,
+            "build_id": doc.get("build_id"),
+            "claim_id": claim_id,
+            "job_id": job_id,
+            "hermes_session": session,
+            "status": status,
+            "change_id": live["change_id"],
+            "jobs_spent": 0,
+            "budget_left": build_budget_left(doc),
+        }
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, str(doc.get("build_id")))
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out["replayed"] = False
+        out["receipt"] = receipt
+        return 200, out
+
+
+def build_run_recipe(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Run one recipe to a completed verdict, in this thread, every time.
+
+    Never enqueued. testRun hands anything slow to the job queue and answers
+    202, which is a receipt for having accepted the work — not for the work
+    having passed. Routed into a gate that reads `ok`, a 202 is indistinguish-
+    able from green, and the whole point of the gate is gone. The recipe's own
+    timeout still applies; a check that runs long makes the gate call slow,
+    which the caller solves with a response webhook, not by believing an
+    acknowledgement.
+    """
+    result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=int(spec["timeout_seconds"]))
+    code = result.get("code")
+    verdict = {
+        "name": name,
+        "kind": spec.get("kind"),
+        "coverage": bool(spec.get("coverage")),
+        # Where it actually ran, not where the catalog said. A verdict that
+        # cannot name its own directory cannot be audited for the one failure
+        # that looks exactly like success.
+        "cwd": str(spec.get("cwd")),
+        "ok": bool(result.get("ok")),
+        "returncode": result.get("returncode"),
+        "timed_out": code == "timeout",
+        "at": utcnow(),
+        "compact": compact_cmd_signal(result),
+    }
+    if code == "missing_binary":
+        # A command that never ran is the "skipped" case. It is not a pass and
+        # it is not a normal failure either, so it says which it is.
+        verdict["ok"] = False
+        verdict["code"] = "missing_binary"
+        verdict["compact"] = str(result.get("error") or "missing binary")
+    elif code == "timeout":
+        verdict["code"] = "timeout"
+    return verdict
+
+
+def build_checks_result(
+    doc: dict[str, Any], phase: str, only: list[str] | None, stack: str | None, repos: dict[str, str]
+) -> tuple[int, dict[str, Any]]:
+    """Run a phase to a verdict per required recipe and record it against HEAD.
+
+    `only` narrows what is *executed*, never what is *required*. A correction
+    turn that touched one file reruns that file's checks and inherits the rest
+    from the verdicts already recorded at this same head — but if a recipe has
+    no verdict at this head at all, the phase is not clean, whatever `only`
+    said.
+    """
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        return build_park(doc, "worktree_mismatch", str(park_detail))
+    head = live["head"]
+    change_id = live["change_id"]
+
+    worktree = Path(str(doc.get("worktree")))
+    changed = build_changed_paths(worktree, doc.get("base_head"))
+    required, why = build_required_recipes(doc, phase, changed)
+    if not required:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "phase": phase,
+            "error": f"the plan declared no {phase} checks and no changed path mandates one",
+            "code": "no_recipes",
+        }
+    candidate: dict[str, str] | None = None
+    runner_tree: str | None = None
+    attempt_id: str | None = None
+    if phase == "integration":
+        stack_entry, runner_gap = build_integration_stack(doc, stack)
+        if stack_entry is None:
+            return 409, {
+                "ok": False, "build_id": doc.get("build_id"), "phase": phase, "stack": stack,
+                "error": runner_gap, "code": "not_a_clean_stack",
+            }
+        candidate, candidate_gap = build_materialize_candidate(worktree, head, change_id)
+        if candidate is None:
+            assert candidate_gap is not None
+            return 409, {
+                "ok": False, "build_id": doc.get("build_id"), "phase": phase, "stack": stack,
+                **candidate_gap,
+            }
+        attempt_id = f"{doc.get('build_id')}-{uuid.uuid4().hex}"
+        runner, provision_gap = build_provision_candidate_runner(
+            worktree, Path(str(stack_entry["cwd"])), candidate, attempt_id
+        )
+        if runner is None:
+            assert provision_gap is not None
+            return 409, {
+                "ok": False, "build_id": doc.get("build_id"), "phase": phase, "stack": stack,
+                **provision_gap,
+            }
+        runner_label = f"candidate runner '{attempt_id}'"
+        runner_tree = build_runner_tree(runner)
+        attempt = {
+            "attempt_id": attempt_id, "stack": stack, "runner": str(runner), **candidate,
+            "runner_tree": runner_tree, "at": utcnow(),
+        }
+        doc["integration_attempts"] = [
+            item for item in (doc.get("integration_attempts") or []) if isinstance(item, dict)
+        ][-15:] + [attempt]
+        write_err = write_build(doc, str(doc.get("build_id")))
+        if write_err:
+            build_cleanup_candidate_runner(worktree, runner)
+            return int(write_err["status"]), write_err
+        if runner_tree != candidate["candidate_tree"]:
+            build_cleanup_candidate_runner(worktree, runner)
+            return 409, {
+                "ok": False, "build_id": doc.get("build_id"), "phase": phase, "stack": stack,
+                "runner": str(runner), "candidate_tree": candidate["candidate_tree"],
+                "runner_tree": runner_tree,
+                "error": "clean runner did not check out the exact staged candidate tree",
+                "code": "runner_tree_mismatch",
+            }
+    else:
+        runner = worktree
+        runner_label = "this build's worktree"
+
+    # Integration recipe resolution happens only after the attempt runner has
+    # checked out and verified the candidate; no baseline catalog is reused.
+    catalog = build_recipe_catalog(repos, runner, runner_label)
+    unknown = [n for n in required if n not in catalog]
+    if unknown:
+        if phase == "integration":
+            build_cleanup_candidate_runner(worktree, runner)
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "phase": phase,
+            "error": f"no such recipe: {', '.join(unknown)}",
+            "code": "unknown_recipe",
+            "unknown": unknown,
+            "allowed": sorted(catalog),
+        }
+    stray = [n for n in required if catalog[n].get("unresolvable")]
+    if stray:
+        if phase == "integration":
+            build_cleanup_candidate_runner(worktree, runner)
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "phase": phase,
+            "error": "; ".join(str(catalog[n]["unresolvable"]) for n in stray[:4]),
+            "code": "recipe_wrong_worktree",
+            "unresolvable": stray,
+        }
+    if not any(catalog[n]["coverage"] for n in required):
+        if phase == "integration":
+            build_cleanup_candidate_runner(worktree, runner)
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "phase": phase,
+            "error": (
+                f"{phase} would run only hook recipes ({', '.join(required)}); a pre-commit "
+                "hook is not unit, type, or integration coverage"
+            ),
+            "code": "hook_not_coverage",
+        }
+    if only:
+        unrequired = [n for n in only if n not in required]
+        if unrequired:
+            if phase == "integration":
+                build_cleanup_candidate_runner(worktree, runner)
+            return 400, {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "phase": phase,
+                "error": f"only names a recipe this phase does not require: {', '.join(unrequired)}",
+                "code": "not_required",
+                "required": required,
+            }
+
+    prior = build_checks_entry(doc, phase)
+    verdicts: dict[str, Any] = {}
+    # Inherited only from a run of this same change *in this same directory*.
+    # An integration verdict recorded against another stack's checkout is not
+    # a verdict about this one, and `only` would otherwise let it be carried
+    # forward without ever re-running.
+    if (
+        isinstance(prior, dict)
+        and prior.get("change_id") == change_id
+        and prior.get("runner") == str(runner)
+    ):
+        verdicts = {
+            name: value
+            for name, value in (prior.get("verdicts") or {}).items()
+            if isinstance(value, dict) and name in required
+        }
+    to_run = [n for n in required if not only or n in only or n not in verdicts]
+    try:
+        for name in to_run:
+            verdicts[name] = build_run_recipe(name, catalog[name])
+    finally:
+        if phase == "integration":
+            build_cleanup_candidate_runner(worktree, runner)
+
+    missing = [n for n in required if not isinstance(verdicts.get(n), dict)]
+    failed = [n for n in required if isinstance(verdicts.get(n), dict) and not verdicts[n].get("ok")]
+    entry = {
+        "phase": phase,
+        "head": head,
+        "change_id": change_id,
+        "at": utcnow(),
+        "stack": stack if phase == "integration" else None,
+        # Where every recipe in this phase actually ran. build_checks_clean
+        # compares it back to the clean stack's directory, so a record cannot
+        # claim a stack it did not execute on.
+        "runner": str(runner),
+        "attempt_id": attempt_id,
+        "candidate_tree": candidate.get("candidate_tree") if candidate else None,
+        "runner_tree": runner_tree,
+        "base_head": candidate.get("base_head") if candidate else None,
+        "materialization": candidate.get("materialization") if candidate else None,
+        "required": required,
+        "required_because": why,
+        "changed_paths": changed,
+        "verdicts": verdicts,
+        "ran": to_run,
+        "missing": missing,
+        "failed": failed,
+        "ok": not missing and not failed,
+    }
+    doc.setdefault("checks", {})[phase] = entry
+    # The gate transition rides on the same write as the verdict that earned
+    # it. Recording the verdict and leaving the stage move to a later call is
+    # what let a caller post `verify_passed` with no verdict at all; doing both
+    # here means there is no window where one exists without the other.
+    gate = None
+    if phase == "fast" and entry["ok"]:
+        pending, why = build_pending_gate(doc, change_id)
+        if pending == "verify_passed":
+            record = build_gate_transition(doc, pending, change_id, "buildChecks", why)
+            gate = record["to"] if record else None
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
+    out = {
+        "ok": entry["ok"],
+        "stage": doc.get("stage"),
+        "gate": gate,
+        "build_id": doc.get("build_id"),
+        "phase": phase,
+        "head": head,
+        "change_id": change_id,
+        "stack": entry["stack"],
+        "runner": entry["runner"],
+        "attempt_id": entry["attempt_id"],
+        "candidate_tree": entry["candidate_tree"],
+        "runner_tree": entry["runner_tree"],
+        "base_head": entry["base_head"],
+        "materialization": entry["materialization"],
+        "required": required,
+        "required_because": why,
+        "ran": to_run,
+        "ran_in": {n: str(catalog[n]["cwd"]) for n in to_run},
+        "verdicts": [verdicts[n] for n in required if isinstance(verdicts.get(n), dict)],
+        "missing": missing,
+        "failed": failed,
+        "compact": "\n".join(
+            verdicts[n].get("compact") or "" for n in failed if isinstance(verdicts.get(n), dict)
+        )[:COMPACT_MAX_CHARS],
+        "budget_left": build_budget_left(doc),
+    }
+    if not entry["ok"]:
+        out["error"] = (
+            f"{phase} checks have no verdict for: {', '.join(missing)}"
+            if missing
+            else f"{phase} checks failed: {', '.join(failed)}"
+        )
+        out["code"] = "missing_verdict" if missing else "check_failed"
+    return 200, out
+
+
+def build_checks_job(job_id: str) -> None:
+    job = read_job(job_id)
+    if not job:
+        return
+    job["status"] = "running"
+    job["started_at"] = utcnow()
+    write_job(job)
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(job["build_id"])
+        if open_err:
+            status, payload = open_err
+        else:
+            assert doc is not None
+            status, payload = build_checks_result(
+                doc, job["phase"], job.get("only"), job.get("stack"), load_repos()
+            )
+    receipt = {
+        "status": "ok" if payload.get("ok") else "nack",
+        "job_id": job_id,
+        "build_id": job["build_id"],
+        "phase": job["phase"],
+        "http_status": status,
+        **{
+            k: payload.get(k)
+            for k in (
+                "ok", "head", "change_id", "required", "missing", "failed", "compact", "code", "error",
+                "runner", "attempt_id", "candidate_tree", "runner_tree", "base_head", "materialization",
+            )
+        },
+    }
+    job = read_job(job_id) or job
+    job["finished_at"] = utcnow()
+    job["receipt"] = receipt
+    job["result"] = payload
+    job["status"] = "completed"
+    hook = deliver_webhook(job, receipt)
+    if hook is not None:
+        job["webhook"] = hook
+    write_job(job)
+    herdr_job_done(job)
+
+
+def build_checks(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The gate. Synchronous by default, webhook-delivered when asked.
+
+    The async form is about delivery, not about the verdict: the job still
+    runs every recipe to completion and the answer arrives in the receipt. A
+    202 from this op is a queue acknowledgement for the graph's wait node and
+    is never itself a passing gate.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    phase = data.get("phase")
+    if phase not in BUILD_CHECK_PHASES:
+        return 400, {"error": "phase must be fast or integration", "code": "bad_phase",
+                     "allowed": list(BUILD_CHECK_PHASES)}
+    only = data.get("only")
+    if only is not None:
+        if isinstance(only, str):
+            only = [only]
+        if not isinstance(only, list) or not all(isinstance(n, str) and n.strip() for n in only):
+            return 400, {"error": "only must be a list of recipe names", "code": "bad_only"}
+        only = [n.strip()[:BUILD_NAME_MAX] for n in only]
+    stack = data.get("stack")
+    if stack is not None and (not isinstance(stack, str) or not stack.strip()):
+        return 400, {"error": "stack must be a name", "code": "bad_stack"}
+    stack = stack.strip()[:BUILD_NAME_MAX] if isinstance(stack, str) else None
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+
+    if not webhook_url:
+        with BUILD_LOCK:
+            doc, open_err = build_open_mechanical(data.get("build_id"))
+            if open_err:
+                return open_err
+            assert doc is not None
+            return build_checks_result(doc, phase, only, stack, repos)
+
+    doc, open_err = build_open_mechanical(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "kind": "build_checks",
+            "status": "queued",
+            "build_id": doc.get("build_id"),
+            "phase": phase,
+            "only": only,
+            "stack": stack,
+            "cwd": str(doc.get("worktree")),
+            "response_webhook_url": webhook_url,
+            "response_webhook_token": webhook_token,
+            "resume_url": webhook_url,
+            "created_at": utcnow(),
+            "started_at": None,
+            "finished_at": None,
+            "receipt": None,
+            "log_ref": str(job_dir(job_id) / "stdout.log"),
+            "error": None,
+            "webhook": None,
+        }
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        write_job(job)
+    herdr_follow_job(job)
+    threading.Thread(
+        target=build_checks_job, args=(job_id,), name=f"graphwing-checks-{job_id[:8]}", daemon=True
+    ).start()
+    return 202, {
+        # False, on a call that succeeded. `ok` on this op means "the gate
+        # passed", and the gate has not run yet. A graph node that branches on
+        # `ok` reads a queue acknowledgement as green otherwise, which is the
+        # whole failure this gate exists to prevent — so the acknowledgement
+        # says no, and the verdict arrives in the receipt.
+        "ok": False,
+        "queued": True,
+        "gate_passed": False,
+        "code": "queued",
+        "error": "queued: this is a receipt for accepting the work, not for passing the gate",
+        "job_id": job_id,
+        "kind": "build_checks",
+        "status": "queued",
+        "build_id": doc.get("build_id"),
+        "phase": phase,
+        "poll": f"/v1/agent/jobs/{job_id}",
+    }
+
+
+def build_writer_vendor(doc: dict[str, Any]) -> str | None:
+    """Which vendor wrote this change, `unknown` if unrecognised, None if unstamped.
+
+    Three answers, not two. None means the route never named a model, which is
+    a planning gap a human fixes. `unknown` means it named one this service
+    cannot place, and that fails closed: an unplaceable writer is one whose
+    reviewer could be the same model under another name.
+    """
+    route = doc.get("route") or {}
+    model = str(route.get("model") or "").strip().lower()
+    if not model:
+        return None
+    for alias, vendor in BUILD_WRITER_VENDOR_ALIASES:
+        if alias in model:
+            return vendor
+    return BUILD_VENDOR_UNKNOWN
+
+
+def build_review_authority_gap(doc: dict[str, Any], reviewer: Any) -> str | None:
+    """Why this reviewer cannot be the independent voice on this build, or None."""
+    name = reviewer.strip() if isinstance(reviewer, str) else ""
+    vendor = BUILD_REVIEWER_VENDOR.get(name)
+    if vendor is None:
+        return f"reviewer '{reviewer}' is not a reviewer this service knows"
+    writer = build_writer_vendor(doc)
+    if writer is None:
+        return "route does not name the writer's model, so reviewer independence cannot be checked"
+    if writer == BUILD_VENDOR_UNKNOWN:
+        model = (doc.get("route") or {}).get("model")
+        return f"writer model '{model}' belongs to no vendor this service knows"
+    if writer == vendor:
+        return f"reviewer '{name}' is the writer's own vendor ({vendor})"
+    return None
+
+
+def build_parse_review_verdict(text: str) -> tuple[str | None, str]:
+    """The reviewer's verdict, or None when it never gave one.
+
+    After trailing blank lines, the final line must be exactly `VERDICT: PASS`
+    or `VERDICT: NACK`. The loose parser this replaced took a substring match
+    anywhere in the transcript and, failing that, fell back to any
+    receipt-shaped JSON with `status: ok` -- so a writer receipt echoed into
+    the reviewer's output was read as a passing review of the writer's own
+    change. Prose after a verdict likewise makes the output incomplete rather
+    than letting an earlier token ship the change.
+
+    Both verdicts present fails closed to NACK. A reviewer that said pass and
+    then nack has not passed anything, and picking either one is a coin toss
+    over whether unreviewed code ships.
+    """
+    lines = (text or "").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[-1] not in ("VERDICT: PASS", "VERDICT: NACK"):
+        return None, "no VERDICT line"
+    found = [line.removeprefix("VERDICT: ") for line in lines
+             if line in ("VERDICT: PASS", "VERDICT: NACK")]
+    if len(set(found)) > 1:
+        return "NACK", "conflicting verdicts: " + ", ".join(found)
+    return found[-1], f"VERDICT: {found[-1]}"
+
+
+def build_review_round_result(reviewer: str, prompt: str, worktree: Path) -> dict[str, Any]:
+    """Run one review and read its verdict off the transcript, strictly.
+
+    Deliberately not `review_result`'s own verdict field: that one is shared
+    with /v1/review/run and parses leniently on purpose. The pre-PR gate is the
+    caller that cannot afford lenient, so it re-reads the raw text here.
+    """
+    raw = review_result(reviewer, prompt, worktree)
+    if raw.get("no_verdict") or raw.get("code") in ("timeout", "not_implemented"):
+        # The provider never finished. Not an opinion, and never a finding.
+        return {**raw, "verdict": None, "no_verdict": True}
+    verdict, why = build_parse_review_verdict(str(raw.get("text") or ""))
+    if verdict is None:
+        return {**raw, "verdict": None, "no_verdict": True, "code": "no_verdict", "summary": why}
+    return {
+        **raw,
+        "verdict": verdict,
+        "no_verdict": False,
+        "ok": verdict == "PASS",
+        "summary": str(raw.get("summary") or why),
+    }
+
+
+def build_review_prompt(doc: dict[str, Any]) -> str:
+    """The behavior-and-test lenses this review has to answer, by name.
+
+    Named individually because a reviewer asked to "review the change" reads
+    the diff and grades the code. Every one of these is a way a diff can be
+    clean code and still be the wrong change, or the right change with nothing
+    holding it in place.
+    """
+    verification = doc.get("verification") or {}
+    integration = [n for n in (verification.get("integration") or []) if isinstance(n, str)]
+    lines = [
+        "Behavior-and-test micro-review. You did not write this change and you are not",
+        "reviewing its style. Answer each lens, then give one verdict.",
+        "",
+        "1. SCOPE: does the diff do the approved ticket and nothing else? Name anything",
+        "   it changes that the ticket did not ask for.",
+        "2. BEHAVIOR: does the change actually produce the behavior the ticket states,",
+        "   or only look like it does? Name the case where it would not.",
+    ]
+    if verification.get("requires_red"):
+        lines.append(
+            "3. RED EVIDENCE: this ticket requires a test that failed before the change. "
+            "If there is no record of it failing first, that is a finding."
+        )
+    else:
+        lines.append(
+            "3. RED EVIDENCE: not required for this ticket. Do not raise its absence as a finding."
+        )
+    lines.extend(
+        [
+            "4. PRODUCTION PATH: do the tests exercise the code that actually runs, or a copy,",
+            "   a mock, or a helper the production path never calls?",
+            "5. INTEGRATION SEAM: the plan declares this seam as "
+            + (", ".join(integration) if integration else "none"),
+            "   Is the seam covered by something that runs it for real?",
+            "",
+            "Ticket:",
+            str(doc.get("ticket") or "(none)"),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Run the micro-review, retrying silence, and record the round.
+
+    Silence and disagreement are the two outcomes that must never be confused.
+    A reviewer that ran out of turns or lost its connection has not found
+    anything; treating that as a finding resumes the writer to fix a problem
+    nobody reported, spends a round of budget, and does it again next time.
+
+    The verdict is read strictly, off a trailing VERDICT line and nothing else,
+    and a PASS this op recorded is also what moves the build to `ready`: no
+    caller ever gets to assert that step.
+    """
+    gap = build_review_authority_gap(doc, reviewer)
+    if gap:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "error": gap,
+            "code": "reviewer_is_writer" if "own vendor" in gap else "no_review_authority",
+        }
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        return build_park(doc, "worktree_mismatch", str(park_detail))
+    head = live["head"]
+    change_id = live["change_id"]
+    worktree = Path(str(doc.get("worktree")))
+    prompt = build_review_prompt(doc)
+
+    park = build_charge(doc, 1)
+    if park:
+        return park
+
+    attempts: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+    for _ in range(BUILD_REVIEW_SILENCE_RETRIES + 1):
+        result = build_review_round_result(reviewer, prompt, worktree)
+        attempts.append({"no_verdict": bool(result.get("no_verdict")), "code": result.get("code")})
+        if not result.get("no_verdict"):
+            break
+
+    if result.get("no_verdict"):
+        # Nothing is recorded. A round that produced no opinion is not a round
+        # of review, and writing it down as one would let `next` read it as a
+        # finding and send the writer off to answer a reviewer that never spoke.
+        write_err = write_build(doc, doc.get("build_id"))
+        if write_err:
+            return int(write_err["status"]), write_err
+        return 200, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "head": head,
+            "change_id": change_id,
+            "verdict": None,
+            "no_verdict": True,
+            "finding": False,
+            "attempts": len(attempts),
+            "error": f"{reviewer} returned no verdict after {len(attempts)} attempts",
+            "code": "no_verdict",
+            "budget_left": build_budget_left(doc),
+        }
+
+    rounds = [r for r in (doc.get("reviews") or []) if isinstance(r, dict)]
+    entry = {
+        "round": len(rounds) + 1,
+        "head": head,
+        "change_id": change_id,
+        "at": utcnow(),
+        "reviewer": reviewer,
+        "verdict": result.get("verdict"),
+        "no_verdict": False,
+        "summary": str(result.get("summary") or "")[:BUILD_REDACT_MAX_STRING],
+        "compact": str(result.get("compact") or "")[:COMPACT_MAX_CHARS],
+        "attempts": len(attempts),
+    }
+    doc["reviews"] = rounds[-(BUILD_REVIEW_ROUNDS_KEPT - 1):] + [entry]
+    gate = None
+    if entry["verdict"] == "PASS":
+        pending, why = build_pending_gate(doc, change_id)
+        if pending == "review_passed":
+            record = build_gate_transition(doc, pending, change_id, "buildReview", why)
+            gate = record["to"] if record else None
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
+    return 200, {
+        "ok": entry["verdict"] == "PASS",
+        "build_id": doc.get("build_id"),
+        "stage": doc.get("stage"),
+        "gate": gate,
+        "reviewer": reviewer,
+        "head": head,
+        "change_id": change_id,
+        "round": entry["round"],
+        "verdict": entry["verdict"],
+        "no_verdict": False,
+        "finding": entry["verdict"] != "PASS",
+        "summary": entry["summary"],
+        "compact": entry["compact"],
+        "attempts": len(attempts),
+        "budget_left": build_budget_left(doc),
+    }
+
+
+def build_review_job(job_id: str) -> None:
+    job = read_job(job_id)
+    if not job:
+        return
+    job["status"] = "running"
+    job["started_at"] = utcnow()
+    write_job(job)
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(job["build_id"])
+        if open_err:
+            status, payload = open_err
+        else:
+            assert doc is not None
+            status, payload = build_review_result(doc, job["reviewer"], load_repos())
+    receipt = {
+        "status": "ok" if payload.get("ok") else "nack",
+        "job_id": job_id,
+        "build_id": job["build_id"],
+        "http_status": status,
+        **{
+            k: payload.get(k)
+            for k in ("ok", "verdict", "no_verdict", "finding", "round", "summary", "compact", "code", "error")
+        },
+    }
+    job = read_job(job_id) or job
+    job["finished_at"] = utcnow()
+    job["receipt"] = receipt
+    job["result"] = payload
+    job["status"] = "completed"
+    hook = deliver_webhook(job, receipt)
+    if hook is not None:
+        job["webhook"] = hook
+    write_job(job)
+    herdr_job_done(job)
+
+
+def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    doc, open_err = build_open_mechanical(data.get("build_id"))
+    if open_err:
+        return open_err
+    assert doc is not None
+    stage = doc.get("stage")
+    if stage != "review":
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "stage": stage,
+            "error": f"the behavior-and-test review runs at stage 'review'; build is at '{stage}'",
+            "code": "invalid_transition",
+        }
+    route = doc.get("route") or {}
+    reviewer = data.get("reviewer") or route.get("reviewer1")
+    if not isinstance(reviewer, str) or reviewer.strip() not in BUILD_REVIEWER_VENDOR:
+        return 400, {
+            "ok": False,
+            "error": "reviewer must be one of " + ", ".join(sorted(BUILD_REVIEWER_VENDOR)),
+            "code": "bad_reviewer",
+        }
+    reviewer = reviewer.strip()
+    gap = build_review_authority_gap(doc, reviewer)
+    if gap:
+        # The review is independent or it is the writer grading its own
+        # homework in a second window. There is no third option, and a writer
+        # model this service cannot place is the second one until proven
+        # otherwise: "sonnet" reviewed by "opus" used to read as independent
+        # because neither name matched the full-model-id prefix table.
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "error": gap,
+            "code": "reviewer_is_writer" if "own vendor" in gap else "no_review_authority",
+        }
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return 400, webhook_err
+
+    if not webhook_url:
+        with BUILD_LOCK:
+            doc, open_err = build_open_mechanical(data.get("build_id"))
+            if open_err:
+                return open_err
+            assert doc is not None
+            return build_review_result(doc, reviewer, repos)
+
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id,
+            "kind": "build_review",
+            "status": "queued",
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "cwd": str(doc.get("worktree")),
+            "response_webhook_url": webhook_url,
+            "response_webhook_token": webhook_token,
+            "resume_url": webhook_url,
+            "created_at": utcnow(),
+            "started_at": None,
+            "finished_at": None,
+            "receipt": None,
+            "log_ref": str(job_dir(job_id) / "stdout.log"),
+            "error": None,
+            "webhook": None,
+        }
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        write_job(job)
+    herdr_follow_job(job)
+    threading.Thread(
+        target=build_review_job, args=(job_id,), name=f"graphwing-breview-{job_id[:8]}", daemon=True
+    ).start()
+    return 202, {
+        # Same reason as build_checks: an acknowledgement is not a verdict.
+        "ok": False,
+        "queued": True,
+        "gate_passed": False,
+        "code": "queued",
+        "error": "queued: this is a receipt for accepting the work, not a review verdict",
+        "job_id": job_id,
+        "kind": "build_review",
+        "status": "queued",
+        "build_id": doc.get("build_id"),
+        "reviewer": reviewer,
+        "poll": f"/v1/agent/jobs/{job_id}",
+    }
+
+
+def build_finalize_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
+    """Everything still standing between this build and a commit."""
+    gaps: list[str] = []
+    branch = doc.get("branch")
+    if isinstance(branch, str) and branch.split("/")[-1] in BUILD_TRUNK_BRANCHES:
+        # Checked again here, not only in preflight. This is the line where the
+        # push happens, and a branch that became trunk after preflight passed
+        # would otherwise land straight on it.
+        gaps.append(f"'{branch}' is a trunk branch; a pre-PR build never commits to trunk")
+    gaps.extend(f"route is missing {name}" for name in build_route_stamp_gaps(doc))
+    for phase in BUILD_CHECK_PHASES:
+        clean, why = build_checks_clean(doc, phase, change_id)
+        if not clean:
+            gaps.append(why)
+    review = build_last_review(doc, change_id)
+    if review is None:
+        gaps.append("no behavior-and-test review has been recorded for this change")
+    elif review.get("verdict") != "PASS":
+        gaps.append(f"the last review returned findings: {review.get('summary')}")
+    else:
+        # A PASS is only evidence if the voice behind it could disagree. An
+        # unknown reviewer name, an unstamped route, or a reviewer sharing the
+        # writer's vendor each make this a self-review wearing a receipt.
+        authority = build_review_authority_gap(doc, review.get("reviewer"))
+        if authority:
+            gaps.append(authority)
+    return gaps
+
+
+def build_commit_dirt(entries: list[str]) -> list[str]:
+    """Porcelain lines for anything on disk that the commit would leave behind.
+
+    The reviewed change is the staged one. An unstaged tracked edit or an
+    untracked file is content that went into the change id every gate was
+    recorded against and would *not* go into the commit, so what ships is not
+    what passed. Reported rather than staged: `git add` here would sweep in
+    whatever else is lying around the worktree, which is the same divergence
+    pointing the other way.
+    """
+    dirt: list[str] = []
+    for line in entries:
+        if line.startswith("??") or (len(line) > 1 and line[1] not in (" ", "")):
+            dirt.append(line[:BUILD_NAME_MAX])
+    return dirt
+
+
+def build_git_authoring_boundary(worktree: Path) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Freeze the identities `git commit` will use, without freezing its clock."""
+    boundary: dict[str, str] = {}
+    for field, variable in (("author", "GIT_AUTHOR_IDENT"), ("committer", "GIT_COMMITTER_IDENT")):
+        result = run_git(worktree, ["var", variable])
+        parts = str(result.get("stdout") or "").strip().rsplit(" ", 2)
+        if not result.get("ok") or len(parts) != 3 or "<" not in parts[0] or not parts[0].endswith(">"):
+            return None, {
+                "ok": False,
+                "error": f"could not resolve git {field} identity",
+                "code": "authoring_boundary_unreadable",
+            }
+        boundary[field] = parts[0]
+    return boundary, None
+
+
+def build_commit_identity(worktree: Path, rev: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read every immutable field used to adopt a commit after a crash."""
+    result = run_git(
+        worktree,
+        ["show", "-s", "--format=%H%x00%T%x00%P%x00%an <%ae>%x00%cn <%ce>%x00%B", rev],
+    )
+    if not result.get("ok"):
+        return None, {
+            "ok": False,
+            "error": str(result.get("error") or "could not inspect commit")[:BUILD_REDACT_MAX_STRING],
+            "code": "commit_unreadable",
+        }
+    parts = str(result.get("stdout") or "").split("\x00", 5)
+    if len(parts) != 6:
+        return None, {"ok": False, "error": "commit metadata was malformed", "code": "commit_unreadable"}
+    return {
+        "sha": parts[0].strip(),
+        "tree": parts[1].strip(),
+        "parent": parts[2].strip(),
+        "author": parts[3].strip(),
+        "committer": parts[4].strip(),
+        "message": parts[5].rstrip("\n"),
+    }, None
+
+
+def build_finalize_adoption_gaps(intent: dict[str, Any], commit: dict[str, Any], branch: str) -> list[str]:
+    gaps: list[str] = []
+    for field, expected in (
+        ("parent", intent.get("expected_parent")),
+        ("tree", intent.get("candidate_tree")),
+        ("message", intent.get("message")),
+    ):
+        if commit.get(field) != expected:
+            gaps.append(f"{field} does not match prepared intent")
+    if branch != intent.get("branch"):
+        gaps.append("branch does not match prepared intent")
+    boundary = intent.get("authoring_boundary")
+    boundary = boundary if isinstance(boundary, dict) else {}
+    for field in ("author", "committer"):
+        if commit.get(field) != boundary.get(field):
+            gaps.append(f"{field} does not match prepared intent")
+    return gaps
+
+
+def build_remote_branch_head(worktree: Path, remote: str, branch: str) -> tuple[str | None, dict[str, Any] | None]:
+    ref = f"refs/heads/{branch}"
+    result = run_git(worktree, ["ls-remote", "--heads", remote, ref])
+    if not result.get("ok"):
+        return None, {
+            "ok": False,
+            "error": str(result.get("error") or "could not inspect remote branch")[:BUILD_REDACT_MAX_STRING],
+            "code": "remote_unreadable",
+            "retryable": True,
+            "compact": compact_cmd_signal(result),
+        }
+    for line in str(result.get("stdout") or "").splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == ref and BUILD_HEAD_RE.fullmatch(fields[0]):
+            return fields[0], None
+    return None, None
+
+
+def build_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Durably prepare, commit, recover, and push one reviewed candidate."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"error": "event_id is required", "code": "bad_event_id"}
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return 400, {"error": "holder is required", "code": "missing_holder"}
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return 400, holder_err
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return 400, {"error": "message is required", "code": "empty_message"}
+    message = message.strip()
+    if len(message) > BUILD_NAME_MAX:
+        return 400, {"error": "message is too long", "code": "message_too_long"}
+    remote = data.get("remote") if data.get("remote") not in ("", None) else "origin"
+    if not isinstance(remote, str) or not valid_remote(remote):
+        return 400, {"error": "remote must be a named remote, not a URL or flag", "code": "bad_remote"}
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": "finalize", "holder": holder,
+         "message": message, "remote": remote}
+    )
+
+    with BUILD_LOCK:
+        doc, open_err = build_open_mechanical(data.get("build_id"))
+        if open_err:
+            return open_err
+        assert doc is not None
+        build_id = str(doc.get("build_id"))
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            record = seen.get(event_id) or {}
+            if record.get("fingerprint") != fingerprint:
+                out = build_public(doc)
+                out.update(ok=False, replayed=False, error="event_id was already used with different input",
+                           code="idempotency_conflict")
+                return 409, out
+            out = build_public(doc)
+            out["replayed"] = True
+            out["receipt"] = record.get("receipt")
+            return int(record.get("status") or 200), out
+
+        existing = doc.get("pr_ready")
+        if isinstance(existing, dict):
+            out = build_public(doc)
+            out.update(ok=True, replayed=True, receipt=existing, code="already_finalized")
+            return 200, out
+        now = time.time()
+        lease = build_lease_live(doc, now)
+        if lease is not None and lease.get("holder") != holder:
+            out = build_public(doc)
+            out.update(ok=False, error="another caller holds the build lease", code="lease_held")
+            return 409, out
+
+        worktree = Path(str(doc.get("worktree")))
+        pending = doc.get("pending_finalize")
+        pending = pending if isinstance(pending, dict) else None
+        if pending and pending.get("event_id") != event_id:
+            out = build_public(doc)
+            out.update(ok=False, replayed=False, error="another event owns the durable finalization intent",
+                       code="finalize_in_progress")
+            return 409, out
+        if pending and pending.get("fingerprint") not in (None, fingerprint):
+            out = build_public(doc)
+            out.update(ok=False, replayed=False, error="event_id was already prepared with different input",
+                       code="idempotency_conflict")
+            return 409, out
+        if pending and pending.get("fingerprint") is None:
+            legacy_input = (
+                pending.get("message") == message
+                and pending.get("remote", "origin") == remote
+                and pending.get("holder") == holder
+            )
+            if not legacy_input:
+                out = build_public(doc)
+                out.update(ok=False, replayed=False, error="legacy finalization intent has different input",
+                           code="idempotency_conflict")
+                return 409, out
+
+        if pending:
+            live, detail = build_resolve_identity(doc, repos)
+            if live is None:
+                return build_park(doc, "finalize_adoption_mismatch", str(detail), event_id, fingerprint, holder)
+            if data.get("worktree") not in (None, "") and str(data.get("worktree")) != doc.get("worktree"):
+                return build_park(doc, "finalize_adoption_mismatch", "worktree does not match prepared intent",
+                                  event_id, fingerprint, holder)
+            head = live["head"]
+            change_id = str(pending.get("verified_change_id") or "")
+            remote = str(pending.get("remote") or remote)
+            message = str(pending.get("message") or message)
+        else:
+            live, park = build_identity_park(doc, "review_passed", data.get("worktree"), None, None, repos)
+            if park is not None:
+                reason, detail = park
+                return build_park(doc, reason, detail, event_id, fingerprint, holder)
+            assert live is not None
+            head = live["head"]
+            change_id = build_change_id(worktree, head)
+            stage = doc.get("stage")
+            if stage != "ready":
+                return 409, {"ok": False, "build_id": build_id, "stage": stage,
+                             "error": f"finalization runs at stage 'ready'; build is at '{stage}'",
+                             "code": "invalid_transition"}
+            status = git_status(worktree)
+            if not status.get("ok"):
+                return 409, {"ok": False, "build_id": build_id,
+                             "error": str(status.get("error") or "git status failed")[:BUILD_REDACT_MAX_STRING],
+                             "code": "identity_unreadable"}
+            dirt = build_commit_dirt(list(status.get("entries") or []))
+            if dirt:
+                return 409, {"ok": False, "build_id": build_id, "stage": stage, "head": head,
+                             "change_id": change_id,
+                             "error": "the worktree holds changes the commit would not carry: " + ", ".join(dirt[:8]),
+                             "code": "worktree_not_equal", "entries": dirt[:8]}
+            gaps = build_finalize_gaps(doc, change_id)
+            if gaps:
+                return 409, {"ok": False, "build_id": build_id, "stage": stage, "head": head,
+                             "change_id": change_id, "error": gaps[0], "code": "not_ready", "gaps": gaps}
+            tree_result = run_git(worktree, ["write-tree"])
+            candidate_tree = str(tree_result.get("stdout") or "").strip()
+            if not tree_result.get("ok") or not BUILD_HEAD_RE.fullmatch(candidate_tree):
+                return 409, {"ok": False, "build_id": build_id,
+                             "error": "could not freeze the staged candidate tree", "code": "candidate_unreadable"}
+            authoring_boundary, boundary_err = build_git_authoring_boundary(worktree)
+            if boundary_err:
+                return 409, {**boundary_err, "build_id": build_id}
+            pending = {
+                "version": 1, "state": "prepared", "event_id": event_id, "fingerprint": fingerprint,
+                "prepared_at": utcnow(), "holder": holder, "remote": remote, "branch": doc.get("branch"),
+                "verified_head": head, "expected_parent": head, "candidate_tree": candidate_tree,
+                "verified_change_id": change_id, "message": message, "authoring_boundary": authoring_boundary,
+            }
+            doc["pending_finalize"] = pending
+            write_err = write_build(doc, build_id)
+            if write_err:
+                return int(write_err["status"]), write_err
+
+        assert pending is not None
+        if pending.get("version") is None and pending.get("sha"):
+            legacy_commit, legacy_err = build_commit_identity(worktree, str(pending["sha"]))
+            if legacy_err:
+                return 409, {**legacy_err, "build_id": build_id}
+            assert legacy_commit is not None
+            legacy_gaps = []
+            if live["head"] != pending.get("sha"):
+                legacy_gaps.append("legacy intent SHA is not live HEAD")
+            if live["branch"] != pending.get("branch"):
+                legacy_gaps.append("legacy intent branch is not live")
+            if pending.get("verified_head") and legacy_commit["parent"] != pending.get("verified_head"):
+                legacy_gaps.append("legacy intent parent does not match verified head")
+            if legacy_commit["message"] != pending.get("message"):
+                legacy_gaps.append("legacy intent message does not match commit")
+            if legacy_gaps:
+                return build_park(doc, "finalize_adoption_mismatch", "; ".join(legacy_gaps),
+                                  event_id, fingerprint, holder)
+            pending = {
+                **pending,
+                "version": 1,
+                "state": "committed",
+                "fingerprint": fingerprint,
+                "expected_parent": legacy_commit["parent"],
+                "candidate_tree": legacy_commit["tree"],
+                "tree": legacy_commit["tree"],
+                "parent": legacy_commit["parent"],
+                "author": legacy_commit["author"],
+                "committer": legacy_commit["committer"],
+                "authoring_boundary": {
+                    "author": legacy_commit["author"],
+                    "committer": legacy_commit["committer"],
+                },
+            }
+            doc["pending_finalize"] = pending
+            write_err = write_build(doc, build_id)
+            if write_err:
+                return int(write_err["status"]), write_err
+        pending_state = str(pending.get("state") or ("committed" if pending.get("sha") else "prepared"))
+        resumed_committed = pending_state == "committed"
+        if pending_state == "prepared":
+            if head == pending.get("expected_parent"):
+                status = git_status(worktree)
+                dirt = build_commit_dirt(list(status.get("entries") or [])) if status.get("ok") else ["unreadable"]
+                tree_result = run_git(worktree, ["write-tree"]) if not dirt else {"ok": False}
+                live_tree = str(tree_result.get("stdout") or "").strip() if tree_result.get("ok") else ""
+                if dirt or live_tree != pending.get("candidate_tree") or live["branch"] != pending.get("branch"):
+                    return build_park(doc, "finalize_adoption_mismatch",
+                                      "the prepared candidate, branch, or worktree changed before commit",
+                                      event_id, fingerprint, holder)
+                commit = run_git(worktree, ["commit", "-m", message])
+                if not commit.get("ok"):
+                    blob = ((commit.get("stdout") or "") + (commit.get("stderr") or "")).lower()
+                    code = "nothing_staged" if "nothing to commit" in blob or "no changes added" in blob else "commit_failed"
+                    return 409, {"ok": False, "build_id": build_id,
+                                 "error": "nothing was staged; the writer made no changes" if code == "nothing_staged"
+                                 else str(commit.get("error") or "commit failed")[:BUILD_REDACT_MAX_STRING],
+                                 "code": code, "compact": compact_cmd_signal(commit)}
+                live_after, identity_err = build_live_identity(worktree)
+                if identity_err:
+                    return 409, {**identity_err, "build_id": build_id}
+                assert live_after is not None
+                live = live_after
+                head = live["head"]
+            commit_identity, commit_err = build_commit_identity(worktree, head)
+            if commit_err:
+                return 409, {**commit_err, "build_id": build_id}
+            assert commit_identity is not None
+            adoption_gaps = build_finalize_adoption_gaps(pending, commit_identity, live["branch"])
+            if adoption_gaps:
+                return build_park(doc, "finalize_adoption_mismatch", "; ".join(adoption_gaps),
+                                  event_id, fingerprint, holder)
+            pending = {
+                **pending, "state": "committed", "committed_at": utcnow(), "sha": commit_identity["sha"],
+                "tree": commit_identity["tree"], "parent": commit_identity["parent"],
+                "message": commit_identity["message"], "author": commit_identity["author"],
+                "committer": commit_identity["committer"],
+            }
+            doc["pending_finalize"] = pending
+            doc["head"] = pending["sha"]
+            write_err = write_build(doc, build_id)
+            if write_err:
+                return int(write_err["status"]), write_err
+        elif pending_state != "committed":
+            return build_park(doc, "finalize_adoption_mismatch",
+                              f"unknown finalization intent state '{pending_state}'",
+                              event_id, fingerprint, holder)
+
+        live_now, detail = build_resolve_identity(doc, repos)
+        if live_now is None:
+            return build_park(doc, "finalize_adoption_mismatch", str(detail), event_id, fingerprint, holder)
+        commit_identity, commit_err = build_commit_identity(worktree, str(pending.get("sha") or "HEAD"))
+        if commit_err:
+            return 409, {**commit_err, "build_id": build_id}
+        assert commit_identity is not None
+        committed_gaps = build_finalize_adoption_gaps(pending, commit_identity, live_now["branch"])
+        if commit_identity.get("sha") != live_now.get("head"):
+            committed_gaps.append("intent SHA is not live HEAD")
+        if committed_gaps:
+            return build_park(doc, "finalize_adoption_mismatch", "; ".join(committed_gaps),
+                              event_id, fingerprint, holder)
+
+        branch = str(pending.get("branch"))
+        ref = f"refs/heads/{branch}"
+        remote_head: str | None = None
+        if resumed_committed:
+            remote_head, remote_err = build_remote_branch_head(worktree, remote, branch)
+            if remote_err:
+                return 409, {**remote_err, "build_id": build_id, "sha": pending.get("sha")}
+        if remote_head != pending.get("sha"):
+            push = run_git(worktree, ["push", remote, f"{pending['sha']}:{ref}"])
+            if not push.get("ok"):
+                return 409, {"ok": False, "build_id": build_id, "sha": pending.get("sha"),
+                             "retryable": True, "pending_finalize": pending,
+                             "error": str(push.get("error") or "push failed")[:BUILD_REDACT_MAX_STRING],
+                             "code": "push_failed", "compact": compact_cmd_signal(push)}
+
+        receipt = {
+            "event_id": event_id, "action": "finalize", "at": utcnow(), "holder": holder,
+            "build_id": build_id, "repo": doc.get("repo"), "branch": branch, "remote": remote,
+            "sha": pending.get("sha"), "verified_head": pending.get("verified_head"),
+            "verified_change_id": pending.get("verified_change_id"),
+            "candidate_tree": pending.get("candidate_tree"), "message": pending.get("message"),
+            "committed": True, "pushed": True, "attempts": int(pending.get("attempts") or 0) + 1,
+        }
+        doc["pr_ready"] = receipt
+        doc["head"] = pending.get("sha") or head
+        doc["pending_finalize"] = {**pending, "state": "pushed", "pushed_at": utcnow()}
+        build_gate_transition(doc, "pr_opened", change_id, "buildFinalize", "the reviewed commit is pushed")
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, build_id)
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out.update(ok=True, replayed=False, receipt=receipt)
+        return 200, out
 
 
 def json_out(status: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
@@ -4757,6 +8238,36 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "GET" and path == "/v1/build/state":
         status, payload = build_state_op(qs)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/build/next":
+        status, payload = build_next_op(qs, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/preflight":
+        status, payload = build_preflight(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/claim":
+        status, payload = build_claim_op(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/gate":
+        status, payload = build_gate_op(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/brief":
+        status, payload = build_brief(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/writer/launch":
+        status, payload = build_writer_launch(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/writer/complete":
+        status, payload = build_writer_complete(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/checks":
+        status, payload = build_checks(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/review":
+        status, payload = build_review(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/finalize":
+        status, payload = build_finalize(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":

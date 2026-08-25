@@ -1,0 +1,1173 @@
+{
+  "slug": "graphwing-pre-pr-build",
+  "name": "graphwing-pre-pr-build",
+  "description": "One bounded invocation of the mechanical pre-PR path. buildNext names the one step this run may take; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and the behavior-and-test review run behind wait webhooks and apply their own successful gates with the verdict write. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Missing verdict, stale head, failed check, review finding, route gap, recipe gap, dirty worktree, trunk branch, a held lease, an existing writer reservation, an exhausted budget, and a non-clean integration stack each end at their own terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 80 }, "config": {} },
+      {
+        "id": "form",
+        "type": "trigger.form",
+        "label": "Form",
+        "position": { "x": 0, "y": 200 },
+        "config": {
+          "enabled": true,
+          "allowDrafts": false,
+          "inputs": {
+            "build_id": { "type": "string", "required": true, "description": "The durable build. Everything else about the run is read off its state document." },
+            "event_id": { "type": "string", "required": true, "description": "Names this one intention. Reused verbatim by buildFinalize and suffixed for each transition, so a retry replays instead of repeating." },
+            "commit_message": { "type": "string", "required": true },
+            "stack": { "type": "string", "required": false, "description": "Clean stack for phase=integration. Never a dev or preview stack, never one of the build's own." },
+            "reviewer": { "type": "string", "required": false, "description": "Overrides route.reviewer1. Refused server-side if it shares a vendor with the writer." }
+          }
+        }
+      },
+      {
+        "id": "hook",
+        "type": "trigger.webhook",
+        "label": "Webhook",
+        "position": { "x": 0, "y": 320 },
+        "config": {
+          "enabled": true,
+          "requireAuthHeader": true,
+          "headerKey": "x-rewst-secret",
+          "headerValue": "$GRAPHWING_HOOK_SECRET",
+          "allowedMethods": ["POST"]
+        }
+      },
+      {
+        "id": "join_start",
+        "type": "logic.join.any",
+        "label": "Start from any trigger",
+        "position": { "x": 140, "y": 200 },
+        "config": { "stopOnFirst": true }
+      },
+
+      {
+        "id": "next",
+        "type": "action.graphwing.GET:/v1/build/next",
+        "label": "buildNext",
+        "position": { "x": 280, "y": 200 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}"
+        }
+      },
+      {
+        "id": "switch_step",
+        "type": "logic.switch",
+        "label": "which step?",
+        "position": { "x": 420, "y": 200 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "preflight", "rules": [{ "path": "data.step", "op": "equals", "value": "preflight" }] },
+            { "label": "write", "rules": [{ "path": "data.step", "op": "equals", "value": "write" }] },
+            { "label": "fast_checks", "rules": [{ "path": "data.step", "op": "equals", "value": "fast_checks" }] },
+            { "label": "fix", "rules": [{ "path": "data.step", "op": "equals", "value": "fix" }] },
+            { "label": "verify_passed", "rules": [{ "path": "data.step", "op": "equals", "value": "verify_passed" }] },
+            { "label": "review", "rules": [{ "path": "data.step", "op": "equals", "value": "review" }] },
+            { "label": "review_passed", "rules": [{ "path": "data.step", "op": "equals", "value": "review_passed" }] },
+            { "label": "integration", "rules": [{ "path": "data.step", "op": "equals", "value": "integration" }] },
+            { "label": "finalize", "rules": [{ "path": "data.step", "op": "equals", "value": "finalize" }] },
+            { "label": "done", "rules": [{ "path": "data.step", "op": "equals", "value": "done" }] }
+          ],
+          "default": { "label": "parked" }
+        }
+      },
+      {
+        "id": "map_next_fail",
+        "type": "transforms.objectBuilder",
+        "label": "buildNext refusal",
+        "position": { "x": 280, "y": 40 },
+        "config": {
+          "alias": "next_fail",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.next.data.code" } },
+            { "id": "m2", "output": "step_reason", "expression": { "kind": "getField", "path": "TASKS.next.data.step_reason" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_next_fail",
+        "type": "logic.switch",
+        "label": "refused how?",
+        "position": { "x": 280, "y": -80 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "parked", "rules": [{ "path": "data.code", "op": "equals", "value": "parked" }] },
+            { "label": "worktree_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_mismatch" }] },
+            { "label": "not_mechanical", "rules": [{ "path": "data.code", "op": "equals", "value": "not_mechanical" }] }
+          ],
+          "default": { "label": "unreadable" }
+        }
+      },
+
+      {
+        "id": "preflight",
+        "type": "action.graphwing.POST:/v1/build/preflight",
+        "label": "buildPreflight",
+        "position": { "x": 560, "y": -40 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}"
+        }
+      },
+      {
+        "id": "if_preflight",
+        "type": "logic.filter",
+        "label": "clear to launch a writer?",
+        "position": { "x": 700, "y": -40 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "map_preflight_fail",
+        "type": "transforms.objectBuilder",
+        "label": "preflight failure code",
+        "position": { "x": 560, "y": -160 },
+        "config": {
+          "alias": "preflight_fail",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.preflight.data.code" } },
+            { "id": "m2", "output": "error", "expression": { "kind": "getField", "path": "TASKS.preflight.data.error" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_preflight_fail",
+        "type": "logic.switch",
+        "label": "preflight failed how?",
+        "position": { "x": 700, "y": -160 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "missing_route_stamp", "rules": [{ "path": "data.code", "op": "equals", "value": "missing_route_stamp" }] },
+            { "label": "trunk_branch", "rules": [{ "path": "data.code", "op": "equals", "value": "trunk_branch" }] },
+            { "label": "worktree_conflicted", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_conflicted" }] },
+            { "label": "worktree_dirty", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_dirty" }] },
+            { "label": "no_recipes", "rules": [{ "path": "data.code", "op": "equals", "value": "no_recipes" }] },
+            { "label": "unknown_recipe", "rules": [{ "path": "data.code", "op": "equals", "value": "unknown_recipe" }] },
+            { "label": "recipe_wrong_worktree", "rules": [{ "path": "data.code", "op": "equals", "value": "recipe_wrong_worktree" }] },
+            { "label": "hook_not_coverage", "rules": [{ "path": "data.code", "op": "equals", "value": "hook_not_coverage" }] },
+            { "label": "worktree_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_mismatch" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "branch_mismatch" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+
+      {
+        "id": "join_write",
+        "type": "logic.join.any",
+        "label": "Join writer turn",
+        "position": { "x": 840, "y": 120 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "claim_initial",
+        "type": "action.graphwing.POST:/v1/build/claim",
+        "label": "buildClaim initial",
+        "position": { "x": 840, "y": 60 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.claim-initial",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "kind": "initial"
+        }
+      },
+      {
+        "id": "if_claim_initial",
+        "type": "logic.filter",
+        "label": "writer slot reserved?",
+        "position": { "x": 910, "y": 60 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "map_claim_initial_fail",
+        "type": "transforms.objectBuilder",
+        "label": "initial claim refusal",
+        "position": { "x": 840, "y": -20 },
+        "config": {
+          "alias": "claim_initial_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.claim_initial.data.code" } },
+            { "id": "m2", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.claim_initial.data.park_reason" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_claim_initial_fail",
+        "type": "logic.switch",
+        "label": "initial claim refused how?",
+        "position": { "x": 910, "y": -20 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "lease_held", "rules": [{ "path": "data.code", "op": "equals", "value": "lease_held" }] },
+            { "label": "writer_claimed", "rules": [{ "path": "data.code", "op": "equals", "value": "writer_claimed" }] },
+            { "label": "no_job_budget", "rules": [{ "path": "data.code", "op": "equals", "value": "no_job_budget" }] },
+            { "label": "budget_exhausted", "rules": [{ "path": "data.code", "op": "equals", "value": "budget_exhausted" }] },
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "worktree_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_mismatch" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "branch_mismatch" }] },
+            { "label": "no_writer_session", "rules": [{ "path": "data.code", "op": "equals", "value": "no_writer_session" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "wait_write",
+        "type": "action.wait.webhook",
+        "label": "Wait for writer receipt",
+        "position": { "x": 1120, "y": 120 },
+        "config": {
+          "alias": "wait_write",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 1800
+        }
+      },
+      {
+        "id": "agent",
+        "type": "action.graphwing.POST:/v1/build/writer/launch",
+        "label": "buildWriterLaunch initial",
+        "position": { "x": 1120, "y": 260 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "claim_id": "{{ CTX.INPUT.event_id }}.claim-initial",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "response_webhook_url": "{{ TASKS.wait_write.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_write.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_writer",
+        "type": "logic.filter",
+        "label": "writer receipt ok?",
+        "position": { "x": 1260, "y": 120 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.writer_result.status", "op": "equals", "value": "ok" }]
+        }
+      },
+      {
+        "id": "advance_writer_done",
+        "type": "action.graphwing.POST:/v1/build/writer/complete",
+        "label": "buildWriterComplete initial",
+        "position": { "x": 1400, "y": 120 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.writer-done",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "claim_id": "{{ CTX.INPUT.event_id }}.claim-initial",
+          "job_id": "{{ TASKS.agent.data.job_id }}",
+          "hermes_session": "{{ TASKS.agent.data.hermes_session }}",
+          "callback": "{{ TASKS.wait_write.request.body }}"
+        }
+      },
+
+      {
+        "id": "claim_fix",
+        "type": "action.graphwing.POST:/v1/build/claim",
+        "label": "buildClaim correction",
+        "position": { "x": 420, "y": 440 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.claim-correction",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "kind": "correction"
+        }
+      },
+      {
+        "id": "if_claim_fix",
+        "type": "logic.filter",
+        "label": "correction slot reserved?",
+        "position": { "x": 490, "y": 440 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "map_claim_fix_fail",
+        "type": "transforms.objectBuilder",
+        "label": "correction claim refusal",
+        "position": { "x": 420, "y": 520 },
+        "config": {
+          "alias": "claim_fix_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.claim_fix.data.code" } },
+            { "id": "m2", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.claim_fix.data.park_reason" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_claim_fix_fail",
+        "type": "logic.switch",
+        "label": "correction claim refused how?",
+        "position": { "x": 490, "y": 520 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "lease_held", "rules": [{ "path": "data.code", "op": "equals", "value": "lease_held" }] },
+            { "label": "writer_claimed", "rules": [{ "path": "data.code", "op": "equals", "value": "writer_claimed" }] },
+            { "label": "no_job_budget", "rules": [{ "path": "data.code", "op": "equals", "value": "no_job_budget" }] },
+            { "label": "budget_exhausted", "rules": [{ "path": "data.code", "op": "equals", "value": "budget_exhausted" }] },
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "worktree_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_mismatch" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "branch_mismatch" }] },
+            { "label": "no_writer_session", "rules": [{ "path": "data.code", "op": "equals", "value": "no_writer_session" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "brief_fix",
+        "type": "action.graphwing.POST:/v1/build/writer/complete",
+        "label": "buildWriterComplete correction",
+        "position": { "x": 560, "y": 440 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.correction-done",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "claim_id": "{{ CTX.INPUT.event_id }}.claim-correction",
+          "job_id": "{{ TASKS.agent_fix.data.job_id }}",
+          "hermes_session": "{{ TASKS.agent_fix.data.hermes_session }}",
+          "callback": "{{ TASKS.wait_fix.request.body }}"
+        }
+      },
+      {
+        "id": "wait_fix",
+        "type": "action.wait.webhook",
+        "label": "Wait for correction receipt",
+        "position": { "x": 840, "y": 440 },
+        "config": {
+          "alias": "wait_fix",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 1800
+        }
+      },
+      {
+        "id": "agent_fix",
+        "type": "action.graphwing.POST:/v1/build/writer/launch",
+        "label": "buildWriterLaunch correction",
+        "position": { "x": 840, "y": 580 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "claim_id": "{{ CTX.INPUT.event_id }}.claim-correction",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "response_webhook_url": "{{ TASKS.wait_fix.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_fix.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_fix_writer",
+        "type": "logic.filter",
+        "label": "correction receipt ok?",
+        "position": { "x": 980, "y": 440 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.writer_result.status", "op": "equals", "value": "ok" }]
+        }
+      },
+
+      {
+        "id": "wait_fast",
+        "type": "action.wait.webhook",
+        "label": "Wait fast-check verdict",
+        "position": { "x": 560, "y": 280 },
+        "config": {
+          "alias": "wait_fast",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 1800
+        }
+      },
+      {
+        "id": "checks_fast",
+        "type": "action.graphwing.POST:/v1/build/checks",
+        "label": "buildChecks fast",
+        "position": { "x": 560, "y": 400 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "phase": "fast",
+          "response_webhook_url": "{{ TASKS.wait_fast.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_fast.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_fast",
+        "type": "logic.filter",
+        "label": "fast gate passed?",
+        "position": { "x": 700, "y": 280 },
+        "config": {
+          "group": "AND",
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" },
+            { "path": "request.body.ok", "op": "equals", "value": true }
+          ]
+        }
+      },
+      {
+        "id": "map_fast_red",
+        "type": "transforms.objectBuilder",
+        "label": "fast gate refusal",
+        "position": { "x": 840, "y": 340 },
+        "config": {
+          "alias": "fast_red",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.wait_fast.request.body.code" } },
+            { "id": "m2", "output": "missing", "expression": { "kind": "getField", "path": "TASKS.wait_fast.request.body.missing" } },
+            { "id": "m3", "output": "failed", "expression": { "kind": "getField", "path": "TASKS.wait_fast.request.body.failed" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_fast_red",
+        "type": "logic.switch",
+        "label": "fast gate refused how?",
+        "position": { "x": 980, "y": 340 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "missing_verdict", "rules": [{ "path": "data.code", "op": "equals", "value": "missing_verdict" }] },
+            { "label": "check_failed", "rules": [{ "path": "data.code", "op": "equals", "value": "check_failed" }] },
+            { "label": "queued", "rules": [{ "path": "data.code", "op": "equals", "value": "queued" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "map_checks_fail",
+        "type": "transforms.objectBuilder",
+        "label": "buildChecks refusal (fast)",
+        "position": { "x": 700, "y": 400 },
+        "config": {
+          "alias": "checks_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.checks_fast.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_checks_fail",
+        "type": "logic.switch",
+        "label": "fast checks refused how?",
+        "position": { "x": 840, "y": 460 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "no_recipes", "rules": [{ "path": "data.code", "op": "equals", "value": "no_recipes" }] },
+            { "label": "unknown_recipe", "rules": [{ "path": "data.code", "op": "equals", "value": "unknown_recipe" }] },
+            { "label": "recipe_wrong_worktree", "rules": [{ "path": "data.code", "op": "equals", "value": "recipe_wrong_worktree" }] },
+            { "label": "hook_not_coverage", "rules": [{ "path": "data.code", "op": "equals", "value": "hook_not_coverage" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "join_verify_passed",
+        "type": "logic.join.any",
+        "label": "Join verify_passed",
+        "position": { "x": 1120, "y": 280 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "advance_verify",
+        "type": "action.graphwing.POST:/v1/build/gate",
+        "label": "buildGate fast checks",
+        "position": { "x": 1260, "y": 280 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.verify-passed",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "release_lease": true
+        }
+      },
+
+      {
+        "id": "wait_review",
+        "type": "action.wait.webhook",
+        "label": "Wait review verdict",
+        "position": { "x": 560, "y": 700 },
+        "config": {
+          "alias": "wait_review",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 1800
+        }
+      },
+      {
+        "id": "review",
+        "type": "action.graphwing.POST:/v1/build/review",
+        "label": "buildReview",
+        "position": { "x": 560, "y": 820 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "reviewer": "{{ CTX.INPUT.reviewer }}",
+          "response_webhook_url": "{{ TASKS.wait_review.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_review.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_review",
+        "type": "logic.filter",
+        "label": "review PASS?",
+        "position": { "x": 700, "y": 700 },
+        "config": {
+          "group": "AND",
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" },
+            { "path": "request.body.ok", "op": "equals", "value": true }
+          ]
+        }
+      },
+      {
+        "id": "map_review_red",
+        "type": "transforms.objectBuilder",
+        "label": "finding or silence?",
+        "position": { "x": 840, "y": 760 },
+        "config": {
+          "alias": "review_red",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "no_verdict", "expression": { "kind": "getField", "path": "TASKS.wait_review.request.body.no_verdict" } },
+            { "id": "m2", "output": "finding", "expression": { "kind": "getField", "path": "TASKS.wait_review.request.body.finding" } },
+            { "id": "m3", "output": "summary", "expression": { "kind": "getField", "path": "TASKS.wait_review.request.body.summary" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_review_red",
+        "type": "logic.switch",
+        "label": "silence or finding?",
+        "position": { "x": 980, "y": 760 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "no_verdict", "rules": [{ "path": "data.no_verdict", "op": "equals", "value": true }] },
+            { "label": "finding", "rules": [{ "path": "data.finding", "op": "equals", "value": true }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "map_review_fail",
+        "type": "transforms.objectBuilder",
+        "label": "buildReview refusal",
+        "position": { "x": 700, "y": 880 },
+        "config": {
+          "alias": "review_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.review.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_review_fail",
+        "type": "logic.switch",
+        "label": "review refused how?",
+        "position": { "x": 840, "y": 880 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "reviewer_is_writer", "rules": [{ "path": "data.code", "op": "equals", "value": "reviewer_is_writer" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "join_review_passed",
+        "type": "logic.join.any",
+        "label": "Join review_passed",
+        "position": { "x": 1120, "y": 700 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "advance_review_passed",
+        "type": "action.graphwing.POST:/v1/build/gate",
+        "label": "buildGate review",
+        "position": { "x": 1260, "y": 700 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}.review-passed",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "release_lease": true
+        }
+      },
+
+      {
+        "id": "wait_int",
+        "type": "action.wait.webhook",
+        "label": "Wait integration verdict",
+        "position": { "x": 560, "y": 1000 },
+        "config": {
+          "alias": "wait_int",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 3000
+        }
+      },
+      {
+        "id": "checks_int",
+        "type": "action.graphwing.POST:/v1/build/checks",
+        "label": "buildChecks integration (clean stack)",
+        "position": { "x": 560, "y": 1120 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "phase": "integration",
+          "stack": "{{ CTX.INPUT.stack }}",
+          "response_webhook_url": "{{ TASKS.wait_int.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_int.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_int",
+        "type": "logic.filter",
+        "label": "integration gate passed?",
+        "position": { "x": 700, "y": 1000 },
+        "config": {
+          "group": "AND",
+          "rules": [
+            { "path": "request.body.status", "op": "equals", "value": "ok" },
+            { "path": "request.body.ok", "op": "equals", "value": true }
+          ]
+        }
+      },
+      {
+        "id": "map_int_red",
+        "type": "transforms.objectBuilder",
+        "label": "integration gate refusal",
+        "position": { "x": 840, "y": 1060 },
+        "config": {
+          "alias": "int_red",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.wait_int.request.body.code" } },
+            { "id": "m2", "output": "missing", "expression": { "kind": "getField", "path": "TASKS.wait_int.request.body.missing" } },
+            { "id": "m3", "output": "failed", "expression": { "kind": "getField", "path": "TASKS.wait_int.request.body.failed" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_int_red",
+        "type": "logic.switch",
+        "label": "integration refused how?",
+        "position": { "x": 980, "y": 1060 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "missing_verdict", "rules": [{ "path": "data.code", "op": "equals", "value": "missing_verdict" }] },
+            { "label": "check_failed", "rules": [{ "path": "data.code", "op": "equals", "value": "check_failed" }] },
+            { "label": "queued", "rules": [{ "path": "data.code", "op": "equals", "value": "queued" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "map_int_fail",
+        "type": "transforms.objectBuilder",
+        "label": "buildChecks refusal (integration)",
+        "position": { "x": 700, "y": 1120 },
+        "config": {
+          "alias": "int_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.checks_int.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_int_fail",
+        "type": "logic.switch",
+        "label": "integration stack or recipes?",
+        "position": { "x": 840, "y": 1180 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "not_a_clean_stack", "rules": [{ "path": "data.code", "op": "equals", "value": "not_a_clean_stack" }] },
+            { "label": "stack_unhealthy", "rules": [{ "path": "data.code", "op": "equals", "value": "stack_unhealthy" }] },
+            { "label": "unknown_stack", "rules": [{ "path": "data.code", "op": "equals", "value": "unknown_stack" }] },
+            { "label": "bad_stack", "rules": [{ "path": "data.code", "op": "equals", "value": "bad_stack" }] },
+            { "label": "no_recipes", "rules": [{ "path": "data.code", "op": "equals", "value": "no_recipes" }] },
+            { "label": "unknown_recipe", "rules": [{ "path": "data.code", "op": "equals", "value": "unknown_recipe" }] },
+            { "label": "recipe_wrong_worktree", "rules": [{ "path": "data.code", "op": "equals", "value": "recipe_wrong_worktree" }] },
+            { "label": "hook_not_coverage", "rules": [{ "path": "data.code", "op": "equals", "value": "hook_not_coverage" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+
+      {
+        "id": "join_finalize",
+        "type": "logic.join.any",
+        "label": "Join finalize",
+        "position": { "x": 1120, "y": 1000 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "finalize",
+        "type": "action.graphwing.POST:/v1/build/finalize",
+        "label": "buildFinalize (only commit and push)",
+        "position": { "x": 1260, "y": 1000 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 120,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}",
+          "holder": "event:{{ CTX.INPUT.event_id }}",
+          "message": "{{ CTX.INPUT.commit_message }}",
+          "remote": "origin"
+        }
+      },
+      {
+        "id": "pr_ready",
+        "type": "transforms.objectBuilder",
+        "label": "PR-ready receipt",
+        "position": { "x": 1400, "y": 1000 },
+        "config": {
+          "alias": "pr_ready",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "CTX.INPUT.build_id" } },
+            { "id": "m3", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.finalize.data.receipt.sha" } },
+            { "id": "m4", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.finalize.data.receipt.branch" } },
+            { "id": "m5", "output": "remote", "expression": { "kind": "getField", "path": "TASKS.finalize.data.receipt.remote" } },
+            { "id": "m6", "output": "replayed", "expression": { "kind": "getField", "path": "TASKS.finalize.data.replayed" } },
+            { "id": "m7", "output": "code", "expression": { "kind": "getField", "path": "TASKS.finalize.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "map_fin_fail",
+        "type": "transforms.objectBuilder",
+        "label": "finalize refusal",
+        "position": { "x": 1260, "y": 1120 },
+        "config": {
+          "alias": "fin_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "code", "expression": { "kind": "getField", "path": "TASKS.finalize.data.code" } },
+            { "id": "m2", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.finalize.data.park_reason" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_fin_fail",
+        "type": "logic.switch",
+        "label": "finalize refused how?",
+        "position": { "x": 1400, "y": 1120 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "not_ready", "rules": [{ "path": "data.code", "op": "equals", "value": "not_ready" }] },
+            { "label": "nothing_staged", "rules": [{ "path": "data.code", "op": "equals", "value": "nothing_staged" }] },
+            { "label": "push_failed", "rules": [{ "path": "data.code", "op": "equals", "value": "push_failed" }] },
+            { "label": "commit_failed", "rules": [{ "path": "data.code", "op": "equals", "value": "commit_failed" }] },
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "lease_held", "rules": [{ "path": "data.code", "op": "equals", "value": "lease_held" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+
+      {
+        "id": "map_wd_fail",
+        "type": "transforms.objectBuilder",
+        "label": "writer_done refusal",
+        "position": { "x": 1540, "y": 40 },
+        "config": {
+          "alias": "wd_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.advance_writer_done.data.park_reason" } },
+            { "id": "m2", "output": "code", "expression": { "kind": "getField", "path": "TASKS.advance_writer_done.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_wd_fail",
+        "type": "logic.switch",
+        "label": "writer_done refused how?",
+        "position": { "x": 1680, "y": 40 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "branch_mismatch" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "map_vp_fail",
+        "type": "transforms.objectBuilder",
+        "label": "verify_passed refusal",
+        "position": { "x": 1400, "y": 340 },
+        "config": {
+          "alias": "vp_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.advance_verify.data.park_reason" } },
+            { "id": "m2", "output": "code", "expression": { "kind": "getField", "path": "TASKS.advance_verify.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_vp_fail",
+        "type": "logic.switch",
+        "label": "verify_passed refused how?",
+        "position": { "x": 1540, "y": 340 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "branch_mismatch" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+      {
+        "id": "map_rp_fail",
+        "type": "transforms.objectBuilder",
+        "label": "review_passed refusal",
+        "position": { "x": 1400, "y": 760 },
+        "config": {
+          "alias": "rp_refusal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.advance_review_passed.data.park_reason" } },
+            { "id": "m2", "output": "code", "expression": { "kind": "getField", "path": "TASKS.advance_review_passed.data.code" } }
+          ]
+        }
+      },
+      {
+        "id": "switch_rp_fail",
+        "type": "logic.switch",
+        "label": "review_passed refused how?",
+        "position": { "x": 1540, "y": 760 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "head_moved", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "head_moved" }] },
+            { "label": "branch_mismatch", "rules": [{ "path": "data.park_reason", "op": "equals", "value": "branch_mismatch" }] }
+          ],
+          "default": { "label": "other" }
+        }
+      },
+
+      { "id": "join_park_state", "type": "logic.join.any", "label": "Join parked", "position": { "x": 2000, "y": -160 }, "config": { "stopOnFirst": true } },
+      { "id": "join_stale_head", "type": "logic.join.any", "label": "Join stale head", "position": { "x": 2000, "y": -80 }, "config": { "stopOnFirst": true } },
+      { "id": "join_route_gap", "type": "logic.join.any", "label": "Join route gap", "position": { "x": 2000, "y": 0 }, "config": { "stopOnFirst": true } },
+      { "id": "join_recipe_gap", "type": "logic.join.any", "label": "Join recipe gap", "position": { "x": 2000, "y": 80 }, "config": { "stopOnFirst": true } },
+      { "id": "join_dirty", "type": "logic.join.any", "label": "Join dirty or conflicted worktree", "position": { "x": 2000, "y": 160 }, "config": { "stopOnFirst": true } },
+      { "id": "join_identity", "type": "logic.join.any", "label": "Join identity mismatch", "position": { "x": 2000, "y": 240 }, "config": { "stopOnFirst": true } },
+      { "id": "join_preflight_fail", "type": "logic.join.any", "label": "Join preflight refusal", "position": { "x": 2000, "y": 320 }, "config": { "stopOnFirst": true } },
+      { "id": "join_no_writer_session", "type": "logic.join.any", "label": "Join no writer session", "position": { "x": 2000, "y": 480 }, "config": { "stopOnFirst": true } },
+      { "id": "join_writer_stuck", "type": "logic.join.any", "label": "Join writer stuck", "position": { "x": 2000, "y": 560 }, "config": { "stopOnFirst": true } },
+      { "id": "join_writer_red", "type": "logic.join.any", "label": "Join writer red", "position": { "x": 2000, "y": 640 }, "config": { "stopOnFirst": true } },
+      { "id": "join_missing_verdict", "type": "logic.join.any", "label": "Join missing verdict", "position": { "x": 2000, "y": 720 }, "config": { "stopOnFirst": true } },
+      { "id": "join_check_failed", "type": "logic.join.any", "label": "Join check failed", "position": { "x": 2000, "y": 800 }, "config": { "stopOnFirst": true } },
+      { "id": "join_gate_fail", "type": "logic.join.any", "label": "Join gate refusal", "position": { "x": 2000, "y": 880 }, "config": { "stopOnFirst": true } },
+      { "id": "join_checks_stuck", "type": "logic.join.any", "label": "Join checks stuck", "position": { "x": 2000, "y": 960 }, "config": { "stopOnFirst": true } },
+      { "id": "join_checks_http_fail", "type": "logic.join.any", "label": "Join buildChecks HTTP refusal", "position": { "x": 2000, "y": 1040 }, "config": { "stopOnFirst": true } },
+      { "id": "join_clean_stack", "type": "logic.join.any", "label": "Join not a clean stack", "position": { "x": 2000, "y": 1120 }, "config": { "stopOnFirst": true } },
+      { "id": "join_review_stuck", "type": "logic.join.any", "label": "Join review stuck", "position": { "x": 2000, "y": 1200 }, "config": { "stopOnFirst": true } },
+      { "id": "join_advance_fail", "type": "logic.join.any", "label": "Join advance refusal", "position": { "x": 2000, "y": 1280 }, "config": { "stopOnFirst": true } },
+      { "id": "join_claim_lease", "type": "logic.join.any", "label": "Join lease held", "position": { "x": 2000, "y": 1360 }, "config": { "stopOnFirst": true } },
+      { "id": "join_claim_held", "type": "logic.join.any", "label": "Join writer already claimed", "position": { "x": 2000, "y": 1440 }, "config": { "stopOnFirst": true } },
+      { "id": "join_claim_budget", "type": "logic.join.any", "label": "Join no job budget", "position": { "x": 2000, "y": 1520 }, "config": { "stopOnFirst": true } },
+      { "id": "join_claim_fail", "type": "logic.join.any", "label": "Join claim refusal", "position": { "x": 2000, "y": 1600 }, "config": { "stopOnFirst": true } },
+
+      { "id": "park_state", "type": "action.noop", "label": "Herdr: build is parked; planning owns it", "position": { "x": 2200, "y": -160 }, "config": {} },
+      { "id": "park_stale_head", "type": "action.noop", "label": "Herdr: head moved since buildNext read it; files kept", "position": { "x": 2200, "y": -80 }, "config": {} },
+      { "id": "park_route_gap", "type": "action.noop", "label": "Herdr: route is missing a launch stamp; no writer started", "position": { "x": 2200, "y": 0 }, "config": {} },
+      { "id": "park_recipe_gap", "type": "action.noop", "label": "Herdr: a declared recipe is unknown, wrong-worktree, or hook-only", "position": { "x": 2200, "y": 80 }, "config": {} },
+      { "id": "park_dirty", "type": "action.noop", "label": "Herdr: worktree is dirty or has unmerged paths; no writer started", "position": { "x": 2200, "y": 160 }, "config": {} },
+      { "id": "park_identity", "type": "action.noop", "label": "Herdr: worktree or branch is not the one this build was opened on", "position": { "x": 2200, "y": 240 }, "config": {} },
+      { "id": "park_trunk_branch", "type": "action.noop", "label": "Herdr: build is on a trunk branch; refused before any writer", "position": { "x": 2200, "y": 280 }, "config": {} },
+      { "id": "preflight_fail", "type": "action.noop", "label": "Herdr: buildPreflight refused; see failures[]", "position": { "x": 2200, "y": 320 }, "config": {} },
+      { "id": "no_writer_session", "type": "action.noop", "label": "Herdr: correction turn has no writer session to resume", "position": { "x": 2200, "y": 480 }, "config": {} },
+      { "id": "writer_stuck", "type": "action.noop", "label": "Herdr: writer never reported; files kept, build stays at writing", "position": { "x": 2200, "y": 560 }, "config": {} },
+      { "id": "writer_red", "type": "action.noop", "label": "Herdr: writer returned non-ok; files kept, no transition recorded", "position": { "x": 2200, "y": 640 }, "config": {} },
+      { "id": "park_missing_verdict", "type": "action.noop", "label": "Herdr: a required recipe produced no verdict; a receipt is not a pass", "position": { "x": 2200, "y": 720 }, "config": {} },
+      { "id": "park_check_failed", "type": "action.noop", "label": "Herdr: a required check failed; next invocation runs fix", "position": { "x": 2200, "y": 800 }, "config": {} },
+      { "id": "gate_fail", "type": "action.noop", "label": "Herdr: gate refused for an unnamed reason; fail closed", "position": { "x": 2200, "y": 880 }, "config": {} },
+      { "id": "checks_stuck", "type": "action.noop", "label": "Herdr: check verdict never arrived; files kept", "position": { "x": 2200, "y": 960 }, "config": {} },
+      { "id": "checks_http_fail", "type": "action.noop", "label": "Herdr: buildChecks HTTP refusal", "position": { "x": 2200, "y": 1040 }, "config": {} },
+      { "id": "park_not_a_clean_stack", "type": "action.noop", "label": "Herdr: integration stack is not a clean stack; a dev stack proves nothing", "position": { "x": 2200, "y": 1120 }, "config": {} },
+      { "id": "review_stuck", "type": "action.noop", "label": "Herdr: review verdict never arrived; nothing recorded", "position": { "x": 2200, "y": 1200 }, "config": {} },
+      { "id": "advance_fail", "type": "action.noop", "label": "Herdr: buildAdvance refused", "position": { "x": 2200, "y": 1280 }, "config": {} },
+      { "id": "not_mechanical", "type": "action.noop", "label": "Herdr: this build is not on the mechanical path", "position": { "x": 2200, "y": -240 }, "config": {} },
+      { "id": "next_unreadable", "type": "action.noop", "label": "Herdr: buildNext refusal could not be read; fail closed", "position": { "x": 2200, "y": -320 }, "config": {} },
+      { "id": "join_writer_bound", "type": "logic.join.any", "label": "Join writer launch", "position": { "x": 1540, "y": 260 }, "config": { "stopOnFirst": true } },
+      { "id": "writer_bound", "type": "action.noop", "label": "Writer session bound to the build", "position": { "x": 1680, "y": 260 }, "config": {} },
+      { "id": "writer_done_ok", "type": "action.noop", "label": "Writer finished; next invocation runs fast checks", "position": { "x": 1680, "y": 120 }, "config": {} },
+      { "id": "fix_done", "type": "action.noop", "label": "Correction turn finished; next invocation re-runs the affected checks", "position": { "x": 1120, "y": 440 }, "config": {} },
+      { "id": "fast_green", "type": "action.noop", "label": "Fast checks clean; next invocation runs the review", "position": { "x": 1400, "y": 280 }, "config": {} },
+      { "id": "fast_green_recovered", "type": "action.noop", "label": "Recovered fast-check gate; next invocation runs the review", "position": { "x": 1680, "y": 280 }, "config": {} },
+      { "id": "correction_pending", "type": "action.noop", "label": "Correction state: reviewer finding recorded; next invocation runs fix", "position": { "x": 1120, "y": 820 }, "config": {} },
+      { "id": "review_no_verdict", "type": "action.noop", "label": "Provider silence: not a finding, no round written; retry the same step", "position": { "x": 1120, "y": 880 }, "config": {} },
+      { "id": "reviewer_is_writer", "type": "action.noop", "label": "Herdr: reviewer shares a vendor with the writer; name another", "position": { "x": 980, "y": 940 }, "config": {} },
+      { "id": "review_green", "type": "action.noop", "label": "Review clean; next invocation runs integration", "position": { "x": 1400, "y": 700 }, "config": {} },
+      { "id": "review_green_recovered", "type": "action.noop", "label": "Recovered review gate; next invocation runs integration", "position": { "x": 1680, "y": 700 }, "config": {} },
+      { "id": "finalize_not_ready", "type": "action.noop", "label": "Herdr: finalize refused, evidence is not clean for this change", "position": { "x": 1680, "y": 1060 }, "config": {} },
+      { "id": "finalize_nothing_staged", "type": "action.noop", "label": "Herdr: nothing was staged; the writer made no changes", "position": { "x": 1680, "y": 1120 }, "config": {} },
+      { "id": "finalize_push_failed", "type": "action.noop", "label": "Herdr: commit stands, push failed; retry pushes the same commit", "position": { "x": 1680, "y": 1180 }, "config": {} },
+      { "id": "finalize_commit_failed", "type": "action.noop", "label": "Herdr: commit failed; no receipt written", "position": { "x": 1680, "y": 1240 }, "config": {} },
+      { "id": "finalize_lease_held", "type": "action.noop", "label": "Herdr: another run holds the build lease", "position": { "x": 1680, "y": 1300 }, "config": {} },
+      { "id": "finalize_fail", "type": "action.noop", "label": "Herdr: buildFinalize refused", "position": { "x": 1680, "y": 1360 }, "config": {} },
+      { "id": "already_done", "type": "action.noop", "label": "This build already produced its PR-ready commit", "position": { "x": 560, "y": 1300 }, "config": {} }
+    ],
+    "edges": [
+      { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_form", "source": "form", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_hook", "source": "hook", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_start_next", "source": "join_start", "sourceHandle": "out", "target": "next", "targetHandle": "in" },
+
+      { "id": "e_next_ok", "source": "next", "sourceHandle": "success", "target": "switch_step", "targetHandle": "in" },
+      { "id": "e_next_bad", "source": "next", "sourceHandle": "failure", "target": "map_next_fail", "targetHandle": "in" },
+      { "id": "e_next_map", "source": "map_next_fail", "sourceHandle": "out", "target": "switch_next_fail", "targetHandle": "in" },
+      { "id": "e_next_parked", "source": "switch_next_fail", "sourceHandle": "case-0", "target": "join_park_state", "targetHandle": "in" },
+      { "id": "e_next_worktree", "source": "switch_next_fail", "sourceHandle": "case-1", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_next_class", "source": "switch_next_fail", "sourceHandle": "case-2", "target": "not_mechanical", "targetHandle": "in" },
+      { "id": "e_next_other", "source": "switch_next_fail", "sourceHandle": "default", "target": "next_unreadable", "targetHandle": "in" },
+
+      { "id": "e_step_preflight", "source": "switch_step", "sourceHandle": "case-0", "target": "preflight", "targetHandle": "in" },
+      { "id": "e_step_write", "source": "switch_step", "sourceHandle": "case-1", "target": "join_write", "targetHandle": "in" },
+      { "id": "e_step_fast", "source": "switch_step", "sourceHandle": "case-2", "target": "wait_fast", "targetHandle": "in" },
+      { "id": "e_step_fix", "source": "switch_step", "sourceHandle": "case-3", "target": "claim_fix", "targetHandle": "in" },
+      { "id": "e_step_verify_passed", "source": "switch_step", "sourceHandle": "case-4", "target": "join_verify_passed", "targetHandle": "in" },
+      { "id": "e_step_review", "source": "switch_step", "sourceHandle": "case-5", "target": "wait_review", "targetHandle": "in" },
+      { "id": "e_step_review_passed", "source": "switch_step", "sourceHandle": "case-6", "target": "join_review_passed", "targetHandle": "in" },
+      { "id": "e_step_integration", "source": "switch_step", "sourceHandle": "case-7", "target": "wait_int", "targetHandle": "in" },
+      { "id": "e_step_finalize", "source": "switch_step", "sourceHandle": "case-8", "target": "join_finalize", "targetHandle": "in" },
+      { "id": "e_step_done", "source": "switch_step", "sourceHandle": "case-9", "target": "already_done", "targetHandle": "in" },
+      { "id": "e_step_parked", "source": "switch_step", "sourceHandle": "default", "target": "join_park_state", "targetHandle": "in" },
+
+      { "id": "e_pf_ok", "source": "preflight", "sourceHandle": "success", "target": "if_preflight", "targetHandle": "in" },
+      { "id": "e_pf_bad", "source": "preflight", "sourceHandle": "failure", "target": "map_preflight_fail", "targetHandle": "in" },
+      { "id": "e_pf_map", "source": "map_preflight_fail", "sourceHandle": "out", "target": "switch_preflight_fail", "targetHandle": "in" },
+      { "id": "e_pf_pass", "source": "if_preflight", "sourceHandle": "pass", "target": "join_write", "targetHandle": "in" },
+      { "id": "e_pf_fail", "source": "if_preflight", "sourceHandle": "fail", "target": "join_preflight_fail", "targetHandle": "in" },
+      { "id": "e_pf_stamp", "source": "switch_preflight_fail", "sourceHandle": "case-0", "target": "join_route_gap", "targetHandle": "in" },
+      { "id": "e_pf_trunk", "source": "switch_preflight_fail", "sourceHandle": "case-1", "target": "park_trunk_branch", "targetHandle": "in" },
+      { "id": "e_pf_conflict", "source": "switch_preflight_fail", "sourceHandle": "case-2", "target": "join_dirty", "targetHandle": "in" },
+      { "id": "e_pf_dirty", "source": "switch_preflight_fail", "sourceHandle": "case-3", "target": "join_dirty", "targetHandle": "in" },
+      { "id": "e_pf_norecipes", "source": "switch_preflight_fail", "sourceHandle": "case-4", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_pf_unknown", "source": "switch_preflight_fail", "sourceHandle": "case-5", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_pf_wrongtree", "source": "switch_preflight_fail", "sourceHandle": "case-6", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_pf_hook", "source": "switch_preflight_fail", "sourceHandle": "case-7", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_pf_worktree", "source": "switch_preflight_fail", "sourceHandle": "case-8", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_pf_branch", "source": "switch_preflight_fail", "sourceHandle": "case-9", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_pf_other", "source": "switch_preflight_fail", "sourceHandle": "default", "target": "join_preflight_fail", "targetHandle": "in" },
+
+      { "id": "e_write_claim", "source": "join_write", "sourceHandle": "out", "target": "claim_initial", "targetHandle": "in" },
+      { "id": "e_claim_ok", "source": "claim_initial", "sourceHandle": "success", "target": "if_claim_initial", "targetHandle": "in" },
+      { "id": "e_claim_bad", "source": "claim_initial", "sourceHandle": "failure", "target": "map_claim_initial_fail", "targetHandle": "in" },
+      { "id": "e_claim_pass", "source": "if_claim_initial", "sourceHandle": "pass", "target": "wait_write", "targetHandle": "in" },
+      { "id": "e_claim_notok", "source": "if_claim_initial", "sourceHandle": "fail", "target": "join_claim_fail", "targetHandle": "in" },
+      { "id": "e_claim_map", "source": "map_claim_initial_fail", "sourceHandle": "out", "target": "switch_claim_initial_fail", "targetHandle": "in" },
+      { "id": "e_claim_lease", "source": "switch_claim_initial_fail", "sourceHandle": "case-0", "target": "join_claim_lease", "targetHandle": "in" },
+      { "id": "e_claim_held", "source": "switch_claim_initial_fail", "sourceHandle": "case-1", "target": "join_claim_held", "targetHandle": "in" },
+      { "id": "e_claim_nobudget", "source": "switch_claim_initial_fail", "sourceHandle": "case-2", "target": "join_claim_budget", "targetHandle": "in" },
+      { "id": "e_claim_spent", "source": "switch_claim_initial_fail", "sourceHandle": "case-3", "target": "join_claim_budget", "targetHandle": "in" },
+      { "id": "e_claim_head", "source": "switch_claim_initial_fail", "sourceHandle": "case-4", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_claim_worktree", "source": "switch_claim_initial_fail", "sourceHandle": "case-5", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_claim_branch", "source": "switch_claim_initial_fail", "sourceHandle": "case-6", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_claim_nosession", "source": "switch_claim_initial_fail", "sourceHandle": "case-7", "target": "join_no_writer_session", "targetHandle": "in" },
+      { "id": "e_claim_other", "source": "switch_claim_initial_fail", "sourceHandle": "default", "target": "join_claim_fail", "targetHandle": "in" },
+      { "id": "e_fixclaim_ok", "source": "claim_fix", "sourceHandle": "success", "target": "if_claim_fix", "targetHandle": "in" },
+      { "id": "e_fixclaim_bad", "source": "claim_fix", "sourceHandle": "failure", "target": "map_claim_fix_fail", "targetHandle": "in" },
+      { "id": "e_fixclaim_pass", "source": "if_claim_fix", "sourceHandle": "pass", "target": "wait_fix", "targetHandle": "in" },
+      { "id": "e_fixclaim_notok", "source": "if_claim_fix", "sourceHandle": "fail", "target": "join_claim_fail", "targetHandle": "in" },
+      { "id": "e_fixclaim_map", "source": "map_claim_fix_fail", "sourceHandle": "out", "target": "switch_claim_fix_fail", "targetHandle": "in" },
+      { "id": "e_fixclaim_lease", "source": "switch_claim_fix_fail", "sourceHandle": "case-0", "target": "join_claim_lease", "targetHandle": "in" },
+      { "id": "e_fixclaim_held", "source": "switch_claim_fix_fail", "sourceHandle": "case-1", "target": "join_claim_held", "targetHandle": "in" },
+      { "id": "e_fixclaim_nobudget", "source": "switch_claim_fix_fail", "sourceHandle": "case-2", "target": "join_claim_budget", "targetHandle": "in" },
+      { "id": "e_fixclaim_spent", "source": "switch_claim_fix_fail", "sourceHandle": "case-3", "target": "join_claim_budget", "targetHandle": "in" },
+      { "id": "e_fixclaim_head", "source": "switch_claim_fix_fail", "sourceHandle": "case-4", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_fixclaim_worktree", "source": "switch_claim_fix_fail", "sourceHandle": "case-5", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_fixclaim_branch", "source": "switch_claim_fix_fail", "sourceHandle": "case-6", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_fixclaim_nosession", "source": "switch_claim_fix_fail", "sourceHandle": "case-7", "target": "join_no_writer_session", "targetHandle": "in" },
+      { "id": "e_fixclaim_other", "source": "switch_claim_fix_fail", "sourceHandle": "default", "target": "join_claim_fail", "targetHandle": "in" },
+
+      { "id": "e_ww_pending", "source": "wait_write", "sourceHandle": "pending", "target": "agent", "targetHandle": "in" },
+      { "id": "e_ww_out", "source": "wait_write", "sourceHandle": "out", "target": "advance_writer_done", "targetHandle": "in" },
+      { "id": "e_ww_timeout", "source": "wait_write", "sourceHandle": "timeout", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_ww_failure", "source": "wait_write", "sourceHandle": "failure", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_agent_ok", "source": "agent", "sourceHandle": "success", "target": "join_writer_bound", "targetHandle": "in" },
+      { "id": "e_agent_bad", "source": "agent", "sourceHandle": "failure", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_writer_pass", "source": "if_writer", "sourceHandle": "pass", "target": "writer_done_ok", "targetHandle": "in" },
+      { "id": "e_writer_fail", "source": "if_writer", "sourceHandle": "fail", "target": "join_writer_red", "targetHandle": "in" },
+      { "id": "e_wd_ok", "source": "advance_writer_done", "sourceHandle": "success", "target": "if_writer", "targetHandle": "in" },
+      { "id": "e_wd_bad", "source": "advance_writer_done", "sourceHandle": "failure", "target": "map_wd_fail", "targetHandle": "in" },
+      { "id": "e_wd_map", "source": "map_wd_fail", "sourceHandle": "out", "target": "switch_wd_fail", "targetHandle": "in" },
+      { "id": "e_wd_head", "source": "switch_wd_fail", "sourceHandle": "case-0", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_wd_branch", "source": "switch_wd_fail", "sourceHandle": "case-1", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_wd_other", "source": "switch_wd_fail", "sourceHandle": "default", "target": "join_advance_fail", "targetHandle": "in" },
+
+      { "id": "e_wfix_pending", "source": "wait_fix", "sourceHandle": "pending", "target": "agent_fix", "targetHandle": "in" },
+      { "id": "e_wfix_out", "source": "wait_fix", "sourceHandle": "out", "target": "brief_fix", "targetHandle": "in" },
+      { "id": "e_wfix_timeout", "source": "wait_fix", "sourceHandle": "timeout", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_wfix_failure", "source": "wait_fix", "sourceHandle": "failure", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_agentfix_bad", "source": "agent_fix", "sourceHandle": "failure", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_agentfix_ok", "source": "agent_fix", "sourceHandle": "success", "target": "join_writer_bound", "targetHandle": "in" },
+      { "id": "e_join_writer_bound", "source": "join_writer_bound", "sourceHandle": "out", "target": "writer_bound", "targetHandle": "in" },
+      { "id": "e_fix_complete_ok", "source": "brief_fix", "sourceHandle": "success", "target": "if_fix_writer", "targetHandle": "in" },
+      { "id": "e_fix_complete_bad", "source": "brief_fix", "sourceHandle": "failure", "target": "join_writer_stuck", "targetHandle": "in" },
+      { "id": "e_fixw_pass", "source": "if_fix_writer", "sourceHandle": "pass", "target": "fix_done", "targetHandle": "in" },
+      { "id": "e_fixw_fail", "source": "if_fix_writer", "sourceHandle": "fail", "target": "join_writer_red", "targetHandle": "in" },
+
+      { "id": "e_wfast_pending", "source": "wait_fast", "sourceHandle": "pending", "target": "checks_fast", "targetHandle": "in" },
+      { "id": "e_wfast_out", "source": "wait_fast", "sourceHandle": "out", "target": "if_fast", "targetHandle": "in" },
+      { "id": "e_wfast_timeout", "source": "wait_fast", "sourceHandle": "timeout", "target": "join_checks_stuck", "targetHandle": "in" },
+      { "id": "e_wfast_failure", "source": "wait_fast", "sourceHandle": "failure", "target": "join_checks_stuck", "targetHandle": "in" },
+      { "id": "e_cfast_bad", "source": "checks_fast", "sourceHandle": "failure", "target": "map_checks_fail", "targetHandle": "in" },
+      { "id": "e_cfast_map", "source": "map_checks_fail", "sourceHandle": "out", "target": "switch_checks_fail", "targetHandle": "in" },
+      { "id": "e_cfast_norecipes", "source": "switch_checks_fail", "sourceHandle": "case-0", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cfast_unknown", "source": "switch_checks_fail", "sourceHandle": "case-1", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cfast_wrongtree", "source": "switch_checks_fail", "sourceHandle": "case-2", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cfast_hook", "source": "switch_checks_fail", "sourceHandle": "case-3", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cfast_other", "source": "switch_checks_fail", "sourceHandle": "default", "target": "join_checks_http_fail", "targetHandle": "in" },
+      { "id": "e_fast_pass", "source": "if_fast", "sourceHandle": "pass", "target": "fast_green", "targetHandle": "in" },
+      { "id": "e_fast_fail", "source": "if_fast", "sourceHandle": "fail", "target": "map_fast_red", "targetHandle": "in" },
+      { "id": "e_fastred_map", "source": "map_fast_red", "sourceHandle": "out", "target": "switch_fast_red", "targetHandle": "in" },
+      { "id": "e_fastred_missing", "source": "switch_fast_red", "sourceHandle": "case-0", "target": "join_missing_verdict", "targetHandle": "in" },
+      { "id": "e_fastred_failed", "source": "switch_fast_red", "sourceHandle": "case-1", "target": "join_check_failed", "targetHandle": "in" },
+      { "id": "e_fastred_queued", "source": "switch_fast_red", "sourceHandle": "case-2", "target": "join_missing_verdict", "targetHandle": "in" },
+      { "id": "e_fastred_other", "source": "switch_fast_red", "sourceHandle": "default", "target": "join_gate_fail", "targetHandle": "in" },
+
+      { "id": "e_vp_advance", "source": "join_verify_passed", "sourceHandle": "out", "target": "advance_verify", "targetHandle": "in" },
+      { "id": "e_vp_ok", "source": "advance_verify", "sourceHandle": "success", "target": "fast_green_recovered", "targetHandle": "in" },
+      { "id": "e_vp_bad", "source": "advance_verify", "sourceHandle": "failure", "target": "map_vp_fail", "targetHandle": "in" },
+      { "id": "e_vp_map", "source": "map_vp_fail", "sourceHandle": "out", "target": "switch_vp_fail", "targetHandle": "in" },
+      { "id": "e_vp_head", "source": "switch_vp_fail", "sourceHandle": "case-0", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_vp_branch", "source": "switch_vp_fail", "sourceHandle": "case-1", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_vp_other", "source": "switch_vp_fail", "sourceHandle": "default", "target": "join_advance_fail", "targetHandle": "in" },
+
+      { "id": "e_wrev_pending", "source": "wait_review", "sourceHandle": "pending", "target": "review", "targetHandle": "in" },
+      { "id": "e_wrev_out", "source": "wait_review", "sourceHandle": "out", "target": "if_review", "targetHandle": "in" },
+      { "id": "e_wrev_timeout", "source": "wait_review", "sourceHandle": "timeout", "target": "join_review_stuck", "targetHandle": "in" },
+      { "id": "e_wrev_failure", "source": "wait_review", "sourceHandle": "failure", "target": "join_review_stuck", "targetHandle": "in" },
+      { "id": "e_rev_bad", "source": "review", "sourceHandle": "failure", "target": "map_review_fail", "targetHandle": "in" },
+      { "id": "e_rev_map", "source": "map_review_fail", "sourceHandle": "out", "target": "switch_review_fail", "targetHandle": "in" },
+      { "id": "e_rev_isw", "source": "switch_review_fail", "sourceHandle": "case-0", "target": "reviewer_is_writer", "targetHandle": "in" },
+      { "id": "e_rev_other", "source": "switch_review_fail", "sourceHandle": "default", "target": "join_review_stuck", "targetHandle": "in" },
+      { "id": "e_rev_pass", "source": "if_review", "sourceHandle": "pass", "target": "review_green", "targetHandle": "in" },
+      { "id": "e_rev_fail", "source": "if_review", "sourceHandle": "fail", "target": "map_review_red", "targetHandle": "in" },
+      { "id": "e_revred_map", "source": "map_review_red", "sourceHandle": "out", "target": "switch_review_red", "targetHandle": "in" },
+      { "id": "e_revred_silence", "source": "switch_review_red", "sourceHandle": "case-0", "target": "review_no_verdict", "targetHandle": "in" },
+      { "id": "e_revred_finding", "source": "switch_review_red", "sourceHandle": "case-1", "target": "correction_pending", "targetHandle": "in" },
+      { "id": "e_revred_other", "source": "switch_review_red", "sourceHandle": "default", "target": "join_review_stuck", "targetHandle": "in" },
+
+      { "id": "e_rp_advance", "source": "join_review_passed", "sourceHandle": "out", "target": "advance_review_passed", "targetHandle": "in" },
+      { "id": "e_rp_ok", "source": "advance_review_passed", "sourceHandle": "success", "target": "review_green_recovered", "targetHandle": "in" },
+      { "id": "e_rp_bad", "source": "advance_review_passed", "sourceHandle": "failure", "target": "map_rp_fail", "targetHandle": "in" },
+      { "id": "e_rp_map", "source": "map_rp_fail", "sourceHandle": "out", "target": "switch_rp_fail", "targetHandle": "in" },
+      { "id": "e_rp_head", "source": "switch_rp_fail", "sourceHandle": "case-0", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_rp_branch", "source": "switch_rp_fail", "sourceHandle": "case-1", "target": "join_identity", "targetHandle": "in" },
+      { "id": "e_rp_other", "source": "switch_rp_fail", "sourceHandle": "default", "target": "join_advance_fail", "targetHandle": "in" },
+
+      { "id": "e_wint_pending", "source": "wait_int", "sourceHandle": "pending", "target": "checks_int", "targetHandle": "in" },
+      { "id": "e_wint_out", "source": "wait_int", "sourceHandle": "out", "target": "if_int", "targetHandle": "in" },
+      { "id": "e_wint_timeout", "source": "wait_int", "sourceHandle": "timeout", "target": "join_checks_stuck", "targetHandle": "in" },
+      { "id": "e_wint_failure", "source": "wait_int", "sourceHandle": "failure", "target": "join_checks_stuck", "targetHandle": "in" },
+      { "id": "e_cint_bad", "source": "checks_int", "sourceHandle": "failure", "target": "map_int_fail", "targetHandle": "in" },
+      { "id": "e_cint_map", "source": "map_int_fail", "sourceHandle": "out", "target": "switch_int_fail", "targetHandle": "in" },
+      { "id": "e_cint_notclean", "source": "switch_int_fail", "sourceHandle": "case-0", "target": "join_clean_stack", "targetHandle": "in" },
+      { "id": "e_cint_unhealthy", "source": "switch_int_fail", "sourceHandle": "case-1", "target": "join_clean_stack", "targetHandle": "in" },
+      { "id": "e_cint_unknownstack", "source": "switch_int_fail", "sourceHandle": "case-2", "target": "join_clean_stack", "targetHandle": "in" },
+      { "id": "e_cint_badstack", "source": "switch_int_fail", "sourceHandle": "case-3", "target": "join_clean_stack", "targetHandle": "in" },
+      { "id": "e_cint_norecipes", "source": "switch_int_fail", "sourceHandle": "case-4", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cint_unknown", "source": "switch_int_fail", "sourceHandle": "case-5", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cint_wrongtree", "source": "switch_int_fail", "sourceHandle": "case-6", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cint_hook", "source": "switch_int_fail", "sourceHandle": "case-7", "target": "join_recipe_gap", "targetHandle": "in" },
+      { "id": "e_cint_other", "source": "switch_int_fail", "sourceHandle": "default", "target": "join_checks_http_fail", "targetHandle": "in" },
+      { "id": "e_int_pass", "source": "if_int", "sourceHandle": "pass", "target": "join_finalize", "targetHandle": "in" },
+      { "id": "e_int_fail", "source": "if_int", "sourceHandle": "fail", "target": "map_int_red", "targetHandle": "in" },
+      { "id": "e_intred_map", "source": "map_int_red", "sourceHandle": "out", "target": "switch_int_red", "targetHandle": "in" },
+      { "id": "e_intred_missing", "source": "switch_int_red", "sourceHandle": "case-0", "target": "join_missing_verdict", "targetHandle": "in" },
+      { "id": "e_intred_failed", "source": "switch_int_red", "sourceHandle": "case-1", "target": "join_check_failed", "targetHandle": "in" },
+      { "id": "e_intred_queued", "source": "switch_int_red", "sourceHandle": "case-2", "target": "join_missing_verdict", "targetHandle": "in" },
+      { "id": "e_intred_other", "source": "switch_int_red", "sourceHandle": "default", "target": "join_gate_fail", "targetHandle": "in" },
+
+      { "id": "e_fin_run", "source": "join_finalize", "sourceHandle": "out", "target": "finalize", "targetHandle": "in" },
+      { "id": "e_fin_ok", "source": "finalize", "sourceHandle": "success", "target": "pr_ready", "targetHandle": "in" },
+      { "id": "e_fin_bad", "source": "finalize", "sourceHandle": "failure", "target": "map_fin_fail", "targetHandle": "in" },
+      { "id": "e_fin_map", "source": "map_fin_fail", "sourceHandle": "out", "target": "switch_fin_fail", "targetHandle": "in" },
+      { "id": "e_fin_notready", "source": "switch_fin_fail", "sourceHandle": "case-0", "target": "finalize_not_ready", "targetHandle": "in" },
+      { "id": "e_fin_nothing", "source": "switch_fin_fail", "sourceHandle": "case-1", "target": "finalize_nothing_staged", "targetHandle": "in" },
+      { "id": "e_fin_push", "source": "switch_fin_fail", "sourceHandle": "case-2", "target": "finalize_push_failed", "targetHandle": "in" },
+      { "id": "e_fin_commit", "source": "switch_fin_fail", "sourceHandle": "case-3", "target": "finalize_commit_failed", "targetHandle": "in" },
+      { "id": "e_fin_head", "source": "switch_fin_fail", "sourceHandle": "case-4", "target": "join_stale_head", "targetHandle": "in" },
+      { "id": "e_fin_lease", "source": "switch_fin_fail", "sourceHandle": "case-5", "target": "finalize_lease_held", "targetHandle": "in" },
+      { "id": "e_fin_other", "source": "switch_fin_fail", "sourceHandle": "default", "target": "finalize_fail", "targetHandle": "in" },
+
+      { "id": "e_join_park_state", "source": "join_park_state", "sourceHandle": "out", "target": "park_state", "targetHandle": "in" },
+      { "id": "e_join_stale_head", "source": "join_stale_head", "sourceHandle": "out", "target": "park_stale_head", "targetHandle": "in" },
+      { "id": "e_join_route_gap", "source": "join_route_gap", "sourceHandle": "out", "target": "park_route_gap", "targetHandle": "in" },
+      { "id": "e_join_recipe_gap", "source": "join_recipe_gap", "sourceHandle": "out", "target": "park_recipe_gap", "targetHandle": "in" },
+      { "id": "e_join_dirty", "source": "join_dirty", "sourceHandle": "out", "target": "park_dirty", "targetHandle": "in" },
+      { "id": "e_join_identity", "source": "join_identity", "sourceHandle": "out", "target": "park_identity", "targetHandle": "in" },
+      { "id": "e_join_preflight_fail", "source": "join_preflight_fail", "sourceHandle": "out", "target": "preflight_fail", "targetHandle": "in" },
+      { "id": "e_join_no_writer_session", "source": "join_no_writer_session", "sourceHandle": "out", "target": "no_writer_session", "targetHandle": "in" },
+      { "id": "e_join_writer_stuck", "source": "join_writer_stuck", "sourceHandle": "out", "target": "writer_stuck", "targetHandle": "in" },
+      { "id": "e_join_writer_red", "source": "join_writer_red", "sourceHandle": "out", "target": "writer_red", "targetHandle": "in" },
+      { "id": "e_join_missing_verdict", "source": "join_missing_verdict", "sourceHandle": "out", "target": "park_missing_verdict", "targetHandle": "in" },
+      { "id": "e_join_check_failed", "source": "join_check_failed", "sourceHandle": "out", "target": "park_check_failed", "targetHandle": "in" },
+      { "id": "e_join_gate_fail", "source": "join_gate_fail", "sourceHandle": "out", "target": "gate_fail", "targetHandle": "in" },
+      { "id": "e_join_checks_stuck", "source": "join_checks_stuck", "sourceHandle": "out", "target": "checks_stuck", "targetHandle": "in" },
+      { "id": "e_join_checks_http_fail", "source": "join_checks_http_fail", "sourceHandle": "out", "target": "checks_http_fail", "targetHandle": "in" },
+      { "id": "e_join_clean_stack", "source": "join_clean_stack", "sourceHandle": "out", "target": "park_not_a_clean_stack", "targetHandle": "in" },
+      { "id": "e_join_review_stuck", "source": "join_review_stuck", "sourceHandle": "out", "target": "review_stuck", "targetHandle": "in" },
+      { "id": "e_join_advance_fail", "source": "join_advance_fail", "sourceHandle": "out", "target": "advance_fail", "targetHandle": "in" }
+    ]
+  }
+}
