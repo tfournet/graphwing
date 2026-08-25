@@ -28,6 +28,7 @@ CATALOG = (
     "scripts.json",
     "tests.json",
     "profiles.json",
+    "graphs/visual-evidence.json",
     "SOUL.md",
     "README.md",
 )

@@ -21,5 +21,6 @@ Copy `examples/rewst-install.example.json` to `$GRAPHWING_HOME/rewst-install.jso
 |---|---|---|
 | `graphwing-verify-stack` | `stack`, `ports` | stackStatus → portCheck |
 | `graphwing-implement-slice` | `repo`, `branch`, `index`, optional `ticket`, `commit_message`, `test`, `class`, `size`, optional `kick_url` | frontier → route → fileHead → agentRun → test → opposing spec-review → complete → commit → push → continue |
+| `graphwing-visual-evidence` | `build_id`, `event_id`, optional `reviewer` | strict preflight → stable preview → real browser before/candidate → inspect/one recapture → automated UI review → durable artifact handoff → Rewst GitHub issue files/comment → optional exact planning-pane prompt; terminal pre-commit with preview alive |
 | `graphwing-pr-drive` | Manual, form, or authenticated webhook: `repo`, `pr`, `test`, `prompt`, `commit_message` | mergeable = all_green and not blocking reviews; red → checkout PR head → agent → testRun → commit/push or keep files on red → checks again |
 | `graphwing-pr-status` | Manual or unauthenticated webhook: `pr` | ghPrView → ghPrChecks → mergeable, red, pending, or blocking reviews; no writes |

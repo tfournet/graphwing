@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -3676,7 +3677,10 @@ class BuildStateTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["stage"], "review")
-        self.assertEqual(payload["evidence_rounds"], [{"n": 1, "shots": ["home.png"]}])
+        self.assertEqual(payload["evidence_rounds"][0]["round"], 1)
+        self.assertEqual(payload["evidence_rounds"][0]["captures"], 1)
+        self.assertNotIn("shots", payload["evidence_rounds"][0])
+        self.assertEqual(self._read_doc()["evidence_rounds"], [{"n": 1, "shots": ["home.png"]}])
 
     def test_an_out_of_order_action_is_refused_and_names_the_expected_one(self):
         self.assertEqual(self._create()[0], 201)
@@ -5599,6 +5603,636 @@ class BuildStateTests(unittest.TestCase):
         for frm, to in server.BUILD_TRANSITIONS.values():
             stages.update((frm, to))
         self.assertEqual(set(schemas["BuildState"]["properties"]["stage"]["enum"]), stages)
+
+
+class VisualEvidenceTests(unittest.TestCase):
+    """The visual round is real-page proof, not a screenshot-shaped receipt."""
+
+    BUILD = BuildStateTests.BUILD
+    BRANCH = BuildStateTests.BRANCH
+    _git = BuildStateTests._git
+    _create_body = BuildStateTests._create_body
+    _create = BuildStateTests._create
+    _post_build = BuildStateTests._post_build
+    _read_doc = BuildStateTests._read_doc
+    _write_doc = BuildStateTests._write_doc
+    _doc_path = BuildStateTests._doc_path
+
+    def setUp(self):
+        BuildStateTests.setUp(self)
+        stacks = {
+            "clean-stack": {
+                "name": "clean-stack", "role": "clean", "cwd": self.clean_runner,
+                "runner": "git-worktree",
+            },
+            "preview-52": {
+                "name": "preview-52", "role": "preview", "cwd": self.repo,
+                "base_url": "http://127.0.0.1:4173",
+            },
+        }
+        patcher = mock.patch.object(server, "build_stack_catalog", return_value=stacks)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _contract(self, human_review=True):
+        return {
+            "route": "/settings/billing",
+            "scenario": "billing-ready",
+            "setup": ["Sign in through the normal test login"],
+            "navigation": ["Open Settings", "Choose Billing"],
+            "expected": ["Current plan: Pro", "Save changes"],
+            "checklist": ["Plan and save action are visible"],
+            "viewports": [{"name": "desktop", "width": 1280, "height": 720}],
+            "human_review": human_review,
+            "preview_stack": "preview-52",
+            "browser_recipe": "visual-browser",
+            "tenant": "Acme test",
+            "planning_pane": "w1:p3" if human_review else None,
+            "allow_login_redirect": False,
+        }
+
+    def _visual_create(self, human_review=True):
+        (self.repo / "ticket.md").write_text("# Visual ticket\n\nShow the current plan and save action.\n")
+        verification = {
+            "fast": ["fast"], "integration": ["integration"],
+            "needs_visual_proof": True, "human_visual_review": human_review,
+            "visual": self._contract(human_review),
+        }
+        status, payload, _ = self._create(
+            story="https://github.com/tfournet/graphwing/issues/52",
+            ticket="ticket.md",
+            route={
+                "class": "visual", "launcher": "hermes", "model": "grok-4.6",
+                "max_turns": 12, "run_budget_seconds": 900, "reviewer1": "sonnet",
+            },
+            verification=verification,
+            stacks=["preview-52"],
+        )
+        self.assertEqual(status, 201, payload)
+        doc = self._read_doc()
+        doc["stage"] = "evidence"
+        self._write_doc(doc)
+        return self._read_doc()
+
+    def test_preflight_requires_complete_contract_and_explicit_human_boolean(self):
+        contract = self._contract()
+        contract.pop("human_review")
+        parsed, error = server.parse_build_visual(contract)
+        self.assertIsNone(parsed)
+        self.assertEqual(error["code"], "missing_human_review")
+        for missing in ("navigation", "expected", "checklist", "viewports"):
+            with self.subTest(missing=missing):
+                incomplete = self._contract()
+                incomplete.pop(missing)
+                self.assertEqual(server.parse_build_visual(incomplete)[1]["code"], "bad_visual")
+
+    def test_preview_identity_url_and_instructions_are_stable_on_resume(self):
+        doc = self._visual_create()
+        recipe = {"visual-browser": {"name": "visual-browser", "cwd": self.repo,
+                  "argv": ["browser"], "timeout_seconds": 30, "unresolvable": None}}
+        healthy = {"ok": True, "healthy": True}
+        probe = {"ok": True, "status": 200}
+        with mock.patch.object(server, "build_visual_recipe_catalog", return_value=recipe), \
+             mock.patch.object(server, "stack_ensure_started", return_value={"ok": True, "resumed": True}), \
+             mock.patch.object(server, "stack_status", return_value=healthy), \
+             mock.patch.object(server, "probe_loopback", return_value=probe):
+            first = self._post_build("visual/preview", event_id="preview-one", holder="event:round-1")
+            replay = self._post_build("visual/preview", event_id="preview-one", holder="event:round-1")
+        self.assertEqual(first[0], 200, first[1])
+        self.assertEqual(first[1]["preview"]["url"], "http://127.0.0.1:4173/settings/billing")
+        self.assertEqual(first[1]["preview"]["preview_id"], server.build_preview_identity(doc, "preview-52"))
+        self.assertEqual(first[1]["instructions"]["navigation"], self._contract()["navigation"])
+        self.assertTrue(replay[1]["replayed"])
+
+    def test_real_page_observation_records_visible_a11y_console_and_request_results(self):
+        contract = self._contract()
+        preview = {"url": "http://127.0.0.1:4173/settings/billing", "preview_id": "preview-id",
+                   "http_status": 200}
+        observation = {
+            "mode": "browser", "synthetic": False, "url": preview["url"],
+            "route": contract["route"], "tenant": contract["tenant"],
+            "served_by": preview["preview_id"], "http_status": 200,
+            "visible": ["Current plan: Pro", "Save changes"],
+            "accessibility": {"ok": False, "violations": ["missing label"]},
+            "console": {"ok": False, "errors": ["hydration failed"]},
+            "requests": {"ok": False, "failures": ["GET /api/plan 500"]},
+            "images": [{"file": "candidate.png", "viewport": "desktop", "source": "browser"}],
+        }
+        self.assertEqual(server.build_visual_observation_gaps(observation, contract, preview), [])
+        for mutation in (
+            {"mode": "dom"}, {"synthetic": True}, {"url": "http://127.0.0.1:9/fake"},
+            {"accessibility": {}}, {"console": {}}, {"requests": {}},
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertTrue(server.build_visual_observation_gaps({**observation, **mutation}, contract, preview))
+
+    def test_review_identity_prompt_and_image_inspection_cover_every_visual_lens(self):
+        doc = {
+            "route": {"model": "grok-4.6"}, "verification": {"visual": self._contract()},
+            "worktree": str(self.repo), "base_head": self.head, "ticket": "ticket.md",
+        }
+        capture = {
+            "role": "candidate", "viewport": "desktop", "width": 1280,
+            "route": "/wrong", "tenant": "Other tenant", "obscured": True,
+            "text": ["Current plan"], "path": "/tmp/candidate.png",
+        }
+        reasons = server.build_visual_image_reasons(capture, self._contract())
+        self.assertTrue(any("obscured" in reason for reason in reasons))
+        self.assertTrue(any("not '/settings/billing'" in reason for reason in reasons))
+        self.assertTrue(any("visible tenant" in reason for reason in reasons))
+        self.assertTrue(any("Save changes" in reason for reason in reasons))
+        self.assertIn("own vendor", server.build_review_authority_gap(doc, "grok"))
+        rnd = {"preview": {"url": "http://127.0.0.1:4173/settings/billing"},
+               "observations": {"candidate": {"accessibility": {"ok": True}}}, "captures": []}
+        prompt = server.build_visual_review_prompt(doc, rnd)
+        for phrase in ("Ticket:", "Diff for this round:", "Browser observations:", "Screenshots", "ACCESSIBILITY"):
+            self.assertIn(phrase, prompt)
+
+    def test_recapture_and_superseding_rounds_keep_before_candidate_history(self):
+        doc = {"verification": {"visual": self._contract()}, "evidence_rounds": []}
+        first = server.build_visual_round_start(doc, {"head": "a" * 40, "change_id": "change-1"})
+        self.assertEqual(server.build_visual_required_roles(first), ["before", "candidate"])
+        first["status"] = "published"
+        second = server.build_visual_round_start(doc, {"head": "b" * 40, "change_id": "change-2"})
+        self.assertEqual(second["supersedes"], 1)
+        self.assertEqual(server.build_visual_required_roles(second), ["candidate"])
+        second["preview"] = {"preview_id": "stable-preview", "url": "http://127.0.0.1:4173/settings/billing"}
+        second["captures"] = [{"role": "candidate", "viewport": "desktop"}]
+        second["inspection"] = {"change_id": "change-2", "ok": False,
+                                "recapture": ["candidate/desktop"], "error": "obscured"}
+        second["inspection_queue"] = [{"role": "candidate", "only": ["desktop"]}]
+        with mock.patch.object(server, "build_visual_contract_gaps", return_value=[]):
+            self.assertEqual(server.build_visual_step({**doc, "stage": "evidence", "budget": {"jobs_max": 9, "jobs_used": 0}}, "change-2")[0], "scenario")
+        self.assertEqual(len(doc["evidence_rounds"]), 2)
+
+    def test_simultaneous_before_and_candidate_failures_queue_both_roles_once(self):
+        failures = [
+            {"role": "before", "viewport": "desktop"},
+            {"role": "candidate", "viewport": "desktop"},
+        ]
+        queue = server.build_visual_recapture_queue(failures, {})
+        self.assertEqual(queue, [
+            {"role": "before", "only": ["desktop"]},
+            {"role": "candidate", "only": ["desktop"]},
+        ])
+        rnd = {
+            "round": 1, "status": "open", "change_id": "change-1",
+            "preview": {"url": "http://127.0.0.1:4173/settings/billing"},
+            "captures": [
+                {"role": "before", "viewport": "desktop"},
+                {"role": "candidate", "viewport": "desktop"},
+            ],
+            "inspection": {"change_id": "change-1", "ok": False},
+            "inspection_queue": queue,
+            "recapture_attempts": {},
+        }
+        doc = {
+            "stage": "evidence", "budget": {"jobs_max": 9, "jobs_used": 0},
+            "verification": {"visual": self._contract()}, "evidence_rounds": [rnd],
+        }
+        with mock.patch.object(server, "build_visual_contract_gaps", return_value=[]):
+            self.assertEqual(server.build_visual_step(doc, "change-1")[0], "scenario")
+        self.assertEqual(server.build_visual_recapture_target(rnd, "before"), ["desktop"])
+        rnd["recapture_attempts"]["before"] = 1
+        rnd["inspection_queue"] = queue[1:]
+        self.assertIsNone(server.build_visual_recapture_target(rnd, "before"))
+        self.assertEqual(server.build_visual_recapture_target(rnd, "candidate"), ["desktop"])
+        rnd["recapture_attempts"]["candidate"] = 1
+        rnd["inspection_queue"] = []
+        rnd["inspection"] = None
+        with mock.patch.object(server, "build_visual_contract_gaps", return_value=[]):
+            self.assertEqual(server.build_visual_step(doc, "change-1")[0], "inspect")
+        rnd["inspection"] = {"change_id": "change-1", "ok": False,
+                             "recapture": ["before/desktop", "candidate/desktop"]}
+        with mock.patch.object(server, "build_visual_contract_gaps", return_value=[]):
+            self.assertEqual(server.build_visual_step(doc, "change-1")[0], "parked")
+
+    def test_artifact_grant_is_private_expiring_single_use_while_record_is_durable(self):
+        meta = {"artifact_id": "a" * 32, "media_type": "image/png", "grant": None}
+        token, grant = server.artifact_mint_grant(meta, 60)
+        self.assertNotIn(token, json.dumps(grant))
+        self.assertRegex(grant["digest"], r"^[0-9a-f]{64}$")
+        self.assertGreater(grant["expires_epoch"], time.time())
+        self.assertIsNone(grant["consumed_at"])
+
+    def test_artifact_grant_consume_is_atomic_and_symlink_bytes_are_rejected(self):
+        artifact_id = "c" * 32
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(server, "BUILDS_DIR", Path(td) / "builds"):
+            path = server.artifact_dir(artifact_id)
+            path.mkdir(parents=True)
+            token, grant = server.artifact_mint_grant({"artifact_id": artifact_id}, 60)
+            server.artifact_write({"artifact_id": artifact_id, "media_type": "image/png", "grant": grant})
+            (path / "image.png").write_bytes(b"real")
+            barrier = threading.Barrier(8)
+            results = []
+
+            def fetch():
+                barrier.wait()
+                results.append(server.artifact_fetch(artifact_id, {server.BUILD_ARTIFACT_TOKEN_HEADER: token})[0])
+
+            threads = [threading.Thread(target=fetch) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(results.count(200), 1, results)
+            self.assertEqual(results.count(410), 7, results)
+
+            second_id = "d" * 32
+            second = server.artifact_dir(second_id)
+            second.mkdir(parents=True)
+            token2, grant2 = server.artifact_mint_grant({"artifact_id": second_id}, 60)
+            server.artifact_write({"artifact_id": second_id, "media_type": "image/png", "grant": grant2})
+            (second / "target.png").write_bytes(b"secret")
+            (second / "image.png").symlink_to(second / "target.png")
+            self.assertEqual(
+                server.artifact_fetch(second_id, {server.BUILD_ARTIFACT_TOKEN_HEADER: token2})[1]["code"],
+                "artifact_gone",
+            )
+
+    def test_handoff_grant_state_never_remints_after_spent_expired_or_missing(self):
+        states = (
+            ({"digest": "a" * 64, "consumed_at": "2026-08-25T12:00:00Z",
+              "expires_epoch": time.time() + 60}, "grant_spent"),
+            ({"digest": "b" * 64, "consumed_at": None,
+              "expires_epoch": time.time() - 1}, "grant_expired"),
+            (None, "grant_missing"),
+        )
+        for number, (grant, expected) in enumerate(states):
+            with self.subTest(expected=expected):
+                artifact_id = f"{number + 1:032x}"
+                path = server.artifact_dir(artifact_id)
+                path.mkdir(parents=True, exist_ok=True)
+                meta = {"artifact_id": artifact_id, "number": 1, "role": "candidate",
+                        "viewport": "desktop", "media_type": "image/png", "digest": "d" * 64,
+                        "grant": grant}
+                server.artifact_write(meta)
+                outstanding, code = server.artifact_grant_replay_state([artifact_id])
+                self.assertEqual(outstanding, [])
+                self.assertEqual(code, expected)
+
+    def test_visual_route_is_strict_and_comment_fields_are_markdown_safe(self):
+        for route in (
+            "https://evil.test/x", "//evil.test/x", "/@evil.test", "/white space", "/line\nbreak",
+            "/x?token=abc", "/x#frag", "/x\\y", "/ghp_abcdefghijklmnopqrstuvwxyz",
+        ):
+            with self.subTest(route=route):
+                contract = self._contract()
+                contract["route"] = route
+                self.assertIsNotNone(server.parse_build_visual(contract)[1])
+        safe = server.github_markdown_text("@octocat [x](evil)\nnext")
+        self.assertNotIn("@octocat", safe)
+        self.assertNotIn("\n", safe)
+        self.assertIn("\\[x\\]", safe)
+        self.assertTrue(server.durable_github_url("https://github.com/tfournet/graphwing/assets/1"))
+        self.assertFalse(server.durable_github_url("http://github.com/tfournet/graphwing/assets/1"))
+        self.assertFalse(server.durable_github_url("https://evil.test/asset"))
+        self.assertFalse(server.durable_github_url("https://github.com/x?token=secret"))
+
+    def test_durable_github_urls_reject_malformed_authorities(self):
+        for url in (
+            "https://github.com/o/r/assets/1",
+            "https://github.com:443/o/r/assets/1",
+            "https://raw.githubusercontent.com/o/r/main/proof.png",
+            "https://user-images.githubusercontent.com/1/proof.png",
+        ):
+            with self.subTest(valid=url):
+                self.assertTrue(server.durable_github_url(url))
+        for url in (
+            "https://github.com:443>/assets/1",
+            "https://github.com%3e/assets/1",
+            "https://github.com\\@evil.test/assets/1",
+            "https://github.com\t.evil.test/assets/1",
+            "https://user@github.com/assets/1",
+            "https://[::1]/assets/1",
+            "https://github.com:444/assets/1",
+            "https://github.com:notaport/assets/1",
+            "https://github.com./assets/1",
+            "https://github.com.evil.test/assets/1",
+            "https://githubusercontent.com/assets/1",
+        ):
+            with self.subTest(invalid=url):
+                self.assertFalse(server.durable_github_url(url))
+        self.assertTrue(server.durable_upload_ref("github-asset-123"))
+        self.assertTrue(server.durable_upload_ref("https://github.com:443/o/r/assets/1"))
+        self.assertFalse(server.durable_upload_ref("https://github.com:443>/assets/1"))
+        self.assertFalse(server.durable_upload_ref("https%3a//github.com:443>/assets/1"))
+
+    def test_unvalidated_authorities_never_break_out_of_markdown(self):
+        attacks = (
+            "https://github.com:443>/assets/1",
+            "https://github.com%3e/assets/1",
+            "https://github.com\\@evil.test/assets/1",
+            "https://user@github.com/assets/1",
+            "https://[::1]:443>/assets/1",
+            "http://127.0.0.1:4173>/proof",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                rendered = server.github_markdown_url(attack)
+                self.assertFalse(rendered.startswith("<"), rendered)
+                self.assertNotIn("<https://", rendered)
+                self.assertNotIn(":443>", rendered)
+        self.assertFalse(server.loopback_http_url("http://127.0.0.1:4173>/proof"))
+
+    def test_validated_urls_are_rendered_as_markdown_safe_autolinks(self):
+        attacks = (
+            ")![x](", "@octocat", "<b>html</b>", "user@example.test",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                rendered = server.github_markdown_url("https://github.com/o/r/assets/" + attack)
+                self.assertTrue(rendered.startswith("<https://github.com/"), rendered)
+                self.assertTrue(rendered.endswith(">"), rendered)
+                self.assertNotIn("\n", rendered)
+                self.assertNotIn(")![x](", rendered)
+                self.assertNotIn("@octocat", rendered)
+                self.assertNotIn("<b>", rendered)
+        for invalid in (
+            "https://github.com/o/r/assets/line\nbreak",
+            "https://github.com/o/r/assets/1?query=x",
+            "https://github.com/o/r/assets/1#fragment",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(server.github_markdown_url(invalid).startswith("<"))
+        doc = {"build_id": self.BUILD, "branch": self.BRANCH,
+               "verification": {"visual": self._contract()}}
+        rnd = {
+            "round": 1, "head": self.head, "human_review": True,
+            "preview": {"preview_id": "p", "url": "http://127.0.0.1:4173/a)![x](b"},
+            "review": {"reviewer": "sonnet", "summary": "ok", "findings": False},
+        }
+        comment = server.build_evidence_comment(doc, rnd, [{
+            "number": 1, "role": "candidate", "viewport": "desktop", "label": "x",
+            "artifact_id": "a" * 32, "url": "https://github.com/o/r/assets/a)![x](b",
+        }])
+        self.assertNotIn(")![x](", comment)
+        self.assertIn("<http://127.0.0.1:4173/a%29%21%5Bx%5D%28b>", comment)
+
+    def test_probe_loopback_does_not_follow_redirects_and_only_allows_safe_login(self):
+        class Redirects(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/ok":
+                    self.send_response(204)
+                elif self.path == "/login-redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/login")
+                elif self.path == "/decoy":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.1:9/login")
+                else:
+                    self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, _format, *_args):
+                return
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Redirects)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        self.assertEqual(server.probe_loopback(base + "/ok")["status"], 204)
+        refused = server.probe_loopback(base + "/login-redirect")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["status"], 302)
+        allowed = server.probe_loopback(base + "/login-redirect", allow_login=True)
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(allowed["status"], 302)
+        self.assertEqual(allowed["final_location"], base + "/login")
+        self.assertFalse(server.probe_loopback(base + "/decoy", allow_login=True)["ok"])
+        self.assertFalse(server.probe_loopback(base + "/missing", allow_login=True)["ok"])
+
+    def test_recipe_observation_cannot_override_graphwing_authority(self):
+        contract = self._contract()
+        preview = {
+            "url": "http://127.0.0.1:4173/settings/billing", "preview_id": "preview-id",
+            "route": contract["route"], "tenant": contract["tenant"], "http_status": 200,
+        }
+        base = {
+            "mode": "browser", "synthetic": False, "url": preview["url"], "route": contract["route"],
+            "tenant": contract["tenant"], "served_by": preview["preview_id"], "http_status": 200,
+            "visible": [], "accessibility": {"ok": True}, "console": {"ok": True},
+            "requests": {"ok": True},
+            "images": [{"file": "candidate.png", "viewport": "desktop", "source": "browser"}],
+        }
+        for field, value in (
+            ("mode", "dom"), ("synthetic", True), ("route", "/forged"), ("tenant", "Other"),
+            ("served_by", "forged"), ("http_status", 404),
+            ("final_location", "http://127.0.0.1:9/login"),
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(server.build_visual_observation_gaps({**base, field: value}, contract, preview))
+
+    def test_visual_browser_catalog_is_graphwing_owned_and_integrity_pinned(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            driver = home / "bin" / "visual-browser"
+            driver.parent.mkdir()
+            driver.write_text("#!/bin/sh\nexit 0\n")
+            digest = __import__("hashlib").sha256(driver.read_bytes()).hexdigest()
+            catalog_path = home / "visual-browsers.json"
+            catalog_path.write_text(json.dumps({"browsers": [{
+                "name": "visual-browser", "argv": ["./bin/visual-browser"],
+                "integrity_path": "bin/visual-browser", "sha256": digest,
+                "timeout_seconds": 30,
+            }]}))
+            with mock.patch.object(server, "HOME", home), \
+                 mock.patch.object(server, "VISUAL_BROWSERS_PATH", catalog_path):
+                catalog = server.build_visual_recipe_catalog()
+                self.assertEqual(catalog["visual-browser"]["cwd"], home)
+                self.assertEqual(catalog["visual-browser"]["integrity_sha256"], digest)
+                self.assertIsNone(catalog["visual-browser"]["unresolvable"])
+                catalog_path.write_text(catalog_path.read_text().replace(digest, "0" * 64))
+                self.assertEqual(
+                    server.build_visual_recipe_catalog()["visual-browser"]["unresolvable"],
+                    "browser driver integrity does not match its installed pin",
+                )
+
+    def test_stopped_preview_starts_once_and_healthy_replay_attaches(self):
+        entry = {"name": "preview-52", "cwd": self.repo, "compose_file": "compose.yml"}
+        with mock.patch.object(server, "stack_status", side_effect=[{"healthy": False}, {"healthy": True}]), \
+             mock.patch.object(server, "run_cmd", return_value={"ok": True}) as run:
+            self.assertEqual(server.stack_ensure_started(entry), {"ok": True, "resumed": False, "error": None})
+            self.assertEqual(server.stack_ensure_started(entry), {"ok": True, "resumed": True})
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(server.loopback_http_url("http://[::1]:4173"))
+
+    def test_round_history_is_complete_beyond_public_summary_bound(self):
+        doc = {"verification": {"visual": self._contract()}, "evidence_rounds": []}
+        for number in range(40):
+            rnd = server.build_visual_round_start(
+                doc, {"head": f"{number:040x}", "change_id": f"change-{number}"}
+            )
+            rnd["status"] = "published"
+            rnd["preview"] = {
+                "preview_id": f"preview-{number}", "url": f"http://127.0.0.1:{4100 + number}/proof",
+                "healthy": True, "browser_argv": ["browser", "--token=secret"],
+            }
+            rnd["captures"] = [
+                {"role": "candidate", "viewport": "desktop", "verified": True,
+                 "path": f"/tmp/round-{number}.png", "text": ["unredacted page text"]},
+                {"role": "before", "viewport": "desktop", "verified": False,
+                 "path": f"/tmp/before-{number}.png"},
+            ]
+            rnd["observations"] = {"candidate": {"cookies": ["session=secret"], "raw": "page text"}}
+            rnd["inspection"] = {"ok": False, "recapture": ["candidate/desktop"]}
+            rnd["review"] = {"verdict": "NACK", "findings": True, "text": "raw review transcript"}
+            rnd["published"] = {
+                "commented_at": f"2026-08-25T12:{number:02d}:00Z",
+                "comment_url": f"https://github.com/tfournet/graphwing/issues/52#issuecomment-{number}",
+                "grant": "secret-grant", "comment": "unredacted comment text",
+            }
+            rnd["prompted_at"] = f"2026-08-25T13:{number:02d}:00Z"
+        self.assertEqual(len(doc["evidence_rounds"]), 40)
+        self.assertEqual(doc["evidence_rounds"][-1]["supersedes"], 39)
+        public = server.build_public(doc)
+        self.assertEqual(len(doc["evidence_rounds"]), 40)
+        self.assertEqual(len(public["evidence_rounds"]), server.BUILD_EVIDENCE_ROUNDS_KEPT)
+        self.assertEqual(public["evidence_rounds"][0]["round"], 9)
+        self.assertEqual(public["evidence_rounds"][-1]["round"], 40)
+        self.assertEqual(public["visual_round"], public["evidence_rounds"][-1])
+        latest = public["visual_round"]
+        self.assertEqual(latest["preview"], {
+            "preview_id": "preview-39", "url": "http://127.0.0.1:4139/proof", "healthy": True,
+        })
+        self.assertEqual(latest["captures"], 2)
+        self.assertEqual(latest["verified"], 1)
+        self.assertEqual(latest["recapture"], ["candidate/desktop"])
+        self.assertEqual(latest["published_at"], "2026-08-25T12:39:00Z")
+        public_text = json.dumps(public["evidence_rounds"])
+        for secret in ("/tmp/", "unredacted", "secret", "browser_argv", "cookies", "observations"):
+            self.assertNotIn(secret, public_text)
+
+    def test_nack_and_no_verdict_cannot_handoff(self):
+        for review in ({"verdict": "NACK"}, {"verdict": None, "no_verdict": True}):
+            rnd = {
+                "inspection": {"ok": True}, "review": review,
+                "captures": [{"verified": True, "role": "candidate"}],
+            }
+            self.assertEqual(server.build_visual_handoff_gap(rnd), "review_not_passed")
+
+    def test_comment_url_must_match_issue_and_round(self):
+        issue = {"owner": "tfournet", "repo": "graphwing", "number": 52}
+        good = "https://github.com/tfournet/graphwing/issues/52#issuecomment-123"
+        self.assertIsNone(server.github_comment_url_gap(good, issue))
+        self.assertIsNotNone(server.github_comment_url_gap(
+            "https://github.com/tfournet/graphwing/issues/51#issuecomment-123", issue
+        ))
+        for url in (
+            "https://github.com:443>/tfournet/graphwing/issues/52#issuecomment-123",
+            "https://github.com%3e/tfournet/graphwing/issues/52#issuecomment-123",
+            "https://user@github.com/tfournet/graphwing/issues/52#issuecomment-123",
+            "https://[::1]/tfournet/graphwing/issues/52#issuecomment-123",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNotNone(server.github_comment_url_gap(url, issue))
+
+    def test_github_issue_comment_payload_uses_durable_artifact_ids_and_no_shortcut(self):
+        doc = {
+            "build_id": self.BUILD, "branch": self.BRANCH,
+            "verification": {"visual": self._contract()},
+        }
+        rnd = {
+            "round": 2, "head": self.head, "supersedes": 1, "human_review": True,
+            "preview": {"preview_id": "preview-id", "url": "http://127.0.0.1:4173/settings/billing"},
+            "review": {"reviewer": "sonnet", "findings": False, "summary": "acknowledged"},
+            "observations": {"candidate": {"visible": ["Current plan: Pro"],
+                "accessibility": {"ok": True}, "console": {"ok": True}, "requests": {"ok": True}}},
+        }
+        uploads = [{"number": 1, "role": "candidate", "viewport": "desktop", "label": "billing",
+                    "artifact_id": "b" * 32, "url": "https://github.com/tfournet/graphwing/assets/1"}]
+        comment = server.build_evidence_comment(doc, rnd, uploads)
+        for expected in ("round 2", "round 1", "b" * 32, uploads[0]["url"], "accessibility", "pre-commit"):
+            self.assertIn(expected.lower(), comment.lower())
+        self.assertNotIn("shortcut", comment.lower())
+        self.assertEqual(server.build_issue_target({"story": "https://github.com/tfournet/graphwing/issues/52"})[0]["number"], 52)
+
+    def test_exact_planning_pane_prompt_is_precommit_and_preserves_stack(self):
+        doc = {"build_id": self.BUILD, "verification": {"visual": self._contract()}}
+        rnd = {
+            "round": 1, "preview": {"url": "http://127.0.0.1:4173/settings/billing"},
+            "published": {"issue": {"url": "https://github.com/tfournet/graphwing/issues/52"},
+                          "uploads": [{"number": 1, "role": "candidate", "viewport": "desktop", "url": "https://example.test/1"}]},
+            "review": {"reviewer": "sonnet", "findings": False, "summary": "acknowledged"},
+        }
+        prompt = server.build_visual_planning_prompt(doc, rnd)
+        self.assertEqual(self._contract()["planning_pane"], "w1:p3")
+        for phrase in ("Open:", "How to view it:", "Proof checklist:", "Screenshots:",
+                       "Nothing is committed", "preview stack stays up", "approve, change"):
+            self.assertIn(phrase, prompt)
+
+    def test_openapi_graph_catalog_install_and_ticket_are_complete(self):
+        root = Path(server.__file__).resolve().parent
+        spec = json.loads((root / "openapi.json").read_text())
+        operations = {
+            "/v1/build/visual/next": ("get", "buildVisualNext"),
+            "/v1/build/visual/preflight": ("post", "buildVisualPreflight"),
+            "/v1/build/visual/preview": ("post", "buildVisualPreview"),
+            "/v1/build/visual/scenario": ("post", "buildVisualScenario"),
+            "/v1/build/visual/inspect": ("post", "buildVisualInspect"),
+            "/v1/build/visual/review": ("post", "buildVisualReview"),
+            "/v1/build/visual/handoff": ("post", "buildVisualHandoff"),
+            "/v1/build/visual/publish": ("post", "buildVisualPublish"),
+            "/v1/build/visual/publish-result": ("post", "buildVisualPublishResult"),
+            "/v1/build/visual/prompt": ("post", "buildVisualPrompt"),
+            "/v1/artifact/{artifact_id}": ("get", "artifactFetch"),
+        }
+        for route, (method, op_id) in operations.items():
+            with self.subTest(route=route):
+                self.assertEqual(spec["paths"][route][method]["operationId"], op_id)
+                schema = spec["paths"][route][method].get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema")
+                if schema and "$ref" in schema:
+                    self.assertFalse(spec["components"]["schemas"][schema["$ref"].split("/")[-1]].get("additionalProperties", True))
+        graph = json.loads((root / "graphs" / "visual-evidence.json").read_text())
+        self.assertEqual(graph["slug"], "graphwing-visual-evidence")
+        text = json.dumps(graph).lower()
+        self.assertIn("github", text)
+        self.assertNotIn("shortcut", text)
+        self.assertNotIn("synthetic", text)
+        self.assertIn("pre-commit", text)
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["recapture_before"]["config"]["role"], "before")
+        self.assertIn("recapture_by_role.before", nodes["recapture_before"]["config"]["only"])
+        self.assertEqual(nodes["recapture_candidate"]["config"]["role"], "candidate")
+        self.assertIn("recapture_by_role.candidate", nodes["recapture_candidate"]["config"]["only"])
+        self.assertIn("publish-result", nodes["publish_result"]["type"])
+        ticket = (root / "slices" / "issue-52-pre-pr-build" / "03-visual-evidence.md").read_text().lower()
+        self.assertNotIn("shortcut", ticket)
+        self.assertIn("github issue #52", ticket)
+        self.assertIn("visual-evidence", (root / "scripts" / "publish_graphs.py").read_text())
+        self.assertIn("graphs", (root / "install.py").read_text())
+
+    def test_visual_graph_is_acyclic_bounded_and_has_deterministic_canary_fixture(self):
+        graph = json.loads((Path(server.__file__).resolve().parent / "graphs" / "visual-evidence.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        incoming = {name: [] for name in nodes}
+        outgoing = {name: [] for name in nodes}
+        for edge in edges:
+            incoming[edge["target"]].append(edge["source"])
+            outgoing[edge["source"]].append(edge["target"])
+        for node_id, sources in incoming.items():
+            if len(sources) > 1:
+                self.assertEqual(nodes[node_id]["type"], "logic.join.any", node_id)
+        indegree = {name: len(sources) for name, sources in incoming.items()}
+        queue = [name for name, degree in indegree.items() if degree == 0]
+        seen = []
+        while queue:
+            name = queue.pop()
+            seen.append(name)
+            for target in outgoing[name]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    queue.append(target)
+        self.assertEqual(len(seen), len(nodes), "visual graph must contain no cycle or unbounded wait")
+        types = [node["type"] for node in nodes.values()]
+        self.assertFalse(any("/v1/build/finalize" in node_type for node_type in types))
+        self.assertFalse(any("/v1/git/commit" in node_type or "/v1/git/push" in node_type for node_type in types))
+        self.assertTrue(any("github" in node_type.lower() and "comment" in node_type.lower() for node_type in types))
+        self.assertIn("canary", graph)
+        self.assertEqual(graph["canary"]["issue"], "https://github.com/tfournet/graphwing/issues/52")
 
 
 if __name__ == "__main__":
