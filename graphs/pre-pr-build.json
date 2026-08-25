@@ -1,0 +1,430 @@
+{
+  "slug": "graphwing-pre-pr-build",
+  "name": "graphwing-pre-pr-build",
+  "tags": ["graphwing-supervised"],
+  "description": "The supervised source workflow. Its first executable action is supervisorRegister, which pins this run id to build_id, event_id, expected_stage, deadline and the exact plan_pane before any writer, check, review or finalize side effect can run: a run that dies before declaring output is still reconcilable, because the launch record was durable before the run could fail. Registration refusing is its own terminal and commits nothing. After registration the durable build state picks the next action, buildAdvance takes the claim under the registered event id, and a replayed event id skips straight to finalize so one event can never fire a second side effect. Tagged graphwing-supervised so trigger.workflowCompleted on graphwing-build-completion-supervisor selects it; the listener carries no tags and cannot select itself. Payload: build_id, event_id, plan_pane, expected_stage, deadline, repo, optional prompt, test, reviewer.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 80 }, "config": {} },
+      {
+        "id": "form",
+        "type": "trigger.form",
+        "label": "Form",
+        "position": { "x": 0, "y": 220 },
+        "config": {
+          "enabled": true,
+          "allowDrafts": false,
+          "inputs": {
+            "build_id": { "type": "string", "required": true, "description": "An already-open pre-PR build" },
+            "event_id": { "type": "string", "required": true, "description": "The one buildAdvance event this run is launched to record. A continuation re-uses it, which is what makes the retry safe." },
+            "plan_pane": { "type": "string", "required": true, "description": "The exact saved planning pane every supervision report goes to. There is no default and no fallback tab." },
+            "expected_stage": { "type": "string", "required": true, "description": "created, writing, verifying, evidence, review, ready, or pr_opened" },
+            "deadline": { "type": "string", "required": true, "description": "UTC instant like 2026-08-25T13:00:00Z. An instant, not a duration." },
+            "repo": { "type": "string", "required": true },
+            "writer_prompt": { "type": "string", "required": true, "description": "Bounded writer prompt content persisted at registration" },
+            "writer_prompt_ref": { "type": "string", "required": true, "description": "Repo-relative ticket or prompt reference" },
+            "fast_recipe": { "type": "string", "required": true, "description": "Named fast tests.json recipe" },
+            "integration_recipe": { "type": "string", "required": true, "description": "Named integration tests.json recipe" },
+            "reviewer": { "type": "string", "required": true, "description": "Spec reviewer" },
+            "class_stamp": { "type": "string", "required": true, "description": "Registered work class stamp" },
+            "route_stamp": { "type": "string", "required": true, "description": "Registered route stamp" }
+          }
+        }
+      },
+      {
+        "id": "hook",
+        "type": "trigger.webhook",
+        "label": "Webhook",
+        "position": { "x": 0, "y": 360 },
+        "config": {
+          "enabled": true,
+          "requireAuthHeader": true,
+          "headerKey": "x-rewst-secret",
+          "headerValue": "$GRAPHWING_HOOK_SECRET",
+          "allowedMethods": ["POST"]
+        }
+      },
+      {
+        "id": "join_start",
+        "type": "logic.join.any",
+        "label": "Start from any trigger",
+        "position": { "x": 160, "y": 220 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "register",
+        "type": "action.graphwing.POST:/v1/supervisor/register",
+        "label": "supervisorRegister (first executable action)",
+        "position": { "x": 340, "y": 220 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}",
+          "workflow_id": "{{ CTX.WORKFLOW.id }}",
+          "workflow_version": "{{ CTX.WORKFLOW.version }}",
+          "expected_stage": "{{ CTX.INPUT.expected_stage }}",
+          "deadline": "{{ CTX.INPUT.deadline }}",
+          "plan_pane": "{{ CTX.INPUT.plan_pane }}",
+          "continuation": {
+            "repo": "{{ CTX.INPUT.repo }}",
+            "writer_prompt": "{{ CTX.INPUT.writer_prompt }}",
+            "writer_prompt_ref": "{{ CTX.INPUT.writer_prompt_ref }}",
+            "fast_recipe": "{{ CTX.INPUT.fast_recipe }}",
+            "integration_recipe": "{{ CTX.INPUT.integration_recipe }}",
+            "reviewer": "{{ CTX.INPUT.reviewer }}",
+            "class_stamp": "{{ CTX.INPUT.class_stamp }}",
+            "route_stamp": "{{ CTX.INPUT.route_stamp }}"
+          }
+        }
+      },
+      {
+        "id": "registration_refused",
+        "type": "transforms.objectBuilder",
+        "label": "Refused: nothing was started",
+        "position": { "x": 340, "y": 480 },
+        "config": {
+          "alias": "registration_refused",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "registration_refused" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "CTX.INPUT.build_id" } },
+            { "id": "m3", "output": "event_id", "expression": { "kind": "getField", "path": "CTX.INPUT.event_id" } },
+            { "id": "m4", "output": "code", "expression": { "kind": "getField", "path": "TASKS.register.data.code" } },
+            { "id": "m5", "output": "files_intact", "expression": { "kind": "literal", "value": true } }
+          ]
+        }
+      },
+      {
+        "id": "state",
+        "type": "action.graphwing.GET:/v1/build/state",
+        "label": "buildState",
+        "position": { "x": 540, "y": 220 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 15,
+          "build_id": "{{ CTX.INPUT.build_id }}"
+        }
+      },
+      {
+        "id": "switch_next",
+        "type": "logic.switch",
+        "label": "what does the build need next?",
+        "position": { "x": 720, "y": 220 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "parked", "rules": [{ "path": "data.stage", "op": "equals", "value": "parked" }] },
+            { "label": "pr_opened", "rules": [{ "path": "data.stage", "op": "equals", "value": "pr_opened" }] }
+          ],
+          "default": { "label": "advance" }
+        }
+      },
+      {
+        "id": "join_terminal",
+        "type": "logic.join.any",
+        "label": "Build is already terminal",
+        "position": { "x": 900, "y": 40 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "already_terminal",
+        "type": "transforms.objectBuilder",
+        "label": "Build is already terminal",
+        "position": { "x": 1080, "y": 40 },
+        "config": {
+          "alias": "already_terminal",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "terminal" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "CTX.INPUT.build_id" } },
+            { "id": "m3", "output": "event_id", "expression": { "kind": "getField", "path": "CTX.INPUT.event_id" } },
+            { "id": "m4", "output": "stage", "expression": { "kind": "getField", "path": "TASKS.state.data.stage" } },
+            { "id": "m5", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.state.data.park_reason" } }
+          ]
+        }
+      },
+      {
+        "id": "advance",
+        "type": "action.graphwing.POST:/v1/build/advance",
+        "label": "buildAdvance (take the claim before any side effect)",
+        "position": { "x": 900, "y": 220 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "build_id": "{{ CTX.INPUT.build_id }}",
+          "event_id": "{{ CTX.INPUT.event_id }}",
+          "action": "{{ TASKS.state.data.next_action }}",
+          "holder": "{{ CTX.WORKFLOW.runId }}"
+        }
+      },
+      {
+        "id": "filter_replayed",
+        "type": "logic.filter",
+        "label": "already recorded?",
+        "position": { "x": 1080, "y": 220 },
+        "config": {
+          "group": "AND",
+          "rules": [{ "path": "data.replayed", "op": "equals", "value": true }]
+        }
+      },
+      {
+        "id": "switch_side",
+        "type": "logic.switch",
+        "label": "which side effect does this transition own?",
+        "position": { "x": 1260, "y": 300 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "start_writer", "rules": [{ "path": "data.next_action", "op": "equals", "value": "start_writer" }] },
+            { "label": "verify_passed", "rules": [{ "path": "data.next_action", "op": "equals", "value": "verify_passed" }] },
+            { "label": "review_passed", "rules": [{ "path": "data.next_action", "op": "equals", "value": "review_passed" }] }
+          ],
+          "default": { "label": "none" }
+        }
+      },
+      {
+        "id": "wait_writer",
+        "type": "action.wait.webhook",
+        "label": "Wait writer",
+        "position": { "x": 1440, "y": 140 },
+        "config": {
+          "alias": "wait_writer",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "writer",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "agentRun writer",
+        "position": { "x": 1620, "y": 140 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "cwd": "{{ CTX.INPUT.repo }}",
+          "prompt": "{{ CTX.INPUT.writer_prompt }}",
+          "supervised_source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "response_webhook_url": "{{ TASKS.wait_writer.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_writer.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "bind_writer",
+        "type": "action.graphwing.POST:/v1/supervisor/bind",
+        "label": "Bind acknowledged writer job",
+        "position": { "x": 1800, "y": 100 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "job_id": "{{ TASKS.writer.data.job_id }}"
+        }
+      },
+      {
+        "id": "wait_check",
+        "type": "action.wait.webhook",
+        "label": "Wait checks",
+        "position": { "x": 1440, "y": 300 },
+        "config": {
+          "alias": "wait_check",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "check",
+        "type": "action.graphwing.POST:/v1/test/run",
+        "label": "testRun check",
+        "position": { "x": 1620, "y": 300 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 200,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "test": "{{ CTX.INPUT.fast_recipe }}",
+          "supervised_source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "response_webhook_url": "{{ TASKS.wait_check.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_check.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "bind_check",
+        "type": "action.graphwing.POST:/v1/supervisor/bind",
+        "label": "Bind acknowledged check job",
+        "position": { "x": 1800, "y": 300 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "job_id": "{{ TASKS.check.data.job_id }}"
+        }
+      },
+      {
+        "id": "wait_review",
+        "type": "action.wait.webhook",
+        "label": "Wait review",
+        "position": { "x": 1440, "y": 460 },
+        "config": {
+          "alias": "wait_review",
+          "allowedMethods": ["POST"],
+          "authMode": "token",
+          "responseStatus": 200,
+          "timeoutSeconds": 960
+        }
+      },
+      {
+        "id": "review",
+        "type": "action.graphwing.POST:/v1/review/run",
+        "label": "specReview",
+        "position": { "x": 1620, "y": 460 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 200,
+          "repo": "{{ CTX.INPUT.repo }}",
+          "reviewer": "{{ CTX.INPUT.reviewer }}",
+          "prompt": "{{ CTX.INPUT.writer_prompt }}",
+          "supervised_source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "response_webhook_url": "{{ TASKS.wait_review.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_review.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "bind_review",
+        "type": "action.graphwing.POST:/v1/supervisor/bind",
+        "label": "Bind acknowledged review job",
+        "position": { "x": 1800, "y": 460 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "job_id": "{{ TASKS.review.data.job_id }}"
+        }
+      },
+      {
+        "id": "join_writer_done",
+        "type": "logic.join.all",
+        "label": "Writer bound and callback complete",
+        "position": { "x": 1980, "y": 100 },
+        "config": {}
+      },
+      {
+        "id": "join_check_done",
+        "type": "logic.join.all",
+        "label": "Checks bound and callback complete",
+        "position": { "x": 1980, "y": 300 },
+        "config": {}
+      },
+      {
+        "id": "join_review_done",
+        "type": "logic.join.all",
+        "label": "Review bound and callback complete",
+        "position": { "x": 1980, "y": 500 },
+        "config": {}
+      },
+      {
+        "id": "join_side_done",
+        "type": "logic.join.any",
+        "label": "Side effect settled",
+        "position": { "x": 1800, "y": 300 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "join_finalize",
+        "type": "logic.join.any",
+        "label": "Ready to declare output",
+        "position": { "x": 1980, "y": 220 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "finalize",
+        "type": "transforms.objectBuilder",
+        "label": "Declared output",
+        "position": { "x": 2160, "y": 220 },
+        "config": {
+          "alias": "finalize",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "CTX.INPUT.build_id" } },
+            { "id": "m3", "output": "event_id", "expression": { "kind": "getField", "path": "CTX.INPUT.event_id" } },
+            { "id": "m4", "output": "stage", "expression": { "kind": "getField", "path": "TASKS.advance.data.stage" } },
+            { "id": "m5", "output": "replayed", "expression": { "kind": "getField", "path": "TASKS.advance.data.replayed" } },
+            { "id": "m6", "output": "plan_pane", "expression": { "kind": "getField", "path": "CTX.INPUT.plan_pane" } }
+          ]
+        }
+      },
+      {
+        "id": "join_failed",
+        "type": "logic.join.any",
+        "label": "Failed after registration",
+        "position": { "x": 1260, "y": 620 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "failed_no_output",
+        "type": "action.noop",
+        "label": "Fail with no declared output; the launch record is what the supervisor reconciles",
+        "position": { "x": 1440, "y": 620 },
+        "config": {}
+      }
+    ],
+    "edges": [
+      { "id": "e_trigger_join", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_form_join", "source": "form", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_hook_join", "source": "hook", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
+      { "id": "e_join_register", "source": "join_start", "sourceHandle": "out", "target": "register", "targetHandle": "in" },
+      { "id": "e_register_refused", "source": "register", "sourceHandle": "failure", "target": "registration_refused", "targetHandle": "in" },
+      { "id": "e_register_state", "source": "register", "sourceHandle": "success", "target": "state", "targetHandle": "in" },
+      { "id": "e_state_failure", "source": "state", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_state_switch", "source": "state", "sourceHandle": "success", "target": "switch_next", "targetHandle": "in" },
+      { "id": "e_next_parked", "source": "switch_next", "sourceHandle": "case-0", "target": "join_terminal", "targetHandle": "in" },
+      { "id": "e_next_pr", "source": "switch_next", "sourceHandle": "case-1", "target": "join_terminal", "targetHandle": "in" },
+      { "id": "e_terminal_output", "source": "join_terminal", "sourceHandle": "out", "target": "already_terminal", "targetHandle": "in" },
+      { "id": "e_next_advance", "source": "switch_next", "sourceHandle": "default", "target": "advance", "targetHandle": "in" },
+      { "id": "e_advance_failure", "source": "advance", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_advance_filter", "source": "advance", "sourceHandle": "success", "target": "filter_replayed", "targetHandle": "in" },
+      { "id": "e_replayed_pass", "source": "filter_replayed", "sourceHandle": "pass", "target": "join_finalize", "targetHandle": "in" },
+      { "id": "e_replayed_fail", "source": "filter_replayed", "sourceHandle": "fail", "target": "switch_side", "targetHandle": "in" },
+      { "id": "e_side_writer", "source": "switch_side", "sourceHandle": "case-0", "target": "wait_writer", "targetHandle": "in" },
+      { "id": "e_side_check", "source": "switch_side", "sourceHandle": "case-1", "target": "wait_check", "targetHandle": "in" },
+      { "id": "e_side_review", "source": "switch_side", "sourceHandle": "case-2", "target": "wait_review", "targetHandle": "in" },
+      { "id": "e_side_none", "source": "switch_side", "sourceHandle": "default", "target": "join_side_done", "targetHandle": "in" },
+      { "id": "e_wait_writer_pending", "source": "wait_writer", "sourceHandle": "pending", "target": "writer", "targetHandle": "in" },
+      { "id": "e_wait_writer_out", "source": "wait_writer", "sourceHandle": "out", "target": "join_writer_done", "targetHandle": "in" },
+      { "id": "e_wait_writer_timeout", "source": "wait_writer", "sourceHandle": "timeout", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_wait_writer_failure", "source": "wait_writer", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_writer_failure", "source": "writer", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_writer_bind", "source": "writer", "sourceHandle": "success", "target": "bind_writer", "targetHandle": "in" },
+      { "id": "e_bind_writer_join", "source": "bind_writer", "sourceHandle": "success", "target": "join_writer_done", "targetHandle": "in" },
+      { "id": "e_writer_done", "source": "join_writer_done", "sourceHandle": "out", "target": "join_side_done", "targetHandle": "in" },
+      { "id": "e_bind_writer_failure", "source": "bind_writer", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_wait_check_pending", "source": "wait_check", "sourceHandle": "pending", "target": "check", "targetHandle": "in" },
+      { "id": "e_wait_check_out", "source": "wait_check", "sourceHandle": "out", "target": "join_check_done", "targetHandle": "in" },
+      { "id": "e_wait_check_timeout", "source": "wait_check", "sourceHandle": "timeout", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_wait_check_failure", "source": "wait_check", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_check_success", "source": "check", "sourceHandle": "success", "target": "bind_check", "targetHandle": "in" },
+      { "id": "e_bind_check_join", "source": "bind_check", "sourceHandle": "success", "target": "join_check_done", "targetHandle": "in" },
+      { "id": "e_check_done", "source": "join_check_done", "sourceHandle": "out", "target": "join_side_done", "targetHandle": "in" },
+      { "id": "e_check_failure", "source": "check", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_bind_check_failure", "source": "bind_check", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_wait_review_pending", "source": "wait_review", "sourceHandle": "pending", "target": "review", "targetHandle": "in" },
+      { "id": "e_wait_review_out", "source": "wait_review", "sourceHandle": "out", "target": "join_review_done", "targetHandle": "in" },
+      { "id": "e_wait_review_timeout", "source": "wait_review", "sourceHandle": "timeout", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_wait_review_failure", "source": "wait_review", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_review_failure", "source": "review", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_review_bind", "source": "review", "sourceHandle": "success", "target": "bind_review", "targetHandle": "in" },
+      { "id": "e_bind_review_join", "source": "bind_review", "sourceHandle": "success", "target": "join_review_done", "targetHandle": "in" },
+      { "id": "e_review_done", "source": "join_review_done", "sourceHandle": "out", "target": "join_side_done", "targetHandle": "in" },
+      { "id": "e_bind_review_failure", "source": "bind_review", "sourceHandle": "failure", "target": "join_failed", "targetHandle": "in" },
+      { "id": "e_side_finalize", "source": "join_side_done", "sourceHandle": "out", "target": "join_finalize", "targetHandle": "in" },
+      { "id": "e_finalize_output", "source": "join_finalize", "sourceHandle": "out", "target": "finalize", "targetHandle": "in" },
+      { "id": "e_failed_noop", "source": "join_failed", "sourceHandle": "out", "target": "failed_no_output", "targetHandle": "in" }
+    ]
+  }
+}

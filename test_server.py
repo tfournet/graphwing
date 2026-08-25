@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -2898,6 +2899,7 @@ class InstallTests(unittest.TestCase):
                     "--unit-dir",
                     str(units),
                     "--non-interactive",
+                    "--no-omarchy-plugin",
                     "--no-cli",
                     "--tunnel",
                     "none",
@@ -4233,6 +4235,1791 @@ class BuildStateTests(unittest.TestCase):
         for frm, to in server.BUILD_TRANSITIONS.values():
             stages.update((frm, to))
         self.assertEqual(set(schemas["BuildState"]["properties"]["stage"]["enum"]), stages)
+
+
+class CompletionSupervisorTests(unittest.TestCase):
+    """Every terminal Rewst run for a supervised build has to land somewhere.
+
+    The failure this class exists to prevent is a build that quietly stops:
+    Rewst says `completed`, nobody checks whether Graphwing recorded anything,
+    and the branch sits there with a running preview stack and no operator who
+    knows. So the tests are mostly about the answers that are *not* success —
+    a completion with no receipt, a claim with no job, a retry that has already
+    been spent, a second delivery of the same run.
+    """
+
+    BUILD = "bld-sup-0001"
+    BRANCH = "feature/issue-52-supervisor"
+    RUN = "rewst-run-00000001"
+    EVENT = "evt-writer-1"
+    LISTENER = "graphwing-build-completion-supervisor@7"
+    WORKFLOW = "wf-pre-pr-build"
+    VERSION = "v11"
+    DEADLINE = "2099-01-01T00:00:00Z"
+    PLAN_PANE = "pane-plan-issue-52"
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        root = Path(self._td.name)
+        self.home = root / "gwhome"
+        self.builds = self.home / "builds"
+        self.supervisor = self.home / "supervisor"
+        self.jobs = self.home / "jobs"
+        self.jobs.mkdir(parents=True)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        for args in (
+            ["git", "init", "-b", "main", str(self.repo)],
+            ["git", "-C", str(self.repo), "config", "user.email", "gw@test"],
+            ["git", "-C", str(self.repo), "config", "user.name", "graphwing-test"],
+            ["git", "-C", str(self.repo), "config", "commit.gpgsign", "false"],
+        ):
+            subprocess.run(args, check=True, capture_output=True)
+        (self.repo / "README").write_text("hi\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-b", self.BRANCH], check=True, capture_output=True
+        )
+        for attr, value in (
+            ("BUILDS_DIR", self.builds),
+            ("SUPERVISOR_DIR", self.supervisor),
+            ("JOBS_DIR", self.jobs),
+        ):
+            patch = mock.patch.object(server, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        rp = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)})
+        rp.start()
+        self.addCleanup(rp.stop)
+        pane = mock.patch.object(
+            server,
+            "herdr_pane_known",
+            side_effect=lambda pane_id: (
+                (True, "")
+                if pane_id == self.PLAN_PANE
+                else (False, "unknown_plan_pane")
+            ),
+        )
+        pane.start()
+        self.addCleanup(pane.stop)
+        self._open_build()
+
+    # -- helpers ------------------------------------------------------------
+
+    def _open_build(self, build_id=None):
+        body = {
+            "build_id": build_id or self.BUILD,
+            "story": "issue-52 completion supervisor",
+            "repo": "scratch",
+            "branch": self.BRANCH,
+            "stacks": ["riftwing-52"],
+            "budget": {"jobs_max": 12},
+        }
+        status, payload, _ = server.dispatch("POST", "/v1/build/create", {}, True, json.dumps(body).encode())
+        self.assertEqual(status, 201, payload)
+        return payload
+
+    def _advance(self, action, event_id, build_id=None, holder="rewst-run-1"):
+        body = {
+            "build_id": build_id or self.BUILD,
+            "event_id": event_id,
+            "action": action,
+            "holder": holder,
+        }
+        return server.dispatch("POST", "/v1/build/advance", {}, True, json.dumps(body).encode())
+
+    def _register_body(self, **over):
+        body = {
+            "source_run_id": self.RUN,
+            "build_id": self.BUILD,
+            "event_id": self.EVENT,
+            "workflow_id": self.WORKFLOW,
+            "workflow_version": self.VERSION,
+            "expected_stage": "created",
+            "deadline": self.DEADLINE,
+            "plan_pane": self.PLAN_PANE,
+            "continuation": {
+                "repo": "scratch",
+                "writer_prompt": "Implement issue 52 ticket 06b only.",
+                "writer_prompt_ref": "slices/issue-52-pre-pr-build/06b-completion-supervisor.md",
+                "fast_recipe": "fast-checks",
+                "integration_recipe": "integration-checks",
+                "reviewer": "terra",
+                "class_stamp": "mechanical",
+                "route_stamp": "writer-check-review",
+            },
+        }
+        body.update(over)
+        return body
+
+    def _register(self, **over):
+        body = self._register_body(**over)
+        return server.dispatch("POST", "/v1/supervisor/register", {}, True, json.dumps(body).encode())
+
+    def _completion(self, status="failed", run=None, **over):
+        """A trigger.workflowCompleted payload, shaped the way the graph sends it."""
+        body = {
+            "listener_id": self.LISTENER,
+            "source_workflow": {
+                "id": self.WORKFLOW,
+                "slug": "graphwing-pre-pr-build",
+                "name": "graphwing-pre-pr-build",
+                "tags": ["graphwing-supervised"],
+            },
+            "source_run": {
+                "id": run or self.RUN,
+                "status": status,
+                "execution_mode": "live",
+                "started_at": "2026-08-25T10:00:00Z",
+                "finished_at": "2026-08-25T10:04:00Z",
+            },
+            "output": {"build_id": self.BUILD, "event_id": self.EVENT},
+            "error": status != "completed",
+        }
+        for key, value in over.items():
+            if isinstance(value, dict) and isinstance(body.get(key), dict):
+                body[key] = {**body[key], **value}
+            else:
+                body[key] = value
+        return body
+
+    def _reconcile(self, status="failed", run=None, **over):
+        body = self._completion(status=status, run=run, **over)
+        return server.dispatch("POST", "/v1/supervisor/reconcile", {}, True, json.dumps(body).encode())
+
+    def _bind(self, job_id, run=None):
+        return server.dispatch(
+            "POST",
+            "/v1/supervisor/bind",
+            {},
+            True,
+            json.dumps({"source_run_id": run or self.RUN, "job_id": job_id}).encode(),
+        )
+
+    def _watch(self, run=None, **over):
+        body = {"source_run_id": run or self.RUN}
+        body.update(over)
+        return server.dispatch(
+            "POST", "/v1/supervisor/watch", {}, True, json.dumps(body).encode()
+        )
+
+    def _report(self, **qs):
+        return server.dispatch(
+            "GET", "/v1/supervisor/report", {k: [v] for k, v in qs.items()}, True, b""
+        )
+
+    def _write_job(self, job_id, status):
+        path = self.jobs / job_id / "job.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"job_id": job_id, "status": status, "kind": "agent"}) + "\n")
+        return job_id
+
+    def _next_run(self, n):
+        return f"rewst-run-{n:08d}"
+
+    def _fresh_delivery(self, n, status="failed", job_id=None, **over):
+        """A retry is a new Rewst run against the same build event id.
+
+        Nothing redelivers the first run: Rewst re-runs the workflow, which
+        gets its own run id and its own launch registration. That is exactly
+        why the retry counter cannot live on the launch record.
+        """
+        run = self._next_run(n)
+        reg = self._register(source_run_id=run, **({"job_id": job_id} if job_id else {}))
+        self.assertEqual(reg[0], 201, reg[1])
+        return self._reconcile(status=status, run=run, **over)
+
+    def _state(self, build_id=None):
+        status, payload, _ = server.dispatch(
+            "GET", "/v1/build/state", {"build_id": [build_id or self.BUILD]}, True, b""
+        )
+        self.assertIn(status, (200, 409), payload)
+        return payload
+
+    def _supervisor_doc(self, build_id=None):
+        path = self.supervisor / "builds" / (build_id or self.BUILD) / "supervisor.json"
+        return json.loads(path.read_text())
+
+    # -- launch registration ------------------------------------------------
+
+    def test_registration_maps_the_source_run_to_the_whole_launch(self):
+        status, payload, _ = self._register()
+        self.assertEqual(status, 201, payload)
+        self.assertTrue(payload["registered"])
+        self.assertTrue(payload["supervised"])
+        self.assertEqual(payload["source_run_id"], self.RUN)
+        self.assertEqual(payload["build_id"], self.BUILD)
+        self.assertEqual(payload["event_id"], self.EVENT)
+        self.assertEqual(payload["workflow_id"], self.WORKFLOW)
+        self.assertEqual(payload["workflow_version"], self.VERSION)
+        self.assertEqual(payload["expected_stage"], "created")
+        self.assertEqual(payload["deadline"], self.DEADLINE)
+        self.assertEqual(payload["plan_pane"], self.PLAN_PANE)
+        self.assertNotIn("continuation", payload, "the source spec is returned only on continuation")
+        saved = self._supervisor_doc()["runs"][self.RUN]["continuation"]
+        self.assertEqual(saved["repo"], "scratch")
+        self.assertEqual(saved["fast_recipe"], "fast-checks")
+        self.assertEqual(saved["integration_recipe"], "integration-checks")
+        self.assertEqual(saved["reviewer"], "terra")
+        self.assertTrue((self.supervisor / "builds" / self.BUILD / "supervisor.json").is_file())
+
+    def test_registration_rejects_secret_or_capability_continuation_values(self):
+        for field, value in (
+            ("writer_prompt", "use token ghp_" + "a" * 36),
+            ("writer_prompt_ref", "https://engine.rewst.io/webhooks/custom/" + "a" * 32),
+        ):
+            with self.subTest(field=field):
+                body = self._register_body(source_run_id=self._next_run(700))
+                body["continuation"][field] = value
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/supervisor/register", {}, True, json.dumps(body).encode()
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertTrue(
+                    payload["code"] == "bad_continuation" or payload["code"].startswith("secret_in_"),
+                    payload,
+                )
+
+    def test_a_local_job_binding_is_narrow_idempotent_and_immutable(self):
+        self.assertEqual(self._register()[0], 201)
+        first_job = "a" * 32
+        status, payload, _ = self._bind(first_job)
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["bound"])
+        self.assertEqual(payload["job_id"], first_job)
+        status, replay, _ = self._bind(first_job)
+        self.assertEqual(status, 200, replay)
+        self.assertFalse(replay["bound"])
+        status, conflict, _ = self._bind("b" * 32)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "job_binding_conflict")
+        self.assertEqual(self._supervisor_doc()["runs"][self.RUN]["job_id"], first_job)
+
+    def test_a_local_job_binding_requires_the_registered_source_run(self):
+        status, payload, _ = self._bind("a" * 32)
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["code"], "unknown_source_run")
+
+    def test_async_job_ops_bind_before_enqueue_and_returning_202(self):
+        runs = (self.RUN, self._next_run(901), self._next_run(902))
+        for run in runs:
+            self.assertEqual(self._register(source_run_id=run)[0], 201)
+        observed = []
+
+        def assert_bound(job):
+            launch = self._supervisor_doc()["runs"][job["supervised_source_run_id"]]
+            self.assertEqual(launch["job_id"], job["job_id"])
+            observed.append(job["kind"])
+
+        profile = [{
+            "id": server.HOME_PROFILE,
+            "runnable": True,
+            "hermes_home": str(server.HOME),
+        }]
+        with mock.patch.object(server, "load_profiles", return_value=profile), mock.patch.object(
+            server, "HERMES_BIN", self.repo / "README"
+        ), mock.patch.object(server, "enqueue_agent", side_effect=assert_bound):
+            status, agent = server.agent_run(
+                json.dumps({"cwd": "scratch", "prompt": "one job", "supervised_source_run_id": runs[0]}).encode(),
+                {"scratch": str(self.repo)},
+            )
+        self.assertEqual(status, 202, agent)
+
+        tests = {"fast": {"argv": ["true"], "cwd": self.repo, "timeout_seconds": 30, "async": True}}
+        with mock.patch.object(server, "load_tests", return_value=tests), mock.patch.object(
+            server, "enqueue_script", side_effect=assert_bound
+        ):
+            status, check = server.test_run(
+                json.dumps({"name": "fast", "supervised_source_run_id": runs[1]}).encode(),
+                {"scratch": str(self.repo)},
+            )
+        self.assertEqual(status, 202, check)
+
+        with mock.patch.object(server, "enqueue_review", side_effect=assert_bound):
+            status, review = server.review_run(
+                json.dumps({
+                    "repo": "scratch", "reviewer": "terra", "prompt": "review only",
+                    "response_webhook_url": "https://example.invalid/resume",
+                    "supervised_source_run_id": runs[2],
+                }).encode(),
+                {"scratch": str(self.repo)},
+            )
+        self.assertEqual(status, 202, review)
+        self.assertEqual(observed, ["agent", "test", "review"])
+
+    def test_registration_requires_an_exact_saved_planning_pane(self):
+        body = self._register_body()
+        body.pop("plan_pane")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/supervisor/register", {}, True, json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "missing_plan_pane")
+        self.assertFalse((self.supervisor / "builds" / self.BUILD / "supervisor.json").exists())
+
+    def test_registration_rejects_an_unknown_planning_pane_without_fallback(self):
+        status, payload, _ = self._register(plan_pane="pane-not-saved")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "unknown_plan_pane")
+        self.assertEqual(payload["plan_pane"], "pane-not-saved")
+        self.assertFalse((self.supervisor / "builds" / self.BUILD / "supervisor.json").exists())
+
+    def test_registering_the_same_source_run_twice_is_idempotent(self):
+        first = self._register()[1]
+        status, payload, _ = self._register()
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["registered"])
+        self.assertEqual(payload["event_id"], first["event_id"])
+        self.assertEqual(len(self._supervisor_doc()["runs"]), 1)
+
+    def test_registering_the_same_source_run_with_new_input_is_a_conflict(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._register(event_id="evt-writer-2")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "registration_conflict")
+        self.assertEqual(self._supervisor_doc()["runs"][self.RUN]["event_id"], self.EVENT)
+
+    def test_registering_one_source_run_against_two_builds_is_a_conflict(self):
+        self.assertEqual(self._register()[0], 201)
+        self._open_build("bld-sup-0002")
+        status, payload, _ = self._register(build_id="bld-sup-0002")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "registration_conflict")
+
+    def test_registration_requires_a_build_that_exists(self):
+        status, payload, _ = self._register(build_id="bld-sup-9999")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["code"], "unknown_build")
+
+    def test_registration_refuses_a_stage_the_build_machine_does_not_have(self):
+        status, payload, _ = self._register(expected_stage="daydreaming")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_expected_stage")
+
+    def test_an_interrupted_registration_is_repaired_by_the_identical_retry(self):
+        # Two files back one registration and they cannot be one write, so the
+        # index write can fail after the launch record lands. Nothing else ever
+        # recreates that entry: the run would look registered and reconcile as
+        # unsupervised forever. The idempotent retry is the repair.
+        real_write = server.supervisor_write_json
+        index_path = server.supervisor_run_index_path(self.RUN)
+
+        def fail_the_index(path, doc):
+            if Path(path) == Path(index_path):
+                return {"ok": False, "error": "disk went away", "code": "supervisor_write_failed", "status": 500}
+            return real_write(path, doc)
+
+        with mock.patch.object(server, "supervisor_write_json", side_effect=fail_the_index):
+            status, payload, _ = self._register()
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["code"], "supervisor_write_failed")
+        self.assertFalse(index_path.exists())
+        # The launch record is there, so this is the interrupted state, not a
+        # registration that never happened.
+        self.assertIn(self.RUN, self._supervisor_doc()["runs"])
+        self.assertEqual(self._reconcile(status="failed")[0], 404, "unsupervised until repaired")
+
+        status, payload, _ = self._register()
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["registered"])
+        self.assertTrue(payload["index_repaired"])
+        self.assertTrue(index_path.is_file())
+        self.assertEqual(len(self._supervisor_doc()["runs"]), 1, "the repair adds no second launch")
+
+        status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["build_id"], self.BUILD)
+        self.assertEqual(payload["action"], "retry_event")
+
+    def test_a_repair_retry_never_repoints_a_run_at_another_build(self):
+        # The repair rewrites an index entry, so it is the one place a
+        # conflicting registration could quietly steal a run. It stays a 409.
+        self.assertEqual(self._register()[0], 201)
+        self._open_build("bld-sup-0003")
+        status, payload, _ = self._register(build_id="bld-sup-0003")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "registration_conflict")
+        mapped, err = server.supervisor_run_lookup(self.RUN)
+        self.assertIsNone(err)
+        self.assertEqual(mapped, self.BUILD)
+
+    def test_registration_refuses_a_deadline_that_is_not_an_instant(self):
+        # A duration would restart on every retried registration, so the
+        # window it was meant to bound would never close.
+        status, payload, _ = self._register(deadline="600")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_deadline")
+
+    # -- reconciliation: the resolved paths ---------------------------------
+
+    def test_a_run_that_recorded_its_terminal_receipt_repeats_no_work(self):
+        job = self._write_job("1" * 32, "running")
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        self.assertEqual(self._bind(job)[0], 200)
+        self._write_job(job, "completed")
+        status, payload, _ = self._reconcile(status="completed")
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["action"], "receipt")
+        self.assertEqual(payload["resolution"], "resolved")
+        self.assertFalse(payload["workflow_fault"])
+        self.assertEqual(payload["receipt"]["action"], "start_writer")
+        self.assertEqual(payload["build_stage"], "writing")
+
+    def test_a_failed_run_that_already_recorded_its_receipt_is_still_resolved(self):
+        # The transition ran and then the graph fell over on the way out. The
+        # receipt is the proof, not the status Rewst reported.
+        job = self._write_job("2" * 32, "running")
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        self.assertEqual(self._bind(job)[0], 200)
+        self._write_job(job, "completed")
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "receipt")
+        self.assertFalse(payload["parked"])
+
+    def test_completed_without_a_terminal_receipt_is_a_workflow_fault(self):
+        # Rewst labels a graph `completed` even when it skipped the path it was
+        # published to take, so `completed` alone is never success here.
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(status="completed")
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["parked"])
+        self.assertTrue(payload["workflow_fault"])
+        self.assertEqual(payload["park_reason"], "workflow_fault")
+        self.assertEqual(payload["resolution"], "parked")
+        self.assertIn("completed without recording event", payload["next_operator_action"])
+        self.assertEqual(self._state()["stage"], "parked")
+        self.assertEqual(self._state()["park_reason"], "workflow_fault")
+
+    # -- reconciliation: the recovery ladder --------------------------------
+
+    def test_an_unclaimed_event_retries_the_same_event_id(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "retry_event")
+        self.assertEqual(payload["resolution"], "retry")
+        self.assertEqual(payload["local_job_status"], "unclaimed")
+        self.assertEqual(payload["event_id"], self.EVENT)
+        self.assertEqual(payload["attempts"], 1)
+        self.assertIn(f"event_id={self.EVENT}", payload["next_operator_action"])
+        self.assertEqual(self._state()["stage"], "created", "a retry must not park the build")
+
+    def test_an_active_local_job_is_watched_rather_than_relaunched(self):
+        job = self._write_job("a" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "watch")
+        self.assertEqual(payload["resolution"], "watching")
+        self.assertEqual(payload["local_job_status"], "active")
+        self.assertEqual(payload["attempts"], 0, "watching must not spend a retry")
+        self.assertEqual(self._supervisor_doc().get("circuits") or {}, {})
+
+    def test_a_start_claim_receipt_does_not_hide_the_bound_active_job(self):
+        job = self._write_job("9" * 32, "running")
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        self.assertEqual(self._bind(job)[0], 200)
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "watch")
+        self.assertEqual(payload["local_job_status"], "active")
+        self.assertIsNone(payload["receipt"])
+
+    def test_an_unbound_start_claim_receipt_is_never_terminal_success(self):
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "state_trace_disagreement")
+        self.assertIsNone(payload["receipt"])
+
+    def test_registration_bind_failure_watch_relaunch_is_reachable(self):
+        job = self._write_job("8" * 32, "running")
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._bind(job)[0], 200)
+        self.assertEqual(self._reconcile(status="failed")[1]["action"], "watch")
+        (self.jobs / job / "job.json").unlink()
+        run = self._next_run(801)
+        self.assertEqual(self._register(source_run_id=run)[0], 201)
+        self.assertEqual(self._bind(job, run=run)[0], 200)
+        payload = self._reconcile(status="failed", run=run)[1]
+        self.assertEqual(payload["action"], "relaunch")
+        self.assertEqual(payload["continuation"]["writer_prompt"], "Implement issue 52 ticket 06b only.")
+
+    def test_a_claimed_job_that_never_started_is_relaunched_once(self):
+        job = "b" * 32
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        first = self._reconcile(status="failed")[1]
+        self.assertEqual(first["action"], "relaunch")
+        self.assertEqual(first["local_job_status"], "missing")
+        self.assertIn("never started", first["next_operator_action"])
+        # A second run for the same event, still with no job on disk, is not a
+        # second relaunch: the seat is not coming back on its own.
+        second = self._fresh_delivery(2, job_id=job)[1]
+        self.assertEqual(second["action"], "park")
+        self.assertEqual(second["park_reason"], "relaunch_exhausted")
+
+    def test_a_finished_job_with_no_receipt_parks_on_the_disagreement(self):
+        job = self._write_job("c" * 32, "completed")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "state_trace_disagreement")
+        self.assertTrue(payload["files_intact"])
+        self.assertEqual(payload["report"]["stacks"], ["riftwing-52"])
+
+    def test_a_build_already_past_the_expected_stage_parks(self):
+        self.assertEqual(self._register(expected_stage="created")[0], 201)
+        # Something else advanced the build, and it did it without ever
+        # recording this run's event id.
+        self.assertEqual(self._advance("start_writer", "evt-other")[0], 200)
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "state_trace_disagreement")
+
+    def test_declared_output_naming_another_build_parks_instead_of_repointing(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed", output={"build_id": "bld-sup-0002"})[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "state_trace_disagreement")
+        self.assertEqual(payload["build_id"], self.BUILD, "the registry, not the output, names the build")
+
+    def test_a_run_that_failed_before_declaring_any_output_is_still_supervised(self):
+        # The whole reason registration happens at launch: this run never got
+        # far enough to say which build it was working on.
+        self.assertEqual(self._register()[0], 201)
+        body = self._completion(status="failed")
+        body.pop("output")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/supervisor/reconcile", {}, True, json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["build_id"], self.BUILD)
+        self.assertEqual(payload["event_id"], self.EVENT)
+        self.assertEqual(payload["action"], "retry_event")
+        self.assertEqual(
+            payload["continuation"],
+            {
+                **self._register_body()["continuation"],
+                "workflow_slug": server.SUPERVISOR_SOURCE_SLUG,
+                "build_id": self.BUILD,
+                "event_id": self.EVENT,
+                "expected_stage": "created",
+                "deadline": self.DEADLINE,
+                "plan_pane": self.PLAN_PANE,
+                "reason": "retry_event",
+                "attempt": 1,
+                "bounded": True,
+            },
+        )
+
+    def test_an_empty_declared_output_is_absent_not_a_disagreement(self):
+        # A Rewst template renders a missing value as "", not as no key.
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed", output={"build_id": "", "event_id": ""})[1]
+        self.assertEqual(payload["action"], "retry_event")
+
+    def test_real_retry_continuation_matches_the_strict_response_schema_and_graph_fields(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed")[1]
+        spec = json.loads(server.openapi_bytes())
+        schema = spec["components"]["schemas"]["SupervisorContinuationResponse"]
+        continuation = payload["continuation"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(continuation), set(schema["required"]))
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "build-completion-supervisor.json").read_text()
+        )
+        node = next(n for n in graph["spec"]["nodes"] if n["id"] == "continue_source")
+        consumed = {
+            value.removeprefix("{{ TASKS.reconcile.data.continuation.").removesuffix(" }}")
+            for value in node["config"]["input"].values()
+        }
+        self.assertLessEqual(consumed, set(continuation))
+        for field in (
+            "workflow_slug", "build_id", "event_id", "expected_stage", "deadline",
+            "plan_pane", "reason", "attempt", "bounded",
+        ):
+            self.assertIn(field, continuation)
+
+    def test_a_deadline_that_has_passed_parks_rather_than_retrying(self):
+        self.assertEqual(self._register(deadline="2020-01-01T00:00:00Z")[0], 201)
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "deadline_exceeded")
+
+    def test_an_already_parked_build_keeps_its_original_park_reason(self):
+        self.assertEqual(self._register()[0], 201)
+        parked = self._advance("park", "evt-park")
+        self.assertEqual(parked[0], 200, parked[1])
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["park_reason"], "build_parked")
+        self.assertEqual(self._state()["park_reason"], "requested")
+
+    # -- retry policy and the circuit ---------------------------------------
+
+    def test_a_timeout_is_transient_and_retries_within_its_bound(self):
+        for n, expected in ((1, "retry_event"), (2, "retry_event"), (3, "retry_event")):
+            payload = self._fresh_delivery(n, status="timed_out")[1]
+            self.assertEqual(payload["action"], expected, f"delivery {n}")
+            self.assertEqual(payload["retry_budget"], server.SUPERVISOR_RETRY_BUDGET["transient"])
+            self.assertEqual(payload["attempts"], n)
+        spent = self._fresh_delivery(4, status="timed_out")[1]
+        self.assertEqual(spent["action"], "park")
+        self.assertEqual(spent["park_reason"], "retry_exhausted")
+
+    def test_a_cancel_is_deterministic_and_never_retries_unchanged(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="canceled")[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "deterministic_failure")
+        self.assertEqual(payload["retry_budget"], 0)
+        self.assertEqual(payload["attempts"], 0)
+        self.assertIn("Do not re-run", payload["next_operator_action"])
+
+    def test_a_caller_cannot_declare_its_own_retry_class(self):
+        # The whole retry ladder hangs off this field, so a listener that could
+        # set it could vote itself three more runs of a graph that is broken --
+        # or, the other way, park a build on the first transient blip.
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="timed_out", failure={"class": "deterministic", "node": "agent1"}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_failure")
+        self.assertIn("source_run.status", payload["error"])
+
+    def test_the_retry_class_comes_from_the_terminal_status_alone(self):
+        # Same body, different status, different budget: the status is the only
+        # thing that moved, so the status is the only thing deciding.
+        for n, (status, expected_class) in enumerate(
+            (("timed_out", "transient"), ("canceled", "deterministic"), ("failed", "unknown")), start=1
+        ):
+            with self.subTest(status=status):
+                self._open_build(f"bld-class-{n}")
+                run = self._next_run(100 + n)
+                reg = self._register(source_run_id=run, build_id=f"bld-class-{n}")
+                self.assertEqual(reg[0], 201, reg[1])
+                payload = self._reconcile(
+                    status=status,
+                    run=run,
+                    output={"build_id": f"bld-class-{n}"},
+                    failure={"node": "agent1", "code": "bad_schema"},
+                )[1]
+                self.assertEqual(payload["report"]["failure_class"], expected_class)
+                self.assertEqual(
+                    payload["retry_budget"], server.SUPERVISOR_RETRY_BUDGET[expected_class]
+                )
+
+    def test_a_deterministic_status_does_not_retry_and_names_the_node(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="canceled", failure={"node": "agent1", "code": "bad_schema"})[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "deterministic_failure")
+        self.assertIn("agent1", payload["next_operator_action"])
+
+    def test_a_completion_that_names_no_node_reports_a_stable_label(self):
+        # Not a blank and not a fresh value per delivery: an operator line that
+        # says nothing is as unhelpful as a circuit that never trips.
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="canceled")[1]
+        self.assertEqual(payload["report"]["failed_node"], server.SUPERVISOR_UNKNOWN_NODE)
+        self.assertIn(server.SUPERVISOR_UNKNOWN_NODE, payload["next_operator_action"])
+
+    def test_an_unknown_failure_gets_exactly_one_retry_before_parking(self):
+        first = self._fresh_delivery(1, status="failed")[1]
+        self.assertEqual(first["action"], "retry_event")
+        self.assertEqual(first["retry_budget"], server.SUPERVISOR_RETRY_BUDGET["unknown"])
+        second = self._fresh_delivery(2, status="failed")[1]
+        self.assertEqual(second["action"], "park")
+        self.assertEqual(second["park_reason"], "retry_exhausted")
+
+    def test_the_same_canonical_failure_giving_up_twice_opens_the_circuit(self):
+        failure = {"node": "commit", "code": "bad_config"}
+        first = self._fresh_delivery(1, status="canceled", failure=failure)[1]
+        self.assertEqual(first["action"], "park")
+        self.assertEqual(first["circuit"]["count"], 1)
+        self.assertFalse(first["circuit"]["open"])
+        second = self._fresh_delivery(2, status="canceled", failure=failure)[1]
+        self.assertEqual(second["action"], "circuit_open")
+        self.assertEqual(second["park_reason"], "circuit_open")
+        self.assertTrue(second["circuit"]["open"])
+        self.assertEqual(second["circuit"]["count"], server.SUPERVISOR_CIRCUIT_THRESHOLD)
+        self.assertIn("stop retrying", second["next_operator_action"])
+        self.assertEqual(
+            second["circuit"]["signature"],
+            f"{self.WORKFLOW}@{self.VERSION}#commit:bad_config",
+        )
+
+    def test_different_authoritative_failure_details_use_separate_circuits(self):
+        first = self._fresh_delivery(1, status="canceled", failure={"node": "commit"})[1]
+        self.assertEqual(first["circuit"]["count"], 1)
+        second = self._fresh_delivery(
+            2, status="canceled", failure={"node": "push", "code": "other_thing"}
+        )[1]
+        self.assertEqual(second["action"], "park")
+        self.assertFalse(second["circuit"]["open"])
+        self.assertNotEqual(second["circuit"]["signature"], first["circuit"]["signature"])
+        self.assertEqual(len(self._supervisor_doc()["circuits"]), 2)
+
+    def test_missing_failure_details_have_one_stable_status_and_presence_signature(self):
+        first = self._fresh_delivery(1, status="canceled", error=False)[1]
+        second = self._fresh_delivery(2, status="canceled", error=False)[1]
+        self.assertEqual(second["action"], "circuit_open")
+        self.assertEqual(first["circuit"]["signature"], second["circuit"]["signature"])
+        self.assertEqual(
+            first["circuit"]["signature"],
+            f"{self.WORKFLOW}@{self.VERSION}#unknown:canceled:no_error",
+        )
+
+    def test_unknown_failure_identity_does_not_collide_across_versions_or_status_classes(self):
+        first = self._fresh_delivery(1, status="canceled", error=True)[1]
+        run = self._next_run(2)
+        self.assertEqual(self._register(source_run_id=run, workflow_version="v12")[0], 201)
+        second = self._reconcile(status="canceled", run=run, error=True)[1]
+        third = self._fresh_delivery(3, status="completed", error=True)[1]
+        signatures = {
+            first["circuit"]["signature"],
+            second["circuit"]["signature"],
+            third["circuit"]["signature"],
+        }
+        self.assertEqual(len(signatures), 3)
+
+    def test_circuit_map_uses_a_deterministic_overflow_identity_at_its_cap(self):
+        with mock.patch.object(server, "SUPERVISOR_CIRCUITS_MAX", 3):
+            outcomes = [
+                self._fresh_delivery(
+                    n,
+                    status="canceled",
+                    failure={"node": f"node{n}", "code": f"code_{n}"},
+                )[1]
+                for n in range(1, 5)
+            ]
+        circuits = self._supervisor_doc()["circuits"]
+        self.assertLessEqual(len(circuits), 3)
+        self.assertEqual(outcomes[2]["circuit"]["signature"], outcomes[3]["circuit"]["signature"])
+        self.assertIn("#overflow:canceled:error", outcomes[2]["circuit"]["signature"])
+
+    def test_watching_a_live_job_never_counts_against_the_circuit(self):
+        job = self._write_job("d" * 32, "queued")
+        for n in (1, 2, 3):
+            payload = self._fresh_delivery(n, job_id=job)[1]
+            self.assertEqual(payload["action"], "watch", f"delivery {n}")
+            self.assertIsNone(payload["circuit"])
+
+    # -- duplicate delivery -------------------------------------------------
+
+    def test_a_duplicate_delivery_replays_the_first_answer(self):
+        self.assertEqual(self._register()[0], 201)
+        first = self._reconcile(status="failed")[1]
+        self.assertEqual(first["attempts"], 1)
+        status, second, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, second)
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["action"], "ignored")
+        self.assertIsNone(second["continuation"], "the same completion cannot launch again")
+        self.assertEqual(second["attempts"], 1, "a redelivery must not spend a second retry")
+        self.assertEqual(len(self._supervisor_doc()["reports"]), 1)
+
+    def test_a_duplicate_delivery_with_different_input_is_a_conflict(self):
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._reconcile(status="failed")[0], 200)
+        status, payload, _ = self._reconcile(status="timed_out")
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "idempotency_conflict")
+
+    def test_concurrent_reconcile_spends_one_retry_and_records_one_side_effect(self):
+        self.assertEqual(self._register()[0], 201)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def reconcile():
+            barrier.wait()
+            results.append(self._reconcile(status="failed")[:2])
+
+        threads = [threading.Thread(target=reconcile) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual({payload["action"] for _, payload in results}, {"retry_event", "ignored"})
+        doc = self._supervisor_doc()
+        self.assertEqual(doc["events"][self.EVENT]["attempts"], 1)
+        self.assertEqual(len(doc["reports"]), 1)
+
+    def test_a_second_listener_version_replays_rather_than_re_deciding(self):
+        # Republishing the listener is routine, and Rewst's outbox can deliver
+        # the same completion to the new version. The dedupe key is the run
+        # plus the listener *slug* precisely so that costs nothing: keying on
+        # the version would spend a second retry, write a second park, and tick
+        # the circuit again, all for one source run.
+        self.assertEqual(self._register()[0], 201)
+        first = self._reconcile(status="failed")[1]
+        self.assertEqual(first["listener_slug"], server.SUPERVISOR_LISTENER_SLUG)
+        status, payload, _ = self._reconcile(
+            status="failed", listener_id="graphwing-build-completion-supervisor@8"
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["action"], "ignored")
+        self.assertIsNone(payload["continuation"])
+        self.assertEqual(payload["attempts"], first["attempts"])
+        self.assertEqual(
+            payload["listener_id"], self.LISTENER, "the replay is the first answer, unedited"
+        )
+        doc = self._supervisor_doc()
+        self.assertEqual(len(doc["reports"]), 1)
+        self.assertEqual(len(doc["deliveries"]), 1)
+        self.assertEqual(doc["events"][self.EVENT]["attempts"], 1)
+
+    def test_a_republished_listener_cannot_park_a_build_a_second_time(self):
+        self.assertEqual(self._register()[0], 201)
+        first = self._reconcile(status="canceled")[1]
+        self.assertEqual(first["park_reason"], "deterministic_failure")
+        self.assertEqual(first["circuit"]["count"], 1)
+        payload = self._reconcile(
+            status="canceled", listener_id="graphwing-build-completion-supervisor@9"
+        )[1]
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["circuit"]["count"], 1)
+        self.assertFalse(payload["circuit"]["open"], "a republish must not trip the breaker")
+        self.assertEqual(self._supervisor_doc()["circuits"][first["circuit"]["signature"]]["count"], 1)
+
+    # -- the crash window between the build write and the supervisor write ---
+
+    def test_a_park_whose_delivery_write_was_lost_replays_on_redelivery(self):
+        self.assertEqual(self._register()[0], 201)
+        # The park reaches the build; the supervisor write that would record
+        # the delivery does not.
+        with mock.patch.object(
+            server,
+            "supervisor_save",
+            return_value={"ok": False, "error": "disk went away", "code": "supervisor_write_failed", "status": 500},
+        ):
+            status, payload, _ = self._reconcile(status="canceled")
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(self._state()["stage"], "parked", "the park itself did land")
+        self.assertEqual(self._state()["park_reason"], "deterministic_failure")
+        doc = self._supervisor_doc()
+        self.assertEqual(doc.get("deliveries") or {}, {}, "no delivery was recorded")
+        self.assertEqual(doc.get("circuits") or {}, {}, "no give-up was recorded")
+
+        # The outbox redelivers. Without the receipt check this walks the
+        # ladder again and charges the circuit for one give-up twice.
+        status, payload, _ = self._reconcile(status="canceled")
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["parked"])
+        self.assertTrue(payload["park_replayed"])
+        self.assertEqual(payload["park_reason"], "deterministic_failure")
+        self.assertIsNone(payload["circuit"], "the replay must not tick the breaker")
+        self.assertEqual(payload["attempts"], 0, "the replay must not spend a retry")
+        self.assertEqual(self._state()["park_reason"], "deterministic_failure")
+        self.assertEqual(self._supervisor_doc().get("circuits") or {}, {})
+
+    def test_a_lost_park_write_is_reported_rather_than_recorded_as_parked(self):
+        # The other half of the same window: if the *build* write fails, the
+        # delivery must not be recorded as a park either, or every later
+        # redelivery replays "parked" for a build that never was.
+        self.assertEqual(self._register()[0], 201)
+        with mock.patch.object(
+            server,
+            "write_build",
+            return_value={"ok": False, "error": "disk went away", "code": "state_write_failed", "status": 500},
+        ):
+            status, payload, _ = self._reconcile(status="canceled")
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(self._state()["stage"], "created")
+        self.assertEqual(self._supervisor_doc().get("deliveries") or {}, {})
+
+    def test_a_redelivery_after_a_lost_write_does_not_relaunch_twice(self):
+        # The relaunch budget is spent in supervisor state, so a lost write
+        # leaves it unspent -- and the redelivery has to reach the same answer
+        # rather than a second, uncounted relaunch.
+        job = "f" * 32
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(
+            server,
+            "supervisor_save",
+            return_value={"ok": False, "error": "disk went away", "code": "supervisor_write_failed", "status": 500},
+        ):
+            self.assertEqual(self._reconcile(status="failed")[0], 500)
+        self.assertEqual(self._supervisor_doc().get("events") or {}, {}, "nothing was spent")
+        payload = self._reconcile(status="failed")[1]
+        self.assertEqual(payload["action"], "relaunch")
+        self.assertEqual(self._supervisor_doc()["events"][self.EVENT]["relaunches"], 1)
+        # And the relaunch is still bounded at one across the whole event.
+        second = self._fresh_delivery(2, job_id=job)[1]
+        self.assertEqual(second["park_reason"], "relaunch_exhausted")
+
+    # -- refusals -----------------------------------------------------------
+
+    def test_a_run_with_no_launch_record_is_not_supervised(self):
+        status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["code"], "unknown_source_run")
+
+    def test_the_supervisor_cannot_listen_to_itself(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="failed", source_workflow={"slug": server.SUPERVISOR_LISTENER_SLUG}
+        )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "self_listener")
+
+    def test_a_supervised_tag_naming_the_listener_is_also_refused(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="failed", source_workflow={"tags": [server.SUPERVISOR_LISTENER_SLUG]}
+        )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "self_listener")
+
+    def test_tags_accept_multiple_empty_and_the_exact_maximum(self):
+        for n, tags in enumerate(
+            (
+                [],
+                ["graphwing-supervised", "pre-pr", "issue-52"],
+                [f"tag-{i}" for i in range(server.SUPERVISOR_TAGS_MAX)],
+            ),
+            start=1,
+        ):
+            with self.subTest(count=len(tags)):
+                run = self._next_run(800 + n)
+                self.assertEqual(self._register(source_run_id=run)[0], 201)
+                status, payload, _ = self._reconcile(
+                    status="failed", run=run, source_workflow={"tags": tags}
+                )
+                self.assertEqual(status, 200, payload)
+
+    def test_tags_reject_arbitrary_encoded_strings_malformed_json_and_non_strings(self):
+        for n, tags in enumerate(
+            ("graphwing-supervised", "['graphwing-supervised']", "{bad", '["ok", 7]'),
+            start=1,
+        ):
+            with self.subTest(tags=tags):
+                run = self._next_run(810 + n)
+                self.assertEqual(self._register(source_run_id=run)[0], 201)
+                status, payload, _ = self._reconcile(
+                    status="failed", run=run, source_workflow={"tags": tags}
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_tags")
+
+    def test_tags_reject_non_string_elements_and_more_than_the_maximum(self):
+        for n, tags in enumerate(
+            (["ok", 7], ["ok"] * (server.SUPERVISOR_TAGS_MAX + 1)), start=1
+        ):
+            with self.subTest(case=n):
+                run = self._next_run(820 + n)
+                self.assertEqual(self._register(source_run_id=run)[0], 201)
+                status, payload, _ = self._reconcile(
+                    status="failed", run=run, source_workflow={"tags": tags}
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_tags")
+
+    def test_a_completion_from_a_different_workflow_parks(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed", source_workflow={"id": "wf-something-else"})[1]
+        self.assertEqual(payload["action"], "park")
+        self.assertEqual(payload["park_reason"], "state_trace_disagreement")
+
+    def test_a_non_terminal_status_is_refused(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(status="running")
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_source_status")
+
+    def test_a_preview_run_is_not_supervised_work(self):
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed", source_run={"execution_mode": "preview"})[1]
+        self.assertEqual(payload["action"], "ignored")
+        self.assertEqual(payload["resolution"], "ignored")
+        self.assertEqual(self._state()["stage"], "created")
+
+    def test_raw_error_text_is_refused_rather_than_redacted(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="failed",
+            error={"present": True, "message": "Traceback: KeyError 'build_id'"},
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "raw_error_forbidden")
+        self.assertFalse((self.supervisor / "builds" / self.BUILD / "supervisor.json").read_text().count("Traceback"))
+
+    def test_a_trace_body_smuggled_through_output_is_refused(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="failed", output={"stack": "at handler (server.py:12)"}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "raw_error_forbidden")
+
+    def test_error_presence_survives_a_jinja_render(self):
+        # A Rewst node config is a string template, so the flag arrives as the
+        # word, not as a JSON boolean.
+        self.assertEqual(self._register()[0], 201)
+        payload = self._reconcile(status="failed", error="true")[1]
+        self.assertTrue(payload["report"]["error_present"])
+
+    def test_a_free_text_failure_code_is_refused(self):
+        self.assertEqual(self._register()[0], 201)
+        status, payload, _ = self._reconcile(
+            status="failed", failure={"code": "connection reset by peer at 10.0.0.1"}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "bad_failure_code")
+
+    def test_no_credential_or_callback_url_reaches_supervisor_state(self):
+        self.assertEqual(self._register()[0], 201)
+        secret = "https://engine.rewst.io/webhooks/custom/9f2c41ab-77d0-4a1e-9d0e-5c1f0b2a7e33"
+        payload = self._reconcile(status="failed", output={"kick_url": secret, "token": "ghp_" + "a" * 32})[1]
+        self.assertEqual(payload["action"], "retry_event")
+        raw = (self.supervisor / "builds" / self.BUILD / "supervisor.json").read_text()
+        self.assertNotIn(secret, raw)
+        self.assertNotIn("ghp_", raw)
+
+    # -- the planning-session report ----------------------------------------
+
+    def test_every_park_reports_what_the_operator_has_to_do_next(self):
+        self.assertEqual(self._register(job_id=self._write_job("e" * 32, "failed"))[0], 201)
+        payload = self._reconcile(status="failed")[1]
+        report = payload["report"]
+        for field in (
+            "source_run_id",
+            "workflow_version",
+            "failed_node",
+            "build_stage",
+            "local_job_status",
+            "action",
+            "next_operator_action",
+        ):
+            self.assertIn(field, report, field)
+        self.assertEqual(report["source_run_id"], self.RUN)
+        self.assertEqual(report["workflow_version"], self.VERSION)
+        self.assertEqual(report["build_stage"], "parked")
+        self.assertEqual(report["local_job_status"], "failed")
+        self.assertEqual(report["action"], "park")
+        self.assertTrue(report["next_operator_action"])
+        self.assertTrue(report["files_intact"])
+
+    def test_the_saved_report_survives_the_run_that_produced_it(self):
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._reconcile(status="failed")[0], 200)
+        status, payload, _ = self._report(build_id=self.BUILD)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(payload["reports"]), 1)
+        self.assertEqual(payload["reports"][0]["action"], "retry_event")
+        self.assertEqual(payload["circuit_threshold"], server.SUPERVISOR_CIRCUIT_THRESHOLD)
+        self.assertEqual(payload["run_count"], 1)
+
+    def test_a_report_can_be_found_by_source_run_id_alone(self):
+        self.assertEqual(self._register()[0], 201)
+        self.assertEqual(self._reconcile(status="failed")[0], 200)
+        self.assertEqual(self._fresh_delivery(2)[0], 200)
+        status, payload, _ = self._report(source_run_id=self.RUN)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["build_id"], self.BUILD)
+        self.assertEqual([r["source_run_id"] for r in payload["reports"]], [self.RUN])
+
+    def test_a_report_for_an_unregistered_run_is_a_404(self):
+        status, payload, _ = self._report(source_run_id="rewst-run-99999999")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["code"], "unknown_source_run")
+
+    def test_the_report_endpoint_needs_a_selector(self):
+        status, payload, _ = self._report()
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "missing_selector")
+
+    # -- restart ------------------------------------------------------------
+
+    def test_supervision_survives_a_service_restart(self):
+        self.assertEqual(self._register()[0], 201)
+        first = self._reconcile(status="failed")[1]
+        # Nothing in memory: every later answer comes off disk.
+        status, payload, _ = self._report(build_id=self.BUILD)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["reports"][0]["next_operator_action"], first["next_operator_action"])
+        self.assertEqual(payload["events"][self.EVENT]["attempts"], 1)
+
+    # -- unauthenticated ----------------------------------------------------
+
+    def test_the_supervisor_operations_require_the_api_key(self):
+        for method, path, body in (
+            ("POST", "/v1/supervisor/register", json.dumps(self._register_body()).encode()),
+            ("POST", "/v1/supervisor/bind", json.dumps({"source_run_id": self.RUN, "job_id": "a" * 32}).encode()),
+            ("POST", "/v1/supervisor/reconcile", json.dumps(self._completion()).encode()),
+            ("POST", "/v1/supervisor/watch", json.dumps({"source_run_id": self.RUN}).encode()),
+            ("GET", "/v1/supervisor/report", b""),
+        ):
+            with self.subTest(path=path):
+                status, payload, _ = server.dispatch(method, path, {}, False, body)
+                self.assertEqual(status, 401, payload)
+                self.assertEqual(payload["code"], "unauthorized")
+
+    def test_watch_request_rejects_fields_outside_the_openapi_contract(self):
+        for extra in (
+            {"response_webhook_url": "https://example.invalid/resume"},
+            {"response_webhook_token": "callback-token"},
+            {"deadline": "2099-01-01T00:00:00Z"},
+        ):
+            with self.subTest(extra=extra):
+                status, payload, _ = self._watch(**extra)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_watch_request")
+
+    def test_watch_start_and_replay_always_call_the_deduping_scheduler(self):
+        job = self._write_job("1" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch") as schedule:
+            status, first, _ = self._watch()
+            replay_status, replay, _ = self._watch()
+        self.assertEqual(status, 202, first)
+        self.assertTrue(first["started"])
+        self.assertEqual(replay_status, 202, replay)
+        self.assertFalse(replay["started"])
+        self.assertEqual(replay["watch_id"], first["watch_id"])
+        self.assertEqual(schedule.call_count, 2)
+        saved = self._supervisor_doc()["watches"]
+        self.assertEqual(len(saved), 1)
+        raw = json.dumps(saved).lower()
+        for forbidden in ("response_webhook", "resumeurl", "resumetoken", "callback", "token"):
+            self.assertNotIn(forbidden, raw)
+
+    def test_process_restart_recovers_a_watching_record(self):
+        job = self._write_job("2" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        with mock.patch.object(server, "supervisor_schedule_watch") as schedule:
+            server.supervisor_recover_watches()
+        schedule.assert_called_once()
+        args = schedule.call_args.args
+        self.assertEqual(args[0], self.BUILD)
+        self.assertIn(self.RUN, args[1])
+
+    def test_reconcile_makes_watch_durable_before_the_graph_watch_handoff(self):
+        job = self._write_job("2" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch") as schedule:
+            status, payload, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "watch")
+        key = f"{self.RUN}|{self.EVENT}"
+        saved = self._supervisor_doc()["watches"][key]
+        self.assertEqual(saved["state"], "watching")
+        self.assertEqual(saved["job_id"], job)
+        schedule.assert_called_once_with(self.BUILD, key)
+        raw = json.dumps(saved).lower()
+        for forbidden in ("response_webhook", "resumeurl", "resumetoken", "callback", "token"):
+            self.assertNotIn(forbidden, raw)
+        with mock.patch.object(server, "supervisor_schedule_watch") as acknowledge_schedule:
+            ack_status, acknowledgement, _ = self._watch()
+        self.assertEqual(ack_status, 202, acknowledgement)
+        self.assertFalse(acknowledgement["started"])
+        self.assertEqual(acknowledgement["watch_id"], saved["watch_id"])
+        acknowledge_schedule.assert_called_once_with(self.BUILD, key)
+
+        # The reconcile response was lost before POST /watch. A fresh process
+        # recovers the durable row and settles it without that graph hop.
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        self._write_job(job, "completed")
+        with mock.patch.object(
+            server, "supervisor_schedule_watch", side_effect=server.supervisor_watch_worker
+        ) as recovered:
+            self.assertEqual(server.supervisor_recover_watches(), 1)
+        recovered.assert_called_once_with(self.BUILD, key)
+        settled = self._supervisor_doc()["watches"][key]
+        self.assertEqual(settled["state"], "settled")
+        self.assertEqual(settled["action"], "receipt")
+
+    def test_replayed_watch_delivery_repairs_a_missing_durable_row(self):
+        job = self._write_job("8" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            first = self._reconcile(status="failed")[1]
+        self.assertEqual(first["action"], "watch")
+        key = f"{self.RUN}|{self.EVENT}"
+        with server.SUPERVISOR_LOCK:
+            doc, err = server.supervisor_load(self.BUILD)
+            self.assertIsNone(err)
+            doc["watches"].pop(key)
+            doc["watch_order"].remove(key)
+            self.assertIsNone(server.supervisor_save(doc))
+
+        with mock.patch.object(server, "supervisor_schedule_watch") as schedule:
+            status, replay, _ = self._reconcile(status="failed")
+        self.assertEqual(status, 200, replay)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["action"], "ignored")
+        repaired = self._supervisor_doc()["watches"][key]
+        self.assertEqual(repaired["state"], "watching")
+        self.assertEqual(repaired["job_id"], job)
+        schedule.assert_called_once_with(self.BUILD, key)
+
+    def test_concurrent_reconcile_and_watch_ack_schedule_one_watcher(self):
+        job = self._write_job("9" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def reconcile():
+            barrier.wait()
+            results.append(self._reconcile(status="failed")[:2])
+
+        def acknowledge():
+            barrier.wait()
+            results.append(self._watch()[:2])
+
+        workers = [threading.Thread(target=reconcile), threading.Thread(target=acknowledge)]
+        key = f"{self.RUN}|{self.EVENT}"
+        identity = (self.BUILD, key)
+        with server.SUPERVISOR_WATCHER_LOCK:
+            server.SUPERVISOR_ACTIVE_WATCHERS.discard(identity)
+        try:
+            with mock.patch.object(server.threading, "Thread") as watcher_thread:
+                watcher_thread.return_value.start.return_value = None
+                for worker in workers:
+                    worker.start()
+                barrier.wait()
+                for worker in workers:
+                    worker.join(timeout=5)
+            self.assertEqual(len(results), 2)
+            self.assertEqual({status for status, _ in results}, {200, 202})
+            self.assertEqual(watcher_thread.call_count, 1)
+            self.assertEqual(len(self._supervisor_doc()["watches"]), 1)
+        finally:
+            with server.SUPERVISOR_WATCHER_LOCK:
+                server.SUPERVISOR_ACTIVE_WATCHERS.discard(identity)
+
+    def test_reconcile_persists_pending_delivery_before_send_and_recovery_retries_it(self):
+        self.assertEqual(self._register()[0], 201)
+        with mock.patch.object(server, "supervisor_attempt_delivery") as attempt:
+            self.assertEqual(self._reconcile(status="failed")[0], 200)
+        report = self._supervisor_doc()["reports"][0]
+        self.assertEqual(report["delivery"]["state"], "pending")
+        self.assertRegex(report["delivery"]["delivery_id"], r"^[0-9a-f]{64}$")
+        attempt.assert_called_once_with(self.BUILD, report["delivery"]["delivery_id"])
+        delivered = {"ok": True, "attempted": True, "code": None, "pane_id": self.PLAN_PANE}
+        with mock.patch.object(server, "herdr_plan_deliver", return_value=delivered) as send:
+            server.supervisor_recover_deliveries()
+        send.assert_called_once()
+        saved = self._supervisor_doc()["reports"][0]["delivery"]
+        self.assertEqual(saved["state"], "delivered")
+
+    def test_delivery_crash_after_send_remains_pending_and_recovery_is_at_least_once(self):
+        self.assertEqual(self._register()[0], 201)
+        with mock.patch.object(server, "supervisor_attempt_delivery"):
+            self.assertEqual(self._reconcile(status="failed")[0], 200)
+        delivery_id = self._supervisor_doc()["reports"][0]["delivery"]["delivery_id"]
+        receipt = {"ok": True, "attempted": True, "code": None, "pane_id": self.PLAN_PANE}
+        with mock.patch.object(server, "herdr_plan_deliver", return_value=receipt), mock.patch.object(
+            server, "supervisor_save", return_value={"status": 500, "code": "supervisor_write_failed"}
+        ):
+            server.supervisor_attempt_delivery(self.BUILD, delivery_id)
+        self.assertEqual(self._supervisor_doc()["reports"][0]["delivery"]["state"], "pending")
+        with mock.patch.object(server, "herdr_plan_deliver", return_value=receipt) as resend:
+            server.supervisor_recover_deliveries()
+        resend.assert_called_once()
+        saved = self._supervisor_doc()["reports"][0]["delivery"]
+        self.assertEqual(saved["state"], "delivered")
+        self.assertTrue(saved["at_least_once"])
+
+    def test_terminal_job_with_expected_build_receipt_resolves_watch(self):
+        job = self._write_job("3" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            watch = self._watch()[1]
+        self.assertEqual(self._advance("start_writer", self.EVENT)[0], 200)
+        self._write_job(job, "completed")
+        server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["state"], "settled")
+        self.assertEqual(saved["action"], "receipt")
+        self.assertEqual(saved["watch_id"], watch["watch_id"])
+        self.assertEqual(saved["build_receipt"]["action"], "start_writer")
+        self.assertEqual(self._state()["stage"], "writing")
+
+    def test_failed_job_without_receipt_parks_before_delivery(self):
+        job = self._write_job("4" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        self._write_job(job, "failed")
+        with mock.patch.object(server, "SUPERVISOR_WATCH_SETTLE_SECONDS", 0):
+            server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        self.assertEqual(self._state()["stage"], "parked")
+        self.assertEqual(self._state()["park_reason"], "state_trace_disagreement")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["action"], "park")
+        self.assertEqual(saved["park_reason"], "state_trace_disagreement")
+        self.assertEqual(saved["state"], "settled")
+        self.assertIn("delivery", saved)
+
+    def test_expired_watch_parks_fail_closed(self):
+        job = self._write_job("5" * 32, "running")
+        self.assertEqual(self._register(job_id=job, deadline="2020-01-01T00:00:00Z")[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        self.assertEqual(self._state()["stage"], "parked")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["action"], "park")
+        self.assertEqual(saved["park_reason"], "deadline_exceeded")
+
+    def test_delivery_failure_is_saved_after_the_watch_parks(self):
+        job = self._write_job("6" * 32, "failed")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        failed = {"ok": False, "attempted": True, "code": "herdr_send_failed", "pane_id": self.PLAN_PANE}
+        with mock.patch.object(server, "SUPERVISOR_WATCH_SETTLE_SECONDS", 0), mock.patch.object(
+            server, "herdr_plan_deliver", return_value=failed
+        ):
+            server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        self.assertEqual(self._state()["stage"], "parked", "delivery cannot undo settlement")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertFalse(saved["delivery"]["ok"])
+        self.assertEqual(saved["delivery"]["state"], "pending")
+        self.assertEqual(saved["delivery"]["receipt"], failed)
+
+    def test_watch_park_write_failure_stays_watching_and_schedules_in_process_retry(self):
+        job = self._write_job("a" * 32, "failed")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        failed = {"ok": False, "error": "disk", "code": "state_write_failed", "status": 500}
+        with mock.patch.object(server, "SUPERVISOR_WATCH_SETTLE_SECONDS", 0), mock.patch.object(
+            server, "write_build", return_value=failed
+        ), mock.patch.object(server, "supervisor_schedule_watch_retry") as retry:
+            server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["state"], "watching")
+        self.assertEqual(saved["settlement_error"]["code"], "state_write_failed")
+        retry.assert_called_once_with(self.BUILD, f"{self.RUN}|{self.EVENT}")
+
+    def test_watch_worker_exception_stays_watching_and_schedules_in_process_retry(self):
+        job = self._write_job("b" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        with mock.patch.object(server, "supervisor_watch_settle", side_effect=RuntimeError("boom")), mock.patch.object(
+            server, "supervisor_schedule_watch_retry"
+        ) as retry:
+            server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["state"], "watching")
+        self.assertEqual(saved["worker_error"]["code"], "watch_worker_failed")
+        retry.assert_called_once_with(self.BUILD, f"{self.RUN}|{self.EVENT}")
+
+    def test_running_to_terminal_race_cannot_strand_the_build(self):
+        job = self._write_job("7" * 32, "running")
+        self.assertEqual(self._register(job_id=job)[0], 201)
+        with mock.patch.object(server, "supervisor_schedule_watch"):
+            self.assertEqual(self._watch()[0], 202)
+        receipt = {"action": "start_writer", "event_id": self.EVENT}
+        with mock.patch.object(
+            server,
+            "supervisor_job_snapshot",
+            side_effect=[
+                ("active", {"job_id": job, "status": "running"}),
+                ("completed", {"job_id": job, "status": "completed"}),
+                ("completed", {"job_id": job, "status": "completed"}),
+            ],
+        ), mock.patch.object(server, "supervisor_event_receipt", return_value=("writing", receipt)), mock.patch.object(
+            server.time, "time", side_effect=[0.0, 10_000_000_000.0]
+        ):
+            server.supervisor_watch_worker(self.BUILD, f"{self.RUN}|{self.EVENT}")
+        saved = self._supervisor_doc()["watches"][f"{self.RUN}|{self.EVENT}"]
+        self.assertEqual(saved["action"], "receipt")
+        self.assertEqual(saved["state"], "settled")
+
+    # -- catalog and graph --------------------------------------------------
+
+    def test_openapi_declares_the_supervisor_operations(self):
+        spec = json.loads(server.openapi_bytes())
+        for route, method, op_id in (
+            ("/v1/supervisor/register", "post", "supervisorRegister"),
+            ("/v1/supervisor/bind", "post", "supervisorBind"),
+            ("/v1/supervisor/reconcile", "post", "supervisorReconcile"),
+            ("/v1/supervisor/watch", "post", "supervisorWatch"),
+            ("/v1/supervisor/report", "get", "supervisorReport"),
+        ):
+            self.assertIn(route, spec["paths"])
+            self.assertEqual(spec["paths"][route][method]["operationId"], op_id)
+        schemas = spec["components"]["schemas"]
+        self.assertEqual(
+            sorted(schemas["SupervisorRegisterRequest"]["required"]),
+            [
+                "build_id",
+                "continuation",
+                "deadline",
+                "event_id",
+                "expected_stage",
+                "plan_pane",
+                "source_run_id",
+                "workflow_id",
+                "workflow_version",
+            ],
+        )
+        self.assertEqual(
+            set(schemas["SupervisorRegisterRequest"]["properties"]["expected_stage"]["enum"]),
+            set(server.BUILD_STAGE_ORDER),
+        )
+        reconcile = schemas["SupervisorReconcileRequest"]["properties"]
+        self.assertEqual(
+            set(reconcile["source_run"]["properties"]["status"]["enum"]),
+            set(server.SUPERVISOR_TERMINAL_STATUSES),
+        )
+        self.assertEqual(
+            set(reconcile["source_run"]["properties"]["execution_mode"]["enum"]),
+            set(server.SUPERVISOR_EXECUTION_MODES),
+        )
+        # No caller-settable retry class in the contract. Authenticated,
+        # bounded node/code metadata may refine circuit identity, never budget.
+        self.assertEqual(set(reconcile["failure"]["properties"]), {"node", "code"})
+        tags = reconcile["source_workflow"]["properties"]["tags"]
+        self.assertEqual(tags["type"], "array")
+        self.assertEqual(tags["maxItems"], server.SUPERVISOR_TAGS_MAX)
+        self.assertEqual(
+            set(schemas["SupervisorPlanReport"]["properties"]["failure_class"]["enum"]),
+            set(server.SUPERVISOR_FAILURE_CLASSES),
+        )
+        watch_request = schemas["SupervisorWatchRequest"]
+        self.assertFalse(watch_request["additionalProperties"])
+        self.assertEqual(watch_request["required"], ["source_run_id"])
+        self.assertEqual(set(watch_request["properties"]), {"source_run_id"})
+        # The strict contract has to admit exactly what a Jinja render of a
+        # boolean produces, and nothing wider.
+        error_forms = reconcile["error"]["oneOf"]
+        rendered = next(o for o in error_forms if o.get("type") == "string")
+        self.assertEqual(set(rendered["enum"]), {"true", "false", ""})
+        # An error object that allows extra keys is an error object someone
+        # will put a stack trace in.
+        error_object = next(option for option in error_forms if option["type"] == "object")
+        self.assertFalse(error_object["additionalProperties"])
+        self.assertFalse(reconcile["failure"]["additionalProperties"])
+        actions = set(schemas["SupervisorReconcile"]["properties"]["action"]["enum"])
+        self.assertEqual(
+            actions,
+            {"receipt", "watch", "relaunch", "retry_event", "park", "circuit_open", "ignored"},
+        )
+        self.assertIn("supervisor", {tag["name"] for tag in spec["tags"]})
+
+    def test_every_graphwing_action_in_the_new_graphs_exists_in_openapi(self):
+        spec = json.loads(server.openapi_bytes())
+        root = Path(__file__).resolve().parent / "graphs"
+        for name in ("pre-pr-build", "build-completion-supervisor"):
+            graph = json.loads((root / f"{name}.json").read_text())
+            for node in graph["spec"]["nodes"]:
+                match = re.fullmatch(r"action\.graphwing\.([A-Z]+):(.+)", node["type"])
+                if not match:
+                    continue
+                method, route = match.groups()
+                self.assertIn(route, spec["paths"], f"{name}:{node['id']} route")
+                self.assertIn(method.lower(), spec["paths"][route], f"{name}:{node['id']} method")
+
+    def test_the_listener_graph_is_a_completion_trigger_that_cannot_self_kick(self):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "build-completion-supervisor.json").read_text()
+        )
+        self.assertEqual(graph["slug"], server.SUPERVISOR_LISTENER_SLUG)
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        trigger = nodes["trigger"]
+        self.assertEqual(trigger["type"], "trigger.workflowCompleted")
+        config = trigger["config"]
+        self.assertEqual(set(config["statuses"]), set(server.SUPERVISOR_TERMINAL_STATUSES))
+        self.assertEqual(config["executionModes"], ["live"])
+        self.assertEqual(config["contextMode"], "output")
+        self.assertEqual(config["sourceWorkflowTags"], [server.SUPERVISOR_TAG])
+        self.assertEqual(config["sourceWorkflowIds"], ["$GRAPHWING_SOURCE_WORKFLOW_ID"])
+        self.assertTrue(config["excludeSelf"])
+        node_types = [node["type"].lower() for node in graph["spec"]["nodes"]]
+        # The server owns durable watch settlement; the listener never holds an
+        # expiring callback capability or an idle wait node.
+        waits = [node for node in nodes.values() if node["type"].startswith("action.wait")]
+        self.assertEqual(waits, [])
+        raw_graph = json.dumps(graph).lower()
+        for forbidden in ("response_webhook", "resumeurl", "resumetoken", "callback"):
+            self.assertNotIn(forbidden, raw_graph)
+        for banned in ("trigger.webhook", "trigger.manual", "rewst/fire", "agent/run", "git/"):
+            self.assertFalse(any(banned in node_type for node_type in node_types), banned)
+        self.assertFalse(
+            any(node["type"].startswith("trigger.") for nid, node in nodes.items() if nid != "trigger"),
+            "the listener has exactly one trigger",
+        )
+        outgoing = {}
+        for edge in graph["spec"]["edges"]:
+            outgoing.setdefault(edge["source"], set()).add(edge["target"])
+        reachable = set()
+        frontier = list(outgoing.get("watch_start", ()))
+        while frontier:
+            nid = frontier.pop()
+            if nid in reachable:
+                continue
+            reachable.add(nid)
+            frontier.extend(outgoing.get(nid, ()))
+        self.assertNotIn("trigger", reachable, "the watch cannot cycle to the completion trigger")
+        self.assertNotIn("watch_start", reachable, "the watch cannot cycle to itself")
+
+    def test_the_listener_graph_routes_every_reconciled_action(self):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "build-completion-supervisor.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["reconcile"]["type"], "action.graphwing.POST:/v1/supervisor/reconcile")
+        self.assertEqual(nodes["report"]["type"], "action.graphwing.GET:/v1/supervisor/report")
+        # The listener sends identity and presence, never a key or a token.
+        raw = json.dumps(nodes["reconcile"]["config"])
+        for banned in ("api_key", "X-Graphwing-Key", "mcp", "token", "kick_url", "GRAPHWING_KEY"):
+            self.assertNotIn(banned, raw, banned)
+        for field in ("sourceWorkflow.id", "sourceWorkflow.slug", "sourceRun.id", "sourceRun.status"):
+            self.assertIn(field, raw, field)
+        payload = nodes["completion_payload"]
+        self.assertEqual(payload["type"], "transforms.objectBuilder")
+        mappings = {m["output"]: m["expression"] for m in payload["config"]["mappings"]}
+        self.assertEqual(
+            mappings["source_workflow"],
+            {"kind": "getField", "path": "TRIGGER.workflowCompleted.sourceWorkflow"},
+        )
+        self.assertEqual(
+            nodes["reconcile"]["config"]["source_workflow"]["tags"],
+            "{{ TASKS.completion_payload.source_workflow.tags | tojson }}",
+        )
+        switch = nodes["switch_action"]
+        labels = [case["label"] for case in switch["config"]["cases"]]
+        labels.append(switch["config"]["default"]["label"])
+        actions = set(
+            json.loads(server.openapi_bytes())["components"]["schemas"]["SupervisorReconcile"][
+                "properties"
+            ]["action"]["enum"]
+        )
+        self.assertEqual(set(labels), actions, "every action the op can return needs an edge")
+        edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
+        self.assertEqual(edges["e_trigger_payload"]["target"], "completion_payload")
+        self.assertEqual(edges["e_payload_reconcile"]["source"], "completion_payload")
+        self.assertEqual(edges["e_payload_reconcile"]["target"], "reconcile")
+        self.assertEqual(edges["e_reconcile_failure"]["target"], "not_supervised")
+        self.assertEqual(edges["e_circuit_join"]["target"], "join_parked")
+        self.assertEqual(edges["e_parked_join"]["target"], "join_parked")
+        self.assertEqual(nodes["join_parked"]["type"], "logic.join.any")
+        targets = {edge["target"] for edge in graph["spec"]["edges"]}
+        for case_index, label in enumerate(switch["config"]["cases"]):
+            handle = f"case-{case_index}"
+            self.assertTrue(
+                any(
+                    edge["source"] == "switch_action" and edge["sourceHandle"] == handle
+                    for edge in graph["spec"]["edges"]
+                ),
+                f"{label['label']} has no edge",
+            )
+        self.assertIn("report", targets)
+
+    def test_retry_event_continues_with_the_registered_writer_check_and_reviewer_input(self):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "build-completion-supervisor.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        continuation = nodes["continue_source"]
+        self.assertEqual(continuation["config"]["workflowId"], "$GRAPHWING_SOURCE_WORKFLOW_ID")
+        self.assertTrue(continuation["config"]["await"])
+        self.assertEqual(continuation["config"]["maxInvocations"], 1)
+        inputs = continuation["config"]["input"]
+        for field in (
+            "build_id", "event_id", "plan_pane", "expected_stage", "deadline", "repo",
+            "writer_prompt", "writer_prompt_ref", "fast_recipe", "integration_recipe", "reviewer",
+            "class_stamp", "route_stamp",
+        ):
+            self.assertEqual(inputs[field], f"{{{{ TASKS.reconcile.data.continuation.{field} }}}}")
+        continued = nodes["continued"]["config"]["mappings"]
+        mapped = {entry["output"]: entry["expression"].get("path") for entry in continued}
+        self.assertEqual(mapped["source_receipt"], "TASKS.continue_source.data.receipt")
+        self.assertEqual(mapped["source_report"], "TASKS.continue_source.data.report")
+
+    def test_source_graph_binds_async_job_acknowledgements_before_callbacks_finish(self):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "pre-pr-build.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        for producer, binder in (
+            ("writer", "bind_writer"),
+            ("check", "bind_check"),
+            ("review", "bind_review"),
+        ):
+            self.assertEqual(nodes[binder]["type"], "action.graphwing.POST:/v1/supervisor/bind")
+            self.assertEqual(nodes[binder]["config"]["source_run_id"], "{{ CTX.WORKFLOW.runId }}")
+            self.assertEqual(nodes[binder]["config"]["job_id"], f"{{{{ TASKS.{producer}.data.job_id }}}}")
+            self.assertEqual(nodes[producer]["config"]["supervised_source_run_id"], "{{ CTX.WORKFLOW.runId }}")
+            self.assertTrue(
+                any(
+                    edge["source"] == producer
+                    and edge["sourceHandle"] == "success"
+                    and edge["target"] == binder
+                    for edge in edges
+                )
+            )
+        for join_id in ("join_writer_done", "join_check_done", "join_review_done"):
+            self.assertEqual(nodes[join_id]["type"], "logic.join.all")
+
+    # -- the body the published listener actually sends ----------------------
+
+    @staticmethod
+    def _render_rewst_config(config, context):
+        """Render a Rewst node config the way the engine does.
+
+        Every node config value is a string template, so whatever a `{{ ... }}`
+        resolves to is stringified on the way out: a list becomes its repr, a
+        boolean becomes "true"/"false", a missing value becomes "". This is the
+        difference between a payload that validates in a hand-written test and
+        one that validates in production.
+        """
+        def resolve(path):
+            value = context
+            for part in path.split("."):
+                if not isinstance(value, dict) or part not in value:
+                    return ""
+                value = value[part]
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            return "" if value is None else str(value)
+
+        def render(node):
+            if isinstance(node, dict):
+                return {k: render(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [render(v) for v in node]
+            if isinstance(node, str):
+                return re.sub(r"\{\{\s*(.+?)\s*\}\}", lambda m: resolve(m.group(1)), node)
+            return node
+
+        return render(config)
+
+    def _graph_reconcile_body(self, tags=None, **run_over):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "build-completion-supervisor.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        config = nodes["reconcile"]["config"]
+        source_run = {
+            "id": self.RUN,
+            "status": "failed",
+            "executionMode": "live",
+            "startedAt": "2026-08-25T10:00:00Z",
+            "finishedAt": "2026-08-25T10:04:00Z",
+        }
+        source_run.update(run_over)
+        context = {
+            "CTX": {"WORKFLOW": {"version": "7"}},
+            "TRIGGER": {
+                "workflowCompleted": {
+                    "sourceWorkflow": {
+                        "id": self.WORKFLOW,
+                        "slug": "graphwing-pre-pr-build",
+                        "name": "graphwing-pre-pr-build",
+                        "tags": ["graphwing-supervised"] if tags is None else tags,
+                    },
+                    "sourceRun": source_run,
+                    "output": {"build_id": self.BUILD, "event_id": self.EVENT},
+                    "error": {"present": source_run["status"] != "completed"},
+                }
+            },
+        }
+        transform = nodes["completion_payload"]["config"]
+        transformed = {}
+        for mapping in transform["mappings"]:
+            path = mapping["expression"]["path"]
+            value = context
+            for part in path.split("."):
+                value = value[part]
+            transformed[mapping["output"]] = value
+        self.assertIsInstance(transformed["source_workflow"]["tags"], list)
+        context["TASKS"] = {"completion_payload": transformed}
+
+        def render_action(node):
+            if isinstance(node, dict):
+                return {k: render_action(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [render_action(v) for v in node]
+            if not isinstance(node, str):
+                return node
+            match = re.fullmatch(r"\{\{\s*(.+?)\s*\}\}", node)
+            if match and match.group(1).endswith(" | tojson"):
+                path = match.group(1)[: -len(" | tojson")]
+                value = context
+                for part in path.split("."):
+                    value = value[part]
+                return json.dumps(value, separators=(",", ":"))
+            return self._render_rewst_config(node, context)
+
+        body = render_action(config)
+        # Node plumbing, not payload.
+        for key in ("integrationInstanceId", "timeout"):
+            body.pop(key, None)
+        return body
+
+    def test_the_body_the_published_listener_renders_is_accepted(self):
+        self.assertEqual(self._register()[0], 201)
+        body = self._graph_reconcile_body()
+        self.assertEqual(body["listener_id"], self.LISTENER)
+        self.assertEqual(json.loads(body["source_workflow"]["tags"]), ["graphwing-supervised"])
+        self.assertEqual(body["error"], "true", "a rendered boolean is the word, not the type")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/supervisor/reconcile", {}, True, json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "retry_event")
+        self.assertTrue(payload["report"]["error_present"])
+        self.assertEqual(payload["listener_slug"], server.SUPERVISOR_LISTENER_SLUG)
+
+    def test_a_clean_completion_renders_error_presence_as_false(self):
+        # The other render of the same field. "" and "false" both mean absent,
+        # and neither may be read as a message.
+        self.assertEqual(self._register()[0], 201)
+        body = self._graph_reconcile_body(status="completed")
+        self.assertEqual(body["error"], "false")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/supervisor/reconcile", {}, True, json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["report"]["error_present"])
+        self.assertTrue(payload["workflow_fault"])
+
+    def test_graph_transform_delivers_multiple_empty_self_and_maximum_tags(self):
+        cases = (
+            ([], 200, None),
+            (["graphwing-supervised", "pre-pr"], 200, None),
+            ([server.SUPERVISOR_LISTENER_SLUG], 409, "self_listener"),
+            ([f"tag-{i}" for i in range(server.SUPERVISOR_TAGS_MAX)], 200, None),
+        )
+        for n, (tags, expected_status, expected_code) in enumerate(cases, start=1):
+            with self.subTest(tags=len(tags), expected=expected_status):
+                run = self._next_run(900 + n)
+                self.assertEqual(self._register(source_run_id=run)[0], 201)
+                body = self._graph_reconcile_body(tags=tags, id=run)
+                self.assertEqual(json.loads(body["source_workflow"]["tags"]), tags)
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/supervisor/reconcile", {}, True, json.dumps(body).encode()
+                )
+                self.assertEqual(status, expected_status, payload)
+                if expected_code:
+                    self.assertEqual(payload["code"], expected_code)
+
+    def test_the_catalog_documents_the_listener(self):
+        readme = (Path(__file__).resolve().parent / "graphs" / "README.md").read_text()
+        self.assertIn(server.SUPERVISOR_LISTENER_SLUG, readme)
+        publish = (Path(__file__).resolve().parent / "scripts" / "publish_graphs.py").read_text()
+        self.assertIn("build-completion-supervisor", publish)
 
 
 if __name__ == "__main__":

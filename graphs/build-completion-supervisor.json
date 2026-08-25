@@ -1,0 +1,300 @@
+{
+  "slug": "graphwing-build-completion-supervisor",
+  "name": "graphwing-build-completion-supervisor",
+  "tags": [],
+  "description": "Completion supervisor. trigger.workflowCompleted on every terminal live status of workflows tagged graphwing-supervised, output context, cannot select itself: this workflow carries no tags of its own, so the filter can never name it. A single objectBuilder first preserves sourceWorkflow as a typed object, including its string-array tags; the custom-action boundary uses tojson for that one array because action configuration templates are scalar, and the server strictly decodes only a bounded JSON array. Calls supervisorReconcile, then routes on the returned action. retry_event and relaunch both start exactly one bounded graphwing-pre-pr-build continuation against the registered build_id and event_id, so the source workflow's own durable claim decides what actually happens and a replayed event id repeats no side effect. watch calls supervisorWatch once and terminates; the server-owned durable watcher settles the build and reports to the exact saved plan pane asynchronously using only stable identity. Parks and open circuits read supervisorReport. No self-kick, no graph cycle, no expiring capability, no unbounded polling, no idle human wait.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      {
+        "id": "trigger",
+        "type": "trigger.workflowCompleted",
+        "label": "Supervised workflow completed",
+        "position": { "x": 0, "y": 260 },
+        "config": {
+          "enabled": true,
+          "sourceWorkflowTags": ["graphwing-supervised"],
+          "sourceWorkflowIds": ["$GRAPHWING_SOURCE_WORKFLOW_ID"],
+          "statuses": ["completed", "failed", "canceled", "timed_out"],
+          "executionModes": ["live"],
+          "contextMode": "output",
+          "excludeSelf": true
+        }
+      },
+      {
+        "id": "completion_payload",
+        "type": "transforms.objectBuilder",
+        "label": "Typed completion payload",
+        "position": { "x": 180, "y": 260 },
+        "config": {
+          "alias": "completion_payload",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "source_workflow", "expression": { "kind": "getField", "path": "TRIGGER.workflowCompleted.sourceWorkflow" } }
+          ]
+        }
+      },
+      {
+        "id": "reconcile",
+        "type": "action.graphwing.POST:/v1/supervisor/reconcile",
+        "label": "supervisorReconcile",
+        "position": { "x": 300, "y": 260 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "listener_id": "graphwing-build-completion-supervisor@{{ CTX.WORKFLOW.version }}",
+          "source_workflow": {
+            "id": "{{ TRIGGER.workflowCompleted.sourceWorkflow.id }}",
+            "slug": "{{ TRIGGER.workflowCompleted.sourceWorkflow.slug }}",
+            "name": "{{ TRIGGER.workflowCompleted.sourceWorkflow.name }}",
+            "tags": "{{ TASKS.completion_payload.source_workflow.tags | tojson }}"
+          },
+          "source_run": {
+            "id": "{{ TRIGGER.workflowCompleted.sourceRun.id }}",
+            "status": "{{ TRIGGER.workflowCompleted.sourceRun.status }}",
+            "execution_mode": "{{ TRIGGER.workflowCompleted.sourceRun.executionMode }}",
+            "started_at": "{{ TRIGGER.workflowCompleted.sourceRun.startedAt }}",
+            "finished_at": "{{ TRIGGER.workflowCompleted.sourceRun.finishedAt }}"
+          },
+          "output": {
+            "build_id": "{{ TRIGGER.workflowCompleted.output.build_id }}",
+            "event_id": "{{ TRIGGER.workflowCompleted.output.event_id }}"
+          },
+          "error": "{{ TRIGGER.workflowCompleted.error.present }}"
+        }
+      },
+      {
+        "id": "switch_action",
+        "type": "logic.switch",
+        "label": "reconciled action",
+        "position": { "x": 600, "y": 260 },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            { "label": "receipt", "rules": [{ "path": "data.action", "op": "equals", "value": "receipt" }] },
+            { "label": "watch", "rules": [{ "path": "data.action", "op": "equals", "value": "watch" }] },
+            { "label": "relaunch", "rules": [{ "path": "data.action", "op": "equals", "value": "relaunch" }] },
+            { "label": "retry_event", "rules": [{ "path": "data.action", "op": "equals", "value": "retry_event" }] },
+            { "label": "circuit_open", "rules": [{ "path": "data.action", "op": "equals", "value": "circuit_open" }] },
+            { "label": "park", "rules": [{ "path": "data.action", "op": "equals", "value": "park" }] }
+          ],
+          "default": { "label": "ignored" }
+        }
+      },
+      {
+        "id": "done_receipt",
+        "type": "transforms.objectBuilder",
+        "label": "Done (terminal receipt)",
+        "position": { "x": 900, "y": 60 },
+        "config": {
+          "alias": "done_receipt",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "terminal_receipt" } },
+            { "id": "m3", "output": "build_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.build_id" } },
+            { "id": "m4", "output": "source_run_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.source_run_id" } }
+          ]
+        }
+      },
+      {
+        "id": "watch_start",
+        "type": "action.graphwing.POST:/v1/supervisor/watch",
+        "label": "supervisorWatch",
+        "position": { "x": 1080, "y": 100 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "source_run_id": "{{ TASKS.reconcile.data.source_run_id }}"
+        }
+      },
+      {
+        "id": "watching",
+        "type": "transforms.objectBuilder",
+        "label": "Durable watch registered; listener done",
+        "position": { "x": 1320, "y": 100 },
+        "config": {
+          "alias": "watching",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "watching" } },
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "server_owned_watch" } },
+            { "id": "m3", "output": "build_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.build_id" } },
+            { "id": "m4", "output": "source_run_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.source_run_id" } },
+            { "id": "m5", "output": "watch_id", "expression": { "kind": "getField", "path": "TASKS.watch_start.data.watch_id" } },
+            { "id": "m6", "output": "watch_state", "expression": { "kind": "getField", "path": "TASKS.watch_start.data.state" } }
+          ]
+        }
+      },
+      {
+        "id": "watch_failed",
+        "type": "action.noop",
+        "label": "Herdr: durable watch could not be registered",
+        "position": { "x": 1320, "y": 200 },
+        "config": {}
+      },
+      {
+        "id": "join_continue",
+        "type": "logic.join.any",
+        "label": "One bounded source continuation",
+        "position": { "x": 1080, "y": 320 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "continue_source",
+        "type": "action.workflow.start",
+        "label": "Start graphwing-pre-pr-build for the registered build and event",
+        "position": { "x": 1320, "y": 320 },
+        "config": {
+          "workflowId": "$GRAPHWING_SOURCE_WORKFLOW_ID",
+          "workflowSlug": "graphwing-pre-pr-build",
+          "await": true,
+          "maxInvocations": 1,
+          "input": {
+            "build_id": "{{ TASKS.reconcile.data.continuation.build_id }}",
+            "event_id": "{{ TASKS.reconcile.data.continuation.event_id }}",
+            "plan_pane": "{{ TASKS.reconcile.data.continuation.plan_pane }}",
+            "expected_stage": "{{ TASKS.reconcile.data.continuation.expected_stage }}",
+            "deadline": "{{ TASKS.reconcile.data.continuation.deadline }}",
+            "repo": "{{ TASKS.reconcile.data.continuation.repo }}",
+            "writer_prompt": "{{ TASKS.reconcile.data.continuation.writer_prompt }}",
+            "writer_prompt_ref": "{{ TASKS.reconcile.data.continuation.writer_prompt_ref }}",
+            "fast_recipe": "{{ TASKS.reconcile.data.continuation.fast_recipe }}",
+            "integration_recipe": "{{ TASKS.reconcile.data.continuation.integration_recipe }}",
+            "reviewer": "{{ TASKS.reconcile.data.continuation.reviewer }}",
+            "class_stamp": "{{ TASKS.reconcile.data.continuation.class_stamp }}",
+            "route_stamp": "{{ TASKS.reconcile.data.continuation.route_stamp }}"
+          }
+        }
+      },
+      {
+        "id": "continued",
+        "type": "transforms.objectBuilder",
+        "label": "Continuation started; this listener is done",
+        "position": { "x": 1560, "y": 320 },
+        "config": {
+          "alias": "continued",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "continued" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.continuation.build_id" } },
+            { "id": "m3", "output": "event_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.continuation.event_id" } },
+            { "id": "m4", "output": "reason", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.continuation.reason" } },
+            { "id": "m5", "output": "attempt", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.continuation.attempt" } },
+            { "id": "m6", "output": "workflow_slug", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.continuation.workflow_slug" } },
+            { "id": "m7", "output": "source_run_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.source_run_id" } },
+            { "id": "m8", "output": "continuation_run_id", "expression": { "kind": "getField", "path": "TASKS.continue_source.data.runId" } },
+            { "id": "m9", "output": "source_receipt", "expression": { "kind": "getField", "path": "TASKS.continue_source.data.receipt" } },
+            { "id": "m10", "output": "source_report", "expression": { "kind": "getField", "path": "TASKS.continue_source.data.report" } }
+          ]
+        }
+      },
+      {
+        "id": "continue_failed",
+        "type": "action.noop",
+        "label": "Herdr: continuation could not be started",
+        "position": { "x": 1320, "y": 440 },
+        "config": {}
+      },
+      {
+        "id": "ignored",
+        "type": "action.noop",
+        "label": "Herdr: not a supervised live run",
+        "position": { "x": 900, "y": 460 },
+        "config": {}
+      },
+      {
+        "id": "circuit_open",
+        "type": "action.noop",
+        "label": "Herdr: circuit opened",
+        "position": { "x": 900, "y": 580 },
+        "config": {}
+      },
+      {
+        "id": "parked",
+        "type": "action.noop",
+        "label": "Herdr: parked",
+        "position": { "x": 900, "y": 680 },
+        "config": {}
+      },
+      {
+        "id": "join_parked",
+        "type": "logic.join.any",
+        "label": "Parked or circuit open",
+        "position": { "x": 1140, "y": 630 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "report",
+        "type": "action.graphwing.GET:/v1/supervisor/report",
+        "label": "supervisorReport",
+        "position": { "x": 1380, "y": 630 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 15,
+          "source_run_id": "{{ TASKS.reconcile.data.source_run_id }}"
+        }
+      },
+      {
+        "id": "parked_report",
+        "type": "transforms.objectBuilder",
+        "label": "Operator report",
+        "position": { "x": 1660, "y": 630 },
+        "config": {
+          "alias": "parked_report",
+          "version": 1,
+          "mappings": [
+            { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "parked" } },
+            { "id": "m2", "output": "build_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.build_id" } },
+            { "id": "m3", "output": "source_run_id", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.source_run_id" } },
+            { "id": "m4", "output": "park_reason", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.park_reason" } },
+            { "id": "m5", "output": "workflow_version", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.workflow_version" } },
+            { "id": "m6", "output": "failed_node", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.report.failed_node" } },
+            { "id": "m7", "output": "build_stage", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.build_stage" } },
+            { "id": "m8", "output": "local_job_status", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.local_job_status" } },
+            { "id": "m9", "output": "next_operator_action", "expression": { "kind": "getField", "path": "TASKS.reconcile.data.next_operator_action" } },
+            { "id": "m10", "output": "reports", "expression": { "kind": "getField", "path": "TASKS.report.reports" } }
+          ]
+        }
+      },
+      {
+        "id": "not_supervised",
+        "type": "action.noop",
+        "label": "Herdr: reconcile HTTP failed or run not supervised",
+        "position": { "x": 600, "y": 780 },
+        "config": {}
+      },
+      {
+        "id": "report_unreadable",
+        "type": "action.noop",
+        "label": "Herdr: report unreadable",
+        "position": { "x": 1380, "y": 780 },
+        "config": {}
+      }
+    ],
+    "edges": [
+      { "id": "e_trigger_payload", "source": "trigger", "sourceHandle": "out", "target": "completion_payload", "targetHandle": "in" },
+      { "id": "e_payload_reconcile", "source": "completion_payload", "sourceHandle": "out", "target": "reconcile", "targetHandle": "in" },
+      { "id": "e_reconcile_success", "source": "reconcile", "sourceHandle": "success", "target": "switch_action", "targetHandle": "in" },
+      { "id": "e_reconcile_failure", "source": "reconcile", "sourceHandle": "failure", "target": "not_supervised", "targetHandle": "in" },
+      { "id": "e_action_receipt", "source": "switch_action", "sourceHandle": "case-0", "target": "done_receipt", "targetHandle": "in" },
+      { "id": "e_action_watch", "source": "switch_action", "sourceHandle": "case-1", "target": "watch_start", "targetHandle": "in" },
+      { "id": "e_action_relaunch", "source": "switch_action", "sourceHandle": "case-2", "target": "join_continue", "targetHandle": "in" },
+      { "id": "e_action_retry", "source": "switch_action", "sourceHandle": "case-3", "target": "join_continue", "targetHandle": "in" },
+      { "id": "e_action_circuit", "source": "switch_action", "sourceHandle": "case-4", "target": "circuit_open", "targetHandle": "in" },
+      { "id": "e_watch_start_success", "source": "watch_start", "sourceHandle": "success", "target": "watching", "targetHandle": "in" },
+      { "id": "e_watch_start_failure", "source": "watch_start", "sourceHandle": "failure", "target": "watch_failed", "targetHandle": "in" },
+      { "id": "e_join_continue_start", "source": "join_continue", "sourceHandle": "out", "target": "continue_source", "targetHandle": "in" },
+      { "id": "e_continue_success", "source": "continue_source", "sourceHandle": "success", "target": "continued", "targetHandle": "in" },
+      { "id": "e_continue_failure", "source": "continue_source", "sourceHandle": "failure", "target": "continue_failed", "targetHandle": "in" },
+      { "id": "e_continue_failed_join", "source": "continue_failed", "sourceHandle": "out", "target": "join_parked", "targetHandle": "in" },
+      { "id": "e_action_park", "source": "switch_action", "sourceHandle": "case-5", "target": "parked", "targetHandle": "in" },
+      { "id": "e_action_ignored", "source": "switch_action", "sourceHandle": "default", "target": "ignored", "targetHandle": "in" },
+      { "id": "e_circuit_join", "source": "circuit_open", "sourceHandle": "out", "target": "join_parked", "targetHandle": "in" },
+      { "id": "e_parked_join", "source": "parked", "sourceHandle": "out", "target": "join_parked", "targetHandle": "in" },
+      { "id": "e_join_report", "source": "join_parked", "sourceHandle": "out", "target": "report", "targetHandle": "in" },
+      { "id": "e_report_success", "source": "report", "sourceHandle": "success", "target": "parked_report", "targetHandle": "in" },
+      { "id": "e_report_failure", "source": "report", "sourceHandle": "failure", "target": "report_unreadable", "targetHandle": "in" }
+    ]
+  }
+}

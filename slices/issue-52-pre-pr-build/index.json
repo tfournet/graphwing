@@ -16,81 +16,83 @@
   },
   "tickets": [
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "01-build-state",
       "path": "slices/issue-52-pre-pr-build/01-build-state.md",
       "kind": "build",
       "status": "done",
-      "blocked_by": [],
-      "ac_count": 8,
-      "seams": 1
+      "blocked_by": []
     },
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "02-mechanical-path",
       "path": "slices/issue-52-pre-pr-build/02-mechanical-path.md",
       "kind": "build",
       "status": "open",
       "blocked_by": [
         "01-build-state"
-      ],
-      "ac_count": 8,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "03-visual-evidence",
       "path": "slices/issue-52-pre-pr-build/03-visual-evidence.md",
       "kind": "build",
       "status": "open",
       "blocked_by": [
         "02-mechanical-path"
-      ],
-      "ac_count": 8,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "04-visual-iteration",
       "path": "slices/issue-52-pre-pr-build/04-visual-iteration.md",
       "kind": "build",
       "status": "open",
       "blocked_by": [
         "03-visual-evidence"
-      ],
-      "ac_count": 8,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 7,
+      "seams": 1,
       "id": "05-sensitive-review",
       "path": "slices/issue-52-pre-pr-build/05-sensitive-review.md",
       "kind": "build",
       "status": "open",
       "blocked_by": [
         "02-mechanical-path"
-      ],
-      "ac_count": 7,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 6,
+      "seams": 1,
       "id": "06-pr-lifecycle",
       "path": "slices/issue-52-pre-pr-build/06-pr-lifecycle.md",
       "kind": "build",
       "status": "open",
       "blocked_by": [
         "04-visual-iteration"
-      ],
-      "ac_count": 6,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "06b-completion-supervisor",
       "path": "slices/issue-52-pre-pr-build/06b-completion-supervisor.md",
       "kind": "build",
-      "status": "open",
+      "status": "done",
       "blocked_by": [
         "01-build-state"
-      ],
-      "ac_count": 8,
-      "seams": 1
+      ]
     },
     {
+      "ac_count": 8,
+      "seams": 1,
       "id": "07-rollout-proof",
       "path": "slices/issue-52-pre-pr-build/07-rollout-proof.md",
       "kind": "build",
@@ -101,9 +103,7 @@
         "05-sensitive-review",
         "06-pr-lifecycle",
         "06b-completion-supervisor"
-      ],
-      "ac_count": 8,
-      "seams": 1
+      ]
     }
   ]
 }

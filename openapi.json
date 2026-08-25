@@ -26,7 +26,8 @@
     { "name": "port" },
     { "name": "test" },
     { "name": "rr" },
-    { "name": "build" }
+    { "name": "build" },
+    { "name": "supervisor" }
   ],
   "paths": {
     "/v1/health": {
@@ -554,6 +555,94 @@
         ],
         "responses": {
           "200": { "description": "state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildState" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supervisor/register": {
+      "post": {
+        "operationId": "supervisorRegister",
+        "tags": ["supervisor"],
+        "summary": "Durably register a launched Rewst source run before monitoring starts. Maps source_run_id to build_id, event_id, workflow_id/workflow_version, expected_stage, deadline, and the exact saved plan_pane, so a run that fails before declaring any output is still supervised and every later report has one destination. Re-posting the same source_run_id with identical input returns the record (registered=false) and repairs a source-run index entry an interrupted registration left missing (index_repaired=true); different input is 409 registration_conflict.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorRegisterRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "already registered, unchanged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorLaunch" } } } },
+          "201": { "description": "registered", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorLaunch" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supervisor/bind": {
+      "post": {
+        "operationId": "supervisorBind",
+        "tags": ["supervisor"],
+        "summary": "Bind one acknowledged local job to an existing registered source run. Only null to a valid job id or an exact replay is accepted; a different job id is 409 job_binding_conflict.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorBindRequest" } } } },
+        "responses": {
+          "200": { "description": "bound or exact replay", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorBinding" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supervisor/reconcile": {
+      "post": {
+        "operationId": "supervisorReconcile",
+        "tags": ["supervisor"],
+        "summary": "Reconcile one terminal source-run completion delivered by trigger.workflowCompleted. Deduplicates on source_run.id plus the listener slug, so a republished listener replays rather than re-decides. Requires a matching launch registration, and treats Rewst `completed` without Graphwing's own terminal receipt as workflow_fault rather than success. Retry class comes only from trusted terminal status. Circuit identity starts with registered workflow ID/version, uses strict node/code metadata when the authenticated listener actually has it, and otherwise uses canonical unknown plus terminal status/error presence. Returns 200 for every reconciled delivery, including a park: the action field carries the outcome so the listener can route without a wait node. Send error.present only; a raw message, trace, or body is refused with raw_error_forbidden.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorReconcileRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "reconciled; read action and resolution. ok=false with parked=true is a park, not a transport failure.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorReconcile" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "unknown_source_run: no launch registration, so the run is not supervised", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "idempotency_conflict, registration_conflict, self_listener, or unreadable supervisor state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supervisor/watch": {
+      "post": {
+        "operationId": "supervisorWatch",
+        "tags": ["supervisor"],
+        "summary": "Start or join one durable server-owned watch for the local job already bound to a registered source run. The request carries only stable identity; registered event, job, deadline, and plan pane are authoritative.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorWatchRequest" } } } },
+        "responses": {
+          "200": { "description": "existing settled watch", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorWatch" } } } },
+          "202": { "description": "watch started or joined", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorWatch" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supervisor/report": {
+      "get": {
+        "operationId": "supervisorReport",
+        "tags": ["supervisor"],
+        "summary": "Read the saved planning-session reports and circuit state for a build. Every retry, park, and circuit-open outcome is recorded here with source run id, workflow version, available failed-node label or canonical unknown, build stage, local job status, action taken, and the exact next operator action. There is no idle human wait anywhere in the path: the report is durable and fetched, never waited on.",
+        "parameters": [
+          { "name": "build_id", "in": "query", "schema": { "type": "string" }, "description": "Required unless source_run_id is given." },
+          { "name": "source_run_id", "in": "query", "schema": { "type": "string" }, "description": "Resolves the build through the launch registry and filters reports to this run." }
+        ],
+        "responses": {
+          "200": { "description": "reports", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SupervisorReport" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "$ref": "#/components/responses/Error" },
@@ -1099,6 +1188,7 @@
         "required": ["name"],
         "properties": {
           "name": { "type": "string", "description": "scripts.json name only. No client argv." },
+          "supervised_source_run_id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "Optional registered source run. The newly persisted async job is bound under the supervisor lock before 202 and before enqueue." },
           "response_webhook_url": {
             "type": "string",
             "format": "uri",
@@ -1347,6 +1437,289 @@
           "code": { "type": "string" }
         }
       },
+      "SupervisorLaunch": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "integer" },
+          "registered": { "type": "boolean", "description": "False when the same source_run_id was already registered with identical input." },
+          "index_repaired": { "type": "boolean", "description": "True when this identical retry found the launch record present but the source-run index entry missing, and rewrote it. That is the state an interrupted registration leaves behind, and nothing else repairs it." },
+          "supervised": { "type": "boolean" },
+          "source_run_id": { "type": "string" },
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "workflow_id": { "type": "string" },
+          "workflow_version": { "type": "string" },
+          "expected_stage": { "type": "string", "enum": ["created", "writing", "verifying", "evidence", "review", "ready", "pr_opened"] },
+          "deadline": { "type": "string" },
+          "job_id": { "type": ["string", "null"] },
+          "plan_pane": { "type": ["string", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "SupervisorRegisterRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_run_id", "build_id", "event_id", "workflow_id", "workflow_version", "expected_stage", "deadline", "plan_pane", "continuation"],
+        "properties": {
+          "source_run_id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "The Rewst run id. This is the external dedupe and correlation key for every later completion, so it is registered before the run can be monitored: a run that fails before declaring any output is still supervised." },
+          "build_id": { "type": "string", "description": "An already-open pre-PR build. Registering against a build that was never opened is 404 unknown_build." },
+          "event_id": { "type": "string", "description": "The buildAdvance event id this run is launched to record. Reconciliation looks for exactly this id in the build's event history; finding it is the terminal receipt." },
+          "workflow_id": { "type": "string" },
+          "workflow_version": { "type": "string", "description": "Half of the circuit-breaker signature: the same version failing at the same node twice opens the circuit." },
+          "expected_stage": { "type": "string", "enum": ["created", "writing", "verifying", "evidence", "review", "ready", "pr_opened"], "description": "The stage the build must still be in when the completion lands. A build past it that never recorded event_id is a state/trace disagreement and parks." },
+          "deadline": { "type": "string", "description": "UTC instant like 2026-08-25T13:00:00Z. An instant, not a duration: a duration would silently extend on every retried registration." },
+          "job_id": { "type": "string", "description": "Optional. The local writer/test/reviewer job this run durably claimed. Present-but-missing on disk is what tells a claimed-never-started job apart from an unclaimed event." },
+          "plan_pane": { "type": "string", "description": "Required exact herdr pane id for the saved planning session that receives retry, park, and circuit-open reports. Registration rejects a missing, malformed, or unknown pane and never falls back to another tab or the graph dashboard." },
+          "continuation": { "$ref": "#/components/schemas/SupervisorContinuationSpec" }
+        }
+      },
+      "SupervisorContinuationSpec": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repo", "writer_prompt", "writer_prompt_ref", "fast_recipe", "integration_recipe", "reviewer", "class_stamp", "route_stamp"],
+        "properties": {
+          "repo": { "type": "string" },
+          "writer_prompt": { "type": "string", "minLength": 1, "maxLength": 100000 },
+          "writer_prompt_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$" },
+          "fast_recipe": { "type": "string" },
+          "integration_recipe": { "type": "string" },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "grok", "terra"] },
+          "class_stamp": { "type": "string" },
+          "route_stamp": { "type": "string" }
+        },
+        "description": "Validated non-secret input sufficient for one bounded source invocation. Persisted at registration and returned only in a reconciliation continuation result."
+      },
+      "SupervisorContinuationResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workflow_slug", "build_id", "event_id", "expected_stage", "deadline", "plan_pane", "reason", "attempt", "bounded", "repo", "writer_prompt", "writer_prompt_ref", "fast_recipe", "integration_recipe", "reviewer", "class_stamp", "route_stamp"],
+        "properties": {
+          "workflow_slug": { "type": "string", "enum": ["graphwing-pre-pr-build"] },
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "expected_stage": { "type": "string", "enum": ["created", "writing", "verifying", "evidence", "review", "ready", "pr_opened"] },
+          "deadline": { "type": "string" },
+          "plan_pane": { "type": "string" },
+          "reason": { "type": "string", "enum": ["retry_event", "relaunch"] },
+          "attempt": { "type": "integer", "minimum": 0 },
+          "bounded": { "type": "boolean", "enum": [true] },
+          "repo": { "type": "string" },
+          "writer_prompt": { "type": "string", "minLength": 1, "maxLength": 100000 },
+          "writer_prompt_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$" },
+          "fast_recipe": { "type": "string" },
+          "integration_recipe": { "type": "string" },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "grok", "terra"] },
+          "class_stamp": { "type": "string" },
+          "route_stamp": { "type": "string" }
+        },
+        "description": "Strict runtime response for one bounded source continuation. It combines the registered invocation with every routing field consumed by the listener graph."
+      },
+      "SupervisorBindRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_run_id", "job_id"],
+        "properties": {
+          "source_run_id": { "type": "string", "minLength": 8, "maxLength": 128 },
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+        }
+      },
+      "SupervisorBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "bound", "source_run_id", "build_id", "event_id", "job_id"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "bound": { "type": "boolean" },
+          "source_run_id": { "type": "string" },
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "job_id": { "type": "string" }
+        }
+      },
+      "SupervisorWatchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_run_id"],
+        "properties": {
+          "source_run_id": { "type": "string", "minLength": 8, "maxLength": 128 }
+        }
+      },
+      "SupervisorWatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "started", "version", "watch_id", "build_id", "event_id", "source_run_id", "job_id", "state", "deadline", "plan_pane"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "started": { "type": "boolean" },
+          "version": { "type": "integer" },
+          "watch_id": { "type": "string" },
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "source_run_id": { "type": "string" },
+          "job_id": { "type": "string" },
+          "state": { "type": "string", "enum": ["watching", "settled"] },
+          "action": { "type": ["string", "null"], "enum": ["receipt", "park", null] },
+          "outcome": { "type": ["string", "null"] },
+          "park_reason": { "type": ["string", "null"] },
+          "deadline": { "type": "string" },
+          "plan_pane": { "type": "string" },
+          "settle_seconds": { "type": "number" },
+          "poll": { "type": "string" }
+        }
+      },
+      "SupervisorReconcileRequest": {
+        "type": "object",
+        "required": ["listener_id", "source_workflow", "source_run"],
+        "properties": {
+          "listener_id": { "type": "string", "description": "Listener identity, normally slug@published-version. Only the slug half deduplicates: it pairs with source_run.id as the delivery key, so republishing the listener replays the first answer instead of spending a second retry. The version is kept on the report as diagnostics." },
+          "source_workflow": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "slug": { "type": "string" },
+              "name": { "type": "string" },
+              "tags": { "type": "array", "items": { "type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$" }, "maxItems": 32, "description": "Array-first. The listener preserves sourceWorkflow as a typed object with objectBuilder; because custom-action configuration is scalar, its one boundary mapping sends compact JSON which the server strictly decodes as this bounded string array. Arbitrary strings, Python reprs, malformed JSON, non-string elements, and excess tags are refused with bad_tags." }
+            },
+            "description": "From TRIGGER.workflowCompleted.sourceWorkflow. A slug or tag naming the supervisor itself is refused with self_listener."
+          },
+          "source_run": {
+            "type": "object",
+            "required": ["id", "status"],
+            "properties": {
+              "id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "The external dedupe and correlation key. The launch registry, not the declared output, is what maps it to a build." },
+              "status": { "type": "string", "enum": ["completed", "failed", "canceled", "timed_out"] },
+              "execution_mode": { "type": "string", "enum": ["live", "preview", "demo"], "default": "live" },
+              "started_at": { "type": "string" },
+              "finished_at": { "type": "string" }
+            }
+          },
+          "output": {
+            "type": "object",
+            "additionalProperties": true,
+            "maxProperties": 32,
+            "description": "Optional declared source output, corroboration only. A build_id or event_id here that disagrees with the registration parks rather than repointing the build. Secret-shaped keys and values are redacted before the write; a key that could carry failure text (message, trace, stack, body, ...) is refused with raw_error_forbidden."
+          },
+          "error": {
+            "oneOf": [
+              { "type": "boolean" },
+              { "type": "string", "enum": ["true", "false", ""], "description": "What a Rewst node config renders. A node config is a string template, so {{ ...error.present }} arrives as the word, never as a JSON boolean; empty is absent, which is false." },
+              { "type": "object", "required": ["present"], "properties": { "present": { "oneOf": [{ "type": "boolean" }, { "type": "string", "enum": ["true", "false", ""] }] } }, "additionalProperties": false }
+            ],
+            "description": "Public error presence only, as a boolean or the exact strings a Jinja render of one produces. Any other value, and any other key on the object form, is refused with raw_error_forbidden or bad_error_present: no raw error, trace body, or response is ever stored."
+          },
+          "failure": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "node": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "description": "Available failed/last node identity from authoritative trigger or declared workflow metadata. A bounded slug, never inferred trace text. It refines circuit identity when supplied; absent reports as \"unknown\"." },
+              "code": { "type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$", "description": "Available normalized failure code from authoritative trigger or declared workflow metadata. Free text is refused. When omitted, reports use trusted terminal status; wholly missing node/code selects the canonical unknown circuit fallback." }
+            },
+            "description": "Optional canonical failure identity, only when the authenticated completion listener has authoritative trigger or declared metadata. The completion trigger is not claimed to provide raw failed-node trace detail for every failure. There is no caller-settable retry class: sending failure.class is refused with bad_failure. Class is derived from source_run.status alone (timed_out transient with 3 attempts, canceled deterministic with none, failed and completed unknown with 1)."
+          }
+        }
+      },
+      "SupervisorReconcile": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "False when the outcome parked. Still HTTP 200: a park is a reconciled delivery, not a transport failure." },
+          "version": { "type": "integer" },
+          "replayed": { "type": "boolean", "description": "True when this source_run_id + listener slug was already reconciled; the first answer is returned unchanged and no work repeats. A republished listener at a new version replays rather than re-deciding." },
+          "source_run_id": { "type": "string" },
+          "listener_id": { "type": "string" },
+          "listener_slug": { "type": "string", "description": "The listener id with the published version stripped. This is the half that deduplicates." },
+          "build_id": { "type": "string" },
+          "event_id": { "type": "string" },
+          "workflow_id": { "type": ["string", "null"] },
+          "workflow_version": { "type": ["string", "null"] },
+          "expected_stage": { "type": ["string", "null"] },
+          "source_status": { "type": "string", "enum": ["completed", "failed", "canceled", "timed_out"] },
+          "execution_mode": { "type": "string" },
+          "action": {
+            "type": "string",
+            "enum": ["receipt", "watch", "relaunch", "retry_event", "park", "circuit_open", "ignored"],
+            "description": "receipt: the build already recorded its terminal receipt, so nothing repeats. watch: a live local job still owns the event. relaunch: a durably claimed job never started. retry_event: re-run the same unclaimed event id. park / circuit_open: stop, with files and stacks intact."
+          },
+          "resolution": { "type": "string", "enum": ["resolved", "watching", "retry", "parked", "ignored"] },
+          "parked": { "type": "boolean" },
+          "park_reason": { "type": ["string", "null"], "enum": ["workflow_fault", "deterministic_failure", "retry_exhausted", "circuit_open", "state_trace_disagreement", "deadline_exceeded", "build_parked", "relaunch_exhausted", "missing_build", "build_unreadable", null] },
+          "park_replayed": { "type": "boolean", "description": "True when this exact source run had already parked this build and the write recording that delivery did not land. The recorded outcome is returned with no second side effect: no new park, no retry spent, no tick on the circuit." },
+          "workflow_fault": { "type": "boolean", "description": "True when Rewst reported completed and Graphwing has no terminal receipt for the registered event id." },
+          "build_stage": { "type": ["string", "null"] },
+          "local_job_status": { "type": "string", "enum": ["unclaimed", "missing", "active", "completed", "failed", "unknown"] },
+          "job_id": { "type": ["string", "null"] },
+          "attempts": { "type": "integer" },
+          "retry_budget": { "type": "integer", "description": "Derived from source_run.status, never from the request body." },
+          "circuit": { "type": ["object", "null"], "additionalProperties": true, "description": "signature, count, open, threshold. Signature is registered workflow_id@workflow_version plus strict node:code when available, otherwise unknown:terminal_status:error-presence. The per-build map is capped; excess distinct detail uses a deterministic overflow identity. Only populated when this delivery counted against the breaker." },
+          "receipt": { "type": ["object", "null"], "additionalProperties": true },
+          "continuation": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/SupervisorContinuationResponse" },
+              { "type": "null" }
+            ]
+          },
+          "report": { "$ref": "#/components/schemas/SupervisorPlanReport" },
+          "next_operator_action": { "type": "string" },
+          "files_intact": { "type": "boolean", "description": "Always true. Reconciliation never touches the worktree, the branch, or a stack." },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "SupervisorPlanReport": {
+        "type": "object",
+        "description": "One line in the saved planning session. Carries everything an operator needs to act without opening the Rewst trace.",
+        "properties": {
+          "at": { "type": "string" },
+          "source_run_id": { "type": "string" },
+          "listener_id": { "type": "string", "description": "Full slug@version. Diagnostics: the version is not part of the delivery key." },
+          "listener_slug": { "type": "string" },
+          "build_id": { "type": "string" },
+          "event_id": { "type": ["string", "null"] },
+          "workflow_id": { "type": ["string", "null"] },
+          "workflow_version": { "type": ["string", "null"] },
+          "source_status": { "type": "string" },
+          "execution_mode": { "type": "string" },
+          "error_present": { "type": "boolean" },
+          "failure_class": { "type": "string", "enum": ["transient", "deterministic", "unknown"], "description": "Derived from source_status by this service." },
+          "failed_node": { "type": "string", "description": "The authoritative node label when supplied, or \"unknown\" when the completion exposes none; never an invented raw trace detail." },
+          "error_code": { "type": "string" },
+          "build_stage": { "type": ["string", "null"] },
+          "local_job_status": { "type": "string" },
+          "job_id": { "type": ["string", "null"] },
+          "action": { "type": "string" },
+          "park_reason": { "type": ["string", "null"] },
+          "workflow_fault": { "type": "boolean" },
+          "attempts": { "type": ["integer", "null"] },
+          "retry_budget": { "type": ["integer", "null"] },
+          "circuit": { "type": ["object", "null"], "additionalProperties": true },
+          "next_operator_action": { "type": "string" },
+          "worktree": { "type": ["string", "null"] },
+          "stacks": { "type": "array", "items": { "type": "string" } },
+          "files_intact": { "type": "boolean" }
+        }
+      },
+      "SupervisorReport": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "integer" },
+          "build_id": { "type": "string" },
+          "source_run_id": { "type": "string" },
+          "reports": { "type": "array", "items": { "$ref": "#/components/schemas/SupervisorPlanReport" } },
+          "circuits": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "circuit_threshold": { "type": "integer" },
+          "events": { "type": "object", "additionalProperties": true, "description": "Retry and relaunch counters keyed by build event id, not by source run id: every retry is a different Rewst run, so a per-run counter would never bind." },
+          "run_count": { "type": "integer" },
+          "run_capacity": { "type": "integer" },
+          "delivery_count": { "type": "integer" },
+          "created_at": { "type": ["string", "null"] },
+          "updated_at": { "type": ["string", "null"] },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
       "GhPrMergeRequest": {
         "type": "object",
         "required": ["repo", "number", "auto_merge", "run_id"],
@@ -1379,6 +1752,7 @@
           "repo": { "type": "string" },
           "reviewer": { "type": "string", "enum": ["sonnet", "opus", "sol"] },
           "prompt": { "type": "string" },
+          "supervised_source_run_id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "Optional registered source run. The newly persisted review job is bound before 202 and before enqueue." },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
@@ -1439,6 +1813,7 @@
         "properties": {
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
+          "supervised_source_run_id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "Optional registered source run. The newly persisted agent job is bound before 202 and before enqueue." },
           "launcher": { "type": "string", "enum": ["hermes", "claude"], "default": "hermes" },
           "model": { "type": "string" },
           "max_turns": { "type": "integer" },
