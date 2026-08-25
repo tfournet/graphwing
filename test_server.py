@@ -379,6 +379,43 @@ class DispatchTests(unittest.TestCase):
             self.assertIsNone(identity["native_session_id"])
             self.assertIsNone(payload["hermes_session"])
 
+    def test_claude_agent_run_records_git_bound_session_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            claude = root / "claude"
+            claude.write_text("fixture")
+            with mock.patch.object(server, "CLAUDE_BIN", claude), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                for model in ("claude-opus-5", "claude-sonnet-5"):
+                    body = json.dumps({
+                        "prompt": "ping", "cwd": "scratch", "launcher": "claude",
+                        "provider": "anthropic", "model": model,
+                    }).encode()
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                    self.assertEqual(status, 202, payload)
+                    self.assertEqual(payload["session_identity"]["launcher"], "claude")
+                    self.assertEqual(payload["session_identity"]["provider"], "anthropic")
+                    self.assertEqual(payload["session_identity"]["model"], model)
+                    self.assertEqual(payload["session_identity"]["repo"], "scratch")
+                    self.assertIsNone(payload["session_identity"]["native_session_id"])
+                    self.assertIsNone(payload["hermes_session"])
+                for provider, model in (
+                    ("openai", "claude-opus-5"),
+                    ("anthropic", "gpt-5.6-sol"),
+                    ("anthropic", "claude-unknown"),
+                ):
+                    body = json.dumps({
+                        "prompt": "ping", "cwd": "scratch", "launcher": "claude",
+                        "provider": provider, "model": model,
+                    }).encode()
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], "bad_model_identity")
+
     def test_agent_run_rejects_launcher_state_mismatches(self):
         session = "gwslice-" + ("ab" * 16)
         resume_job_id = "cd" * 16
@@ -472,6 +509,55 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(status, 202, payload)
             self.assertEqual(payload["session_identity"], identity)
 
+    def test_claude_resume_requires_matching_successful_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            claude = root / "claude"
+            claude.write_text("fixture")
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            identity = {
+                "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+                "repo": "scratch", "branch": branch, "starting_head": head,
+                "native_session_id": "claude-123",
+            }
+            prior_job_id = "ab" * 16
+            prior_dir = jobs / prior_job_id
+            prior_dir.mkdir(parents=True)
+            prior = {
+                "job_id": prior_job_id, "status": "completed", "launcher": "claude",
+                "session_identity": identity,
+                "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
+            }
+            (prior_dir / "job.json").write_text(json.dumps(prior))
+            body = json.dumps({
+                "prompt": "continue", "cwd": "scratch", "launcher": "claude",
+                "provider": "anthropic", "model": "claude-opus-5",
+                "session_identity": identity, "resume_job_id": prior_job_id,
+            }).encode()
+            with mock.patch.object(server, "CLAUDE_BIN", claude), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                prior["session_identity"] = dict(identity, native_session_id="claude-other")
+                (prior_dir / "job.json").write_text(json.dumps(prior))
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "untraceable_resume_session")
+                prior["session_identity"] = identity
+                (prior_dir / "job.json").write_text(json.dumps(prior))
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 202, payload)
+            self.assertEqual(payload["session_identity"], identity)
+
     def test_codex_resume_rejects_stale_git_identity_with_valid_provenance(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -556,6 +642,22 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(server.parse_native_session_id(text), "codex-123")
         self.assertEqual(server.parse_receipt_text(text)["summary"], "done")
 
+    def test_parse_claude_json_receipt_and_session(self):
+        text = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "claude-123",
+            "result": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+        })
+        self.assertEqual(server.parse_native_session_id(text, "claude"), "claude-123")
+        self.assertEqual(server.parse_receipt_text(text)["summary"], "done")
+        self.assertIsNone(server.parse_native_session_id("session_id: invented", "claude"))
+        failed = json.dumps({
+            "type": "result", "subtype": "error", "is_error": True,
+            "session_id": "claude-123",
+            "result": '{"status":"ok","summary":"must not pass"}',
+        })
+        self.assertIsNone(server.parse_receipt_text(failed))
+
     def test_receipt_and_codex_session_fail_closed(self):
         job = {"job_id": "ab" * 16, "profile": "graphwing", "launcher": "codex", "log_ref": "/tmp/log", "session_identity": {"native_session_id": "codex-123"}}
         parsed = {"status": "ok", "summary": "done"}
@@ -563,8 +665,19 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(server.normalize_receipt(job, parsed, 2, False)["status"], "error")
         missing = dict(job, session_identity={"native_session_id": None})
         self.assertEqual(server.normalize_receipt(missing, parsed, 0, False)["status"], "error")
-        self.assertIn("changed", server.record_codex_session(job, "codex-456"))
+        self.assertIn("changed", server.record_native_session(job, "codex-456"))
         self.assertEqual(job["session_identity"]["native_session_id"], "codex-123")
+
+    def test_receipt_and_claude_session_fail_closed(self):
+        job = {
+            "job_id": "ab" * 16, "profile": "graphwing", "launcher": "claude",
+            "log_ref": "/tmp/log", "session_identity": {"native_session_id": "claude-123"},
+        }
+        parsed = {"status": "ok", "summary": "done"}
+        missing = dict(job, session_identity={"native_session_id": None})
+        self.assertEqual(server.normalize_receipt(missing, parsed, 0, False)["status"], "error")
+        self.assertIn("changed", server.record_native_session(job, "claude-456"))
+        self.assertEqual(job["session_identity"]["native_session_id"], "claude-123")
 
     def test_agent_run_missing_binary(self):
         with mock.patch.object(server, "HERMES_BIN", Path("/nope/hermes")):
@@ -659,6 +772,48 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNotNone(initial_proc)
         self.assertNotIn("resume", initial_cmd)
         self.assertEqual(initial_cmd[-1], "-")
+
+    def test_spawn_claude_uses_json_resume_contract(self):
+        captured = {}
+
+        class FakePopen:
+            pid = 7
+
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = list(cmd)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_id = "ab" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            (jdir / "prompt.txt").write_text("fixture prompt")
+            claude = root / "claude"
+            claude.write_text("fixture")
+            job = {
+                "job_id": job_id, "cwd": td, "model": "claude-opus-5",
+                "launcher": "claude", "max_turns": 12,
+                "session_identity": {"native_session_id": "claude-123"},
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "CLAUDE_BIN", claude), \
+                 mock.patch.object(server.subprocess, "Popen", FakePopen):
+                proc, err = server.spawn_claude(job)
+                resume_cmd = captured["cmd"]
+                initial_proc, initial_err = server.spawn_claude(
+                    dict(job, session_identity={"native_session_id": None})
+                )
+                initial_cmd = captured["cmd"]
+        self.assertIsNone(err)
+        self.assertIsNotNone(proc)
+        self.assertEqual(resume_cmd[:2], [str(claude), "-p"])
+        self.assertEqual(resume_cmd[resume_cmd.index("--output-format") + 1], "json")
+        self.assertEqual(resume_cmd[resume_cmd.index("--resume") + 1], "claude-123")
+        self.assertEqual(resume_cmd[-1], "fixture prompt")
+        self.assertIsNone(initial_err)
+        self.assertIsNotNone(initial_proc)
+        self.assertNotIn("--resume", initial_cmd)
 
     def test_hermes_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
@@ -781,6 +936,52 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(saved["session_identity"]["native_session_id"], "codex-123")
         self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "codex-123")
 
+    def test_claude_job_completes_only_with_structured_session_and_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_id = "ef" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            identity = {
+                "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+                "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+                "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "status": "queued", "profile": "graphwing",
+                "repo": "scratch", "cwd": td, "prompt": "x", "launcher": "claude",
+                "provider": "anthropic", "model": "claude-opus-5",
+                "session_identity": identity, "hermes_session": None, "created_at": "t",
+                "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": None,
+            }
+            (jdir / "job.json").write_text(json.dumps(job))
+            (jdir / "prompt.txt").write_text("x")
+
+            class FakeProc:
+                pid = 42
+                returncode = 0
+
+                def wait(self, timeout=None):
+                    (jdir / "stdout.log").write_text(json.dumps({
+                        "type": "result", "subtype": "success", "is_error": False,
+                        "session_id": "claude-123",
+                        "result": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                    }))
+                    return 0
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)):
+                server.run_agent_job(job_id)
+            saved = json.loads((jdir / "job.json").read_text())
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["session_identity"]["native_session_id"], "claude-123")
+        self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "claude-123")
+
     def test_agent_run_stores_webhook_hides_token(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
@@ -856,6 +1057,13 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("response_webhook_token", props)
         self.assertIn("session_identity", props)
         self.assertIn("resume_job_id", props)
+        identity = spec["components"]["schemas"]["SessionIdentity"]["properties"]
+        self.assertEqual(set(identity["launcher"]["enum"]), {"codex", "claude"})
+        self.assertEqual(set(identity["provider"]["enum"]), {"openai", "anthropic"})
+        self.assertEqual(
+            set(identity["model"]["enum"]),
+            {"gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5"},
+        )
         self.assertIn("/v1/git/status", spec["paths"])
         self.assertIn("/v1/git/checkout", spec["paths"])
         self.assertIn("/v1/git/restore", spec["paths"])

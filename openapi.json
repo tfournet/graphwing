@@ -644,7 +644,7 @@
       "post": {
         "operationId": "agentRun",
         "tags": ["agent"],
-        "summary": "Queue one bounded writer run. Mechanical Codex jobs fail closed without a valid final receipt and stable structured session identity.",
+        "summary": "Queue one bounded writer run. Native Codex and Claude jobs fail closed without a valid final receipt and stable structured session identity.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1292,7 +1292,7 @@
           "resume_job_id": {
             "type": "string",
             "pattern": "^[0-9a-f]{32}$",
-            "description": "Required with Codex session_identity resume. Must reference a prior completed successful Graphwing Codex job whose receipt session_identity exactly matches."
+            "description": "Required with native session_identity resume. Must reference a prior completed successful Graphwing job from the same launcher whose receipt session_identity exactly matches."
           },
           "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
           "response_webhook_url": {
@@ -1351,13 +1351,13 @@
         "type": "object",
         "required": ["launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"],
         "properties": {
-          "launcher": { "type": "string", "enum": ["codex"] },
-          "provider": { "type": "string", "enum": ["openai"] },
-          "model": { "type": "string", "enum": ["gpt-5.6-sol"] },
+          "launcher": { "type": "string", "enum": ["codex", "claude"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5"] },
           "repo": { "type": "string" },
           "branch": { "type": "string" },
           "starting_head": { "type": "string" },
-          "native_session_id": { "type": ["string", "null"], "description": "Parsed from Codex thread.started JSONL; required non-null for success and resume." }
+          "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id or Claude result.session_id. Required non-null for success and resume." }
         }
       },
       "AgentReceipt": {
