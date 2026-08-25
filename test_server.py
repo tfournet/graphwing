@@ -1571,6 +1571,20 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
         self.assertIn("findings", nodes["agent"]["config"]["prompt"])
 
+    def test_pr_drive_waits_outlast_the_work_they_wait_on(self):
+        # A writer took 335s against a 300s wait and the run was discarded at
+        # herdr_wait_timeout, 35 seconds short, with rc 0 and the work staged.
+        # The lock says "Graph wait >= budget", but equal leaves no room for
+        # process start, the webhook round trip, or a slow provider. The
+        # mechanical L budget is 600s, so a wait must clear that with margin.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        longest_budget = max(w for _, w in server.SLICE_BUDGET.values())
+        for n_id, n in nodes.items():
+            if n["type"] == "action.wait.webhook":
+                self.assertGreater(n["config"]["timeoutSeconds"], longest_budget,
+                                   f"{n_id} can time out on work that is still succeeding")
+
     def test_pr_drive_gates_never_read_an_artifact_stub(self):
         # A node returning more than ~20KB has its output replaced by an
         # artifact stub, and a filter fed that stub evaluates nothing while
