@@ -42,7 +42,7 @@ Use the template below.
 
 Hold both from the grill and hand them to `to-tickets`, which writes them into `index.json`:
 
-- **class**: `mechanical`, `visual`, or `sensitive`. Absent means `mechanical`.
+- **class**: the highest that applies. `sensitive` is auth, permissions, tenant isolation, or data loss. `visual` is anything a person looks at **and all TypeScript implementation**. `mechanical` is everything else: scripts, config, infra, Go. Absent means `mechanical`, which is the cheapest writer and the weakest review.
 - **size floor**: `S`, `M`, or `L`.
 
 They pick the writer model and the reviewer at run time, so they have to survive from the grill to the run payload. `index.json` is where they survive.

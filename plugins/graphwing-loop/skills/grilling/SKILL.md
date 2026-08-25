@@ -69,7 +69,10 @@ Operator lock: `docs/HUMAN-LOOP.md` in the graphwing checkout (`repos.json` maps
 
 Close the grill by stamping two things:
 
-- **class**: `mechanical`, `visual`, or `sensitive`. Absent class means `mechanical`.
+- **class**: stamp the **highest** one that applies. Absent class means `mechanical`, so an unstamped story gets the cheapest writer and the weakest review — say it out loud rather than letting it default.
+  - `sensitive` — auth, permissions, tenant isolation, credentials, or anything that can lose or leak data.
+  - `visual` — anything a person looks at, **and all TypeScript implementation**. Frontend, components, hooks, and the TS behind them.
+  - `mechanical` — everything else: scripts, config, infra, Go, test harnesses. No visible surface, no TypeScript, no security boundary.
 - **size floor**: `S`, `M`, or `L`. Yours to set. Graph may bump one step up from countable features, never down, never across class, never because tests are red.
 
 Then hand off with `rewst-graph-handoff`. No `/implement`, `/build`, `/tdd`, or product edits in this pane.

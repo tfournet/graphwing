@@ -73,6 +73,22 @@ Payload is the **ticket path**, not the whole spec. Same workflow JSON; next sli
 
 Closed table. Graph looks up the row. No per-slice model picker. Missing class → `mechanical`. Story size floor is **yours**; Graph may bump **one** step from **countable** features (AC count, seams, class) at the **start** of the ticket. Never down. Never across class. **Never because tests are red.**
 
+**What the classes mean.** They pick the writer, so they are about what the code
+is, not how hard it feels:
+
+- **`sensitive`** — auth, permissions, tenant isolation, RLS, credentials, or
+  anything that can lose or leak data. Two independent acks before commit.
+- **`visual`** — anything a person looks at, **and all TypeScript
+  implementation**. Frontend, components, hooks, and the TS that feeds them are
+  Opus work: this is where design judgement and type-level reasoning live, and
+  it is not what the mechanical writer is for. `visual` still needs a named test
+  recipe; no recipe, no visual slice.
+- **`mechanical`** — everything else. Scripts, config, infra, Go, test harnesses.
+  No visible surface, no TypeScript, no security boundary.
+
+Stamp the highest class that applies. A TypeScript change to an auth boundary is
+`sensitive`, not `visual`.
+
 | class | writer launcher / model | spec-review (plan mode) |
 |---|---|---|
 | `mechanical` | Hermes `agentRun` `grok-4.6` (`xai-oauth`) | Anthropic Sonnet |
