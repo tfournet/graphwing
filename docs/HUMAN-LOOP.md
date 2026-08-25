@@ -175,15 +175,60 @@ Do not resume the last feature session to “fix e2e.”
 
 Future work lives in Obsidian `Riftwing/Notes/Graphwing human loop.md`. This list is what an engineer hits today.
 
-1. Structure is human `/to-tickets`. Graph never cuts tickets.
-2. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
-3. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
-4. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
-5. **Re-import the integration after any `openapi.json` change**: `python3 scripts/reimport_integration.py`, then publish graphs. Rewst builds every request from its own copy of the operation list, so a field the graph sends and the server reads is dropped silently if the integration does not declare it. No error at any layer.
+### Blocking
 
-The mechanical writer is `grok-4.6` via Hermes, confirmed on the first real run (SC-110290, 30 turns, 300s). The graph passes `model` explicitly from `sliceRoute`, so the seat's `config.yaml` default does not apply to slices and does not need flipping.
+1. **The serial walker has never walked.** `implement-slice` chains the next
+   slice by POSTing `kick_url`, which is a Rewst **webhook**, and a
+   webhook-triggered run never creates `CTX.INPUT` at all: every
+   `{{ CTX.INPUT.* }}` resolves empty and the run dies at its first
+   parameterised node while Rewst reports it `completed`. Its one green run
+   (SC-110290) was a single-ticket map, so nothing ever exercised the chain.
+   **A multi-ticket story cannot run today.** The fix is the one that already
+   worked for `pr-drive`: hold the loop in a driver that starts each run with
+   `POST /workflows/{slug}/run`, not in the graph. See `scripts/drive-pr.py`.
+2. **`visual` and `sensitive` have never executed.** No slice has used the
+   `claude -p` writer or the Terra/Grok reviewers. Since all TypeScript is now
+   `visual`, the first TS story exercises three untested things at once, and
+   `visual` additionally requires a named test recipe, of which
+   `riftwing-local-gates` is the only one that exists.
 
-`POST /v1/slice/e2e` runs after the map is empty when `e2e` is set: green/skip complete, `FAIL:` lines auto-add a ticket, blob drafts, three reds park. Next slice is `kick_url`, not a cycle inside one run.
+### Known
+
+3. Structure is human `/to-tickets`. Graph never cuts tickets.
+4. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
+5. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
+6. **`pr-drive` has no reviewer at all.** It writes, tests, commits and pushes
+   with no spec-review node, so a PR fix gets less scrutiny than a slice. The
+   only thing grading it is CI's next audit round.
+7. **CI's reviewers are outside this table.** `clean-code-review.yml` in
+   riftwing reviews with Opus primary and **Sol** second opinion. If Sol is the
+   planning session, Sol is second-opinion reviewing its own spec on every PR.
+   `sliceRoute` cannot reach that; fixing it means editing that workflow.
+8. **Re-import the integration after any `openapi.json` change**: `python3 scripts/reimport_integration.py`, then publish graphs. Rewst builds every request from its own copy of the operation list, so a field the graph sends and the server reads is dropped silently if the integration does not declare it. No error at any layer.
+9. Superpowers is already **disabled**. Leave it. Anthropic `code-review` plugin clashes with Matt `/code-review` if both enabled.
+10. Skills are **per-profile** on a hermes seat, not per-seat. Editing one in the
+    catalog means syncing five copies under `$GRAPHWING_HOME` (the seat plus each
+    profile), or symlinking them.
+
+### Reserved names that fail silently
+
+The Rewst connector reads certain config field names as HTTP mechanics rather
+than passing them through. Each cost a run that reported success:
+
+| name | what the connector does with it |
+|---|---|
+| `path` | uses it as the request URL path (`fileHead`/`gitDiff` use `rel`) |
+| `method` | uses it as the HTTP verb (merge uses `merge_method`) |
+
+Two more traps in the same family. A node result is exposed as
+`TASKS.<node>.data.<field>`, so an endpoint that nests its payload under `data`
+makes every path a double `.data.data` that reads null. And a node output over
+~20KB is replaced by an artifact stub, which a filter passes without evaluating
+— `TASKS.checks.all_green` is permanently unreadable for that reason.
+
+When a run does nothing, read `/runs/{id}/trace`. The run status endpoint only
+ever says `completed`, and the HTTP access log cannot tell you which branch a
+switch took.
 
 How to fire a run: [USING.md](USING.md).
 
