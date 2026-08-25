@@ -35,6 +35,17 @@ echo "deploying $BRANCH from $SRC"
 GRAPHWING_HOME=. python3 "$SRC/test_server.py" >/dev/null 2>&1 \
   || { echo "tests are red, not deploying" >&2; exit 1; }
 
+# Deploying restarts graphwing-api, which drops every in-flight wait webhook and
+# kills any running writer. A run that has already spent five minutes on an
+# agent session then dies for no reason visible in its trace.
+RUNNING="$(find "$HOME_DIR/jobs" -maxdepth 2 -name job.json -newermt '-30 minutes' 2>/dev/null \
+  | xargs -r grep -l '"status": *"running"' 2>/dev/null | wc -l)"
+if [ "${RUNNING:-0}" -gt 0 ] && [ -z "${GRAPHWING_DEPLOY_ANYWAY:-}" ]; then
+  echo "refusing: $RUNNING job(s) still running; a restart would kill them" >&2
+  echo "wait, or set GRAPHWING_DEPLOY_ANYWAY=1 to override" >&2
+  exit 1
+fi
+
 for f in "${FILES[@]}"; do
   if cmp -s "$SRC/$f" "$HOME_DIR/$f"; then
     echo "  same  $f"
