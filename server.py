@@ -86,6 +86,26 @@ SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
+ROUTE_VERSION = "normal-v1"
+NORMAL_WRITER_ROUTES = {
+    "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
+    "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
+    "research_ops": ("grok", "xai", "grok-4.6", "default"),
+}
+NORMAL_REVIEWER_ROUTES = {
+    "openai": (
+        ("claude", "anthropic", "claude-sonnet-5", "default"),
+        ("grok", "xai", "grok-4.6", "default"),
+    ),
+    "anthropic": (
+        ("codex", "openai", "gpt-5.6-sol", "high"),
+        ("grok", "xai", "grok-4.6", "default"),
+    ),
+    "xai": (
+        ("codex", "openai", "gpt-5.6-sol", "high"),
+        ("claude", "anthropic", "claude-opus-5", "default"),
+    ),
+}
 # Reviews need enough turns to read the ticket and diff before returning a verdict.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
 SLICE_BUDGET = {
@@ -1442,38 +1462,20 @@ def slice_route_lookup(
     turns, wait = SLICE_BUDGET[(class_name, sized)]
     if work_kind is None:
         raise ValueError("work_kind is required")
-    writers = {
-        "go_coding": ("codex", "openai", "gpt-5.6-sol"),
-        "typescript_coding": ("claude", "anthropic", "claude-opus-5"),
-        "research_ops": ("grok", "xai", "grok-4.6"),
-    }
-    launcher, provider, model = writers[work_kind]
-    opposing = {
-        "openai": [
-            ("claude", "anthropic", "claude-sonnet-5"),
-            ("grok", "xai", "grok-4.6"),
-        ],
-        "anthropic": [
-            ("codex", "openai", "gpt-5.6-sol"),
-            ("grok", "xai", "grok-4.6"),
-        ],
-        "xai": [
-            ("codex", "openai", "gpt-5.6-sol"),
-            ("claude", "anthropic", "claude-opus-5"),
-        ],
-    }
+    launcher, provider, model, effort = NORMAL_WRITER_ROUTES[work_kind]
     if class_name == "sensitive":
         review_count = 2
     elif class_name == "mechanical" and sized == "S":
         review_count = 0
     else:
         review_count = 1
-    reviewers = opposing[provider][:review_count]
+    reviewers = list(NORMAL_REVIEWER_ROUTES[provider][:review_count])
     while len(reviewers) < 2:
-        reviewers.append(("none", "none", "none"))
+        reviewers.append(("none", "none", "none", "none"))
     reviewer1, reviewer2 = reviewers
     return {
         "ok": True,
+        "route_version": ROUTE_VERSION,
         "class": class_name,
         "work_kind": work_kind,
         "size_floor": size_floor,
@@ -1481,16 +1483,22 @@ def slice_route_lookup(
         "launcher": launcher,
         "provider": provider,
         "model": model,
+        "effort": effort,
+        "reason": f"work_kind={work_kind}",
         "max_turns": turns,
         "run_budget_seconds": wait,
         "reviewer1": reviewer1[2],
         "reviewer1_launcher": reviewer1[0],
         "reviewer1_provider": reviewer1[1],
         "reviewer1_model": reviewer1[2],
+        "reviewer1_effort": reviewer1[3],
+        "reviewer1_reason": "different_provider_from_writer" if reviewer1[0] != "none" else "not_required_by_review_policy",
         "reviewer2": reviewer2[2],
         "reviewer2_launcher": reviewer2[0],
         "reviewer2_provider": reviewer2[1],
         "reviewer2_model": reviewer2[2],
+        "reviewer2_effort": reviewer2[3],
+        "reviewer2_reason": "different_provider_from_writer_and_reviewer1" if reviewer2[0] != "none" else "not_required_by_review_policy",
         "review": "none" if reviewer1[0] == "none" else (
             f"{reviewer1[2]}_{reviewer2[2]}" if reviewer2[0] != "none" else reviewer1[2]
         ),
