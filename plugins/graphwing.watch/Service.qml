@@ -27,7 +27,7 @@ Item {
   readonly property int activeCount: Number(counts.active || 0)
   readonly property int failedRecent: Number(counts.failed_recent || 0)
   readonly property bool busy: activeCount > 0
-  readonly property bool alarming: !online || !apiActive || failedRecent > 0
+  readonly property bool alarming: !online || !apiActive
   readonly property bool notifyOnFail: setting("notifyOnFail", true) !== false
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 5, 2, 120)
