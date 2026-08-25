@@ -373,7 +373,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
-          "message": "{{ CTX.INPUT.commit_message }}"
+          "message": "{{ CTX.INPUT.commit_message | default('fix: address review findings') }}"
         }
       },
       {

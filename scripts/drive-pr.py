@@ -52,6 +52,8 @@ def main() -> int:
     ap.add_argument("--auto-merge", action="store_true")
     ap.add_argument("--max-attempts", default="3")
     ap.add_argument("--wait", type=int, default=900)
+    ap.add_argument("--message", default="fix: address review findings",
+                    help="commit message; git_commit rejects an empty one")
     args = ap.parse_args()
 
     install = pg.load_install()
@@ -65,6 +67,7 @@ def main() -> int:
         "attempt": "1",
         "max_attempts": str(args.max_attempts),
         "auto_merge": "true" if args.auto_merge else "false",
+        "commit_message": args.message,
     }
     # run_slug posts this body verbatim. It must be wrapped: a bare payload
     # arrives as a manual trigger with body {} and CTX.INPUT is never created,
