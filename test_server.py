@@ -1571,6 +1571,33 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
         self.assertIn("findings", nodes["agent"]["config"]["prompt"])
 
+    def test_pr_drive_gates_never_read_an_artifact_stub(self):
+        # A node returning more than ~20KB has its output replaced by an
+        # artifact stub, and a filter fed that stub evaluates nothing while
+        # still reporting pass. if_green2 decided the loop was finished that
+        # way, off a 21KB checks payload it could not see. gh pr checks is the
+        # known-large one; gates must read the small findings payload instead.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        big = {n_id for n_id, n in nodes.items() if n["type"].endswith("/v1/gh/pr/checks")}
+        for e in edges:
+            target = nodes.get(e["target"], {})
+            if target.get("type") in ("logic.filter", "logic.switch"):
+                self.assertNotIn(e["source"], big,
+                                 f"{e['target']} gates on {e['source']}, whose output is "
+                                 "artifact-stubbed and unreadable")
+
+    def test_pr_drive_auto_merge_rule_matches_the_value_it_receives(self):
+        # Form inputs arrive as strings, so auto_merge is "true"/"false". The
+        # rule compared against boolean true, so the merge branch could never
+        # be taken even when a run explicitly asked for it.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        rule = nodes["switch_merge"]["config"]["cases"][0]["rules"][0]
+        self.assertIsInstance(rule["value"], str, "auto_merge arrives as a string")
+        self.assertEqual(rule["value"], "true")
+
     def test_pr_drive_switch_can_actually_match_its_input(self):
         # Inserting findings in front of switch_checks left its rules reading
         # data.all_green, which lives on the checks payload and not the findings

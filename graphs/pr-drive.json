@@ -263,7 +263,7 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "auto_merge", "rules": [{ "path": "auto_merge", "op": "equals", "value": true }] }
+            { "label": "auto_merge", "rules": [{ "path": "auto_merge", "op": "equals", "value": "true" }] }
           ],
           "default": { "label": "engineer_merges" }
         }
@@ -392,7 +392,7 @@
 
       {
         "id": "checks2",
-        "type": "action.graphwing.GET:/v1/gh/pr/checks",
+        "type": "action.graphwing.GET:/v1/gh/pr/findings",
         "label": "ghPrChecks after fix",
         "position": { "x": 3300, "y": 160 },
         "config": {
@@ -409,7 +409,7 @@
         "position": { "x": 3520, "y": 160 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.all_green", "op": "equals", "value": true }]
+          "rules": [{ "path": "data.blocking", "op": "equals", "value": false }]
         }
       },
       {
