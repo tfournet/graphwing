@@ -866,6 +866,17 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             if not added.get("ok"):
                 return git_write_result(name, added)
     out = run_git(resolved, ["commit", "-m", message.strip()])
+    if not out.get("ok"):
+        blob = ((out.get("stdout") or "") + (out.get("stderr") or "")).lower()
+        # An empty commit is still a failed slice, per the lock. It is just a
+        # different failure from a broken commit, and saying so is the
+        # difference between "the writer had nothing to do" and "the commit
+        # is broken" — which read identically in the trace and cost two rounds
+        # of misdiagnosis.
+        if "nothing to commit" in blob or "no changes added to commit" in blob:
+            return 400, {"ok": False, "repo": name, "code": "nothing_staged",
+                         "error": "nothing was staged; the writer made no changes",
+                         "stdout": out.get("stdout") or "", "stderr": out.get("stderr") or ""}
     return git_write_result(name, out)
 
 

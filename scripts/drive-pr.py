@@ -52,6 +52,34 @@ def summarize(trace) -> None:
         print(line)
 
 
+def failed_node(trace):
+    """First failed node and its error, so a run says why it stopped."""
+    if isinstance(trace, dict):
+        tasks = trace.get("trace") or trace.get("tasks")
+    else:
+        tasks = trace
+    if not isinstance(tasks, list):
+        return None
+    for t in tasks:
+        if isinstance(t, dict) and (t.get("status") or t.get("state")) in ("failed", "error"):
+            return t.get("id") or t.get("nodeId") or "?", str(t.get("error") or "")
+    return None
+
+
+def worst_case_run_seconds() -> int:
+    """Longest a single pr-drive run can legitimately take.
+
+    Derived from the graph rather than guessed, because every hardcoded timeout
+    in this chain has already drifted behind the work it wraps at least once.
+    Every wait node can expire in the same run, so they add.
+    """
+    graph = json.loads((Path(__file__).resolve().parent.parent /
+                        "graphs" / "pr-drive.json").read_text())
+    waits = [n["config"]["timeoutSeconds"] for n in graph["spec"]["nodes"]
+             if n["type"] == "action.wait.webhook"]
+    return sum(waits) + 300  # margin for the non-waiting nodes and gh calls
+
+
 def findings(mcp: str, repo: str, pr: str):
     """Read the PR's machine verdict through the same endpoint the graph uses."""
     import urllib.error
@@ -112,10 +140,27 @@ def main() -> int:
     ap.add_argument("--test", default="riftwing-local-gates")
     ap.add_argument("--auto-merge", action="store_true")
     ap.add_argument("--max-attempts", default="3")
-    ap.add_argument("--wait", type=int, default=900)
+    ap.add_argument("--wait", type=int, default=0,
+                    help="seconds to poll one run; defaults to the graph's own worst case")
     ap.add_argument("--message", default="fix: address review findings",
                     help="commit message; git_commit rejects an empty one")
     args = ap.parse_args()
+
+    floor = worst_case_run_seconds()
+    if not args.wait:
+        args.wait = floor
+    elif args.wait < floor:
+        print("refusing: --wait %ds is below the graph's worst case of %ds. "
+              "run_slug would abandon a run that is still working, and the Rewst "
+              "run would keep going with nothing watching it." % (args.wait, floor))
+        return 1
+
+    per_attempt = args.wait + REVIEW_WAIT_SECONDS
+    total = per_attempt * (int(args.max_attempts) - 1) + args.wait
+    print("budget: %d attempts, up to %ds each (%ds run + %ds review), "
+          "%.1f h end to end. Anything wrapping this must clear that."
+          % (int(args.max_attempts), per_attempt, args.wait,
+             REVIEW_WAIT_SECONDS, total / 3600))
 
     install = pg.load_install()
     pg.TENANT = pg.tenant_id(install)
@@ -137,6 +182,21 @@ def main() -> int:
     # the chain can only be driven from a caller that can reach
     # POST /workflows/{slug}/run. implement-slice chains slices the same broken
     # way; its one green run was a single-ticket map, so it never noticed.
+    # Attempt 1 was the one round with no freshness check, so a driver started
+    # while the audit was mid-run handed the writer findings that HEAD had
+    # already fixed. The writer correctly changed nothing, nothing was staged,
+    # and the commit failed. Wait at the entry point too, not only between
+    # attempts.
+    opening = findings(mcp, args.repo, args.pr)
+    if opening is None:
+        return 1
+    if opening.get("holds"):
+        print("audit is still running on this commit (%s); waiting for a verdict "
+              "before starting, or attempt 1 works from a stale brief"
+              % ", ".join(opening["holds"]))
+        if not wait_for_fresh_review(mcp, args.repo, args.pr, opening):
+            return 1
+
     last = 1
     for attempt in range(1, int(args.max_attempts) + 1):
         payload["attempt"] = str(attempt)
@@ -151,6 +211,14 @@ def main() -> int:
         print("nodes:")
         summarize(trace)
         last = 0 if status == "completed" else 1
+
+        why = failed_node(trace)
+        if why:
+            node, err = why
+            print("run stopped at %s: %s" % (node, err[:200]))
+            if node == "fix_commit" and "nothing_staged" in err:
+                print("the writer had nothing to do: the brief was already "
+                      "satisfied at HEAD. Not a commit failure.")
 
         state = findings(mcp, args.repo, args.pr)
         if state is None:

@@ -1418,6 +1418,27 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(ok, err)
         self.assertIsNone(err)
 
+    def test_git_commit_names_an_empty_commit_for_what_it_is(self):
+        # A run handed the writer findings that were already fixed. It
+        # correctly changed nothing, so nothing was staged, and git_commit
+        # failed like any other error. In the trace that is indistinguishable
+        # from a broken commit, and it cost two rounds of misdiagnosis. The
+        # lock treats an empty commit as a failed slice, which stays true; it
+        # just has to say which failure it is.
+        def fake_run_git(path, argv):
+            if argv[0] == "commit":
+                return {"ok": False, "stdout": "nothing to commit, working tree clean",
+                        "stderr": "", "returncode": 1}
+            return {"ok": True, "stdout": "", "stderr": "", "returncode": 0}
+
+        with mock.patch.object(server, "run_git", fake_run_git):
+            status, payload = server.git_commit(
+                json.dumps({"repo": "r", "message": "fix: nothing"}).encode(),
+                {"r": str(Path(server.__file__).parent)},
+            )
+        self.assertFalse(payload.get("ok"))
+        self.assertEqual(payload.get("code"), "nothing_staged", payload)
+
     def test_pr_findings_extracts_the_machine_verdict_not_the_prose(self):
         # pr-drive took its fix instructions from CTX.INPUT.prompt, so a human
         # had to read the review and write them. The reviewers already publish
