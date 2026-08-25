@@ -31,9 +31,25 @@ Usage:
 
 Session: herdr --session graphwing (override GRAPHWING_HERDR_SESSION).
 Dashboard space "graphwing" / tab "graph" are left alone.
-Each idea is a new space. Claude runs in tab "claude" inside that space.
+Each idea is a new space. The planning session runs in tab "plan".
+
+Planner: hermes -p riftwing-planner (gpt-5.6-sol) with the grilling skill,
+against HERMES_HOME=$GRAPHWING_HOME. Override with GRAPHWING_PLAN_PROFILE,
+or GRAPHWING_PLAN_KIND=claude to go back to a Claude pane.
 EOF
 }
+
+# The grill runs on the planner seat by default. Sol plans; the class table
+# keeps Sol out of reviewing so it never grades its own spec.
+PLAN_KIND="${GRAPHWING_PLAN_KIND:-hermes}"
+PLAN_PROFILE="${GRAPHWING_PLAN_PROFILE:-riftwing-planner}"
+if [[ "$PLAN_KIND" == "hermes" ]]; then
+  PLAN_TAB="${GRAPHWING_PLAN_TAB:-plan}"
+  PLAN_ARGS=(-p "$PLAN_PROFILE" chat -s grilling)
+else
+  PLAN_TAB="${GRAPHWING_PLAN_TAB:-claude}"
+  PLAN_ARGS=()
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -180,10 +196,20 @@ start_claude() {
   fi
   # New tabs are not a shell prompt yet; agent start fails if we race it.
   herdr_s pane wait-output --source recent-unwrapped --regex '.' --timeout 15000 "$pane" >/dev/null 2>&1 || true
+
+  # The planning seat is the graphwing hermes home, not the personal one: it
+  # holds this org's Rewst install, the loop skills, and the riftwing-*
+  # profiles. The alias has no HERMES_HOME baked in, so export it in the pane
+  # before the agent starts or the session silently uses ~/.hermes instead.
+  local seat="${GRAPHWING_HOME:-$HOME/.graphwing}"
+  herdr_s pane send-text "$pane" "export HERMES_HOME='$seat'"$'\n' >/dev/null 2>&1 || true
+  herdr_s pane wait-output --source recent-unwrapped --regex '.' --timeout 5000 "$pane" >/dev/null 2>&1 || true
+
   local i err
   err="$(mktemp)"
   for i in 1 2 3 4 5 6 7 8; do
-    if herdr_s agent start "$agent" --kind claude --pane "$pane" --timeout 60000 >/dev/null 2>"$err"; then
+    if herdr_s agent start "$agent" --kind "$PLAN_KIND" --pane "$pane" --timeout 60000 \
+        -- "${PLAN_ARGS[@]}" >/dev/null 2>"$err"; then
       rm -f "$err"
       return 0
     fi
@@ -193,7 +219,8 @@ start_claude() {
     fi
     sleep 1
   done
-  echo "note: Claude did not start. Click space $LABEL, tab claude, type: claude" >&2
+  echo "note: planner did not start. Click space $LABEL, tab $PLAN_TAB, type:" >&2
+  echo "  HERMES_HOME='$seat' hermes -p $PLAN_PROFILE chat -s grilling" >&2
   cat "$err" >&2 || true
   rm -f "$err"
 }
@@ -287,9 +314,9 @@ cmd_open() {
 
   local tab_id pane_id created focus_flag=(--no-focus)
   [[ "$FOCUS" -eq 1 ]] && focus_flag=(--focus)
-  tab_id="$(tab_id_for "$ws_id" claude || true)"
+  tab_id="$(tab_id_for "$ws_id" "$PLAN_TAB" || true)"
   if [[ -z "${tab_id:-}" ]]; then
-    created="$(herdr_s tab create --workspace "$ws_id" --cwd "$idea_cwd" --label claude "${focus_flag[@]}")"
+    created="$(herdr_s tab create --workspace "$ws_id" --cwd "$idea_cwd" --label "$PLAN_TAB" "${focus_flag[@]}")"
     tab_id="$(json_get '(obj.get("tab") or obj).get("tab_id","")' <<<"$created")"
     pane_id="$(json_get '((obj.get("root_pane") or obj.get("pane") or {})).get("pane_id","")' <<<"$created")"
   else
@@ -307,7 +334,7 @@ for p in (d.get("result", d).get("panes") or []):
 ' <<<"$panes")"
     [[ "$FOCUS" -eq 1 ]] && herdr_s tab focus "$tab_id" >/dev/null || true
   fi
-  [[ -n "${pane_id:-}" ]] || die "no pane in tab claude (space $LABEL)"
+  [[ -n "${pane_id:-}" ]] || die "no pane in tab $PLAN_TAB (space $LABEL)"
 
   local agent
   agent="$(slugify "grill-${LABEL}")"
@@ -325,12 +352,12 @@ print(json.dumps({
   "dashboard_space": "graphwing",
   "space": sys.argv[2],
   "workspace_id": sys.argv[3],
-  "tab": "claude",
+  "tab": "'"$PLAN_TAB"'",
   "tab_id": sys.argv[4],
   "pane_id": sys.argv[5],
   "cwd": sys.argv[6],
   "agent": sys.argv[7],
-  "next": "In tab claude type /grill-with-docs then the idea. Do not type in tab graph.",
+  "next": "In tab '"$PLAN_TAB"' start grilling the idea. Do not type in tab graph.",
 }, indent=2))
 ' "$SESSION" "$LABEL" "$ws_id" "${tab_id:-}" "$pane_id" "$idea_cwd" "$agent"
 }
