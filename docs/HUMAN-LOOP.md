@@ -76,18 +76,29 @@ Closed table. Graph looks up the row. No per-slice model picker. Missing class �
 | class | writer launcher / model | spec-review (plan mode) |
 |---|---|---|
 | `mechanical` | Hermes `agentRun` `grok-4.6` (`xai-oauth`) | Anthropic Sonnet |
-| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Fable** (`claude -p claude-fable-5`) |
-| `sensitive` | `claude -p` `claude-opus-5` | **Fable, then Opus** (both must ack) |
+| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Grok** (`grok-4.6`, xAI) |
+| `sensitive` | `claude -p` `claude-opus-5` | **Grok, then Terra** (both must ack) |
 
-**Sol plans, so Sol does not review.** The planning session is
-`HERMES_HOME=$GRAPHWING_HOME hermes chat -s grilling` on `gpt-5.6-sol`, and a
-reviewer that wrote the spec is the same conflict the opposing-vendor rule
-prevents, one step earlier in the chain. `visual` and `sensitive` used to review
-with Sol; they now review with Anthropic models through `claude -p`.
+**The reviewer's vendor is never the writer's, and never the planner's.** Two
+separate constraints, and they are what fix the table:
 
-That trades vendor diversity for model diversity on those two classes: Opus
-writes and Fable grades. `mechanical` is unaffected and keeps true opposing
-vendors, Grok writing and Sonnet reviewing.
+| seat | profile | vendor |
+|---|---|---|
+| planner | `riftwing-planner` `gpt-5.6-sol` | OpenAI |
+| writer (visual/sensitive) | `riftwing-autopilot` / `riftwing-oneshot` `claude-opus-5` | Anthropic |
+| investigator | `riftwing-investigator` `grok-4.6` | xAI |
+
+`mechanical` writes with Grok and reviews with Sonnet: xAI graded by Anthropic.
+For `visual` and `sensitive` the writer is Anthropic, so no Anthropic model may
+review — that rules out Sonnet, Opus **and Fable**. Sol is the planning session,
+so it cannot grade a spec it wrote. xAI is the only vendor that is neither,
+which is why Grok reviews there. `sensitive` needs two acks from two vendors, so
+Terra is second: OpenAI, but a different model from the planner, so the spec's
+author stays out of the review chain.
+
+Reviewers running through Hermes are always launched with an explicit `-m`.
+Without it every one of them silently takes the seat's default profile, and
+"Grok reviewed it" would only ever mean "whatever `config.yaml` said today".
 
 Example budgets (tune later; Graph wait ≥ budget):
 

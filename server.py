@@ -1326,16 +1326,19 @@ def slice_route_lookup(
         launcher, model = "hermes", "grok-4.6"
         reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
     elif class_name == "visual":
-        # Sol is the planning session. A reviewer that wrote the spec is the
-        # same conflict the opposing-vendor rule prevents, one step earlier,
-        # so visual and sensitive review with Anthropic models instead. The
-        # writer is Opus, so the diversity here is model, not vendor: Fable
-        # grades what Opus wrote.
+        # The rule is vendor separation. These writers are Opus, so an
+        # Anthropic reviewer grades its own vendor's work; and Sol is the
+        # planning session, so Sol grades its own spec. That leaves xAI as the
+        # only vendor that is neither, which is why the investigator model
+        # reviews here.
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "fable", "none"
+        reviewer1, reviewer2 = "grok", "none"
     else:
+        # Sensitive needs two acks from two vendors, and neither may be the
+        # writer's. Grok is xAI; Terra is OpenAI but a different model from the
+        # planner, so the spec's author is still not in the review chain.
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "fable", "opus"
+        reviewer1, reviewer2 = "grok", "terra"
     return {
         "ok": True,
         "class": class_name,
@@ -1617,10 +1620,16 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         if not HERMES_BIN.is_file():
             return {"ok": False, "verdict": "NACK", "no_verdict": True,
                     "error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
+        # Name the model. Without -m every hermes reviewer silently takes the
+        # seat's default profile, so "grok reviewed it" and "terra reviewed it"
+        # would both mean "whatever config.yaml said today".
+        model = {"sol": "gpt-5.6-sol", "grok": "grok-4.6", "terra": "gpt-5.6-terra"}[reviewer]
         cmd = [
             str(HERMES_BIN),
             "chat",
             "-Q",
+            "-m",
+            model,
             "--query",
             body_prompt,
             "--in",
@@ -1716,8 +1725,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 400, err
     assert data is not None
     reviewer = str(data.get("reviewer") or "").strip()
-    if reviewer not in {"sonnet", "opus", "fable", "sol"}:
-        return 400, {"error": "reviewer must be sonnet, opus, fable, or sol",
+    if reviewer not in {"sonnet", "opus", "fable", "sol", "grok", "terra"}:
+        return 400, {"error": "reviewer must be sonnet, opus, fable, sol, grok, or terra",
                      "code": "bad_reviewer"}
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
