@@ -39,6 +39,13 @@ class DispatchTests(unittest.TestCase):
         p = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.scratch)})
         p.start()
         self.addCleanup(p.stop)
+        runs = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        runs.close()
+        self.runs_path = Path(runs.name)
+        rp = mock.patch.object(server, "RUNS_PATH", self.runs_path)
+        rp.start()
+        self.addCleanup(rp.stop)
+        self.addCleanup(lambda: self.runs_path.unlink(missing_ok=True))
 
     def _doorbell(self, claims=None, body=None, headers=None, authed=False, install=None):
         claims = claims or {"repository": "RewstApp/riftwing", "actor": "tfournet"}
@@ -561,7 +568,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.4")
+        self.assertEqual(spec["info"]["version"], "0.5.5")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -1176,6 +1183,50 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(payload["counts"]["active"], 0)
             self.assertEqual(payload["active"], [])
             self.assertEqual(payload["recent"], [])
+            self.assertEqual(payload["workflows"]["recent"], [])
+
+    def test_watch_recent_workflows_come_from_fires(self):
+        self.runs_path.write_text(
+            json.dumps(
+                {
+                    "workflow": "implement-slice",
+                    "status": "fired",
+                    "source": "fire",
+                    "input": {
+                        "repo": "riftwing",
+                        "ticket": "slices/demo/01-login.md",
+                        "kick_url": "https://app.rewst.ai/api/hooks/secret",
+                    },
+                    "created_at": "2026-08-24T12:00:00Z",
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "workflow": "pr-drive",
+                    "status": "fired",
+                    "source": "doorbell",
+                    "input": {"repo": "riftwing", "pr": 3523},
+                    "created_at": "2026-08-24T13:00:00Z",
+                }
+            )
+            + "\n"
+        )
+        with mock.patch.object(server, "JOBS_DIR", Path(tempfile.mkdtemp())), mock.patch.object(
+            server,
+            "units_status",
+            return_value={"ok": True, "healthy": True, "units": {"graphwing-api": {"active": True, "state": "active"}}},
+        ):
+            status, payload, _ = server.dispatch("GET", "/v1/watch", {}, True, b"")
+        self.assertEqual(status, 200, payload)
+        recent = payload["workflows"]["recent"]
+        self.assertEqual(recent[0]["kind"], "pr-drive")
+        self.assertEqual(recent[0]["title"], "pr-drive PR 3523")
+        self.assertEqual(recent[1]["title"], "implement-slice 01-login")
+        self.assertEqual(recent[1]["tab"], "graph")
+        dumped = json.dumps(payload)
+        self.assertNotIn("kick_url", dumped)
+        self.assertNotIn("hooks/secret", dumped)
 
     def test_herdr_agents(self):
         status, payload, _ = server.dispatch("GET", "/v1/herdr/agents", {}, True, b"")
@@ -1438,6 +1489,12 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["url"], "https://app.rewst.ai/api/hooks/o/trigger/t")
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
+        recorded = [json.loads(line) for line in self.runs_path.read_text().splitlines() if line.strip()]
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["workflow"], "implement-slice")
+        self.assertEqual(recorded[0]["input"], {"repo": "riftwing"})
+        self.assertNotIn("kick_url", json.dumps(recorded[0]))
+        self.assertNotIn("shh", json.dumps(recorded[0]))
 
     def test_review_no_verdict_is_flagged_not_an_opinion(self):
         # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran

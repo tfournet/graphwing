@@ -16,11 +16,11 @@ omarchy plugin enable graphwing.watch --section right --before omarchy.agents
 - **Hero** — Graphwing, and a one-line status (`Idle`, `2 running`, `Daemon down`).
 - **Units** — `api`, `tunnel`, `herdr` as systemd --user reports them. Herdr is
   optional. The bar only goes red when `graphwing-api` is down.
-- **Jobs** — queued and running first, then the last eight finished. Failed
-  rows use the urgent color. Titles prefer a ticket path or PR number, then a
-  heading slug like `01-login`, then the recipe or reviewer. Running and
-  finished rows show elapsed time. A finished job's receipt summary is the
-  extra line, not the transcript. No webhook tokens.
+- **Jobs** — in-flight local nodes (agent, test, review) while something is
+  running.
+- **Recent** — Rewst graphs this seat fired (`implement-slice`, `pr-drive`)
+  plus doorbell rings. Ticket or PR in the title. Not the inner agent/test
+  jobs. Click focuses herdr tab `graph`.
 
 The icon stays at full contrast while the API is up, so it does not vanish
 next to Tailscale when idle. Urgent means the API is down or a job just

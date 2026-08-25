@@ -23,7 +23,7 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property var unitRows: Model.unitRows(watch.units)
-  readonly property var jobs: watch.activeJobs.concat(watch.recentJobs)
+  readonly property var jobs: watch.activeJobs.concat(watch.workflowRuns)
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
   readonly property color barIconColor: {
     if (!watch.online || !watch.apiActive) return urgent
@@ -295,7 +295,7 @@ Panel {
             spacing: Style.space(10)
 
             PanelSectionHeader {
-              text: watch.busy ? "JOBS" : "RECENT"
+              text: watch.activeCount > 0 ? "RUNNING" : "RECENT"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -303,7 +303,7 @@ Panel {
             Text {
               visible: root.jobs.length === 0
               width: parent.width
-              text: watch.online ? "No jobs yet." : "Start graphwing-api, then this fills in."
+              text: watch.online ? "No workflow runs yet." : "Start graphwing-api, then this fills in."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
