@@ -89,20 +89,10 @@ SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
+SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
-# Spec-review turn budget. Was hardcoded to 1 for the claude reviewers, so
-# every review died on "Reached max turns (1)" and parsed as a NACK without
-# reading anything (SC-110290's first run nacked twice that way). The hermes
-# reviewer already used 8. Read the diff, think, answer, and leave slack for a
-# provider hiccup or a dropped connection costing a turn.
+# Reviews need enough turns to read the ticket and diff before returning a verdict.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
-# Spec-review is read-only. The claude reviewers get --permission-mode plan,
-# which enforces that in the runner. Hermes has no equivalent flag, so the sol
-# reviewer is restricted by toolset instead: the ticket and diff are already in
-# the prompt, so it needs no file or terminal tools to answer. An empty -t is
-# silently ignored (hermes falls back to the config default), so name a real
-# harmless toolset.
-REVIEW_TOOLSETS = os.environ.get("GRAPHWING_REVIEW_TOOLSETS", "todo")
 SLICE_BUDGET = {
     ("mechanical", "S"): (10, 120),
     ("mechanical", "M"): (30, 300),
@@ -1356,6 +1346,7 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "commit_message": data.get("commit_message"),
         "iters_left": data.get("iters_left"),
         "class": data.get("class"),
+        "work_kind": data.get("work_kind"),
         "size": data.get("size"),
         "ac_count": data.get("ac_count"),
         "seams": data.get("seams"),
@@ -1478,29 +1469,50 @@ def bump_slice_size(size: str, class_name: str, ac_count: int | None, seams: int
 
 
 def slice_route_lookup(
-    class_name: str, size_floor: str, ac_count: int | None = None, seams: int | None = None
+    class_name: str,
+    size_floor: str,
+    ac_count: int | None = None,
+    seams: int | None = None,
+    work_kind: str | None = None,
 ) -> dict[str, Any]:
     sized = bump_slice_size(size_floor, class_name, ac_count, seams)
     turns, wait = SLICE_BUDGET[(class_name, sized)]
-    if class_name == "mechanical":
-        launcher, provider, model = "codex", "openai", "gpt-5.6-sol"
-        reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
-    elif class_name == "visual":
-        # Every review crosses vendors, and all three vendors are in the loop:
-        # xAI writes mechanical and Anthropic grades it; Anthropic writes these
-        # and OpenAI grades them. Sol is excluded because it is the planning
-        # session, so Terra carries OpenAI here — same vendor, different model,
-        # so the spec's author is never in the review chain.
-        launcher, provider, model = "claude", "anthropic", "claude-opus-5"
-        reviewer1, reviewer2 = "terra", "none"
+    if work_kind is None:
+        raise ValueError("work_kind is required")
+    writers = {
+        "go_coding": ("codex", "openai", "gpt-5.6-sol"),
+        "typescript_coding": ("claude", "anthropic", "claude-opus-5"),
+        "research_ops": ("grok", "xai", "grok-4.6"),
+    }
+    launcher, provider, model = writers[work_kind]
+    opposing = {
+        "openai": [
+            ("claude", "anthropic", "claude-sonnet-5"),
+            ("grok", "xai", "grok-4.6"),
+        ],
+        "anthropic": [
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("grok", "xai", "grok-4.6"),
+        ],
+        "xai": [
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("claude", "anthropic", "claude-opus-5"),
+        ],
+    }
+    if class_name == "sensitive":
+        review_count = 2
+    elif class_name == "mechanical" and sized == "S":
+        review_count = 0
     else:
-        # Sensitive needs two acks, and both from vendors that are not the
-        # writer's: OpenAI and xAI grade what Anthropic wrote.
-        launcher, provider, model = "claude", "anthropic", "claude-opus-5"
-        reviewer1, reviewer2 = "terra", "grok"
+        review_count = 1
+    reviewers = opposing[provider][:review_count]
+    while len(reviewers) < 2:
+        reviewers.append(("none", "none", "none"))
+    reviewer1, reviewer2 = reviewers
     return {
         "ok": True,
         "class": class_name,
+        "work_kind": work_kind,
         "size_floor": size_floor,
         "size": sized,
         "launcher": launcher,
@@ -1508,10 +1520,17 @@ def slice_route_lookup(
         "model": model,
         "max_turns": turns,
         "run_budget_seconds": wait,
-        "reviewer1": reviewer1,
-        "reviewer2": reviewer2,
-        "review": "none" if reviewer1 == "none" else (
-            f"{reviewer1}_{reviewer2}" if reviewer2 != "none" else reviewer1),
+        "reviewer1": reviewer1[2],
+        "reviewer1_launcher": reviewer1[0],
+        "reviewer1_provider": reviewer1[1],
+        "reviewer1_model": reviewer1[2],
+        "reviewer2": reviewer2[2],
+        "reviewer2_launcher": reviewer2[0],
+        "reviewer2_provider": reviewer2[1],
+        "reviewer2_model": reviewer2[2],
+        "review": "none" if reviewer1[0] == "none" else (
+            f"{reviewer1[2]}_{reviewer2[2]}" if reviewer2[0] != "none" else reviewer1[2]
+        ),
     }
 
 
@@ -1522,17 +1541,23 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     assert data is not None
     class_name = str(data.get("class") or "mechanical").strip()
     size_floor = str(data.get("size") or "M").strip()
+    work_kind = str(data.get("work_kind") or "").strip()
     if class_name not in SLICE_CLASSES:
         return 400, {"error": "class must be mechanical, visual, or sensitive", "code": "bad_class"}
     if size_floor not in SLICE_SIZES:
         return 400, {"error": "size must be S, M, or L", "code": "bad_size"}
+    if work_kind not in SLICE_WORK_KINDS:
+        return 400, {
+            "error": "work_kind must be go_coding, typescript_coding, or research_ops",
+            "code": "bad_work_kind",
+        }
     ac_count, ac_err = parse_optional_int(data, "ac_count", 0, 99)
     if ac_err:
         return 400, ac_err
     seams, seams_err = parse_optional_int(data, "seams", 0, 20)
     if seams_err:
         return 400, seams_err
-    return 200, slice_route_lookup(class_name, size_floor, ac_count, seams)
+    return 200, slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
 
 
 def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -1748,8 +1773,26 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
-def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
-    """Run one spec-review to completion and return its verdict payload."""
+def native_review_result(
+    launcher: str,
+    provider: str,
+    model: str,
+    prompt: str,
+    resolved: Path,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """Run one read-only review through a proven direct native launcher."""
+    spec = NATIVE_LAUNCHERS.get(launcher)
+    if spec is None:
+        return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                "error": "review launcher must be codex, claude, or grok", "code": "bad_launcher"}
+    if provider != spec["provider"] or model not in spec["models"]:
+        return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
+    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}[launcher]
+    if not binary.is_file():
+        return {"ok": False, "verdict": "NACK", "no_verdict": True,
+                "error": f"{launcher} binary missing: {binary}", "code": "not_implemented"}
     diff = git_diff(resolved, "HEAD", None)
     diff_text = str(diff.get("diff") or "")[:12000]
     body_prompt = (
@@ -1757,77 +1800,96 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
         f"Ticket:\n{prompt[:8000]}\n\nDiff:\n{diff_text}\n"
     )
-    if reviewer in {"sonnet", "opus", "fable"}:
-        if not CLAUDE_BIN.is_file():
-            return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                    "error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
-        model = {"sonnet": "sonnet", "opus": "opus", "fable": "claude-fable-5"}[reviewer]
-        cmd = [
-            str(CLAUDE_BIN),
-            "-p",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "plan",
-            "--max-turns",
-            str(REVIEW_MAX_TURNS),
-            "--model",
-            model,
-            body_prompt,
-        ]
-        env = {k: v for k, v in os.environ.items()}
+    receipt_prompt = body_prompt + (
+        "\nFor this transport, put the verdict in summary and return exactly one JSON object: "
+        '{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}'
+        " or the same object with status error and summary VERDICT: NACK."
+    )
+    returncode = 1
+    timed_out = False
+    text = ""
+    ephemeral = job_id is None
+    error: str | None = None
+    if launcher == "grok":
+        run_id = job_id or uuid.uuid4().hex
+        path = job_dir(run_id)
+        path.mkdir(parents=True, exist_ok=True)
+        path.joinpath("prompt.txt").write_text(receipt_prompt)
+        grok_job = read_job(run_id) or {}
+        grok_job.update({
+            "job_id": run_id,
+            "kind": "review",
+            "cwd": str(resolved),
+            "launcher": launcher,
+            "provider": provider,
+            "model": model,
+            "run_budget_seconds": 180,
+            "session_identity": None,
+        })
+        returncode, timed_out, _session_id, error = run_grok_acp(grok_job)
+        text = read_bounded_output(path / "last-message.txt")
     else:
-        if not HERMES_BIN.is_file():
-            return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                    "error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
-        # Name the model. Without -m every hermes reviewer silently takes the
-        # seat's default profile, so "grok reviewed it" and "terra reviewed it"
-        # would both mean "whatever config.yaml said today".
-        model = {"sol": "gpt-5.6-sol", "grok": "grok-4.6", "terra": "gpt-5.6-terra"}[reviewer]
-        cmd = [
-            str(HERMES_BIN),
-            "chat",
-            "-Q",
-            "-m",
-            model,
-            "--query",
-            body_prompt,
-            "--in",
-            str(resolved),
-            "--no-restore-cwd",
-            "-t",
-            REVIEW_TOOLSETS,
-            "--max-turns",
-            str(REVIEW_MAX_TURNS),
-            "--run-budget",
-            "180",
-            "--yolo",
-            "--source",
-            "tool",
-        ]
-        env = hermes_job_env({"job_id": "review", "cwd": str(resolved)})
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(resolved),
-            env=env,
-            capture_output=True,
-            timeout=200,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                "error": "review timed out", "code": "timeout", "reviewer": reviewer}
-    text = (proc.stdout or b"").decode("utf-8", "replace")
+        run_id = job_id or uuid.uuid4().hex
+        path = job_dir(run_id)
+        path.mkdir(parents=True, exist_ok=True)
+        if launcher == "codex":
+            cmd = [
+                str(CODEX_BIN), "exec", "--json", "--model", model,
+                "-c", "model_reasoning_effort=high", "-C", str(resolved),
+                "--sandbox", "read-only",
+                "--output-last-message", str(path / "last-message.txt"), "-",
+            ]
+            run_input = receipt_prompt.encode()
+        else:
+            cmd = [
+                str(CLAUDE_BIN), "-p", "--output-format", "text",
+                "--permission-mode", "plan", "--max-turns", str(REVIEW_MAX_TURNS),
+                "--model", model, body_prompt,
+            ]
+            run_input = None
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(resolved), env={k: v for k, v in os.environ.items()},
+                input=run_input, capture_output=True, timeout=200,
+            )
+            returncode = proc.returncode
+            stdout = (proc.stdout or b"").decode("utf-8", "replace")
+            text = read_bounded_output(path / "last-message.txt") or stdout
+            if launcher == "codex":
+                parsed = parse_receipt_text(text) or parse_receipt_text(stdout)
+                text = str(parsed.get("summary") or "") if parsed else ""
+        except subprocess.TimeoutExpired:
+            timed_out, error = True, "review timed out"
+        except OSError as exc:
+            error = f"review spawn failed: {exc}"
+    if launcher == "grok":
+        parsed = parse_receipt_text(text)
+        text = str(parsed.get("summary") or "") if parsed else ""
     verdict, summary = parse_review_verdict(text)
-    return {
-        "ok": verdict == "PASS",
+    no_verdict = bool(error) or review_said_nothing(text)
+    if timed_out:
+        code = "timeout"
+    elif error:
+        code = "review_failed"
+    else:
+        code = None
+    result = {
+        "ok": verdict == "PASS" and returncode == 0 and not no_verdict,
         "verdict": verdict,
-        "no_verdict": review_said_nothing(text),
-        "reviewer": reviewer,
-        "summary": summary,
-        "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
-        "returncode": proc.returncode,
+        "no_verdict": no_verdict,
+        "launcher": launcher,
+        "provider": provider,
+        "model": model,
+        "reviewer": model,
+        "summary": error or summary,
+        "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": error or ""}),
+        "returncode": returncode,
     }
+    if code:
+        result["code"] = code
+    if ephemeral:
+        shutil.rmtree(path, ignore_errors=True)
+    return result
 
 
 def review_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -1836,7 +1898,10 @@ def review_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any
         "job_id": job["job_id"],
         "verdict": result.get("verdict"),
         "no_verdict": bool(result.get("no_verdict")),
-        "reviewer": job.get("reviewer"),
+        "reviewer": job.get("model"),
+        "launcher": job.get("launcher"),
+        "provider": job.get("provider"),
+        "model": job.get("model"),
         "summary": str(result.get("summary") or result.get("error") or "")[:500],
         "compact": result.get("compact") or "",
     }
@@ -1849,7 +1914,10 @@ def run_review_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    result = review_result(job["reviewer"], job["prompt"], Path(job["cwd"]))
+    result = native_review_result(
+        job["launcher"], job["provider"], job["model"], job["prompt"],
+        Path(job["cwd"]), job_id=job["job_id"],
+    )
     receipt = review_receipt(job, result)
     job = read_job(job_id) or job
     job["finished_at"] = utcnow()
@@ -1884,10 +1952,14 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     if err:
         return 400, err
     assert data is not None
-    reviewer = str(data.get("reviewer") or "").strip()
-    if reviewer not in {"sonnet", "opus", "fable", "sol", "grok", "terra"}:
-        return 400, {"error": "reviewer must be sonnet, opus, fable, sol, grok, or terra",
-                     "code": "bad_reviewer"}
+    launcher = str(data.get("launcher") or "").strip()
+    native_spec = NATIVE_LAUNCHERS.get(launcher)
+    if native_spec is None:
+        return 400, {"error": "launcher must be codex, claude, or grok", "code": "bad_launcher"}
+    provider = str(data.get("provider") or "").strip()
+    model = str(data.get("model") or "").strip()
+    if provider != native_spec["provider"] or model not in native_spec["models"]:
+        return 400, {"error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return 400, {"error": "prompt is required", "code": "missing_prompt"}
@@ -1900,7 +1972,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 400, webhook_err
 
     if not webhook_url:
-        result = review_result(reviewer, prompt, resolved)
+        result = native_review_result(launcher, provider, model, prompt, resolved)
         if result.get("code") == "not_implemented":
             return 501, result
         if result.get("code") == "timeout":
@@ -1915,7 +1987,9 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "job_id": job_id,
             "kind": "review",
             "status": "queued",
-            "reviewer": reviewer,
+            "launcher": launcher,
+            "provider": provider,
+            "model": model,
             "repo": name,
             "cwd": str(resolved),
             "prompt": prompt,
@@ -1938,7 +2012,9 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         "job_id": job_id,
         "kind": "review",
         "status": "queued",
-        "reviewer": reviewer,
+        "launcher": launcher,
+        "provider": provider,
+        "model": model,
         "repo": name,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
@@ -3121,6 +3197,7 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
 def codex_command(job: dict[str, Any], prompt_path: Path, cwd: str) -> list[str]:
     command = [
         str(CODEX_BIN), "exec", "--json", "--model", str(job["model"]),
+        "-c", "model_reasoning_effort=high",
         "-C", cwd, "--sandbox", "workspace-write",
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
     ]

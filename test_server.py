@@ -894,6 +894,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(cmd[:2], [str(codex), "exec"])
         self.assertIn("--json", cmd)
         self.assertEqual(cmd[cmd.index("--sandbox") + 1], "workspace-write")
+        self.assertIn("model_reasoning_effort=high", cmd)
         self.assertNotIn("--cwd", cmd)
         self.assertNotIn("--prompt-file", cmd)
         self.assertEqual(cmd[cmd.index("resume") + 1], "codex-123")
@@ -1727,6 +1728,7 @@ while True:
                     "branch": "feature/x",
                     "test": "graphwing-unit",
                     "commit_message": "slice",
+                    "work_kind": "typescript_coding",
                     "kick_url": "https://example.com/hook",
                     "kick_token": "tok",
                 }
@@ -1742,6 +1744,7 @@ while True:
             self.assertEqual(captured["url"], "https://example.com/hook")
             self.assertEqual(captured["body"]["ticket"], "slices/demo/02-checkout.md")
             self.assertEqual(captured["body"]["kick_url"], "https://example.com/hook")
+            self.assertEqual(captured["body"]["work_kind"], "typescript_coding")
 
     def test_slice_continue_rejects_http_kick_url(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2767,124 +2770,38 @@ while True:
         # turn cannot read a diff and answer.
         self.assertGreaterEqual(server.REVIEW_MAX_TURNS, 8)
 
-    def _review_cmd(self, reviewer):
-        """Build one review command without running it."""
-        seen = {}
-
-        class FakeProc:
-            stdout = b"VERDICT: PASS\n"
-            stderr = b""
-            returncode = 0
-
-        def fake_run(cmd, **kw):
-            seen["cmd"] = cmd
-            return FakeProc()
-
-        with mock.patch.object(server, "git_diff", return_value={"diff": "diff --git a b"}), \
-             mock.patch.object(server.subprocess, "run", fake_run), \
-             mock.patch.object(server.Path, "is_file", lambda self: True), \
-             mock.patch.object(server, "hermes_job_env", return_value={}):
-            server.review_result(reviewer, "ticket text", Path("/tmp"))
-        return seen["cmd"]
-
-    def test_all_three_vendors_are_in_the_loop(self):
-        # Pulling Sol out for the planner conflict left OpenAI reviewing
-        # exactly one class. Opposing-vendor is necessary but not sufficient:
-        # each vendor should be reviewing someone.
-        VENDOR = {"grok-4.6": "xai", "gpt-5.6-sol": "openai", "claude-opus-5": "anthropic",
-                  "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic",
-                  "grok": "xai", "terra": "openai", "sol": "openai"}
-        reviewing = set()
-        for cls in ("mechanical", "visual", "sensitive"):
-            r = server.slice_route_lookup(cls, "M")
-            for slot in ("reviewer1", "reviewer2"):
-                if r[slot] != "none":
-                    reviewing.add(VENDOR[r[slot]])
-        self.assertEqual(reviewing, {"anthropic", "openai", "xai"},
-                         f"only {sorted(reviewing)} review anything")
-
-    def test_reviewer_is_always_an_opposing_vendor(self):
-        # The rule is vendor separation, not model separation. Fable grading
-        # Opus is Anthropic reviewing Anthropic, which is the thing the rule
-        # exists to prevent. Sol is the planner, so xAI is the only vendor that
-        # is neither the writer's nor the planner's.
-        VENDOR = {
-            "grok-4.6": "xai", "gpt-5.6-sol": "openai", "claude-opus-5": "anthropic",
-            "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic",
-            "grok": "xai", "terra": "openai", "sol": "openai",
+    def test_direct_reviewer_routes_are_always_vendor_independent(self):
+        vendor = {
+            "openai": "openai", "anthropic": "anthropic", "xai": "xai",
         }
-        for cls in ("mechanical", "visual", "sensitive"):
-            for size in ("S", "M", "L"):
-                r = server.slice_route_lookup(cls, size)
-                writer = VENDOR[r["model"]]
-                for slot in ("reviewer1", "reviewer2"):
-                    who = r[slot]
-                    if who == "none":
-                        continue
-                    self.assertNotEqual(VENDOR[who], writer,
-                                        f"{cls}/{size}: {who} shares a vendor with the writer")
-                    self.assertNotEqual(who, "sol",
-                                        f"{cls}/{size}: the planner must not review")
+        reviewing = set()
+        for work_kind in ("go_coding", "typescript_coding", "research_ops"):
+            for cls in ("mechanical", "visual", "sensitive"):
+                for size in ("S", "M", "L"):
+                    route = server.slice_route_lookup(cls, size, work_kind=work_kind)
+                    writer = vendor[route["provider"]]
+                    for slot in ("reviewer1", "reviewer2"):
+                        launcher = route[f"{slot}_launcher"]
+                        if launcher == "none":
+                            continue
+                        reviewer = vendor[route[f"{slot}_provider"]]
+                        reviewing.add(reviewer)
+                        self.assertNotEqual(
+                            reviewer, writer,
+                            f"{work_kind}/{cls}/{size}: {slot} shares vendor {writer}",
+                        )
+                        self.assertIn(launcher, server.NATIVE_LAUNCHERS)
+                        self.assertIn(
+                            route[f"{slot}_model"], server.NATIVE_LAUNCHERS[launcher]["models"]
+                        )
+        self.assertEqual(reviewing, {"anthropic", "openai", "xai"})
 
-    def test_sol_does_not_review_when_sol_plans(self):
-        # Sol is the planning session, so Sol grading slices against its own
-        # spec is the failure the opposing-vendor rule exists to prevent, one
-        # step earlier in the chain. visual and sensitive both reviewed with
-        # Sol; they now review with Anthropic models.
-        for cls in ("visual", "sensitive"):
-            for size in ("S", "M", "L"):
-                r = server.slice_route_lookup(cls, size)
-                self.assertNotIn("sol", (r["reviewer1"], r["reviewer2"]),
-                                 f"{cls}/{size} still reviews with the planner")
-
-    def test_fable_is_a_usable_reviewer_even_though_unrouted(self):
-        # Kept callable for /v1/review/run, but sliceRoute no longer picks it:
-        # Fable is Anthropic and so are these writers.
-        # Adding a reviewer name the runner cannot launch would nack every
-        # slice with not_implemented, which parses as a real rejection.
-        seen = {}
-
-        class FakeProc:
-            stdout = b"VERDICT: PASS\n"
-            stderr = b""
-            returncode = 0
-
-        with mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
-             mock.patch.object(server.subprocess, "run",
-                               lambda cmd, **kw: (seen.__setitem__("cmd", cmd), FakeProc())[1]), \
-             mock.patch.object(server.Path, "is_file", lambda self: True), \
-             mock.patch.object(server, "hermes_job_env", return_value={}):
-            out = server.review_result("fable", "ticket", Path("/tmp"))
-        self.assertEqual(out["verdict"], "PASS", out)
-        self.assertIn("--model", seen["cmd"])
-        self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1], "claude-fable-5")
-        # Reviewers are read-only; plan mode is what enforces that.
-        self.assertIn("plan", seen["cmd"])
-
-    def test_sol_reviewer_cannot_write_to_the_repo(self):
-        # The claude reviewers get --permission-mode plan, which enforces
-        # read-only in the runner. The hermes reviewer got --yolo and no
-        # toolset restriction, so "do not edit files, commit, or push" was
-        # prompt text a model could ignore. Sol gates every visual and
-        # sensitive slice, which are the classes least safe to leave writable.
-        # The diff and ticket are already in the prompt, so the reviewer needs
-        # no file or terminal tools to answer.
-        cmd = self._review_cmd("sol")
-        self.assertIn("-t", cmd, "sol review must restrict toolsets")
-        toolsets = cmd[cmd.index("-t") + 1].split(",")
-        for banned in ("file", "terminal", "code_execution", "browser"):
-            self.assertNotIn(banned, toolsets)
-        # -t '' is silently ignored by hermes: an empty string falls back to
-        # the config default and the model keeps its file tools.
-        self.assertTrue(toolsets and toolsets[0], "empty -t does not restrict anything")
-
-    def test_sol_reviewer_honours_the_shared_turn_budget(self):
-        # REVIEW_MAX_TURNS is env-tunable but only the claude branch read it.
-        # The hermes branch passed a literal "8", so raising the knob did
-        # nothing for the reviewer that gates visual and sensitive slices.
-        cmd = self._review_cmd("sol")
-        self.assertIn("--max-turns", cmd)
-        self.assertEqual(cmd[cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
+    def test_route_never_returns_a_profile_named_reviewer(self):
+        banned = {"terra", "sol", "sonnet", "opus", "fable"}
+        for work_kind in ("go_coding", "typescript_coding", "research_ops"):
+            for cls in ("mechanical", "visual", "sensitive"):
+                route = server.slice_route_lookup(cls, "M", work_kind=work_kind)
+                self.assertTrue(banned.isdisjoint({route["reviewer1"], route["reviewer2"]}))
 
     def test_pr_drive_gates_wait_for_results_too(self):
         # implement-slice got wait nodes for every async op; pr-drive did not.
@@ -3065,32 +2982,208 @@ while True:
         self.assertEqual(nodes["join_receipt_fail"]["type"], "logic.join.any")
         self.assertTrue(any(e["source"] == "join_receipt_fail" and e["target"] == "receipt_fail" for e in edges))
 
-    def test_retry_writers_receive_both_supported_session_receipts(self):
+    def test_native_retry_writers_use_recorded_receipts_only(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
-        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+        expected = {
+            "agent2": "record",
+            "agent3": "record2",
+            "agent_rn1": "record",
+            "agent_rn2": "record",
+        }
+        for node_id, receipt in expected.items():
             config = nodes[node_id]["config"]
-            self.assertEqual(config["session_identity"], "{{ TASKS.wait.request.body.session_identity }}")
-            self.assertEqual(config["resume_job_id"], "{{ TASKS.wait.request.body.job_id }}")
-            self.assertEqual(config["hermes_session"], "{{ TASKS.wait.request.body.hermes_session }}")
+            self.assertEqual(config["session_identity"], f"{{{{ TASKS.{receipt}.session_identity }}}}")
+            self.assertEqual(config["resume_job_id"], f"{{{{ TASKS.{receipt}.resume_job_id }}}}")
+            self.assertNotIn("hermes_session", config)
             self.assertEqual(config["provider"], "{{ TASKS.route.data.provider }}")
+        for receipt in ("record", "record2"):
+            outputs = {m["output"] for m in nodes[receipt]["config"]["mappings"]}
+            self.assertIn("session_identity", outputs)
+            self.assertIn("resume_job_id", outputs)
+            self.assertNotIn("hermes_session", outputs)
+
+    def test_implement_slice_routes_direct_native_reviewers(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        for suffix in ("1", "1b", "2", "2b"):
+            node = nodes[f"review{suffix}"]
+            slot = "reviewer1" if suffix.startswith("1") else "reviewer2"
+            config = node["config"]
+            self.assertNotIn("reviewer", config)
+            self.assertEqual(config["launcher"], f"{{{{ TASKS.route.data.{slot}_launcher }}}}")
+            self.assertEqual(config["provider"], f"{{{{ TASKS.route.data.{slot}_provider }}}}")
+            self.assertEqual(config["model"], f"{{{{ TASKS.route.data.{slot}_model }}}}")
+        second = nodes["switch_rev2"]["config"]
+        self.assertEqual(second["cases"][0]["rules"], [
+            {"path": "data.reviewer2_launcher", "op": "equals", "value": "none"}
+        ])
+        edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
+        self.assertEqual(
+            (edges["e_rev2_skip"]["sourceHandle"], edges["e_rev2_skip"]["target"]),
+            ("case-0", "join_commit"),
+        )
+        self.assertEqual(
+            (edges["e_rev2_need"]["sourceHandle"], edges["e_rev2_need"]["target"]),
+            ("default", "wait_rev2"),
+        )
 
     def test_review_run_is_async_when_given_a_webhook(self):
         body = json.dumps({
-            "repo": "scratch", "reviewer": "sonnet", "prompt": "ticket",
+            "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-sonnet-5", "prompt": "ticket",
             "response_webhook_url": "https://example.invalid/resume",
         }).encode()
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
-            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+            jobs = Path(td) / "jobs"
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
                 status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
         self.assertEqual(status, 202, payload)
         self.assertEqual(payload["status"], "queued")
         self.assertEqual(payload["kind"], "review")
+        self.assertEqual(
+            (payload["launcher"], payload["provider"], payload["model"]),
+            ("claude", "anthropic", "claude-sonnet-5"),
+        )
         self.assertTrue(payload["job_id"])
-        enq.assert_called_once()
+        queued = enq.call_args.args[0]
+        self.assertNotIn("reviewer", queued)
+
+    def test_review_run_rejects_profile_named_or_mismatched_reviewers(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                for request, code in (
+                    ({"repo": "scratch", "reviewer": "terra", "prompt": "x"}, "bad_launcher"),
+                    ({"repo": "scratch", "launcher": "codex", "provider": "anthropic", "model": "gpt-5.6-sol", "prompt": "x"}, "bad_model_identity"),
+                ):
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                    )
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], code)
+
+    def test_direct_review_commands_are_read_only_and_explicit(self):
+        commands = []
+
+        class FakeProc:
+            stderr = b""
+            returncode = 0
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(cmd, **kwargs):
+            commands.append((list(cmd), kwargs))
+            if "exec" in cmd:
+                receipt = json.dumps({
+                    "status": "ok", "sha": None, "pr_url": None,
+                    "summary": "VERDICT: PASS",
+                })
+                event = {"type": "item.completed", "item": {"type": "agent_message", "text": receipt}}
+                return FakeProc((json.dumps(event) + "\n").encode())
+            return FakeProc(b"VERDICT: PASS\n")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+             mock.patch.object(server.Path, "is_file", lambda self: True), \
+             mock.patch.object(server.subprocess, "run", fake_run):
+            codex = server.native_review_result(
+                "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+            )
+            claude = server.native_review_result(
+                "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td)
+            )
+        self.assertEqual((codex["verdict"], claude["verdict"]), ("PASS", "PASS"))
+        codex_cmd, codex_kwargs = commands[0]
+        self.assertEqual(codex_cmd[codex_cmd.index("--sandbox") + 1], "read-only")
+        self.assertIn("model_reasoning_effort=high", codex_cmd)
+        self.assertEqual(codex_cmd[codex_cmd.index("--model") + 1], "gpt-5.6-sol")
+        self.assertIn("input", codex_kwargs)
+        claude_cmd, _ = commands[1]
+        self.assertEqual(claude_cmd[claude_cmd.index("--permission-mode") + 1], "plan")
+        self.assertEqual(claude_cmd[claude_cmd.index("--model") + 1], "claude-sonnet-5")
+        self.assertEqual(claude_cmd[claude_cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
+
+    def test_direct_review_failures_never_pass(self):
+        class FakeProc:
+            stderr = b""
+
+            def __init__(self, stdout, returncode=0):
+                self.stdout = stdout
+                self.returncode = returncode
+
+        receipt = json.dumps({
+            "status": "ok", "sha": None, "pr_url": None,
+            "summary": "VERDICT: PASS",
+        })
+        event = json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": receipt},
+        }).encode()
+        cases = (
+            (FakeProc(event, returncode=7), None),
+            (FakeProc(b"not a verdict"), None),
+            (subprocess.TimeoutExpired("codex", 200), "timeout"),
+            (OSError("spawn failed"), "review_failed"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for outcome, code in cases:
+                effect = outcome if isinstance(outcome, BaseException) else None
+                with self.subTest(outcome=type(outcome).__name__, code=code), \
+                     mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+                     mock.patch.object(server.Path, "is_file", lambda self: True), \
+                     mock.patch.object(
+                         server.subprocess, "run",
+                         side_effect=effect,
+                         return_value=None if effect else outcome,
+                     ):
+                    result = server.native_review_result(
+                        "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+                    )
+                self.assertFalse(result["ok"], result)
+                if code:
+                    self.assertEqual(result["code"], code)
+        with mock.patch.object(server.Path, "is_file", lambda self: False):
+            missing = server.native_review_result(
+                "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+            )
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["code"], "not_implemented")
+
+    def test_grok_review_reuses_the_direct_acp_launcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            job_id = "ab" * 16
+            (jobs / job_id).mkdir(parents=True)
+
+            def fake_acp(job):
+                self.assertEqual(job["response_webhook_url"], "https://example.invalid/resume")
+                path = jobs / job["job_id"]
+                path.joinpath("last-message.txt").write_text(json.dumps({
+                    "status": "ok", "sha": None, "pr_url": None,
+                    "summary": "VERDICT: PASS",
+                }))
+                return 0, False, "grok-review-session", None
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "GROK_BIN", Path(td) / "grok"), \
+                 mock.patch.object(server.Path, "is_file", lambda self: True), \
+                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+                 mock.patch.object(server, "run_grok_acp", fake_acp):
+                server.write_job({
+                    "job_id": job_id,
+                    "response_webhook_url": "https://example.invalid/resume",
+                })
+                out = server.native_review_result(
+                    "grok", "xai", "grok-4.6", "ticket", Path(td), job_id=job_id
+                )
+        self.assertEqual(out["verdict"], "PASS", out)
+        self.assertEqual((out["launcher"], out["model"]), ("grok", "grok-4.6"))
 
     def test_async_ops_declare_webhook_fields_in_the_spec(self):
         # The graph sent response_webhook_url to reviewRun, the server read it,
@@ -3721,9 +3814,9 @@ while True:
         self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
-        self.assertIn("hermes_session", agent2["config"])
-        self.assertIn("TASKS.wait.request.body.hermes_session", agent2["config"]["hermes_session"])
-        self.assertIn("TASKS.wait.request.body.session_identity", agent2["config"]["session_identity"])
+        self.assertNotIn("hermes_session", agent2["config"])
+        self.assertEqual(agent2["config"]["session_identity"], "{{ TASKS.record.session_identity }}")
+        self.assertEqual(agent2["config"]["resume_job_id"], "{{ TASKS.record.resume_job_id }}")
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
@@ -3782,50 +3875,86 @@ while True:
         self.assertIn("review/run", review1["type"])
 
     def test_slice_route_table(self):
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"mechanical","size":"S"}'
+        def route(work_kind, cls="mechanical", size="M", **extra):
+            body = {"class": cls, "size": size, "work_kind": work_kind, **extra}
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/slice/route", {}, True, json.dumps(body).encode()
+            )
+            self.assertEqual(status, 200, payload)
+            return payload
+
+        go = route("go_coding", size="S")
+        self.assertEqual(
+            (go["launcher"], go["provider"], go["model"]),
+            ("codex", "openai", "gpt-5.6-sol"),
         )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(payload["launcher"], "codex")
-        self.assertEqual(payload["provider"], "openai")
-        self.assertEqual(payload["model"], "gpt-5.6-sol")
-        self.assertEqual(payload["reviewer1"], "none")
-        self.assertEqual(payload["max_turns"], 10)
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"mechanical","size":"M"}'
+        self.assertEqual(go["reviewer1_launcher"], "none")
+        self.assertEqual(go["max_turns"], 10)
+
+        go_sensitive = route("go_coding", cls="sensitive")
+        self.assertEqual(
+            (go_sensitive["reviewer1_launcher"], go_sensitive["reviewer1_model"]),
+            ("claude", "claude-sonnet-5"),
         )
-        self.assertEqual(payload["reviewer1"], "sonnet")
-        self.assertEqual(payload["max_turns"], 30)
-        status, payload, _ = server.dispatch(
-            "POST",
-            "/v1/slice/route",
-            {},
-            True,
-            b'{"class":"mechanical","size":"S","ac_count":6}',
+        self.assertEqual(
+            (go_sensitive["reviewer2_launcher"], go_sensitive["reviewer2_model"]),
+            ("grok", "grok-4.6"),
         )
-        self.assertEqual(payload["size"], "M")
-        self.assertEqual(payload["size_floor"], "S")
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"S"}'
+
+        typescript = route("typescript_coding")
+        self.assertEqual(
+            (typescript["launcher"], typescript["provider"], typescript["model"]),
+            ("claude", "anthropic", "claude-opus-5"),
         )
-        self.assertEqual(payload["launcher"], "claude")
-        self.assertEqual(payload["size"], "M")
-        self.assertEqual(payload["reviewer1"], "terra")
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"M"}'
+        self.assertEqual(
+            (typescript["reviewer1_launcher"], typescript["reviewer1_model"]),
+            ("codex", "gpt-5.6-sol"),
         )
-        self.assertEqual(payload["launcher"], "claude")
-        self.assertEqual(payload["reviewer1"], "terra")
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"sensitive","size":"M"}'
+
+        research = route("research_ops")
+        self.assertEqual(
+            (research["launcher"], research["provider"], research["model"]),
+            ("grok", "xai", "grok-4.6"),
         )
-        self.assertEqual(payload["reviewer1"], "terra")
-        self.assertEqual(payload["reviewer2"], "grok")
+        self.assertEqual(
+            (research["reviewer1_launcher"], research["reviewer1_model"]),
+            ("codex", "gpt-5.6-sol"),
+        )
+
+        research_sensitive = route("research_ops", cls="sensitive")
+        self.assertEqual(
+            (research_sensitive["reviewer1_launcher"], research_sensitive["reviewer1_model"]),
+            ("codex", "gpt-5.6-sol"),
+        )
+        self.assertEqual(
+            (research_sensitive["reviewer2_launcher"], research_sensitive["reviewer2_model"]),
+            ("claude", "claude-opus-5"),
+        )
+
+        bumped = route("go_coding", size="S", ac_count=6)
+        self.assertEqual((bumped["size"], bumped["size_floor"]), ("M", "S"))
+
         status, payload, _ = server.dispatch(
-            "POST", "/v1/slice/route", {}, True, b'{"class":"nope","size":"M"}'
+            "POST", "/v1/slice/route", {}, True,
+            b'{"class":"mechanical","size":"M","work_kind":"nope"}',
         )
         self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "bad_class")
+        self.assertEqual(payload["code"], "bad_work_kind")
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route", {}, True,
+            b'{"class":"mechanical","size":"M"}',
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_work_kind")
+        for body, code in (
+            ({"class": "nope", "size": "M", "work_kind": "go_coding"}, "bad_class"),
+            ({"class": "mechanical", "size": "XL", "work_kind": "go_coding"}, "bad_size"),
+        ):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/slice/route", {}, True, json.dumps(body).encode()
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["code"], code)
 
     def test_parse_review_verdict(self):
         self.assertEqual(server.parse_review_verdict("noise\nVERDICT: PASS\n")[0], "PASS")

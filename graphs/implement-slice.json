@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, iters_left, optional kick_url.",
+  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, class, work_kind, iters_left, optional kick_url.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -23,6 +23,7 @@
             "test": { "type": "string", "required": true },
             "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same native session with a compact test signal" },
             "class": { "type": "string", "required": false, "description": "mechanical (default), visual, or sensitive" },
+            "work_kind": { "type": "string", "required": true, "description": "go_coding, typescript_coding, or research_ops" },
             "size": { "type": "string", "required": false, "description": "S, M (default), or L floor" },
             "ac_count": { "type": "string", "required": false },
             "seams": { "type": "string", "required": false },
@@ -112,6 +113,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 15,
           "class": "{{ CTX.INPUT.class }}",
+          "work_kind": "{{ CTX.INPUT.work_kind }}",
           "size": "{{ CTX.INPUT.size }}",
           "ac_count": "{{ CTX.INPUT.ac_count }}",
           "seams": "{{ CTX.INPUT.seams }}"
@@ -139,7 +141,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "reviewer": "{{ TASKS.route.data.reviewer1 }}",
+          "launcher": "{{ TASKS.route.data.reviewer1_launcher }}",
+          "provider": "{{ TASKS.route.data.reviewer1_provider }}",
+          "model": "{{ TASKS.route.data.reviewer1_model }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_rev1.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rev1.pending.resumeToken }}"
@@ -165,7 +169,7 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "none", "rules": [{ "path": "data.reviewer1", "op": "equals", "value": "none" }] }
+            { "label": "none", "rules": [{ "path": "data.reviewer1_launcher", "op": "equals", "value": "none" }] }
           ],
           "default": { "label": "review" }
         }
@@ -178,9 +182,9 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "opus", "rules": [{ "path": "data.reviewer2", "op": "equals", "value": "opus" }] }
+            { "label": "none", "rules": [{ "path": "data.reviewer2_launcher", "op": "equals", "value": "none" }] }
           ],
-          "default": { "label": "done" }
+          "default": { "label": "review" }
         }
       },
       {
@@ -205,7 +209,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "reviewer": "opus",
+          "launcher": "{{ TASKS.route.data.reviewer2_launcher }}",
+          "provider": "{{ TASKS.route.data.reviewer2_provider }}",
+          "model": "{{ TASKS.route.data.reviewer2_model }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_rev2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rev2.pending.resumeToken }}"
@@ -245,9 +251,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
-          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
-          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
+          "session_identity": "{{ TASKS.record.session_identity }}",
+          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
@@ -301,7 +306,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "reviewer": "{{ TASKS.route.data.reviewer1 }}",
+          "launcher": "{{ TASKS.route.data.reviewer1_launcher }}",
+          "provider": "{{ TASKS.route.data.reviewer1_provider }}",
+          "model": "{{ TASKS.route.data.reviewer1_model }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_r1b.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_r1b.pending.resumeToken }}"
@@ -341,9 +348,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
-          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
-          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
+          "session_identity": "{{ TASKS.record.session_identity }}",
+          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
@@ -397,7 +403,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "reviewer": "opus",
+          "launcher": "{{ TASKS.route.data.reviewer2_launcher }}",
+          "provider": "{{ TASKS.route.data.reviewer2_provider }}",
+          "model": "{{ TASKS.route.data.reviewer2_model }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_r2b.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_r2b.pending.resumeToken }}"
@@ -474,7 +482,7 @@
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
-            { "id": "m7", "output": "hermes_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.hermes_session" } },
+            { "id": "m7", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
             { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.session_identity" } }
           ]
         }
@@ -546,9 +554,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
-          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
-          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
+          "session_identity": "{{ TASKS.record.session_identity }}",
+          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
@@ -574,7 +581,8 @@
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
-            { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } }
+            { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } },
+            { "id": "m8", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } }
           ]
         }
       },
@@ -649,9 +657,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
-          "session_identity": "{{ TASKS.wait.request.body.session_identity }}",
-          "resume_job_id": "{{ TASKS.wait.request.body.job_id }}",
+          "session_identity": "{{ TASKS.record2.session_identity }}",
+          "resume_job_id": "{{ TASKS.record2.resume_job_id }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
@@ -751,6 +758,7 @@
           "commit_message": "{{ CTX.INPUT.commit_message }}",
           "iters_left": "{{ CTX.INPUT.iters_left }}",
           "class": "{{ CTX.INPUT.class }}",
+          "work_kind": "{{ CTX.INPUT.work_kind }}",
           "size": "{{ CTX.INPUT.size }}",
           "ac_count": "{{ CTX.INPUT.ac_count }}",
           "seams": "{{ CTX.INPUT.seams }}",
@@ -837,7 +845,7 @@
           "alias": "rev_gate",
           "version": 1,
           "mappings": [
-            { "id": "m1", "output": "reviewer1", "expression": { "kind": "getField", "path": "TASKS.route.data.reviewer1" } }
+            { "id": "m1", "output": "reviewer1_launcher", "expression": { "kind": "getField", "path": "TASKS.route.data.reviewer1_launcher" } }
           ]
         }
       },
@@ -878,7 +886,7 @@
           "alias": "rev2_gate",
           "version": 1,
           "mappings": [
-            { "id": "m1", "output": "reviewer2", "expression": { "kind": "getField", "path": "TASKS.route.data.reviewer2" } }
+            { "id": "m1", "output": "reviewer2_launcher", "expression": { "kind": "getField", "path": "TASKS.route.data.reviewer2_launcher" } }
           ]
         }
       },
@@ -904,6 +912,7 @@
           "commit_message": "{{ CTX.INPUT.commit_message }}",
           "iters_left": "{{ CTX.INPUT.iters_left }}",
           "class": "{{ CTX.INPUT.class }}",
+          "work_kind": "{{ CTX.INPUT.work_kind }}",
           "size": "{{ CTX.INPUT.size }}",
           "ac_count": "{{ CTX.INPUT.ac_count }}",
           "seams": "{{ CTX.INPUT.seams }}",
@@ -1060,8 +1069,8 @@
       { "id": "e_r1b_http", "source": "review1b", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_r1b_pass", "source": "if_review1b", "sourceHandle": "pass", "target": "join_switch_rev2", "targetHandle": "in" },
       { "id": "e_r1b_nack", "source": "if_review1b", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
-      { "id": "e_rev2_need", "source": "switch_rev2", "sourceHandle": "case-0", "target": "wait_rev2", "targetHandle": "in" },
-      { "id": "e_rev2_skip", "source": "switch_rev2", "sourceHandle": "default", "target": "join_commit", "targetHandle": "in" },
+      { "id": "e_rev2_skip", "source": "switch_rev2", "sourceHandle": "case-0", "target": "join_commit", "targetHandle": "in" },
+      { "id": "e_rev2_need", "source": "switch_rev2", "sourceHandle": "default", "target": "wait_rev2", "targetHandle": "in" },
       { "id": "e_rev2_ok", "source": "wait_rev2", "sourceHandle": "out", "target": "if_review2", "targetHandle": "in" },
       { "id": "e_rev2_http", "source": "review2", "sourceHandle": "failure", "target": "join_review_fail", "targetHandle": "in" },
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
