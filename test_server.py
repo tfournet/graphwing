@@ -2647,7 +2647,64 @@ while True:
                         self.assertIn(
                             route[f"{slot}_model"], server.NATIVE_LAUNCHERS[launcher]["models"]
                         )
+                    if route["reviewer2_launcher"] != "none":
+                        self.assertNotEqual(
+                            route["reviewer1_provider"], route["reviewer2_provider"],
+                            f"{work_kind}/{cls}/{size}: reviewers share a provider",
+                        )
         self.assertEqual(reviewing, {"anthropic", "openai", "xai"})
+
+    def test_normal_route_contract_is_frozen_and_versioned(self):
+        expected = {
+            "go_coding": {
+                "writer": ("codex", "openai", "gpt-5.6-sol", "high", "work_kind=go_coding"),
+                "reviewers": (
+                    ("claude", "anthropic", "claude-sonnet-5", "default", "different_provider_from_writer"),
+                    ("grok", "xai", "grok-4.6", "default", "different_provider_from_writer_and_reviewer1"),
+                ),
+            },
+            "typescript_coding": {
+                "writer": ("claude", "anthropic", "claude-opus-5", "default", "work_kind=typescript_coding"),
+                "reviewers": (
+                    ("codex", "openai", "gpt-5.6-sol", "high", "different_provider_from_writer"),
+                    ("grok", "xai", "grok-4.6", "default", "different_provider_from_writer_and_reviewer1"),
+                ),
+            },
+            "research_ops": {
+                "writer": ("grok", "xai", "grok-4.6", "default", "work_kind=research_ops"),
+                "reviewers": (
+                    ("codex", "openai", "gpt-5.6-sol", "high", "different_provider_from_writer"),
+                    ("claude", "anthropic", "claude-opus-5", "default", "different_provider_from_writer_and_reviewer1"),
+                ),
+            },
+        }
+        for work_kind, contract in expected.items():
+            route = server.slice_route_lookup("sensitive", "M", work_kind=work_kind)
+            self.assertEqual(route["route_version"], "normal-v1")
+            self.assertEqual(
+                tuple(route[key] for key in ("launcher", "provider", "model", "effort", "reason")),
+                contract["writer"],
+            )
+            for index, reviewer in enumerate(contract["reviewers"], 1):
+                self.assertEqual(
+                    tuple(route[f"reviewer{index}_{key}"] for key in ("launcher", "provider", "model", "effort", "reason")),
+                    reviewer,
+                )
+        review_counts = {
+            ("mechanical", "S"): 0,
+            ("mechanical", "M"): 1,
+            ("mechanical", "L"): 1,
+            ("visual", "S"): 1,
+            ("visual", "M"): 1,
+            ("visual", "L"): 1,
+            ("sensitive", "S"): 2,
+            ("sensitive", "M"): 2,
+            ("sensitive", "L"): 2,
+        }
+        for (class_name, size), count in review_counts.items():
+            route = server.slice_route_lookup(class_name, size, seams=0, work_kind="go_coding")
+            actual = sum(route[f"reviewer{i}_launcher"] != "none" for i in (1, 2))
+            self.assertEqual(actual, count, f"{class_name}/{size}")
 
     def test_route_never_returns_a_profile_named_reviewer(self):
         banned = {"terra", "sol", "sonnet", "opus", "fable"}
@@ -2877,6 +2934,26 @@ while True:
             (edges["e_rev2_need"]["sourceHandle"], edges["e_rev2_need"]["target"]),
             ("default", "wait_rev2"),
         )
+
+    def test_graph_receipts_keep_route_provenance(self):
+        root = Path(server.__file__).parent / "graphs"
+        implement = json.loads((root / "implement-slice.json").read_text())
+        implement_nodes = {n["id"]: n for n in implement["spec"]["nodes"]}
+        for node_id in ("record", "record2"):
+            mappings = implement_nodes[node_id]["config"]["mappings"]
+            route = next(m for m in mappings if m["output"] == "route")
+            self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
+
+        drive = json.loads((root / "pr-drive.json").read_text())
+        drive_nodes = {n["id"]: n for n in drive["spec"]["nodes"]}
+        self.assertEqual(
+            drive_nodes["route"]["config"]["work_kind"],
+            "{{ CTX.INPUT.work_kind | default('go_coding') }}",
+        )
+        self.assertIn("work_kind", drive_nodes["form"]["config"]["inputs"])
+        mappings = drive_nodes["receipt"]["config"]["mappings"]
+        route = next(m for m in mappings if m["output"] == "route")
+        self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
 
     def test_review_run_is_async_when_given_a_webhook(self):
         body = json.dumps({
@@ -3776,6 +3853,20 @@ while True:
             )
             self.assertEqual(status, 400)
             self.assertEqual(payload["code"], code)
+
+    def test_route_provenance_is_declared_in_openapi(self):
+        spec = json.loads(server.openapi_bytes())
+        request = spec["components"]["schemas"]["SliceRouteRequest"]
+        self.assertIn("work_kind", request["required"])
+        route = spec["components"]["schemas"]["SliceRoute"]["properties"]
+        for field in (
+            "route_version", "launcher", "provider", "model", "effort", "reason",
+            "reviewer1_launcher", "reviewer1_provider", "reviewer1_model",
+            "reviewer1_effort", "reviewer1_reason", "reviewer2_launcher",
+            "reviewer2_provider", "reviewer2_model", "reviewer2_effort",
+            "reviewer2_reason",
+        ):
+            self.assertIn(field, route)
 
     def test_parse_review_verdict(self):
         self.assertEqual(server.parse_review_verdict("noise\nVERDICT: PASS\n")[0], "PASS")

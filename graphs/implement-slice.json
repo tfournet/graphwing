@@ -483,7 +483,8 @@
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
             { "id": "m7", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
-            { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.session_identity" } }
+            { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.session_identity" } },
+            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }
           ]
         }
       },
@@ -582,7 +583,8 @@
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
             { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } },
-            { "id": "m8", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } }
+            { "id": "m8", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } },
+            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }
           ]
         }
       },

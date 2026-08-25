@@ -1131,6 +1131,7 @@
       },
       "SliceRouteRequest": {
         "type": "object",
+        "required": ["work_kind"],
         "properties": {
           "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
           "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
@@ -1143,6 +1144,7 @@
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "route_version": { "type": "string", "enum": ["normal-v1"] },
           "class": { "type": "string" },
           "work_kind": { "type": "string" },
           "size": { "type": "string" },
@@ -1150,16 +1152,22 @@
           "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string", "description": "Explicit model paired with launcher/provider. Codex runs pin model_reasoning_effort=high." },
+          "effort": { "type": "string", "enum": ["high", "default"] },
+          "reason": { "type": "string" },
           "max_turns": { "type": "integer" },
           "run_budget_seconds": { "type": "integer" },
           "reviewer1": { "type": "string" },
           "reviewer1_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
           "reviewer1_provider": { "type": "string" },
           "reviewer1_model": { "type": "string" },
+          "reviewer1_effort": { "type": "string", "enum": ["none", "high", "default"] },
+          "reviewer1_reason": { "type": "string" },
           "reviewer2": { "type": "string" },
           "reviewer2_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
           "reviewer2_provider": { "type": "string" },
           "reviewer2_model": { "type": "string" },
+          "reviewer2_effort": { "type": "string", "enum": ["none", "high", "default"] },
+          "reviewer2_reason": { "type": "string" },
           "review": { "type": "string" }
         }
       },

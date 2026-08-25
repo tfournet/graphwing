@@ -25,6 +25,7 @@
             "test": { "type": "string", "required": true },
             "class": { "type": "string", "required": false, "description": "mechanical | visual | sensitive; absent means mechanical" },
             "size": { "type": "string", "required": false },
+            "work_kind": { "type": "string", "required": false, "description": "go_coding, typescript_coding, or research_ops; absent preserves the existing Codex route" },
             "prompt": { "type": "string", "required": false },
             "commit_message": { "type": "string", "required": true }
           }
@@ -201,7 +202,8 @@
             { "id": "m1", "output": "status", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.status" } },
             { "id": "m2", "output": "summary", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.summary" } },
             { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
-            { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } }
+            { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
+            { "id": "m5", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }
           ]
         }
       },
@@ -359,6 +361,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 15,
           "class": "{{ CTX.INPUT.class }}",
+          "work_kind": "{{ CTX.INPUT.work_kind | default('go_coding') }}",
           "size": "{{ CTX.INPUT.size }}"
         }
       },
