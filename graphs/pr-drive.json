@@ -282,7 +282,7 @@
           "repo": "{{ CTX.INPUT.repo }}",
           "number": "{{ CTX.INPUT.pr_number }}",
           "auto_merge": "{{ CTX.INPUT.auto_merge }}",
-          "run_id": "{{ CTX.RUN.id }}",
+          "run_id": "{{ WORKFLOW.runId }}",
           "merge_method": "squash"
         }
       },

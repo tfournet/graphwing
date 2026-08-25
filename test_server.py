@@ -1245,6 +1245,15 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
 
+    def test_pr_merge_run_id_uses_a_variable_that_exists(self):
+        # CTX.RUN.id does not exist. The run identity lives at WORKFLOW.runId,
+        # so the guard refused every merge with no_run_id while every other
+        # condition passed: all_green, MERGEABLE, no holds, auto_merge true.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        cfg = {n["id"]: n for n in graph["spec"]["nodes"]}["merge"]["config"]
+        self.assertIn("WORKFLOW.runId", cfg["run_id"])
+        self.assertNotIn("CTX.RUN", cfg["run_id"])
+
     def test_pr_merge_field_is_not_called_method(self):
         # The connector treats a config field named `method` as the HTTP verb,
         # the same way it treats `path` as the URL path. The graph sent
