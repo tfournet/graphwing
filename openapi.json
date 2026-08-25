@@ -545,6 +545,15 @@
         }
       }
     },
+    "/v1/build/lifecycle": {
+      "post": {
+        "operationId": "buildLifecycle",
+        "tags": ["build"],
+        "summary": "Record one authenticated PR lifecycle event against its durable build and recorded preview. Same event_id replays its receipt; conflicting reuse has no side effect. Opened never creates a preview; verified merge cleanup is terminal; closed without merge uses only the exact saved planning pane.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["build_id", "event_id", "event", "pr"], "properties": { "build_id": {"type": "string"}, "event_id": {"type": "string"}, "event": {"type": "string", "enum": ["opened", "merged", "closed"]}, "pr": {"type": "object", "required": ["number"], "additionalProperties": false, "properties": {"number": {"type": "integer", "minimum": 1}, "url": {"type": "string"}}}, "choice": {"type": "string", "enum": ["keep", "stop"]}, "plan_pane": {"type": "string", "description": "Required on a closed keep/stop choice; must equal the exact saved planning pane."} } } } } },
+        "responses": { "200": {"description": "durable lifecycle receipt or replay", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"description": "refusal, partial cleanup, identity conflict, or out-of-order event", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}} }
+      }
+    },
     "/v1/build/claim": {
       "post": {
         "operationId": "buildClaim",

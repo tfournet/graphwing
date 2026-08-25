@@ -30,6 +30,7 @@ CATALOG = (
     "profiles.json",
     "graphs/visual-evidence.json",
     "graphs/visual-iteration.json",
+    "graphs/pr-lifecycle.json",
     "SOUL.md",
     "README.md",
 )

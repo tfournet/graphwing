@@ -1131,6 +1131,11 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
             if isinstance(h, dict) and h.get("name") and h.get("url"):
                 health.append({"name": str(h["name"]), "url": str(h["url"])})
         sport: list[int] = []
+        units: list[str] = []
+        for raw in item.get("units") or []:
+            unit = str(raw).strip()
+            if unit and re.fullmatch(r"[A-Za-z0-9@_.-]{1,128}", unit):
+                units.append(unit)
         for raw in item.get("ports") or []:
             try:
                 p = int(raw)
@@ -1157,6 +1162,7 @@ def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
             "compose_file": str(item.get("compose_file") or "docker-compose.yml"),
             "health": health,
             "ports": sport,
+            "units": units,
             "role": role,
             "base_url": base_url,
             "runner": str(item.get("runner") or "compose").strip().lower(),
@@ -2725,11 +2731,15 @@ def stack_status(name: str | None) -> dict[str, Any]:
     }
 
 
+def port_observation(port: int) -> dict[str, Any]:
+    result = run_cmd(["ss", "-ltnH", f"sport = :{port}"], timeout=5)
+    return {"ok": bool(result.get("ok")), "listening": bool((result.get("stdout") or "").strip()) if result.get("ok") else None,
+            "error": None if result.get("ok") else str(result.get("error") or "ss failed")[:BUILD_REDACT_MAX_STRING]}
+
+
 def port_listening(port: int) -> bool:
-    r = run_cmd(["ss", "-ltnH", f"sport = :{port}"], timeout=5)
-    if not r.get("ok"):
-        return False
-    return bool((r.get("stdout") or "").strip())
+    observation = port_observation(port)
+    return observation.get("listening") is True
 
 
 def port_check(raw: str | None) -> dict[str, Any]:
@@ -14439,6 +14449,301 @@ def build_visual_prompt(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
         )
 
 
+# --- PR lifecycle -----------------------------------------------------------
+#
+# A lifecycle event is a durable build event, not a second controller.  The
+# event reporter names a build and PR; resources come only from the recorded
+# preview evidence and the role-separated stack catalog.
+
+
+def parse_lifecycle_pr(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(raw, dict) or set(raw) - {"number", "url"}:
+        return None, {"ok": False, "code": "bad_pr", "error": "pr must contain only number and optional url"}
+    number = raw.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= 2**31 - 1:
+        return None, {"ok": False, "code": "bad_pr", "error": "pr.number must be a positive integer"}
+    out: dict[str, Any] = {"number": number}
+    url = raw.get("url")
+    if url is not None:
+        if not isinstance(url, str) or not url.strip() or len(url) > BUILD_NAME_MAX:
+            return None, {"ok": False, "code": "bad_pr", "error": "pr.url must be a short URL when present"}
+        out["url"] = url.strip()
+    return out, None
+
+
+def lifecycle_pr_url_gap(doc: dict[str, Any], pr: dict[str, Any]) -> str | None:
+    url = pr.get("url")
+    if url is None:
+        return None
+    story = str(doc.get("story") or "")
+    try:
+        story_parts = urlparse(story).path.strip("/").split("/")
+        parsed = urlparse(str(url))
+        parts = parsed.path.strip("/").split("/")
+    except ValueError:
+        return "pr.url is malformed"
+    if len(story_parts) < 4 or story_parts[2] not in ("issues", "pull"):
+        return "build has no durable GitHub repository identity for pr.url"
+    if not (parsed.scheme == "https" and strict_url_authority(parsed, r"github\.com", {None, 443}) and not parsed.query and not parsed.fragment and not parsed.username and not parsed.password and len(parts) == 4 and parts[:2] == story_parts[:2] and parts[2] == "pull" and parts[3] == str(pr["number"])):
+        return "pr.url must be the exact GitHub pull URL for this build repository and PR"
+    return None
+
+
+def build_recorded_preview(doc: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return the one build-derived preview recorded by visual evidence."""
+    for rnd in reversed(doc.get("evidence_rounds") or []):
+        preview = rnd.get("preview") if isinstance(rnd, dict) else None
+        if not isinstance(preview, dict):
+            continue
+        stack = preview.get("stack")
+        if not isinstance(stack, str):
+            continue
+        entry = build_stack_catalog().get(stack)
+        if not entry or entry.get("role") != BUILD_PREVIEW_STACK_ROLE:
+            continue
+        if preview.get("preview_id") != build_preview_identity(doc, stack):
+            continue
+        if not isinstance(preview.get("url"), str) or not preview.get("url"):
+            continue
+        return {k: preview.get(k) for k in ("preview_id", "stack", "url", "healthy")}, entry
+    return None, None
+
+
+def stack_stop(entry: dict[str, Any]) -> dict[str, Any]:
+    """Stop only the catalogued preview stack; verification happens separately."""
+    args = ["podman", "compose"]
+    compose = str(entry.get("compose_file") or "")
+    if compose:
+        args.extend(["-f", compose])
+    args.append("down")
+    result = run_cmd(args, cwd=entry.get("cwd"), timeout=120, env=podman_env())
+    unit_results = [
+        run_cmd(["systemctl", "--user", "stop", str(unit)], timeout=30)
+        for unit in entry.get("units") or []
+    ]
+    return {**result, "units_stop_ok": all(row.get("ok") for row in unit_results)}
+
+
+def unit_absence_observation(unit: str) -> dict[str, Any]:
+    """Interpret systemctl's authoritative state, not just its exit status."""
+    result = run_cmd(["systemctl", "--user", "is-active", unit], timeout=5)
+    state = str(result.get("stdout") or "").strip().lower()
+    if state in ("inactive", "unknown"):
+        return {"unit": unit, "ok": True, "absent": True, "active": False, "state": state}
+    if state in ("active", "activating", "reloading", "deactivating", "failed"):
+        return {"unit": unit, "ok": True, "absent": False, "active": True, "state": state}
+    return {"unit": unit, "ok": False, "absent": False, "active": False, "state": state or None,
+            "error": str(result.get("error") or "unit status unreadable")[:BUILD_REDACT_MAX_STRING]}
+
+
+def preview_teardown(entry: dict[str, Any]) -> dict[str, Any]:
+    """Stop then prove absence of exactly the declared preview resources."""
+    stopped = stack_stop(entry)
+    status = stack_status(str(entry.get("name") or ""))
+    stack_observed = status.get("ok") is True and status.get("compose_ok") is True
+    stack_gone = stack_observed and not (status.get("containers") or []) and not bool(status.get("healthy"))
+    ports = []
+    survivors = []
+    if not stack_gone:
+        survivors.append({"kind": "stack", "name": entry.get("name")})
+    if not stack_observed:
+        survivors.append({"kind": "stack_observation", "name": entry.get("name"), "error": status.get("compose_error") or "stack status unreadable"})
+    for port in entry.get("ports") or []:
+        observation = port_observation(int(port))
+        ports.append({"port": int(port), **observation})
+        if observation.get("ok") is not True or observation.get("listening") is True:
+            survivors.append({"kind": "port" if observation.get("ok") else "port_observation", "port": int(port), "error": observation.get("error")})
+    units = []
+    for unit in entry.get("units") or []:
+        observation = unit_absence_observation(str(unit))
+        units.append(observation)
+        if not observation["absent"]:
+            survivors.append({"kind": "unit" if observation.get("ok") else "unit_observation", "name": str(unit), "error": observation.get("error") or observation.get("state")})
+    return {
+        "verified": not survivors,
+        "stop_acknowledged": bool(stopped.get("ok")),
+        "stack": {"name": entry.get("name"), "gone": stack_gone, "containers": status.get("containers") or []},
+        "ports": ports,
+        "units": units,
+        "survivors": survivors,
+    }
+
+
+def build_clean_cleanup_ready(doc: dict[str, Any]) -> bool:
+    """Authorize only the durable integration receipt for the finalized candidate."""
+    integration = build_checks_entry(doc, "integration")
+    final = doc.get("pr_ready")
+    return bool(
+        isinstance(final, dict) and isinstance(integration, dict)
+        and integration.get("ok") is True
+        and integration.get("change_id") == final.get("verified_change_id")
+        and integration.get("candidate_tree") == final.get("candidate_tree")
+        and isinstance(integration.get("stack"), str) and integration.get("stack")
+    )
+
+
+def lifecycle_clean_cleanup(doc: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any] | None:
+    """Reclaim only a proven final clean runner; prove the preview survived."""
+    if not build_clean_cleanup_ready(doc):
+        return None
+    integration = build_checks_entry(doc, "integration") or {}
+    entry, gap = build_integration_stack(doc, integration.get("stack"))
+    if entry is None:
+        return {"attempted": False, "verified": False, "code": "clean_stack_unavailable", "survivors": [{"kind": "clean_stack", "name": integration.get("stack"), "error": gap}]}
+    before = {k: preview.get(k) for k in ("preview_id", "url", "healthy")}
+    cleanup = preview_teardown(entry)
+    live_preview = stack_status(str(preview.get("stack") or ""))
+    preview_observed = live_preview.get("ok") is True and live_preview.get("compose_ok") is True
+    preview_unchanged = preview_observed and bool(live_preview.get("healthy")) == bool(before["healthy"])
+    survivors = list(cleanup.get("survivors") or [])
+    if not preview_unchanged:
+        survivors.append({"kind": "preview_observation", "name": preview.get("stack"), "error": "preview health changed or could not be observed"})
+    return {"attempted": True, "verified": not survivors, "stack": entry.get("name"), "stop_acknowledged": cleanup.get("stop_acknowledged"), "preview": before, "preview_unchanged": preview_unchanged, "survivors": survivors, "teardown": cleanup, "code": None if not survivors else "clean_cleanup_unverified"}
+
+
+def lifecycle_response(doc: dict[str, Any], event_id: str, fingerprint: str, receipt: dict[str, Any], status: int) -> tuple[int, dict[str, Any]]:
+    build_record_event(doc, event_id, fingerprint, receipt, status)
+    error = write_build(doc, doc.get("build_id"))
+    if error:
+        return int(error["status"]), error
+    out = build_public(doc)
+    out.update(ok=status == 200, replayed=False, receipt=receipt)
+    if status != 200:
+        out.update(code=receipt.get("code"), error=receipt.get("error"))
+    if "preview" in receipt:
+        out["preview"] = receipt["preview"]
+    if "teardown" in receipt:
+        out["teardown"] = receipt["teardown"]
+    teardown = receipt.get("teardown") if isinstance(receipt.get("teardown"), dict) else {}
+    herdr_log(f"lifecycle build={doc.get('build_id')} event={receipt.get('event')} pr={((receipt.get('pr') or {}).get('number'))} status={status} outcome={receipt.get('outcome') or receipt.get('code')} verified={teardown.get('verified')} survivors={len(teardown.get('survivors') or [])}")
+    return status, out
+
+
+def build_lifecycle(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, error = parse_json_object(body)
+    if error:
+        return 400, error
+    assert data is not None
+    build_id, event_id, event = data.get("build_id"), data.get("event_id"), data.get("event")
+    if not valid_build_id(build_id):
+        return 400, {"ok": False, "code": "bad_build_id", "error": "invalid build_id"}
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"ok": False, "code": "bad_event_id", "error": "event_id is required"}
+    if event not in ("opened", "merged", "closed"):
+        return 400, {"ok": False, "code": "bad_lifecycle_event", "error": "event must be opened, merged, or closed"}
+    pr, pr_error = parse_lifecycle_pr(data.get("pr"))
+    if pr_error:
+        return 400, pr_error
+    assert pr is not None
+    if set(data) - {"build_id", "event_id", "event", "pr", "choice", "plan_pane"}:
+        return 400, {"ok": False, "code": "unexpected_lifecycle_field", "error": "lifecycle input contains an unsupported field"}
+    choice = data.get("choice")
+    if choice not in (None, "keep", "stop") or (choice is not None and event != "closed"):
+        return 400, {"ok": False, "code": "bad_close_choice", "error": "choice is keep or stop only for closed"}
+    plan_pane = data.get("plan_pane")
+    if plan_pane is not None and (not isinstance(plan_pane, str) or not plan_pane.strip()):
+        return 400, {"ok": False, "code": "bad_plan_pane", "error": "plan_pane must be a non-empty exact pane id"}
+    plan_pane = plan_pane.strip() if isinstance(plan_pane, str) else None
+    fingerprint = event_fingerprint({"build_id": build_id, "event": event, "pr": pr, "choice": choice, "plan_pane": plan_pane})
+    with BUILD_LOCK:
+        doc, read_error = load_build(build_id)
+        if read_error:
+            return int(read_error["status"]), read_error
+        if doc is None:
+            return 404, {"ok": False, "code": "unknown_build", "error": "unknown build", "build_id": build_id}
+        if doc.get("version") != BUILD_STATE_VERSION:
+            return 409, build_version_park(doc)
+        url_gap = lifecycle_pr_url_gap(doc, pr)
+        if url_gap:
+            return 400, {"ok": False, "code": "bad_pr_url", "error": url_gap}
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            record = seen[event_id]
+            if record.get("fingerprint") != fingerprint:
+                return 409, {**build_public(doc), "ok": False, "replayed": False, "code": "idempotency_conflict", "error": "event_id was already used with different input"}
+            receipt = record.get("receipt")
+            status = int(record.get("status") or 200)
+            out = build_public(doc)
+            out.update(ok=status == 200, replayed=True, receipt=receipt)
+            if isinstance(receipt, dict):
+                out.update(preview=receipt.get("preview"), teardown=receipt.get("teardown"))
+                if status != 200:
+                    out.update(code=receipt.get("code"), error=receipt.get("error"))
+            return status, out
+        if len(seen) >= BUILD_EVENT_HARD_MAX:
+            return 409, {"ok": False, "code": "event_history_full", "error": "build has used its whole event history"}
+        lifecycle = doc.setdefault("lifecycle", {})
+        receipt_base = {"event_id": event_id, "event": event, "pr": pr, "at": utcnow()}
+        if lifecycle.get("state") == "merged_verified" and event in ("opened", "closed"):
+            receipt = {**receipt_base, "code": "lifecycle_out_of_order", "error": "verified merged teardown is terminal; event starts nothing, prompts nobody, and cleans nothing"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        if lifecycle.get("state") == "partial_cleanup" and event != "merged":
+            receipt = {**receipt_base, "code": "partial_cleanup_pending", "error": "partial merged cleanup accepts only a fresh merged retry; this event prompts nobody and cleans nothing"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        if lifecycle.get("state") == "closed_partial_cleanup":
+            receipt = {**receipt_base, "code": "closed_partial_cleanup", "error": "closed-stop partial cleanup requires the recorded operator action; lifecycle events perform no further cleanup"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        bound = doc.get("pr")
+        if event != "opened" and not isinstance(bound, dict):
+            receipt = {**receipt_base, "code": "pr_not_opened", "error": "merged or closed requires the durable PR identity recorded by opened"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        if isinstance(bound, dict) and bound != pr:
+            receipt = {**receipt_base, "code": "pr_identity_mismatch", "error": "lifecycle PR does not match the durable build PR"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        preview, entry = build_recorded_preview(doc)
+        if event == "opened":
+            if preview is None:
+                receipt = {**receipt_base, "code": "preview_missing", "error": "no durable recorded preview exists; opened creates nothing", "refused": True}
+                return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+            doc["pr"] = pr
+            doc["stage"] = "pr_opened"
+            clean_cleanup = lifecycle_clean_cleanup(doc, preview)
+            if isinstance(clean_cleanup, dict) and clean_cleanup.get("attempted") and not clean_cleanup.get("verified"):
+                receipt = {**receipt_base, "preview": preview, "clean_cleanup": clean_cleanup, "code": "clean_partial_cleanup", "error": "clean integration cleanup is incomplete", "next_action": "resolve surviving clean resources and retry with a fresh opened event"}
+                return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+            receipt = {**receipt_base, "preview": preview, "clean_cleanup": clean_cleanup, "outcome": "opened_recorded"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 200)
+        if preview is None or entry is None:
+            receipt = {**receipt_base, "code": "preview_missing", "error": "no durable recorded preview exists to reclaim"}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        if event == "closed" and choice is None:
+            contract = build_visual_contract(doc) or {}
+            pane = str(contract.get("planning_pane") or "")
+            if not pane:
+                receipt = {**receipt_base, "code": "missing_planning_pane", "error": "closed without merge has no exact saved planning pane"}
+                return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+            delivery = herdr_plan_deliver(pane, f"PR #{pr['number']} closed without merge for build {build_id}; choose keep or stop for {preview['url']}.")
+            receipt = {**receipt_base, "preview": preview, "outcome": "close_choice_requested", "delivery": delivery}
+            if not delivery.get("ok"):
+                receipt.update(code="planning_send_failed", error="the exact planning pane could not be reached")
+                return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+            lifecycle["close_pending"] = {"pr": pr, "pane": pane, "preview": preview}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 200)
+        if event == "closed" and choice is not None:
+            pending = lifecycle.get("close_pending")
+            if not isinstance(pending, dict) or pending.get("pr") != pr or pending.get("pane") != plan_pane:
+                receipt = {**receipt_base, "code": "close_choice_not_pending", "error": "no choice from the exact saved planning pane is pending"}
+                return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+            if choice == "keep":
+                lifecycle["close_pending"] = None
+                return lifecycle_response(doc, event_id, fingerprint, {**receipt_base, "preview": preview, "pane": plan_pane, "outcome": "close_kept"}, 200)
+        teardown = preview_teardown(entry)
+        if not teardown["verified"]:
+            lifecycle["state"] = "partial_cleanup"
+            if event == "merged":
+                lifecycle["state"] = "partial_cleanup"
+                next_action = "resolve surviving preview resources and retry with a fresh merged event"
+            else:
+                lifecycle["state"] = "closed_partial_cleanup"
+                next_action = "resolve surviving preview resources through the recorded close decision; no merged retry is implied"
+            receipt = {**receipt_base, "preview": preview, "teardown": teardown, "code": "partial_cleanup", "error": "preview cleanup is incomplete", "next_action": next_action}
+            return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
+        lifecycle["state"] = "merged_verified" if event == "merged" else "closed_verified"
+        lifecycle["close_pending"] = None
+        receipt = {**receipt_base, "preview": preview, "teardown": teardown, "outcome": "merged_cleaned" if event == "merged" else "closed_stopped"}
+        return lifecycle_response(doc, event_id, fingerprint, receipt, 200)
+
+
 # --- pre-PR visual iteration ------------------------------------------------
 #
 # A visual round proves what the page looks like. This is what happens next: a
@@ -15865,6 +16170,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/build/advance":
         status, payload = build_advance(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/lifecycle":
+        status, payload = build_lifecycle(body, repos)
         return json_out(status, payload)
     if method == "GET" and path == "/v1/build/state":
         status, payload = build_state_op(qs)

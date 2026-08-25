@@ -8745,5 +8745,166 @@ class VisualIterationTests(VisualEvidenceTests):
         self.assertEqual(graph["canary"]["turn"], 21)
 
 
+class PrLifecycleTests(VisualEvidenceTests):
+    """Lifecycle receipts may only reclaim the preview bound to this build."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(server, "herdr_log")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _lifecycle_ready(self):
+        self._visual_create()
+        doc = self._read_doc()
+        preview = {
+            "preview_id": server.build_preview_identity(doc, "preview-52"),
+            "stack": "preview-52", "url": "http://127.0.0.1:4173/settings/billing",
+            "healthy": True,
+        }
+        doc["stage"] = "pr_opened"
+        doc["pr"] = {"number": 52}
+        doc["evidence_rounds"] = [{"round": 1, "status": "published", "preview": preview}]
+        self._write_doc(doc)
+        return preview
+
+    def _lifecycle(self, event_id, event, **over):
+        body = {"build_id": self.BUILD, "event_id": event_id, "event": event, "pr": {"number": 52}}
+        body.update(over)
+        return server.dispatch("POST", "/v1/build/lifecycle", {}, True, json.dumps(body).encode())
+
+    def test_opened_records_bound_pr_without_starting_or_replacing_preview(self):
+        self._lifecycle_ready()
+        with mock.patch.object(server, "stack_ensure_started") as start:
+            result = self._lifecycle("opened-1", "opened")
+        self.assertEqual(result[0], 200, result[1])
+        self.assertEqual(result[1]["preview"]["preview_id"], server.build_preview_identity(self._read_doc(), "preview-52"))
+        start.assert_not_called()
+        self.assertEqual(self._lifecycle("opened-1", "opened")[1]["receipt"], result[1]["receipt"])
+
+    def test_missing_preview_refuses_without_side_effect(self):
+        self._visual_create()
+        with mock.patch.object(server, "stack_ensure_started") as start, mock.patch.object(server, "run_cmd") as command:
+            result = self._lifecycle("opened-missing", "opened")
+        self.assertEqual(result[0], 409, result[1])
+        self.assertEqual(result[1]["code"], "preview_missing")
+        start.assert_not_called(); command.assert_not_called()
+
+    def test_merge_is_verified_replayed_and_late_events_are_out_of_order(self):
+        self._lifecycle_ready()
+        stopped = {"ok": True, "compose_ok": True, "healthy": False, "containers": []}
+        with mock.patch.object(server, "stack_stop", return_value={"ok": True}), \
+             mock.patch.object(server, "stack_status", return_value=stopped), \
+             mock.patch.object(server, "port_observation", return_value={"ok": True, "listening": False, "error": None}):
+            first = self._lifecycle("merged-1", "merged")
+            replay = self._lifecycle("merged-1", "merged")
+            late_opened = self._lifecycle("opened-late", "opened")
+            late_closed = self._lifecycle("closed-late", "closed")
+        self.assertEqual(first[0], 200, first[1]); self.assertTrue(first[1]["teardown"]["verified"])
+        self.assertTrue(replay[1]["replayed"])
+        self.assertEqual(late_opened[1]["code"], "lifecycle_out_of_order")
+        self.assertEqual(late_closed[1]["code"], "lifecycle_out_of_order")
+
+    def test_partial_merge_replays_failure_and_fresh_event_retries_only_preview(self):
+        self._lifecycle_ready()
+        calls = []
+        def stop(entry): calls.append(entry["name"]); return {"ok": True}
+        with mock.patch.object(server, "stack_stop", side_effect=stop), \
+             mock.patch.object(server, "stack_status", return_value={"ok": True, "compose_ok": True, "healthy": True, "containers": [{"name": "survivor"}]}), \
+             mock.patch.object(server, "port_observation", return_value={"ok": True, "listening": False, "error": None}):
+            failed = self._lifecycle("merged-fail", "merged")
+            replay = self._lifecycle("merged-fail", "merged")
+            retry = self._lifecycle("merged-retry", "merged")
+        self.assertEqual(failed[0], 409, failed[1]); self.assertEqual(failed[1]["code"], "partial_cleanup")
+        self.assertTrue(replay[1]["replayed"]); self.assertEqual(calls, ["preview-52", "preview-52"])
+        self.assertEqual(retry[1]["code"], "partial_cleanup")
+        self.assertNotIn("clean-stack", calls)
+
+    def test_closed_prompts_exact_pane_then_only_recorded_stop_can_teardown(self):
+        self._lifecycle_ready()
+        doc = self._read_doc(); doc["verification"]["visual"]["planning_pane"] = "w1:p3"; self._write_doc(doc)
+        with mock.patch.object(server, "herdr_plan_deliver", return_value={"ok": True, "pane": "w1:p3"}) as deliver:
+            parked = self._lifecycle("closed-ask", "closed")
+        self.assertEqual(parked[0], 200, parked[1]); deliver.assert_called_once()
+        wrong_pane = self._lifecycle("closed-wrong-pane", "closed", choice="stop", plan_pane="w1:p4")
+        self.assertEqual(wrong_pane[0], 409, wrong_pane[1]); self.assertEqual(wrong_pane[1]["code"], "close_choice_not_pending")
+        with mock.patch.object(server, "stack_stop", return_value={"ok": True}), \
+             mock.patch.object(server, "stack_status", return_value={"ok": True, "compose_ok": True, "healthy": False, "containers": []}), \
+             mock.patch.object(server, "port_observation", return_value={"ok": True, "listening": False, "error": None}):
+            stopped = self._lifecycle("closed-stop", "closed", choice="stop", plan_pane="w1:p3")
+        self.assertEqual(stopped[0], 200, stopped[1]); self.assertTrue(stopped[1]["teardown"]["verified"])
+
+    def test_pr_identity_conflict_and_clean_evidence_gate_cannot_cross_scope(self):
+        self._lifecycle_ready()
+        wrong = self._lifecycle("wrong-pr", "merged", pr={"number": 99})
+        self.assertEqual(wrong[0], 409, wrong[1]); self.assertEqual(wrong[1]["code"], "pr_identity_mismatch")
+        doc = self._read_doc(); doc.pop("pr"); self._write_doc(doc)
+        before_open = self._lifecycle("no-open-merge", "merged")
+        self.assertEqual(before_open[1]["code"], "pr_not_opened")
+
+    def test_clean_cleanup_requires_final_receipt_and_never_uses_partial_receipt(self):
+        self._lifecycle_ready()
+        doc = self._read_doc(); doc["pr_ready"] = {"verified_change_id": "final-change", "candidate_tree": "tree"}; doc["checks"] = {"integration": {"ok": True, "change_id": "final-change", "candidate_tree": "tree", "stack": "clean-stack"}}; self._write_doc(doc)
+        self.assertTrue(server.build_clean_cleanup_ready(self._read_doc()))
+        doc = self._read_doc(); doc["checks"]["integration"] = {"ok": False, "change_id": "final-change", "candidate_tree": "tree", "stack": "clean-stack"}; doc["lifecycle"] = {"state": "partial_cleanup"}; self._write_doc(doc)
+        self.assertFalse(server.build_clean_cleanup_ready(self._read_doc()))
+
+    def test_clean_partial_is_non_success_replays_and_fresh_opened_can_retry(self):
+        self._lifecycle_ready()
+        doc = self._read_doc(); doc["pr_ready"] = {"verified_change_id": "final", "candidate_tree": "tree"}; doc["checks"] = {"integration": {"ok": True, "change_id": "final", "candidate_tree": "tree", "stack": "clean-stack"}}; self._write_doc(doc)
+        failed_cleanup = {"attempted": True, "verified": False, "survivors": [{"kind": "port", "port": 9999}], "preview_unchanged": True}
+        with mock.patch.object(server, "lifecycle_clean_cleanup", return_value=failed_cleanup):
+            first = self._lifecycle("clean-fail", "opened")
+            replay = self._lifecycle("clean-fail", "opened")
+            retry = self._lifecycle("clean-retry", "opened")
+        self.assertEqual(first[0], 409, first[1]); self.assertEqual(first[1]["code"], "clean_partial_cleanup")
+        self.assertTrue(replay[1]["replayed"]); self.assertEqual(retry[0], 409)
+        self.assertEqual(self._read_doc()["pr"]["number"], 52)
+
+    def test_unit_absence_observation_distinguishes_inactive_active_and_unreadable(self):
+        cases = (({"ok": False, "stdout": "inactive\n"}, True, True), ({"ok": False, "stdout": "unknown\n"}, True, True), ({"ok": True, "stdout": "active\n"}, False, True), ({"ok": False, "stdout": "", "error": "bus failed"}, False, False))
+        for result, absent, observed in cases:
+            with self.subTest(result=result):
+                with mock.patch.object(server, "run_cmd", return_value=result):
+                    row = server.unit_absence_observation("gw-ticket06-proof.service")
+                self.assertEqual(row["absent"], absent)
+                self.assertEqual(row["ok"], observed)
+
+    def test_unreadable_observations_are_survivors_and_lifecycle_logs_are_redacted(self):
+        self._lifecycle_ready()
+        with mock.patch.object(server, "stack_stop", return_value={"ok": True}), \
+             mock.patch.object(server, "stack_status", return_value={"ok": False, "compose_ok": False, "containers": []}), \
+             mock.patch.object(server, "port_observation", return_value={"ok": False, "listening": None, "error": "ss failed"}), \
+             mock.patch.object(server, "herdr_log") as log:
+            failed = self._lifecycle("unreadable", "merged")
+        self.assertEqual(failed[1]["code"], "partial_cleanup")
+        self.assertFalse(failed[1]["teardown"]["verified"])
+        self.assertIn("lifecycle build=", log.call_args.args[0])
+        self.assertNotIn("https://", log.call_args.args[0])
+
+    def test_closed_partial_never_claims_merged_retry(self):
+        self._lifecycle_ready()
+        with mock.patch.object(server, "herdr_plan_deliver", return_value={"ok": True}):
+            self.assertEqual(self._lifecycle("ask", "closed")[0], 200)
+        with mock.patch.object(server, "stack_stop", return_value={"ok": True}), \
+             mock.patch.object(server, "stack_status", return_value={"ok": True, "compose_ok": True, "healthy": True, "containers": [{"name": "survivor"}]}), \
+             mock.patch.object(server, "port_observation", return_value={"ok": True, "listening": False, "error": None}):
+            failed = self._lifecycle("closed-partial", "closed", choice="stop", plan_pane="w1:p3")
+        self.assertEqual(failed[1]["code"], "partial_cleanup")
+        self.assertNotIn("fresh merged", failed[1]["receipt"]["next_action"])
+        self.assertEqual(self._read_doc()["lifecycle"]["state"], "closed_partial_cleanup")
+        blocked = self._lifecycle("false-merged", "merged")
+        self.assertEqual(blocked[1]["code"], "closed_partial_cleanup")
+
+    def test_lifecycle_openapi_graph_and_publication_catalog_are_present(self):
+        root = Path(server.__file__).resolve().parent
+        spec = json.loads((root / "openapi.json").read_text())
+        self.assertEqual(spec["paths"]["/v1/build/lifecycle"]["post"]["operationId"], "buildLifecycle")
+        graph = json.loads((root / "graphs" / "pr-lifecycle.json").read_text())
+        self.assertEqual(graph["slug"], "graphwing-pr-lifecycle")
+        self.assertIn("plan_pane", graph["spec"]["nodes"][1]["config"])
+        self.assertIn("pr-lifecycle", (root / "scripts" / "publish_graphs.py").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

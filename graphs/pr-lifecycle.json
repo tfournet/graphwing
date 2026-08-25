@@ -1,0 +1,14 @@
+{
+  "slug": "graphwing-pr-lifecycle",
+  "name": "graphwing-pr-lifecycle",
+  "description": "One bounded authenticated PR lifecycle event. The upstream workflow supplies build_id, unique event_id, event, and PR identity. Graphwing records/replays the receipt, preserves an existing preview on open, verifies only that build's preview cleanup on merge, and asks only the saved planning pane on close without merge.",
+  "spec": {
+    "meta": { "useSearchAttributes": true },
+    "nodes": [
+      { "id": "trigger", "type": "trigger.manual", "label": "PR lifecycle", "position": { "x": 0, "y": 80 }, "config": {} },
+      { "id": "lifecycle", "type": "action.graphwing.POST:/v1/build/lifecycle", "label": "Record lifecycle receipt", "position": { "x": 300, "y": 80 }, "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 180, "build_id": "{{ CTX.INPUT.build_id }}", "event_id": "{{ CTX.INPUT.event_id }}", "event": "{{ CTX.INPUT.event }}", "pr": "{{ CTX.INPUT.pr }}", "choice": "{{ CTX.INPUT.choice }}", "plan_pane": "{{ CTX.INPUT.plan_pane }}" } }
+    ],
+    "edges": [ { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "lifecycle", "targetHandle": "in" } ]
+  },
+  "canary": { "issue": "https://github.com/tfournet/graphwing/issues/52", "mode": "ticket-07-only" }
+}

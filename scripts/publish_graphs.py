@@ -178,6 +178,7 @@ def resolve_stems(only: str) -> list[str]:
             "pr-status",
             "pre-pr-build",
             "build-completion-supervisor",
+            "pr-lifecycle",
         ]
         if only == "all"
         else [only]
@@ -232,6 +233,7 @@ def persist_published(install: dict, published: dict[str, dict]) -> None:
         "visual-iteration": "visual_iteration",
         "pre-pr-build": "pre_pr_build",
         "build-completion-supervisor": "build_completion_supervisor",
+        "pr-lifecycle": "pr_lifecycle",
     }
     for stem, key in mappings.items():
         if stem in published:
