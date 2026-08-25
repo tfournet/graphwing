@@ -34,7 +34,9 @@ Two different "graphs". Do not smash them:
 7. **E2E.** After the map is empty, **before** PR/CI: named smoke/e2e on the seat. Green is supposed to comment `slices complete` (Graph does not post it yet). Red goes back to slices (below).
 8. **Proof.** Bug: the failing command is green. UI: drive a live stack. Minor UI: before/after on the story. You, not Graph.
 9. **PR.** Then GitHub CI (deterministic) then Engineering grade (AI, same vendor table as spec-review). Graph does not move Shortcut columns; you close the story after proof + merge.
-10. **Drive to green.** Getting a PR from red to mergeable is `graphwing-pr-drive`, not hand work. It reads the reviewers' `engineering-findings-json` itself, so nobody writes a fix brief. Red → one fix slice → test → commit → push → re-check → kick the next attempt, up to `max_attempts` (default 3). See [USING.md](USING.md#drive-a-pr-to-green).
+10. **Drive to green.** `python3 scripts/drive-pr.py <pr> --message "..."`. It reads the reviewers' `engineering-findings-json` itself, so nobody writes a fix brief. Green-but-graded counts as red: a PR that passes CI and still carries findings goes to the fix path, not to mergeable. One fix slice → test → commit → push → re-read findings → kick the next attempt, up to `max_attempts` (default 3). **Not by webhook**: a webhook run never creates `CTX.INPUT` and dies at the first parameterised node while Rewst reports it completed. See [USING.md](USING.md#drive-a-pr-to-green).
+    - Read `/runs/{id}/trace` when a run does nothing. The status endpoint only ever says `completed`, and the HTTP access log cannot tell you which branch a switch took.
+    - Gates must never read `gh pr checks` output: it is ~21KB and Rewst swaps an output that large for an artifact stub, which a filter passes without evaluating.
 11. **Merge.** Yours by default. A run started with `auto_merge: true` may merge when it is green, mergeable, and unheld; the endpoint re-reads the PR and re-decides rather than trusting the graph. Merge requires a `run_id`, so it is reachable only from inside a run.
 
 ## Slice map
