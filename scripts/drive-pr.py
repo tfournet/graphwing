@@ -240,6 +240,13 @@ def main() -> int:
               % REVIEW_WAIT_SECONDS)
         if not wait_for_fresh_review(mcp, args.repo, args.pr, state):
             return 1
+        # Re-check before spending another attempt. The wait ends as soon as a
+        # fresh verdict lands, and that verdict is often "clear" — starting the
+        # next attempt anyway burns a run to discover what was already known.
+        fresh = findings(mcp, args.repo, args.pr)
+        if fresh is not None and not fresh.get("blocking"):
+            print("nothing left to fix (grade=%s)" % fresh.get("grade"))
+            return last
     return last
 
 
