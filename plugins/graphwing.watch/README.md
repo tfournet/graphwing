@@ -22,11 +22,10 @@ omarchy plugin enable graphwing.watch --section right --before omarchy.agents
   plus doorbell rings. Ticket or PR in the title. Not the inner agent/test
   jobs. Click focuses herdr tab `graph`.
 
-The icon stays at full contrast while the API is up, so it does not vanish
-next to Tailscale when idle. Urgent means the API is down or a job just
-failed. A small count appears while anything is queued or running. A new
-failure also fires an Omarchy notification. Existing failures at startup
-do not.
+The icon stays at full contrast while the API is up. Urgent is only daemon
+down (unreachable or graphwing-api inactive). A job that fails still shows
+in the panel and can fire a notification. It does not paint the glyph red,
+so a pr-drive timeout does not look like Graphwing itself is broken.
 
 ## Data
 
