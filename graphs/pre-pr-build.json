@@ -2,7 +2,7 @@
   "slug": "graphwing-pre-pr-build",
   "name": "graphwing-pre-pr-build",
   "tags": ["graphwing-supervised"],
-  "description": "One bounded invocation of the mechanical pre-PR path. buildNext names the one step this run may take; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and the behavior-and-test review run behind wait webhooks and apply their own successful gates with the verdict write. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Missing verdict, stale head, failed check, review finding, route gap, recipe gap, dirty worktree, trunk branch, a held lease, an existing writer reservation, an exhausted budget, and a non-clean integration stack each end at their own terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
+  "description": "One bounded invocation of the shared mechanical-and-sensitive pre-PR path. buildNext names the one step and, for review, the exact role and reviewer this run may use; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and reviews run behind wait webhooks and apply their own successful gates with the verdict write. Sensitive runs Terra behavior review and Grok security review as separate invocations against the same durable change and evidence identity. A sensitive visible build terminates at an explicit visual-evidence handoff until that separate path records its required proof. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Missing verdict, stale head, failed check, review finding, route gap, recipe gap, dirty worktree, trunk branch, a held lease, an existing writer reservation, an exhausted budget, and a non-clean integration stack each end at their own terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -83,7 +83,8 @@
             { "label": "review_passed", "rules": [{ "path": "data.step", "op": "equals", "value": "review_passed" }] },
             { "label": "integration", "rules": [{ "path": "data.step", "op": "equals", "value": "integration" }] },
             { "label": "finalize", "rules": [{ "path": "data.step", "op": "equals", "value": "finalize" }] },
-            { "label": "done", "rules": [{ "path": "data.step", "op": "equals", "value": "done" }] }
+            { "label": "done", "rules": [{ "path": "data.step", "op": "equals", "value": "done" }] },
+            { "label": "evidence", "rules": [{ "path": "data.step", "op": "equals", "value": "evidence" }] }
           ],
           "default": { "label": "parked" }
         }
@@ -112,7 +113,7 @@
           "cases": [
             { "label": "parked", "rules": [{ "path": "data.code", "op": "equals", "value": "parked" }] },
             { "label": "worktree_mismatch", "rules": [{ "path": "data.code", "op": "equals", "value": "worktree_mismatch" }] },
-            { "label": "not_mechanical", "rules": [{ "path": "data.code", "op": "equals", "value": "not_mechanical" }] }
+            { "label": "not_on_path", "rules": [{ "path": "data.code", "op": "equals", "value": "not_on_path" }] }
           ],
           "default": { "label": "unreadable" }
         }
@@ -554,7 +555,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "build_id": "{{ CTX.INPUT.build_id }}",
-          "reviewer": "{{ CTX.INPUT.reviewer }}",
+          "reviewer": "{{ TASKS.next.data.review_reviewer }}",
           "response_webhook_url": "{{ TASKS.wait_review.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_review.pending.resumeToken }}"
         }
@@ -955,7 +956,7 @@
       { "id": "park_not_a_clean_stack", "type": "action.noop", "label": "Herdr: integration stack is not a clean stack; a dev stack proves nothing", "position": { "x": 2200, "y": 1120 }, "config": {} },
       { "id": "review_stuck", "type": "action.noop", "label": "Herdr: review verdict never arrived; nothing recorded", "position": { "x": 2200, "y": 1200 }, "config": {} },
       { "id": "advance_fail", "type": "action.noop", "label": "Herdr: buildAdvance refused", "position": { "x": 2200, "y": 1280 }, "config": {} },
-      { "id": "not_mechanical", "type": "action.noop", "label": "Herdr: this build is not on the mechanical path", "position": { "x": 2200, "y": -240 }, "config": {} },
+      { "id": "not_on_path", "type": "action.noop", "label": "Herdr: this build is not on the shared mechanical-and-sensitive path", "position": { "x": 2200, "y": -240 }, "config": {} },
       { "id": "next_unreadable", "type": "action.noop", "label": "Herdr: buildNext refusal could not be read; fail closed", "position": { "x": 2200, "y": -320 }, "config": {} },
       { "id": "join_writer_bound", "type": "logic.join.any", "label": "Any acknowledged local job bound", "position": { "x": 1540, "y": 260 }, "config": { "stopOnFirst": true } },
       { "id": "writer_bound", "type": "action.noop", "label": "Local job accepted and durably bound", "position": { "x": 1680, "y": 260 }, "config": {} },
@@ -1026,7 +1027,8 @@
       {"id": "bind_review", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged behavior-review job", "position": {"x": 700, "y": 820}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.review.data.job_id }}"}},
       {"id": "bind_integration", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged integration-check job", "position": {"x": 700, "y": 1120}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.checks_int.data.job_id }}"}},
       {"id": "join_bind_failed", "type": "logic.join.any", "label": "Any supervisor binding failure", "position": {"x": 980, "y": 1320}, "config": {"stopOnFirst": true}},
-      {"id": "bind_failed", "type": "action.noop", "label": "Park: local job was not bound to source run", "position": {"x": 1160, "y": 1320}, "config": {"status": "parked", "reason": "job_binding_failed", "files_intact": true}}
+      {"id": "bind_failed", "type": "action.noop", "label": "Park: local job was not bound to source run", "position": {"x": 1160, "y": 1320}, "config": {"status": "parked", "reason": "job_binding_failed", "files_intact": true}},
+      { "id": "visual_evidence_required", "type": "action.noop", "label": "Sensitive visible build requires the separate visual-evidence path before review", "position": { "x": 560, "y": 1380 }, "config": {} }
     ],
     "edges": [
       { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
@@ -1039,7 +1041,7 @@
       { "id": "e_next_map", "source": "map_next_fail", "sourceHandle": "out", "target": "switch_next_fail", "targetHandle": "in" },
       { "id": "e_next_parked", "source": "switch_next_fail", "sourceHandle": "case-0", "target": "join_park_state", "targetHandle": "in" },
       { "id": "e_next_worktree", "source": "switch_next_fail", "sourceHandle": "case-1", "target": "join_identity", "targetHandle": "in" },
-      { "id": "e_next_class", "source": "switch_next_fail", "sourceHandle": "case-2", "target": "not_mechanical", "targetHandle": "in" },
+      { "id": "e_next_class", "source": "switch_next_fail", "sourceHandle": "case-2", "target": "not_on_path", "targetHandle": "in" },
       { "id": "e_next_other", "source": "switch_next_fail", "sourceHandle": "default", "target": "next_unreadable", "targetHandle": "in" },
 
       { "id": "e_step_preflight", "source": "switch_step", "sourceHandle": "case-0", "target": "preflight", "targetHandle": "in" },
@@ -1052,6 +1054,7 @@
       { "id": "e_step_integration", "source": "switch_step", "sourceHandle": "case-7", "target": "wait_int", "targetHandle": "in" },
       { "id": "e_step_finalize", "source": "switch_step", "sourceHandle": "case-8", "target": "join_finalize", "targetHandle": "in" },
       { "id": "e_step_done", "source": "switch_step", "sourceHandle": "case-9", "target": "already_done", "targetHandle": "in" },
+      { "id": "e_step_evidence", "source": "switch_step", "sourceHandle": "case-10", "target": "visual_evidence_required", "targetHandle": "in" },
       { "id": "e_step_parked", "source": "switch_step", "sourceHandle": "default", "target": "join_park_state", "targetHandle": "in" },
 
       { "id": "e_pf_ok", "source": "preflight", "sourceHandle": "success", "target": "if_preflight", "targetHandle": "in" },
