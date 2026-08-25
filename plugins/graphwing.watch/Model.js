@@ -13,6 +13,7 @@ function emptySnapshot() {
     counts: emptyCounts(),
     active: [],
     recent: [],
+    workflows: [],
     error: "",
     code: ""
   }
@@ -80,6 +81,7 @@ function parseWatch(raw) {
   snap.counts = asCounts(parsed.counts)
   snap.active = asJobs(parsed.active)
   snap.recent = asJobs(parsed.recent)
+  snap.workflows = asJobs(parsed.workflows && parsed.workflows.recent ? parsed.workflows.recent : [])
   snap.error = String(parsed.error || "")
   snap.code = String(parsed.code || "")
   if (parsed.ok === false && snap.error === "") snap.error = "graphwing error"

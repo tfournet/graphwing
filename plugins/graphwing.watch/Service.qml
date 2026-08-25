@@ -16,6 +16,7 @@ Item {
   property var counts: Model.emptyCounts()
   property var activeJobs: []
   property var recentJobs: []
+  property var workflowRuns: []
   property string statusText: "Checking…"
   property string lastError: ""
   property string lastCode: ""
@@ -83,6 +84,7 @@ Item {
     counts = snap.counts
     activeJobs = snap.active
     recentJobs = snap.recent
+    workflowRuns = snap.workflows
     lastError = snap.online ? "" : String(snap.error || "daemon down")
     lastCode = String(snap.code || "")
     statusText = Model.statusLabel(snap)
