@@ -56,6 +56,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 |---|---|---|
 | `graphwing-implement-slice` | repo, branch, ticket path, test | One ticket: code, test, review, commit. Then start the next ticket. |
 | `graphwing-visual-evidence` | build id, event id, optional reviewer | One bounded pre-commit real-browser evidence round: stable preview, capture/inspect/one recapture, automated UI review, durable artifact handoff, GitHub issue comment, and optional planning-pane prompt. The preview stays running. |
+| `graphwing-visual-iteration` | build id, event id, one feedback, decision, return, or resume action | One bounded design turn. It records exact feedback, resumes the saved writer, reruns changed-area checks and typecheck, composes a real-browser evidence round, and reports the verified candidate to the exact planning pane. Turn 20 is a one-time checkpoint, not a ceiling. |
 | `graphwing-verify-stack` | stack, ports | Check that a local stack is up. |
 | `graphwing-pr-status` | PR number | Read GitHub checks. No writes. |
 | `graphwing-pr-drive` | repo, PR, test | One fix attempt when CI is red. |
