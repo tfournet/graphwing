@@ -639,7 +639,7 @@
       "get": {
         "operationId": "buildNext",
         "tags": ["build"],
-        "summary": "The mechanical stage switch. Reads durable state and the change currently on disk, and names the one step this invocation is allowed to run. Read-only: safe to call from a run that is about to be abandoned. The caller never asserts a stage; a step it did not ask for is the correct answer to a replay. 409 means parked or not on the mechanical path.",
+        "summary": "The shared mechanical-and-sensitive stage switch. Reads durable state and the change currently on disk, names the one step this invocation may run, and server-selects the next required review role and reviewer. Read-only: safe to call from a run that is about to be abandoned. 409 means parked or not on this path.",
         "parameters": [
           { "name": "build_id", "in": "query", "required": true, "schema": { "type": "string" } }
         ],
@@ -648,7 +648,7 @@
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "$ref": "#/components/responses/Error" },
-          "409": { "description": "parked, worktree_mismatch, or not_mechanical", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildNext" } } } }
+          "409": { "description": "parked, worktree_mismatch, or not_on_path", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildNext" } } } }
         }
       }
     },
@@ -712,7 +712,7 @@
       "post": {
         "operationId": "buildReview",
         "tags": ["build"],
-        "summary": "The independent behavior-and-test micro-review: scope, behavior, RED evidence where the ticket requires it, production-path coverage, and the declared integration seam. Refuses a reviewer from the writer's own vendor. Provider silence is retried and recorded as no_verdict with finding=false — it is not a finding, and no review round is written for it. With response_webhook_url the delivery is async and answers 202 with ok=false.",
+        "summary": "Run the one server-selected micro-review due for this change. Mechanical uses the behavior-and-test lens. Sensitive runs Terra for behavior and tests, then Grok for security and tenant isolation; both roles must PASS the same change and evidence identity. Provider silence is retried and returned as no_verdict with finding=false, with no review round written. With response_webhook_url delivery is async and answers 202 with ok=false.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReviewRequest" } } }
@@ -1435,7 +1435,7 @@
         "properties": {
           "fast": { "type": "array", "items": { "type": "string" } },
           "integration": { "type": "array", "items": { "type": "string" } },
-          "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage: verify_passed goes straight to review. A mechanical build that sets this true parks, because the mechanical path has no way to capture a screenshot round." },
+          "needs_visual_proof": { "type": "boolean", "description": "False skips the evidence stage. A mechanical build that sets this true parks. A sensitive build surfaces step=evidence for the separate visual-evidence path; both sensitive reviews remain required afterward." },
           "human_visual_review": { "type": "boolean" },
           "requires_red": { "type": "boolean", "description": "When true the reviewer treats a missing record of the test failing first as a finding. When false or absent the reviewer is told explicitly not to raise its absence." },
           "path_rules": {
@@ -1479,12 +1479,17 @@
           "stage": { "type": "string" },
           "step": {
             "type": "string",
-            "enum": ["preflight", "write", "fast_checks", "fix", "verify_passed", "review", "review_passed", "integration", "finalize", "done", "parked"],
+            "enum": ["preflight", "write", "fast_checks", "fix", "verify_passed", "evidence", "review", "review_passed", "integration", "finalize", "done", "parked"],
             "description": "Read off the durable document and the change on disk, never from the caller. That is what makes a replay safe: a run that died after its writer finished comes back, is told fast_checks, and does not start a second writer."
           },
           "step_reason": { "type": "string", "description": "Why this step and not another, in a sentence a human can act on." },
           "finding": { "type": "string", "description": "Non-empty only on step=fix: the exact correction text to pass to buildBrief. Composed from durable state, so a resumed writer sees the same finding whether the run that produced it is alive or died an hour ago." },
-          "class": { "type": "string", "description": "The routed class. Anything but mechanical is refused with not_mechanical: a visual or sensitive build has stages this workflow does not run." },
+          "class": { "type": "string", "enum": ["mechanical", "sensitive"], "description": "The routed class on this shared path. Visual-only builds are refused with not_on_path." },
+          "review_role": { "type": ["string", "null"], "enum": ["behavior", "security", null], "description": "The review lens due when step=review, selected from durable state by the server." },
+          "review_reviewer": { "type": ["string", "null"], "description": "The route-stamped reviewer for review_role. Sensitive routing fixes behavior to Terra and security to Grok." },
+          "review_roles": { "type": "array", "items": { "type": "string", "enum": ["behavior", "security"] } },
+          "reviews_outstanding": { "type": "array", "items": { "type": "string" }, "description": "Every missing, negative, non-independent, or stale-evidence review acknowledgement." },
+          "visual_outstanding": { "type": "array", "items": { "type": "string" }, "description": "Visual proof or human approval still owed for this exact change." },
           "live_head": { "type": "string" },
           "live_branch": { "type": "string" },
           "change_id": { "type": "string", "description": "head plus a hash of the staged and unstaged diff. The writer stages and never commits, so HEAD alone cannot tell one round of the correction loop from the next; every check and review receipt is keyed on this instead." },
@@ -1613,7 +1618,7 @@
                 "check": { "type": "string" },
                 "code": {
                   "type": "string",
-                  "enum": ["missing_route_stamp", "no_recipes", "unknown_recipe", "recipe_wrong_worktree", "hook_not_coverage", "trunk_branch", "branch_mismatch", "worktree_mismatch", "worktree_conflicted", "worktree_dirty", "identity_unreadable"]
+                  "enum": ["missing_route_stamp", "invalid_sensitive_route", "no_recipes", "unknown_recipe", "recipe_wrong_worktree", "hook_not_coverage", "trunk_branch", "branch_mismatch", "worktree_mismatch", "worktree_conflicted", "worktree_dirty", "identity_unreadable"]
                 },
                 "detail": { "type": "string" }
               }
@@ -1703,7 +1708,7 @@
         "required": ["build_id"],
         "properties": {
           "build_id": { "type": "string" },
-          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "terra", "grok"], "description": "Defaults to route.reviewer1. Refused with reviewer_is_writer when it shares a vendor with the writer's model: the review is independent or it is the writer grading its own homework in a second window." },
+          "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "terra", "grok"], "description": "Optional mechanical override. Sensitive review roles and reviewers are selected by the server from durable state; a conflicting assertion is refused." },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
@@ -1718,8 +1723,10 @@
           "poll": { "type": "string" },
           "build_id": { "type": "string" },
           "reviewer": { "type": "string" },
+          "role": { "type": "string", "enum": ["behavior", "security"] },
           "head": { "type": "string" },
           "change_id": { "type": "string" },
+          "evidence_id": { "type": "string", "description": "Identity of the visual evidence set acknowledged by this review, or none when no visual evidence is required." },
           "round": { "type": "integer" },
           "verdict": { "type": ["string", "null"], "enum": ["PASS", "NACK", null] },
           "no_verdict": { "type": "boolean", "description": "The reviewer ran out of turns or lost its connection. Nothing is recorded and finding stays false: treating silence as a finding resumes the writer to fix a problem nobody reported, spends a round of budget, and does it again next time." },
@@ -1729,7 +1736,7 @@
           "compact": { "type": "string" },
           "budget_left": { "type": ["integer", "null"] },
           "error": { "type": "string" },
-          "code": { "type": "string", "enum": ["queued", "no_verdict", "invalid_transition", "bad_reviewer", "reviewer_is_writer", "busy"] }
+          "code": { "type": "string", "enum": ["queued", "no_verdict", "invalid_transition", "review_not_due", "bad_reviewer", "reviewer_is_writer", "no_review_authority", "busy"] }
         }
       },
       "BuildFinalizeIntent": {

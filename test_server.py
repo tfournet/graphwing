@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -3090,7 +3091,10 @@ class BuildStateTests(unittest.TestCase):
             "head": self.head,
             "index": "slices/demo/index.json",
             "ticket": "slices/demo/01-build-state.md",
-            "route": {"class": "sensitive", "launcher": "hermes", "model": "sol"},
+            # Ticket-01 exercises the legacy generic transition surface. Visual
+            # is deliberately outside the authoritative mechanical/sensitive
+            # path, whose writer and gate assertions are operation-owned.
+            "route": {"class": "visual", "launcher": "hermes", "model": "sol"},
             "verification": {"fast": ["graphwing-compile"], "integration": ["graphwing-unit"]},
             "stacks": ["riftwing-52"],
             "budget": {"jobs_max": 12},
@@ -3221,10 +3225,10 @@ class BuildStateTests(unittest.TestCase):
 
     def _gate(self, event_id, holder="rewst-run-1", **over):
         doc = self._read_doc()
-        if server.build_class(doc) != server.BUILD_MECHANICAL_CLASS:
-            action = "verify_passed" if doc.get("stage") == "verifying" else "review_passed"
-            return self._advance(action, event_id, holder=holder, jobs_spent=0, **over)
-        return self._post_build("gate", event_id=event_id, holder=holder, **over)
+        if server.build_class(doc) in server.BUILD_PATH_CLASSES:
+            return self._post_build("gate", event_id=event_id, holder=holder, **over)
+        action = "verify_passed" if doc.get("stage") == "verifying" else "review_passed"
+        return self._advance(action, event_id, holder=holder, jobs_spent=0, **over)
 
     def _ready_finalize_fixture(self, filename="change.txt"):
         self.assertEqual(self._mechanical_create()[0], 201)
@@ -3302,6 +3306,19 @@ class BuildStateTests(unittest.TestCase):
         route.update(over)
         return route
 
+    def _sensitive_route(self, **over):
+        route = {
+            "class": "sensitive",
+            "launcher": "claude",
+            "model": "claude-opus-5",
+            "max_turns": 30,
+            "run_budget_seconds": 600,
+            "reviewer1": "terra",
+            "reviewer2": "grok",
+        }
+        route.update(over)
+        return route
+
     def _recipe_catalog(self, **extra):
         def recipe(name, argv=("python3", "-c", "raise SystemExit(0)"), coverage=True, cwd=None):
             return {
@@ -3329,6 +3346,18 @@ class BuildStateTests(unittest.TestCase):
         body = {
             "ticket": "ticket.md",
             "route": self._mechanical_route(),
+            "verification": verification
+            or {"fast": ["fast"], "integration": ["integration"]},
+        }
+        body.update(over)
+        return self._create(**body)
+
+    def _sensitive_create(self, verification=None, **over):
+        ticket = self.repo / "ticket.md"
+        ticket.write_text("# Sensitive ticket\n\nPreserve tenant isolation.\n")
+        body = {
+            "ticket": "ticket.md",
+            "route": self._sensitive_route(),
             "verification": verification
             or {"fast": ["fast"], "integration": ["integration"]},
         }
@@ -4065,7 +4094,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(after["index"], "slices/demo/index.json")
         self.assertEqual(after["ticket"], "slices/demo/01-build-state.md")
         self.assertEqual(
-            after["route"], {"class": "sensitive", "launcher": "hermes", "model": "sol"}
+            after["route"], {"class": "visual", "launcher": "hermes", "model": "sol"}
         )
         self.assertTrue(after["verification"]["needs_visual_proof"])
         self.assertEqual(after["writer_session"], session)
@@ -4254,7 +4283,7 @@ class BuildStateTests(unittest.TestCase):
         resume = "https://rewst.test/webhooks/resume/9f2c"
         self.assertEqual(
             self._create(
-                route={"class": "sensitive", "launcher": "hermes", "model": "sol", "kick_url": resume}
+                route={"class": "visual", "launcher": "hermes", "model": "sol", "kick_url": resume}
             )[0],
             201,
         )
@@ -5552,6 +5581,215 @@ class BuildStateTests(unittest.TestCase):
         ), mock.patch.object(server, "stack_status", return_value={"ok": True, "healthy": True}):
             self.assertTrue(self._post_build("checks", phase="integration", stack="clean-stack")[1]["ok"])
         self.assertEqual(self._next()[1]["step"], "finalize")
+
+    # -- sensitive ticket 05 -----------------------------------------------
+
+    def test_sensitive_generic_advance_cannot_assert_writer_or_gate_state(self):
+        self.assertEqual(self._sensitive_create()[0], 201)
+        for action, code in (
+            ("start_writer", "writer_op_required"),
+            ("writer_done", "writer_op_required"),
+            ("verify_passed", "gate_op_required"),
+            ("review_passed", "gate_op_required"),
+            ("pr_opened", "gate_op_required"),
+        ):
+            with self.subTest(action=action):
+                result = self._advance(action, "sensitive-inject-" + action)
+                self.assertEqual(result[0], 409, result[1])
+                self.assertEqual(result[1]["code"], code)
+        self.assertEqual(self._state()[1]["stage"], "created")
+
+    def test_historical_mechanical_open_surface_delegates_to_the_shared_path(self):
+        self.assertEqual(self._sensitive_create()[0], 201)
+        expected = server.build_open_path(self.BUILD)
+        actual = server.build_open_mechanical(self.BUILD)
+        self.assertEqual(actual, expected)
+        self.assertEqual(server.build_class(actual[0]), server.BUILD_SENSITIVE_CLASS)
+
+    def test_sensitive_reviews_are_server_routed_and_both_gate_the_same_change(self):
+        self.assertEqual(self._sensitive_create()[0], 201)
+        change_id = self._record_fast_pass()
+        doc = self._read_doc()
+        doc["stage"] = "review"
+        self._write_doc(doc)
+
+        status, due, _ = self._next()
+        self.assertEqual(status, 200, due)
+        self.assertEqual(due["review_role"], "behavior")
+        self.assertEqual(due["review_reviewer"], "terra")
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+        ):
+            first = self._post_build("review")
+        self.assertEqual(first[0], 200, first[1])
+        self.assertEqual(first[1]["role"], "behavior")
+        self.assertEqual(first[1]["reviewer"], "terra")
+        self.assertEqual(self._read_doc()["stage"], "review")
+
+        due = self._next()[1]
+        self.assertEqual(due["review_role"], "security")
+        self.assertEqual(due["review_reviewer"], "grok")
+        with mock.patch.object(
+            server,
+            "build_review_round_result",
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+        ):
+            second = self._post_build("review")
+        self.assertEqual(second[0], 200, second[1])
+        self.assertEqual(second[1]["role"], "security")
+        self.assertEqual(second[1]["reviewer"], "grok")
+        self.assertEqual(second[1]["gate"], "ready")
+        recorded = self._read_doc()["reviews"]
+        self.assertEqual([entry["role"] for entry in recorded], ["behavior", "security"])
+        self.assertEqual({entry["change_id"] for entry in recorded}, {change_id})
+        self.assertEqual({entry["evidence_id"] for entry in recorded}, {"none"})
+
+    def test_sensitive_preflight_rejects_any_route_that_is_not_opus_terra_grok(self):
+        cases = (
+            ("model", "grok-4.6", "written by Opus"),
+            ("reviewer1", "sonnet", "behavior-and-test review is 'terra'"),
+            ("reviewer2", "terra", "security-and-tenant review is 'grok'"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                if self._doc_path().exists():
+                    shutil.rmtree(self._doc_path().parent)
+                self.assertEqual(self._sensitive_create(route=self._sensitive_route(**{field: value}))[0], 201)
+                with mock.patch.object(
+                    server, "build_recipe_catalog", return_value=self._recipe_catalog()
+                ), mock.patch.object(server, "git_status", return_value={"ok": True, "entries": []}):
+                    status, payload, _ = self._post_build("preflight")
+                self.assertEqual(status, 409, payload)
+                failures = [item for item in payload["failures"] if item["code"] == "invalid_sensitive_route"]
+                self.assertTrue(failures, payload)
+                self.assertIn(message, failures[0]["detail"])
+
+    def test_sensitive_review_prompts_are_focused_and_do_not_share_hidden_reasoning(self):
+        self.assertEqual(self._sensitive_create()[0], 201)
+        doc = self._read_doc()
+        doc["reviews"] = [{"compact": "SECRET PRIOR REVIEW REASONING"}]
+        behavior = server.build_review_prompt(doc, server.BUILD_REVIEW_BEHAVIOR_ROLE)
+        security = server.build_review_prompt(doc, server.BUILD_REVIEW_SECURITY_ROLE)
+        for lens in ("PROMISED BEHAVIOR", "SCOPE", "RED EVIDENCE", "PRODUCTION PATH", "INTEGRATION SEAM", "HONEST FAILURE"):
+            self.assertIn(lens, behavior)
+        for lens in ("TENANT SCOPE", "PERMISSIONS", "FORGED INPUT", "LEAKAGE", "IDEMPOTENCY", "DATA LOSS"):
+            self.assertIn(lens, security)
+        self.assertNotIn("SECRET PRIOR REVIEW REASONING", behavior)
+        self.assertNotIn("SECRET PRIOR REVIEW REASONING", security)
+
+    def test_sensitive_visible_reviews_bind_to_the_same_approved_evidence(self):
+        self.assertEqual(
+            self._sensitive_create(
+                verification={
+                    "fast": ["fast"],
+                    "integration": ["integration"],
+                    "needs_visual_proof": True,
+                    "human_visual_review": True,
+                }
+            )[0],
+            201,
+        )
+        change_id = server.build_change_id(self.repo, self.head)
+        doc = self._read_doc()
+        doc["evidence_rounds"] = [
+            {
+                "round": 1,
+                "change_id": change_id,
+                "shots": [{"name": "tenant-list"}],
+                "human_review": {"verdict": "approved"},
+            },
+            {
+                "round": 2,
+                "change_id": change_id,
+                "shots": [{"name": "tenant-detail"}],
+            },
+        ]
+        old_evidence_id = server.build_evidence_identity(
+            {**doc, "evidence_rounds": doc["evidence_rounds"][:1]}, change_id
+        )
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "terra", "role": "behavior", "verdict": "PASS", "evidence_id": old_evidence_id},
+            {"change_id": change_id, "reviewer": "grok", "role": "security", "verdict": "PASS", "evidence_id": old_evidence_id},
+        ]
+        visual = server.build_visual_gaps(doc, change_id)
+        self.assertEqual(len(visual), 1)
+        self.assertIn("latest", visual[0])
+        stale = server.build_review_gaps(doc, change_id)
+        self.assertEqual(len(stale), 2)
+        self.assertTrue(all("no longer" in gap for gap in stale))
+
+        doc["evidence_rounds"][-1]["human_review"] = {"verdict": "approved"}
+        evidence_id = server.build_evidence_identity(doc, change_id)
+        for review in doc["reviews"]:
+            review["evidence_id"] = evidence_id
+        self.assertEqual(server.build_visual_gaps(doc, change_id), [])
+        self.assertEqual(server.build_review_gaps(doc, change_id), [])
+        self.assertEqual({review["evidence_id"] for review in doc["reviews"]}, {evidence_id})
+
+    def test_sensitive_review_receipts_require_the_current_evidence_identity(self):
+        self.assertEqual(self._sensitive_create()[0], 201)
+        change_id = self._record_fast_pass()
+        doc = self._read_doc()
+        live = server.build_evidence_identity(doc, change_id)
+        valid = {
+            "behavior": {"change_id": change_id, "reviewer": "terra", "role": "behavior", "verdict": "PASS", "evidence_id": live},
+            "security": {"change_id": change_id, "reviewer": "grok", "role": "security", "verdict": "PASS", "evidence_id": live},
+        }
+        for verdict in ("PASS", "NACK"):
+            for bad_evidence in (None, "different-evidence"):
+                with self.subTest(role="behavior", verdict=verdict, evidence_id=bad_evidence):
+                    behavior = {**valid["behavior"], "verdict": verdict, "evidence_id": bad_evidence}
+                    if bad_evidence is None:
+                        behavior.pop("evidence_id")
+                    candidate = {**doc, "reviews": [behavior, valid["security"]]}
+                    self.assertEqual(server.build_next_review_role(candidate, change_id)[0], "behavior")
+                    gaps = server.build_finalize_gaps(candidate, change_id)
+                    self.assertTrue(any("behavior-and-test" in gap and "evidence" in gap for gap in gaps), gaps)
+                with self.subTest(role="security", verdict=verdict, evidence_id=bad_evidence):
+                    security = {**valid["security"], "verdict": verdict, "evidence_id": bad_evidence}
+                    if bad_evidence is None:
+                        security.pop("evidence_id")
+                    candidate = {**doc, "reviews": [valid["behavior"], security]}
+                    self.assertEqual(server.build_next_review_role(candidate, change_id)[0], "security")
+                    gaps = server.build_finalize_gaps(candidate, change_id)
+                    self.assertTrue(any("security-and-tenant" in gap and "evidence" in gap for gap in gaps), gaps)
+
+    def test_ticket_02_mechanical_review_receipts_keep_legacy_evidence_compatibility(self):
+        self.assertEqual(self._mechanical_create()[0], 201)
+        change_id = self._record_fast_pass()
+        doc = self._read_doc()
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "sonnet", "verdict": "PASS"}
+        ]
+        self.assertEqual(server.build_review_gaps(doc, change_id), [])
+        self.assertEqual(server.build_next_review_role(doc, change_id), (None, ""))
+
+    def test_sensitive_catalog_and_graph_expose_the_server_selected_review(self):
+        spec = json.loads(server.openapi_bytes())
+        next_props = spec["components"]["schemas"]["BuildNext"]["properties"]
+        review_props = spec["components"]["schemas"]["BuildReview"]["properties"]
+        for field in ("review_role", "review_reviewer", "review_roles", "reviews_outstanding", "visual_outstanding"):
+            self.assertIn(field, next_props)
+        for field in ("role", "evidence_id"):
+            self.assertIn(field, review_props)
+
+        graph = json.loads(
+            (Path(server.__file__).resolve().parent / "graphs" / "pre-pr-build.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["review"]["config"]["reviewer"], "{{ TASKS.next.data.review_reviewer }}")
+        cases = nodes["switch_step"]["config"]["cases"]
+        evidence_index = next(
+            index for index, case in enumerate(cases)
+            if case["rules"][0]["value"] == "evidence"
+        )
+        edge = next(
+            edge for edge in graph["spec"]["edges"]
+            if edge["source"] == "switch_step" and edge["sourceHandle"] == f"case-{evidence_index}"
+        )
+        self.assertEqual(edge["target"], "visual_evidence_required")
 
     # -- catalog ------------------------------------------------------------
 

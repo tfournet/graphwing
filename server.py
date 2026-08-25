@@ -131,7 +131,7 @@ BUILD_TRANSITIONS: dict[str, tuple[str, str]] = {
     "pr_opened": ("ready", "pr_opened"),
 }
 BUILD_TERMINAL = frozenset({"pr_opened", "parked"})
-# The three transitions that assert a gate was satisfied. On the mechanical
+# The three transitions that assert a gate was satisfied. On the shared build
 # path an API caller may not perform them at all: buildChecks, buildReview,
 # buildGate, and buildFinalize record them from the receipts they just wrote,
 # after re-verifying that those receipts belong to the change now on disk.
@@ -194,6 +194,55 @@ BUILD_MECHANICAL_STEPS = (
     "parked",
 )
 BUILD_MECHANICAL_CLASS = "mechanical"
+BUILD_SENSITIVE_CLASS = "sensitive"
+# The classes graphwing-pre-pr-build drives end to end. Sensitive rides the same
+# stage machine as mechanical and differs in exactly one place: the `review`
+# stage owes two independent acknowledgements instead of one. Adding a second
+# workflow for it would have duplicated preflight, the claim, the writer, the
+# checks, and finalization -- five places to keep in step -- to express one
+# extra reviewer.
+BUILD_PATH_CLASSES = (BUILD_MECHANICAL_CLASS, BUILD_SENSITIVE_CLASS)
+# The two lenses a review can be. A role is not a reviewer name: the role says
+# what the review is answerable for, and the route says who answers it. Keeping
+# them apart is what lets a receipt record "the security review passed" rather
+# than "grok said ok", which is the only form that survives a routing change.
+BUILD_REVIEW_BEHAVIOR_ROLE = "behavior"
+BUILD_REVIEW_SECURITY_ROLE = "security"
+BUILD_REVIEW_ROLES = (BUILD_REVIEW_BEHAVIOR_ROLE, BUILD_REVIEW_SECURITY_ROLE)
+BUILD_REVIEW_ROLE_LABEL = {
+    BUILD_REVIEW_BEHAVIOR_ROLE: "behavior-and-test",
+    BUILD_REVIEW_SECURITY_ROLE: "security-and-tenant",
+}
+# Which route stamp names the reviewer for each role. sliceRoute already writes
+# reviewer1/reviewer2, so the pre-PR build reads the planner's row rather than
+# inventing a second vocabulary for the same two seats.
+BUILD_ROLE_ROUTE_STAMP = {
+    BUILD_REVIEW_BEHAVIOR_ROLE: "reviewer1",
+    BUILD_REVIEW_SECURITY_ROLE: "reviewer2",
+}
+# What each class owes before `review_passed`. A review recorded on a document
+# written before roles existed has no role field and reads as `behavior`, which
+# is what it was.
+BUILD_CLASS_REVIEW_ROLES = {
+    BUILD_MECHANICAL_CLASS: (BUILD_REVIEW_BEHAVIOR_ROLE,),
+    BUILD_SENSITIVE_CLASS: BUILD_REVIEW_ROLES,
+}
+# Sensitive routing is not a preference the planner expresses; it is a fixed
+# assignment this service enforces. Opus writes, Terra grades behavior and
+# tests, Grok grades security and tenant isolation. Naming them here rather
+# than accepting whatever the route says is what makes "the security review
+# passed" mean something: a route that swapped Grok for another Anthropic model
+# would still satisfy a generic cross-vendor rule while putting the writer's own
+# vendor on both sides of the highest-risk class.
+BUILD_SENSITIVE_REVIEWER = {
+    BUILD_REVIEW_BEHAVIOR_ROLE: "terra",
+    BUILD_REVIEW_SECURITY_ROLE: "grok",
+}
+# Sensitive work is written by Opus. Matched as an alias inside the route's
+# model string, the same way BUILD_WRITER_VENDOR_ALIASES matches, so both
+# `opus` and `claude-opus-5` are the same declaration.
+BUILD_SENSITIVE_WRITER_ALIAS = "opus"
+BUILD_SENSITIVE_WRITER_VENDOR = "anthropic"
 # The two ways a writer is launched, and the two things a reservation can be
 # taken for. `initial` opens the session, `correction` resumes the one already
 # recorded. Both charge a job before the agent exists, so a run that dies
@@ -207,6 +256,11 @@ BUILD_TRUNK_BRANCHES = frozenset({"main", "master", "trunk", "develop", "HEAD"})
 # launch argument: an absent max_turns is not "use the default", it is a
 # writer that runs until something else kills it.
 BUILD_ROUTE_STAMPS = ("launcher", "model", "max_turns", "run_budget_seconds", "reviewer1")
+# A sensitive build additionally cannot be launched without the second seat.
+# An absent reviewer2 is not "review with one voice"; it is a build that can
+# never satisfy its own review gate, discovered after the writer has spent its
+# turn rather than at preflight.
+BUILD_SENSITIVE_ROUTE_STAMPS = BUILD_ROUTE_STAMPS + ("reviewer2",)
 # The recipe the pre-PR plan calls out by name: it is a pre-commit hook, so it
 # may run, but it can never be the thing that makes a phase covered. Catalog
 # entries can say "coverage": false for themselves; this is the backstop for
@@ -4750,24 +4804,24 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
                 "event_capacity": BUILD_EVENT_HARD_MAX,
             }
 
-        mechanical = build_class(doc) == BUILD_MECHANICAL_CLASS
-        if mechanical and action in ("start_writer", "writer_done"):
+        on_path = build_class(doc) in BUILD_PATH_CLASSES
+        if on_path and action in ("start_writer", "writer_done"):
             out = build_public(doc)
             out["ok"] = False
             out["error"] = (
-                f"'{action}' asserts writer state; on the mechanical path only "
+                f"'{action}' asserts writer state; on this build path only "
                 "buildWriterLaunch and buildWriterComplete may change it"
             )
             out["code"] = "writer_op_required"
             return 409, out
-        if mechanical and action in BUILD_GATE_ACTIONS:
+        if on_path and action in BUILD_GATE_ACTIONS:
             # Answered after the replay check so a recorded gate receipt still
             # replays, and before anything is written so a rejected caller
             # spends no budget and moves no stage.
             out = build_public(doc)
             out["ok"] = False
             out["error"] = (
-                f"'{action}' asserts a gate was satisfied; on the mechanical path only "
+                f"'{action}' asserts a gate was satisfied; on this build path only "
                 "buildChecks, buildReview, buildGate, and buildFinalize record it, from "
                 "receipts they verified against the change on disk"
             )
@@ -4836,7 +4890,7 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
                 return 409, out
             target = build_transition_target(doc, action)
 
-        if mechanical and action == "start_writer":
+        if on_path and action == "start_writer":
             claim = build_claim_live(doc, now)
             if claim is None:
                 # The writer is already running by the time this transition is
@@ -4933,7 +4987,7 @@ def build_state_op(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
 # --- pre-PR mechanical path -------------------------------------------------
 #
 # One bounded Rewst invocation runs exactly one step. Which step is read off
-# the durable document by build_mechanical_step, never asserted by the caller:
+# durable document by build_path_step, never asserted by the caller:
 # an invocation that arrives twice with the same intent finds the build has
 # already moved and is given the next step instead of repeating the last one.
 #
@@ -4972,31 +5026,139 @@ def build_class(doc: dict[str, Any]) -> str:
     return raw if isinstance(raw, str) and raw in SLICE_CLASSES else BUILD_MECHANICAL_CLASS
 
 
-def build_open_mechanical(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
-    """Load a build and refuse it if this is not its path.
+def build_open_path(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Load a build and refuse it if this workflow does not drive its class.
 
-    A visual or sensitive build has extra stages this workflow does not run.
-    Letting one through here would take it past evidence capture and the
-    second reviewer without either having happened.
+    Mechanical and sensitive both run here. A visual build does not: it has an
+    evidence stage this workflow has no way to capture, and letting one through
+    would take it past screenshot capture and human review without either
+    having happened.
     """
     doc, err = build_open(build_id)
     if err:
         return None, err
     assert doc is not None
     found = build_class(doc)
-    if found != BUILD_MECHANICAL_CLASS:
+    if found not in BUILD_PATH_CLASSES:
         return None, (
             409,
             {
                 "ok": False,
                 "build_id": doc.get("build_id"),
                 "stage": doc.get("stage"),
-                "step": "not_mechanical",
-                "error": f"build is routed '{found}', not mechanical",
-                "code": "not_mechanical",
+                "step": "not_on_path",
+                "error": (
+                    f"build is routed '{found}'; this workflow drives "
+                    + " and ".join(BUILD_PATH_CLASSES)
+                ),
+                "code": "not_on_path",
             },
         )
     return doc, None
+
+
+def build_open_mechanical(
+    build_id: Any,
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Compatibility surface for the historical mechanical-path operations.
+
+    The path now admits both mechanical and sensitive builds; keeping this
+    name lets ticket-02 callers share that implementation without restoring
+    the old mechanical-only routing or duplicating the class gate.
+    """
+    return build_open_path(build_id)
+
+
+def build_is_sensitive(doc: dict[str, Any]) -> bool:
+    return build_class(doc) == BUILD_SENSITIVE_CLASS
+
+
+def build_review_roles(doc: dict[str, Any]) -> tuple[str, ...]:
+    """Every review this build's class owes before it may be finalized."""
+    return BUILD_CLASS_REVIEW_ROLES.get(build_class(doc), (BUILD_REVIEW_BEHAVIOR_ROLE,))
+
+
+def build_review_entry_role(entry: dict[str, Any]) -> str:
+    """The role a recorded round answered for.
+
+    Rounds written before roles existed carry no field. They were the
+    behavior-and-test review, so they read as one -- not as an unlabelled round
+    that could be counted for whichever role happens to be missing.
+    """
+    raw = entry.get("role")
+    return raw if isinstance(raw, str) and raw in BUILD_REVIEW_ROLES else BUILD_REVIEW_BEHAVIOR_ROLE
+
+
+def build_route_reviewer(doc: dict[str, Any], role: str) -> str | None:
+    """The reviewer this build's route names for one role, or None.
+
+    `none` is the sliceRoute spelling for an empty seat and is not a reviewer,
+    so it answers None here rather than becoming a reviewer name nothing can
+    launch.
+    """
+    route = doc.get("route")
+    if not isinstance(route, dict):
+        return None
+    raw = route.get(BUILD_ROLE_ROUTE_STAMP.get(role, ""))
+    name = raw.strip() if isinstance(raw, str) else ""
+    if not name or name == "none":
+        return None
+    return name
+
+
+def build_route_stamps(doc: dict[str, Any]) -> tuple[str, ...]:
+    return BUILD_SENSITIVE_ROUTE_STAMPS if build_is_sensitive(doc) else BUILD_ROUTE_STAMPS
+
+
+def build_sensitive_route_gaps(doc: dict[str, Any]) -> list[str]:
+    """Why this route cannot carry a sensitive build, or nothing.
+
+    Three separate claims, and every one of them fails closed. The writer is
+    Opus. Each review seat holds the one reviewer named for its role. And the
+    three seats are three vendors, checked rather than assumed: the mapping
+    above is the only thing making that true, so a future edit to it has to
+    break a test instead of quietly putting Anthropic on both sides of the
+    highest-risk class.
+    """
+    if not build_is_sensitive(doc):
+        return []
+    gaps: list[str] = []
+    route = doc.get("route") if isinstance(doc.get("route"), dict) else {}
+    model = str(route.get("model") or "").strip().lower()
+    writer = build_writer_vendor(doc)
+    if not model:
+        gaps.append("route does not name the writer's model; sensitive work is written by Opus")
+    elif BUILD_SENSITIVE_WRITER_ALIAS not in model or writer != BUILD_SENSITIVE_WRITER_VENDOR:
+        gaps.append(f"sensitive work is written by Opus; route names '{route.get('model')}'")
+    vendors: dict[str, str] = {}
+    for role in BUILD_REVIEW_ROLES:
+        expected = BUILD_SENSITIVE_REVIEWER[role]
+        named = build_route_reviewer(doc, role)
+        stamp = BUILD_ROLE_ROUTE_STAMP[role]
+        if named is None:
+            gaps.append(f"route is missing {stamp}, the {BUILD_REVIEW_ROLE_LABEL[role]} reviewer")
+            continue
+        if named != expected:
+            gaps.append(
+                f"the {BUILD_REVIEW_ROLE_LABEL[role]} review is '{expected}'; "
+                f"route names '{named}' as {stamp}"
+            )
+            continue
+        vendor = BUILD_REVIEWER_VENDOR.get(named)
+        if vendor is None:
+            gaps.append(f"reviewer '{named}' belongs to no vendor this service knows")
+            continue
+        if vendor in vendors:
+            gaps.append(
+                f"'{named}' and '{vendors[vendor]}' are both {vendor}; the two sensitive "
+                "reviews would share a vendor"
+            )
+            continue
+        if writer is not None and vendor == writer:
+            gaps.append(f"reviewer '{named}' is the writer's own vendor ({vendor})")
+            continue
+        vendors[vendor] = named
+    return gaps
 
 
 def build_recipe_cwd(
@@ -5274,10 +5436,11 @@ def build_required_recipes(
 
 
 def build_route_stamp_gaps(doc: dict[str, Any]) -> list[str]:
+    stamps = build_route_stamps(doc)
     route = doc.get("route")
     if not isinstance(route, dict):
-        return list(BUILD_ROUTE_STAMPS)
-    return [k for k in BUILD_ROUTE_STAMPS if route.get(k) in (None, "")]
+        return list(stamps)
+    return [k for k in stamps if route.get(k) in (None, "")]
 
 
 def build_worktree_conflicts(entries: list[str]) -> list[str]:
@@ -5528,10 +5691,21 @@ def build_step_finding(doc: dict[str, Any], step: str, change_id: str) -> str:
     """
     if step != "fix":
         return ""
-    review = build_last_review(doc, change_id)
-    if review is not None and review.get("verdict") != "PASS":
+    # Every reviewer that finished and said no, in role order. A sensitive
+    # change can come back from both at once, and handing the writer one
+    # finding at a time would spend a correction turn and a review round per
+    # lens to learn what one turn could have fixed.
+    findings = []
+    for role in build_review_roles(doc):
+        review = build_last_review(doc, change_id, role)
+        if review is None or review.get("verdict") == "PASS":
+            continue
         text = str(review.get("compact") or review.get("summary") or "")
-        return f"The behavior-and-test review returned findings.\n{text}"[:COMPACT_MAX_CHARS]
+        findings.append(
+            f"The {BUILD_REVIEW_ROLE_LABEL[role]} review returned findings.\n{text}"
+        )
+    if findings:
+        return "\n\n".join(findings)[:COMPACT_MAX_CHARS]
     red = build_red_fast_checks(doc, change_id)
     if not red:
         return ""
@@ -5543,17 +5717,148 @@ def build_step_finding(doc: dict[str, Any], step: str, change_id: str) -> str:
     return f"These declared fast checks are red: {', '.join(red)}\n{detail}"[:COMPACT_MAX_CHARS]
 
 
-def build_last_review(doc: dict[str, Any], change_id: str) -> dict[str, Any] | None:
+def build_last_review(
+    doc: dict[str, Any], change_id: str, role: str | None = None
+) -> dict[str, Any] | None:
     """The most recent micro-review recorded against this exact change.
 
     A review of the diff the writer has since rewritten is not a review of what
     would be committed, so it does not answer here at all — the caller sees the
     same "nobody has reviewed this" it would see if no review had ever run.
+
+    With a role, only that lens answers. The two sensitive reviews are separate
+    acknowledgements of the same diff, and a security PASS that satisfied the
+    behavior seat because it happened to be the latest round is exactly the
+    single-voice gate the class exists to avoid.
     """
     for entry in reversed(doc.get("reviews") or []):
-        if isinstance(entry, dict) and entry.get("change_id") == change_id and entry.get("verdict"):
-            return entry
+        if not isinstance(entry, dict) or entry.get("change_id") != change_id:
+            continue
+        if not entry.get("verdict"):
+            continue
+        if role is not None and build_review_entry_role(entry) != role:
+            continue
+        return entry
     return None
+
+
+def build_evidence_identity(doc: dict[str, Any], change_id: str) -> str:
+    """One name for the evidence set that stands behind this change.
+
+    Two reviewers must acknowledge the same diff *and* the same evidence. The
+    change id already pins the diff; this pins everything the visual path
+    recorded for it. A behavior review taken before a screenshot round was
+    recaptured and a security review taken after are two reviews of two
+    different bodies of evidence, and the pair would gate a state neither
+    reviewer actually saw.
+
+    `none` when nothing has been captured, which is the honest answer for a
+    build whose plan asks for no visual proof.
+    """
+    rounds = [
+        entry
+        for entry in (doc.get("evidence_rounds") or [])
+        if isinstance(entry, dict) and entry.get("change_id") == change_id
+    ]
+    if not rounds:
+        return "none"
+    material = [
+        {
+            "round": entry.get("round"),
+            "change_id": entry.get("change_id"),
+            "shots": entry.get("shots"),
+            "human_review": entry.get("human_review"),
+        }
+        for entry in rounds
+    ]
+    return hashlib.sha256(canonical_json(material).encode()).hexdigest()[:32]
+
+
+def build_visual_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
+    """What the planning record's visual requirements still owe at this change.
+
+    A sensitive change can also be visible, and when it is, the two sensitive
+    reviews do not stand in for the screenshot round or the human look — they
+    compose with them. Expressed as gaps rather than as a stage so the
+    requirement holds at the commit line whatever order the rounds arrived in.
+    """
+    verification = doc.get("verification") or {}
+    if not verification.get("needs_visual_proof") and not verification.get("human_visual_review"):
+        return []
+    rounds = [
+        entry
+        for entry in (doc.get("evidence_rounds") or [])
+        if isinstance(entry, dict) and entry.get("change_id") == change_id
+    ]
+    gaps: list[str] = []
+    if verification.get("needs_visual_proof") and not rounds:
+        gaps.append("the plan requires visual proof and no evidence round was captured for this change")
+    if verification.get("human_visual_review"):
+        latest = rounds[-1] if rounds else None
+        approved = (
+            isinstance(latest, dict)
+            and isinstance(latest.get("human_review"), dict)
+            and latest["human_review"].get("verdict") == "approved"
+        )
+        if not approved:
+            gaps.append(
+                "the plan requires human visual review and the latest evidence round is not approved"
+            )
+    return gaps
+
+
+def build_review_evidence_gap(
+    doc: dict[str, Any], entry: dict[str, Any], change_id: str, label: str
+) -> str | None:
+    """Reject a review that does not identify the evidence it acknowledged."""
+    seen = entry.get("evidence_id")
+    live = build_evidence_identity(doc, change_id)
+    if build_is_sensitive(doc) and seen != live:
+        if not isinstance(seen, str):
+            return f"the {label} review has no evidence identity for this sensitive change"
+        return (
+            f"the {label} review acknowledged evidence {seen}, which is no longer "
+            f"what stands behind this change ({live})"
+        )
+    if isinstance(seen, str) and seen != live:
+        return (
+            f"the {label} review acknowledged evidence {seen}, which is no longer "
+            f"what stands behind this change ({live})"
+        )
+    return None
+
+
+def build_review_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
+    """Every acknowledgement this build still owes at this exact change.
+
+    One entry per role, in a fixed order, so two runs looking at the same
+    document name the same missing review. A role answers only for itself:
+    absent, negative, and present-but-not-independent are three different
+    sentences because they need three different next moves — run the review,
+    resume the writer, fix the route.
+    """
+    gaps: list[str] = []
+    for role in build_review_roles(doc):
+        label = BUILD_REVIEW_ROLE_LABEL[role]
+        entry = build_last_review(doc, change_id, role)
+        if entry is None:
+            gaps.append(f"no {label} review has been recorded for this change")
+            continue
+        evidence_gap = build_review_evidence_gap(doc, entry, change_id, label)
+        if evidence_gap:
+            gaps.append(evidence_gap)
+            continue
+        if entry.get("verdict") != "PASS":
+            gaps.append(f"the last {label} review returned findings: {entry.get('summary')}")
+            continue
+        # A PASS is only evidence if the voice behind it could disagree. An
+        # unknown reviewer name, an unstamped route, or a reviewer sharing the
+        # writer's vendor each make this a self-review wearing a receipt.
+        authority = build_review_authority_gap(doc, entry.get("reviewer"), role)
+        if authority:
+            gaps.append(authority)
+            continue
+    return gaps
 
 
 def build_charge(doc: dict[str, Any], jobs: int) -> tuple[int, dict[str, Any]] | None:
@@ -5686,19 +5991,50 @@ def build_pending_gate(doc: dict[str, Any], change_id: str) -> tuple[str | None,
         clean, why = build_checks_clean(doc, "fast", change_id)
         if not clean:
             return None, why
-        review = build_last_review(doc, change_id)
-        if review is None:
-            return None, "no behavior-and-test review has been recorded for this change"
-        if review.get("verdict") != "PASS":
-            return None, f"the last review returned findings: {review.get('summary')}"
-        gap = build_review_authority_gap(doc, review.get("reviewer"))
-        if gap:
-            return None, gap
-        return "review_passed", "the review is clean and independent for this change"
+        gaps = build_review_gaps(doc, change_id) + build_visual_gaps(doc, change_id)
+        if gaps:
+            return None, gaps[0]
+        roles = build_review_roles(doc)
+        return "review_passed", (
+            "every required review is clean and independent for this change: "
+            + ", ".join(BUILD_REVIEW_ROLE_LABEL[role] for role in roles)
+        )
     return None, f"stage '{stage}' has no gate waiting on a recorded receipt"
 
 
-def build_mechanical_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
+def build_next_review_role(doc: dict[str, Any], change_id: str) -> tuple[str | None, str]:
+    """The one review this invocation should run, and why, or None.
+
+    Findings come first, across every role, before any missing review is run.
+    A behavior reviewer that said no has already invalidated the diff the
+    security reviewer would be reading, so spending a round on it buys a
+    verdict about code that is about to be rewritten.
+    """
+    for role in build_review_roles(doc):
+        entry = build_last_review(doc, change_id, role)
+        if entry is not None:
+            evidence_gap = build_review_evidence_gap(
+                doc, entry, change_id, BUILD_REVIEW_ROLE_LABEL[role]
+            )
+            if evidence_gap:
+                return role, evidence_gap
+        if entry is not None and entry.get("verdict") != "PASS":
+            return None, f"the {BUILD_REVIEW_ROLE_LABEL[role]} review returned findings"
+    for role in build_review_roles(doc):
+        label = BUILD_REVIEW_ROLE_LABEL[role]
+        entry = build_last_review(doc, change_id, role)
+        if entry is None:
+            return role, f"no {label} review for this change"
+        gap = build_review_authority_gap(doc, entry.get("reviewer"), role)
+        if gap:
+            # A recorded PASS from a reviewer that cannot be independent is not
+            # a review. Re-reviewing is the only thing that moves it, and the
+            # route has to name a reviewer that can.
+            return role, gap
+    return None, ""
+
+
+def build_path_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
     """Name the one step this invocation may run, and why.
 
     Reading the step off the document rather than taking it from the caller is
@@ -5739,10 +6075,13 @@ def build_mechanical_step(doc: dict[str, Any], change_id: str) -> tuple[str, str
             return "verify_passed", "the declared fast checks are clean for this change"
         return "fast_checks", why
     if stage == "evidence":
-        # Only reachable if a build declared visual proof and was still routed
-        # here. Saying so is better than running a screenshot round the
-        # mechanical path has no way to capture.
-        return "parked", "mechanical builds do not capture visual evidence"
+        if build_is_sensitive(doc) and build_needs_visual(doc):
+            # A sensitive change can also be visible. This workflow does not
+            # capture screenshots, so it names the round rather than parking:
+            # the visual evidence path owns it, and the two sensitive reviews
+            # still have to happen afterwards.
+            return "evidence", "the plan requires visual proof; the visual evidence path owns this round"
+        return "parked", "this workflow does not capture visual evidence"
     if stage == "review":
         # Checks come first even at review. A correction turn that answered a
         # finding produced a new change id, which invalidated the fast phase as
@@ -5754,27 +6093,28 @@ def build_mechanical_step(doc: dict[str, Any], change_id: str) -> tuple[str, str
             if red:
                 return "fix", "fast checks are red for this change: " + ", ".join(red)
             return "fast_checks", why
-        last = build_last_review(doc, change_id)
-        if last is None:
-            return "review", "no behavior-and-test review for this change"
-        if last.get("verdict") != "PASS":
-            return "fix", "the last review returned findings"
-        gap = build_review_authority_gap(doc, last.get("reviewer"))
-        if gap:
-            # A recorded PASS from a reviewer that cannot be independent is not
-            # a review. Re-reviewing is the only thing that moves it, and the
-            # route has to name a reviewer that can.
-            return "review", gap
+        role, why = build_next_review_role(doc, change_id)
+        if role is not None:
+            return "review", why
+        if why:
+            return "fix", why
+        visual = build_visual_gaps(doc, change_id)
+        if visual:
+            return "evidence", visual[0]
         # Not "review" again: a clean review that re-ran itself would spend a
         # round of budget to be told the same thing, and could only ever change
         # its mind for the worse.
-        return "review_passed", "the review is clean for this change"
+        roles = build_review_roles(doc)
+        return "review_passed", (
+            "every required review is clean for this change: "
+            + ", ".join(BUILD_REVIEW_ROLE_LABEL[role] for role in roles)
+        )
     if stage == "ready":
         clean, why = build_checks_clean(doc, "integration", change_id)
         if not clean:
             return "integration", why
         return "finalize", "final checks and review are clean"
-    return "parked", f"stage '{stage}' is not on the mechanical path"
+    return "parked", f"stage '{stage}' is not on this workflow's path"
 
 
 def build_next_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -5784,7 +6124,7 @@ def build_next_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int,
     it must be safe to call from a run that is about to be abandoned.
     """
     build_id = first_query(qs, "build_id")
-    doc, err = build_open_mechanical(build_id)
+    doc, err = build_open_path(build_id)
     if err:
         return err
     assert doc is not None
@@ -5798,7 +6138,7 @@ def build_next_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int,
         out["step_reason"] = str(park_detail)
         out["code"] = "worktree_mismatch"
         return 409, out
-    step, reason = build_mechanical_step(doc, live["change_id"])
+    step, reason = build_path_step(doc, live["change_id"])
     out = build_public(doc)
     out["ok"] = step != "parked"
     out["step"] = step
@@ -5807,6 +6147,16 @@ def build_next_op(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int,
     out["live_branch"] = live["branch"]
     out["change_id"] = live["change_id"]
     out["class"] = build_class(doc)
+    # Which review is due, named by the server rather than chosen by the graph.
+    # A caller that picked the role could run the behavior lens twice and reach
+    # `review_passed` on a sensitive build with nobody having looked at tenant
+    # scope, which is the one thing the class is for.
+    role, _why = build_next_review_role(doc, live["change_id"]) if step == "review" else (None, "")
+    out["review_role"] = role
+    out["review_reviewer"] = build_route_reviewer(doc, role) if role else None
+    out["review_roles"] = list(build_review_roles(doc))
+    out["reviews_outstanding"] = build_review_gaps(doc, live["change_id"])
+    out["visual_outstanding"] = build_visual_gaps(doc, live["change_id"])
     # The correction text travels with the step, not with the run that produced
     # it. A graph that read the finding out of its own task history could only
     # correct a failure it had personally witnessed, which is every case except
@@ -6000,6 +6350,14 @@ def build_preflight(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
                 "code": "missing_route_stamp",
                 "detail": f"route is missing {', '.join(gaps)}",
                 "missing": gaps,
+            }
+        )
+    for detail in build_sensitive_route_gaps(doc):
+        failures.append(
+            {
+                "check": "route",
+                "code": "invalid_sensitive_route",
+                "detail": detail,
             }
         )
 
@@ -6216,7 +6574,7 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             out["code"] = "writer_claimed"
             return 409, out
 
-        step, reason = build_mechanical_step(doc, change_id)
+        step, reason = build_path_step(doc, change_id)
         wanted = "preflight" if kind == "initial" else "fix"
         if step != wanted:
             # The document, not the caller, says which turn is due. A
@@ -7385,8 +7743,21 @@ def build_writer_vendor(doc: dict[str, Any]) -> str | None:
     return BUILD_VENDOR_UNKNOWN
 
 
-def build_review_authority_gap(doc: dict[str, Any], reviewer: Any) -> str | None:
-    """Why this reviewer cannot be the independent voice on this build, or None."""
+def build_review_authority_gap(
+    doc: dict[str, Any], reviewer: Any, role: str = BUILD_REVIEW_BEHAVIOR_ROLE
+) -> str | None:
+    """Why this reviewer cannot be the independent voice on this build, or None.
+
+    Two layers. Every class needs a reviewer from a vendor that is not the
+    writer's. A sensitive build additionally needs *this* reviewer in *this*
+    seat, because the two lenses are not interchangeable: Terra passing the
+    security seat would be one vendor holding both acknowledgements, and the
+    tenant-isolation questions would never have been asked by anyone.
+    """
+    if role not in BUILD_REVIEW_ROLES:
+        return f"'{role}' is not a review this service knows"
+    if role not in build_review_roles(doc):
+        return f"a {build_class(doc)} build has no {BUILD_REVIEW_ROLE_LABEL[role]} review"
     name = reviewer.strip() if isinstance(reviewer, str) else ""
     vendor = BUILD_REVIEWER_VENDOR.get(name)
     if vendor is None:
@@ -7399,6 +7770,16 @@ def build_review_authority_gap(doc: dict[str, Any], reviewer: Any) -> str | None
         return f"writer model '{model}' belongs to no vendor this service knows"
     if writer == vendor:
         return f"reviewer '{name}' is the writer's own vendor ({vendor})"
+    if build_is_sensitive(doc):
+        gaps = build_sensitive_route_gaps(doc)
+        if gaps:
+            return gaps[0]
+        expected = BUILD_SENSITIVE_REVIEWER[role]
+        if name != expected:
+            return (
+                f"the {BUILD_REVIEW_ROLE_LABEL[role]} review on a sensitive build is "
+                f"'{expected}'; '{name}' cannot hold that seat"
+            )
     return None
 
 
@@ -7452,7 +7833,7 @@ def build_review_round_result(reviewer: str, prompt: str, worktree: Path) -> dic
     }
 
 
-def build_review_prompt(doc: dict[str, Any]) -> str:
+def build_behavior_review_prompt(doc: dict[str, Any]) -> list[str]:
     """The behavior-and-test lenses this review has to answer, by name.
 
     Named individually because a reviewer asked to "review the change" reads
@@ -7468,7 +7849,7 @@ def build_review_prompt(doc: dict[str, Any]) -> str:
         "",
         "1. SCOPE: does the diff do the approved ticket and nothing else? Name anything",
         "   it changes that the ticket did not ask for.",
-        "2. BEHAVIOR: does the change actually produce the behavior the ticket states,",
+        "2. PROMISED BEHAVIOR: does the change actually produce the behavior the ticket states,",
         "   or only look like it does? Name the case where it would not.",
     ]
     if verification.get("requires_red"):
@@ -7483,19 +7864,68 @@ def build_review_prompt(doc: dict[str, Any]) -> str:
     lines.extend(
         [
             "4. PRODUCTION PATH: do the tests exercise the code that actually runs, or a copy,",
-            "   a mock, or a helper the production path never calls?",
+            "   a mock, or a helper the production path never calls? Does anything the change",
+            "   promises to keep survive a restart, or does it only live in memory?",
             "5. INTEGRATION SEAM: the plan declares this seam as "
             + (", ".join(integration) if integration else "none"),
             "   Is the seam covered by something that runs it for real?",
-            "",
-            "Ticket:",
-            str(doc.get("ticket") or "(none)"),
+            "6. HONEST FAILURE: when a step fails, times out, or returns nothing, does the",
+            "   change say so, or does it report success anyway? Name any path where a",
+            "   failure reads as a pass.",
         ]
     )
-    return "\n".join(lines)
+    return lines
 
 
-def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+def build_security_review_prompt(doc: dict[str, Any]) -> list[str]:
+    """The security-and-tenant lenses, by name, scoped to this ticket.
+
+    Deliberately not "look for vulnerabilities". A reviewer given that
+    instruction audits the whole file and reports the oldest thing in it; these
+    six ask what this diff did to the boundaries the ticket touches, which is
+    the question a correction turn can actually answer.
+    """
+    return [
+        "Security-and-tenant micro-review. You did not write this change. Judge only what",
+        "this diff does to the boundaries the ticket touches. Answer each lens, then give",
+        "one verdict.",
+        "",
+        "1. TENANT SCOPE: can this change read, write, or reveal another tenant's data?",
+        "   Name the query, path, or identifier that is not scoped.",
+        "2. PERMISSIONS: does every new or changed entry point check what the caller is",
+        "   allowed to do, or does it rely on the caller having asked nicely?",
+        "3. FORGED INPUT: what happens when a caller sends an id, path, or state it does",
+        "   not own? Name any field the change trusts because it arrived in the request.",
+        "4. LEAKAGE: can a credential, token, capability URL, or screenshot reach a log,",
+        "   a receipt, a state file, or an error message?",
+        "5. IDEMPOTENCY: can a retry, a replay, or two concurrent callers make this",
+        "   happen twice? Name the side effect that would repeat.",
+        "6. DATA LOSS: can this change destroy or overwrite something it cannot restore?",
+        "   Name the write that has no recovery.",
+    ]
+
+
+def build_review_prompt(doc: dict[str, Any], role: str = BUILD_REVIEW_BEHAVIOR_ROLE) -> str:
+    """One reviewer's whole world: its own lenses and the approved ticket.
+
+    Composed from the ticket and the declared verification only. No recorded
+    round, summary, or compact transcript is interpolated, so no reviewer ever
+    reads what the other one was thinking — two acknowledgements that agreed
+    because the second was shown the first are one acknowledgement.
+    """
+    if role == BUILD_REVIEW_SECURITY_ROLE:
+        lines = build_security_review_prompt(doc)
+    else:
+        lines = build_behavior_review_prompt(doc)
+    return "\n".join(lines + ["", "Ticket:", str(doc.get("ticket") or "(none)")])
+
+
+def build_review_result(
+    doc: dict[str, Any],
+    reviewer: str,
+    repos: dict[str, str],
+    role: str = BUILD_REVIEW_BEHAVIOR_ROLE,
+) -> tuple[int, dict[str, Any]]:
     """Run the micro-review, retrying silence, and record the round.
 
     Silence and disagreement are the two outcomes that must never be confused.
@@ -7507,12 +7937,13 @@ def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str
     and a PASS this op recorded is also what moves the build to `ready`: no
     caller ever gets to assert that step.
     """
-    gap = build_review_authority_gap(doc, reviewer)
+    gap = build_review_authority_gap(doc, reviewer, role)
     if gap:
         return 409, {
             "ok": False,
             "build_id": doc.get("build_id"),
             "reviewer": reviewer,
+            "role": role,
             "error": gap,
             "code": "reviewer_is_writer" if "own vendor" in gap else "no_review_authority",
         }
@@ -7521,8 +7952,19 @@ def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str
         return build_park(doc, "worktree_mismatch", str(park_detail))
     head = live["head"]
     change_id = live["change_id"]
+    due_role, due_reason = build_next_review_role(doc, change_id)
+    if due_role != role:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "reviewer": reviewer,
+            "role": role,
+            "error": due_reason or f"the {BUILD_REVIEW_ROLE_LABEL[role]} review is not due",
+            "code": "review_not_due",
+        }
     worktree = Path(str(doc.get("worktree")))
-    prompt = build_review_prompt(doc)
+    prompt = build_review_prompt(doc, role)
+    evidence_id = build_evidence_identity(doc, change_id)
 
     park = build_charge(doc, 1)
     if park:
@@ -7547,8 +7989,10 @@ def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str
             "ok": False,
             "build_id": doc.get("build_id"),
             "reviewer": reviewer,
+            "role": role,
             "head": head,
             "change_id": change_id,
+            "evidence_id": evidence_id,
             "verdict": None,
             "no_verdict": True,
             "finding": False,
@@ -7565,6 +8009,8 @@ def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str
         "change_id": change_id,
         "at": utcnow(),
         "reviewer": reviewer,
+        "role": role,
+        "evidence_id": evidence_id,
         "verdict": result.get("verdict"),
         "no_verdict": False,
         "summary": str(result.get("summary") or "")[:BUILD_REDACT_MAX_STRING],
@@ -7587,8 +8033,10 @@ def build_review_result(doc: dict[str, Any], reviewer: str, repos: dict[str, str
         "stage": doc.get("stage"),
         "gate": gate,
         "reviewer": reviewer,
+        "role": role,
         "head": head,
         "change_id": change_id,
+        "evidence_id": evidence_id,
         "round": entry["round"],
         "verdict": entry["verdict"],
         "no_verdict": False,
@@ -7613,7 +8061,9 @@ def build_review_job(job_id: str) -> None:
             status, payload = open_err
         else:
             assert doc is not None
-            status, payload = build_review_result(doc, job["reviewer"], load_repos())
+            status, payload = build_review_result(
+                doc, job["reviewer"], load_repos(), job["role"]
+            )
     receipt = {
         "status": "ok" if payload.get("ok") else "nack",
         "job_id": job_id,
@@ -7621,7 +8071,10 @@ def build_review_job(job_id: str) -> None:
         "http_status": status,
         **{
             k: payload.get(k)
-            for k in ("ok", "verdict", "no_verdict", "finding", "round", "summary", "compact", "code", "error")
+            for k in (
+                "ok", "role", "reviewer", "evidence_id", "verdict", "no_verdict",
+                "finding", "round", "summary", "compact", "code", "error",
+            )
         },
     }
     job = read_job(job_id) or job
@@ -7654,8 +8107,33 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "error": f"the behavior-and-test review runs at stage 'review'; build is at '{stage}'",
             "code": "invalid_transition",
         }
-    route = doc.get("route") or {}
-    reviewer = data.get("reviewer") or route.get("reviewer1")
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        return build_park(doc, "worktree_mismatch", str(park_detail))
+    role, due_reason = build_next_review_role(doc, live["change_id"])
+    if role is None:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "stage": stage,
+            "error": due_reason or "no review is due for this change",
+            "code": "review_not_due",
+        }
+    routed_reviewer = build_route_reviewer(doc, role)
+    requested_reviewer = data.get("reviewer")
+    if build_is_sensitive(doc) and requested_reviewer not in (None, "", routed_reviewer):
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "role": role,
+            "reviewer": requested_reviewer,
+            "error": (
+                f"the {BUILD_REVIEW_ROLE_LABEL[role]} review is server-routed "
+                f"to '{routed_reviewer}'"
+            ),
+            "code": "no_review_authority",
+        }
+    reviewer = routed_reviewer if build_is_sensitive(doc) else requested_reviewer or routed_reviewer
     if not isinstance(reviewer, str) or reviewer.strip() not in BUILD_REVIEWER_VENDOR:
         return 400, {
             "ok": False,
@@ -7663,7 +8141,7 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "code": "bad_reviewer",
         }
     reviewer = reviewer.strip()
-    gap = build_review_authority_gap(doc, reviewer)
+    gap = build_review_authority_gap(doc, reviewer, role)
     if gap:
         # The review is independent or it is the writer grading its own
         # homework in a second window. There is no third option, and a writer
@@ -7687,7 +8165,7 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             if open_err:
                 return open_err
             assert doc is not None
-            return build_review_result(doc, reviewer, repos)
+            return build_review_result(doc, reviewer, repos, role)
 
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
@@ -7699,6 +8177,7 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "status": "queued",
             "build_id": doc.get("build_id"),
             "reviewer": reviewer,
+            "role": role,
             "cwd": str(doc.get("worktree")),
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
@@ -7729,6 +8208,7 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
         "status": "queued",
         "build_id": doc.get("build_id"),
         "reviewer": reviewer,
+        "role": role,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
 
@@ -7747,18 +8227,8 @@ def build_finalize_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
         clean, why = build_checks_clean(doc, phase, change_id)
         if not clean:
             gaps.append(why)
-    review = build_last_review(doc, change_id)
-    if review is None:
-        gaps.append("no behavior-and-test review has been recorded for this change")
-    elif review.get("verdict") != "PASS":
-        gaps.append(f"the last review returned findings: {review.get('summary')}")
-    else:
-        # A PASS is only evidence if the voice behind it could disagree. An
-        # unknown reviewer name, an unstamped route, or a reviewer sharing the
-        # writer's vendor each make this a self-review wearing a receipt.
-        authority = build_review_authority_gap(doc, review.get("reviewer"))
-        if authority:
-            gaps.append(authority)
+    gaps.extend(build_review_gaps(doc, change_id))
+    gaps.extend(build_visual_gaps(doc, change_id))
     return gaps
 
 
