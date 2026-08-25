@@ -1508,7 +1508,13 @@ def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, 
         "ok": True,
         "grade": grade,
         "holds": holds,
-        "blocking": bool(ordered or holds),
+        # "Any finding at all" never converges: at grade A the reviewer still
+        # lists nits, so a loop gated on that spends writer sessions forever.
+        # review-hold.yml clears hold:pm-review at A/A-, so that is the real
+        # merge bar. Findings on an A-graded PR stay in the payload as
+        # advisory. No grade means the audit has not spoken yet, which is not
+        # the same as clear.
+        "blocking": bool(holds) or grade is None or grade.rstrip("+-") != "A",
         "findings": ordered,
         "brief": render_findings_brief(ordered),
         **counts,

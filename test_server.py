@@ -1477,6 +1477,32 @@ class DispatchTests(unittest.TestCase):
             self.assertIn(fp, out["brief"])
         self.assertNotIn("prose a model should not have to parse", out["brief"])
 
+    def test_pr_findings_blocking_means_would_block_a_merge(self):
+        # "Any finding at all" never converges: at grade A the reviewer still
+        # lists nits, so the loop would keep spending writer sessions forever.
+        # The repo's own bar is review-hold.yml, which clears hold:pm-review at
+        # A/A-. Match that: holds block, and so does a grade below the bar.
+        # Findings on an A-graded PR are advisory and stay in the payload.
+        graded_a = server.pr_findings_from(
+            labels=["grade-A"],
+            comment_bodies=['<!-- engineering-findings-json\n'
+                            '{"findings":[{"severity":"minor","fingerprint":"nit",'
+                            '"remedy":"tidy"}]}\n-->'],
+        )
+        self.assertFalse(graded_a["blocking"], graded_a)
+        self.assertEqual(len(graded_a["findings"]), 1, "advisory findings still reported")
+
+        for label in ("grade-A-", "grade-A+"):
+            self.assertFalse(server.pr_findings_from(labels=[label], comment_bodies=[])["blocking"])
+        for label in ("grade-B+", "grade-B", "grade-C"):
+            self.assertTrue(server.pr_findings_from(labels=[label], comment_bodies=[])["blocking"], label)
+
+        # A hold blocks regardless of grade.
+        held = server.pr_findings_from(labels=["grade-A", "hold:pm-review"], comment_bodies=[])
+        self.assertTrue(held["blocking"])
+        # No grade yet means the audit has not spoken; do not call that clear.
+        self.assertTrue(server.pr_findings_from(labels=[], comment_bodies=[])["blocking"])
+
     def test_pr_findings_says_clear_when_nothing_blocks(self):
         # A green PR must not look like a PR whose findings failed to parse:
         # both would otherwise be an empty list.
