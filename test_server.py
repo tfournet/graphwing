@@ -1582,6 +1582,22 @@ class DispatchTests(unittest.TestCase):
             server.review_result(reviewer, "ticket text", Path("/tmp"))
         return seen["cmd"]
 
+    def test_all_three_vendors_are_in_the_loop(self):
+        # Pulling Sol out for the planner conflict left OpenAI reviewing
+        # exactly one class. Opposing-vendor is necessary but not sufficient:
+        # each vendor should be reviewing someone.
+        VENDOR = {"grok-4.6": "xai", "claude-opus-5": "anthropic",
+                  "sonnet": "anthropic", "opus": "anthropic", "fable": "anthropic",
+                  "grok": "xai", "terra": "openai", "sol": "openai"}
+        reviewing = set()
+        for cls in ("mechanical", "visual", "sensitive"):
+            r = server.slice_route_lookup(cls, "M")
+            for slot in ("reviewer1", "reviewer2"):
+                if r[slot] != "none":
+                    reviewing.add(VENDOR[r[slot]])
+        self.assertEqual(reviewing, {"anthropic", "openai", "xai"},
+                         f"only {sorted(reviewing)} review anything")
+
     def test_reviewer_is_always_an_opposing_vendor(self):
         # The rule is vendor separation, not model separation. Fable grading
         # Opus is Anthropic reviewing Anthropic, which is the thing the rule
@@ -2563,17 +2579,17 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(payload["launcher"], "claude")
         self.assertEqual(payload["size"], "M")
-        self.assertEqual(payload["reviewer1"], "grok")
+        self.assertEqual(payload["reviewer1"], "terra")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"visual","size":"M"}'
         )
         self.assertEqual(payload["launcher"], "claude")
-        self.assertEqual(payload["reviewer1"], "grok")
+        self.assertEqual(payload["reviewer1"], "terra")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"sensitive","size":"M"}'
         )
-        self.assertEqual(payload["reviewer1"], "grok")
-        self.assertEqual(payload["reviewer2"], "terra")
+        self.assertEqual(payload["reviewer1"], "terra")
+        self.assertEqual(payload["reviewer2"], "grok")
         status, payload, _ = server.dispatch(
             "POST", "/v1/slice/route", {}, True, b'{"class":"nope","size":"M"}'
         )

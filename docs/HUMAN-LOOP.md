@@ -76,8 +76,8 @@ Closed table. Graph looks up the row. No per-slice model picker. Missing class �
 | class | writer launcher / model | spec-review (plan mode) |
 |---|---|---|
 | `mechanical` | Hermes `agentRun` `grok-4.6` (`xai-oauth`) | Anthropic Sonnet |
-| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Grok** (`grok-4.6`, xAI) |
-| `sensitive` | `claude -p` `claude-opus-5` | **Grok, then Terra** (both must ack) |
+| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Terra** (`gpt-5.6-terra`, OpenAI) |
+| `sensitive` | `claude -p` `claude-opus-5` | **Terra, then Grok** (both must ack) |
 
 **The reviewer's vendor is never the writer's, and never the planner's.** Two
 separate constraints, and they are what fix the table:
@@ -88,13 +88,16 @@ separate constraints, and they are what fix the table:
 | writer (visual/sensitive) | `riftwing-autopilot` / `riftwing-oneshot` `claude-opus-5` | Anthropic |
 | investigator | `riftwing-investigator` `grok-4.6` | xAI |
 
-`mechanical` writes with Grok and reviews with Sonnet: xAI graded by Anthropic.
+All three vendors review, and no vendor ever reviews itself:
+
+- `mechanical`: xAI writes, **Anthropic** grades it.
+- `visual`: Anthropic writes, **OpenAI** grades it.
+- `sensitive`: Anthropic writes, **OpenAI and xAI** both grade it.
+
 For `visual` and `sensitive` the writer is Anthropic, so no Anthropic model may
-review — that rules out Sonnet, Opus **and Fable**. Sol is the planning session,
-so it cannot grade a spec it wrote. xAI is the only vendor that is neither,
-which is why Grok reviews there. `sensitive` needs two acks from two vendors, so
-Terra is second: OpenAI, but a different model from the planner, so the spec's
-author stays out of the review chain.
+review — that rules out Sonnet, Opus **and Fable**. Sol is excluded separately,
+as the planning session, so OpenAI is represented by Terra: same vendor,
+different model, so the spec's author is never in the review chain.
 
 Reviewers running through Hermes are always launched with an explicit `-m`.
 Without it every one of them silently takes the seat's default profile, and

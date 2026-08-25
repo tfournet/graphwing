@@ -1326,19 +1326,18 @@ def slice_route_lookup(
         launcher, model = "hermes", "grok-4.6"
         reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
     elif class_name == "visual":
-        # The rule is vendor separation. These writers are Opus, so an
-        # Anthropic reviewer grades its own vendor's work; and Sol is the
-        # planning session, so Sol grades its own spec. That leaves xAI as the
-        # only vendor that is neither, which is why the investigator model
-        # reviews here.
+        # Every review crosses vendors, and all three vendors are in the loop:
+        # xAI writes mechanical and Anthropic grades it; Anthropic writes these
+        # and OpenAI grades them. Sol is excluded because it is the planning
+        # session, so Terra carries OpenAI here — same vendor, different model,
+        # so the spec's author is never in the review chain.
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "grok", "none"
+        reviewer1, reviewer2 = "terra", "none"
     else:
-        # Sensitive needs two acks from two vendors, and neither may be the
-        # writer's. Grok is xAI; Terra is OpenAI but a different model from the
-        # planner, so the spec's author is still not in the review chain.
+        # Sensitive needs two acks, and both from vendors that are not the
+        # writer's: OpenAI and xAI grade what Anthropic wrote.
         launcher, model = "claude", "claude-opus-5"
-        reviewer1, reviewer2 = "grok", "terra"
+        reviewer1, reviewer2 = "terra", "grok"
     return {
         "ok": True,
         "class": class_name,
