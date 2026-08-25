@@ -644,7 +644,7 @@
       "post": {
         "operationId": "agentRun",
         "tags": ["agent"],
-        "summary": "Queue one bounded writer run. Native Codex and Claude jobs fail closed without a valid final receipt and stable structured session identity.",
+        "summary": "Queue one bounded writer run. Native Codex, Claude, and Grok jobs fail closed without a valid final receipt and stable structured session identity.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1279,7 +1279,7 @@
         "properties": {
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
-          "launcher": { "type": "string", "enum": ["hermes", "claude", "codex"], "default": "hermes" },
+          "launcher": { "type": "string", "enum": ["hermes", "claude", "codex", "grok"], "default": "hermes" },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string" },
           "max_turns": { "type": "integer" },
@@ -1351,13 +1351,13 @@
         "type": "object",
         "required": ["launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"],
         "properties": {
-          "launcher": { "type": "string", "enum": ["codex", "claude"] },
-          "provider": { "type": "string", "enum": ["openai", "anthropic"] },
-          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5"] },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
           "repo": { "type": "string" },
           "branch": { "type": "string" },
           "starting_head": { "type": "string" },
-          "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id or Claude result.session_id. Required non-null for success and resume." }
+          "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id, Claude result.session_id, or Grok ACP session/new result.sessionId. Required non-null for success and resume." }
         }
       },
       "AgentReceipt": {

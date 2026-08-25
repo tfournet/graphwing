@@ -416,6 +416,128 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(status, 400, payload)
                     self.assertEqual(payload["code"], "bad_model_identity")
 
+    def test_grok_agent_run_records_exact_git_bound_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            grok = root / "grok"
+            grok.write_text("fixture")
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            body = json.dumps({"prompt": "ping", "cwd": "scratch", "launcher": "grok"}).encode()
+            with mock.patch.object(server, "GROK_BIN", grok), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload["launcher"], "grok")
+        self.assertEqual(payload["provider"], "xai")
+        self.assertEqual(payload["model"], "grok-4.6")
+        self.assertEqual(payload["session_identity"], {
+            "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+            "repo": "scratch", "branch": branch, "starting_head": head,
+            "native_session_id": None,
+        })
+
+    def test_grok_resume_rejects_every_identity_mismatch_dimension(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            grok = root / "grok"
+            grok.write_text("fixture")
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            identity = {
+                "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+                "repo": "scratch", "branch": branch, "starting_head": head,
+                "native_session_id": "grok-123",
+            }
+            prior_job_id = "ab" * 16
+            prior_dir = jobs / prior_job_id
+            prior_dir.mkdir(parents=True)
+            prior = {
+                "job_id": prior_job_id, "status": "completed", "launcher": "grok",
+                "session_identity": identity,
+                "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
+            }
+            (prior_dir / "job.json").write_text(json.dumps(prior))
+            replacements = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "other", "branch": "other", "starting_head": "f" * 40,
+            }
+            base = {
+                "prompt": "continue", "cwd": "scratch", "launcher": "grok",
+                "provider": "xai", "model": "grok-4.6", "resume_job_id": prior_job_id,
+            }
+            with mock.patch.object(server, "GROK_BIN", grok), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                for key, value in replacements.items():
+                    body = json.dumps({**base, "session_identity": dict(identity, **{key: value})}).encode()
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                    self.assertEqual(status, 400, key)
+                    self.assertEqual(payload["code"], "session_identity_mismatch", key)
+                valid = json.dumps({**base, "session_identity": identity}).encode()
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid)
+                self.assertEqual(status, 202, payload)
+                self.assertEqual(payload["session_identity"], identity)
+                changed_session = json.dumps({
+                    **base, "session_identity": dict(identity, native_session_id="grok-other"),
+                }).encode()
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, changed_session)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "untraceable_resume_session")
+                bad_priors = [
+                    ("failed job", dict(prior, status="failed")),
+                    ("wrong job launcher", dict(prior, launcher="codex")),
+                    ("error receipt", dict(prior, receipt=dict(prior["receipt"], status="error"))),
+                    ("timeout receipt", dict(prior, receipt=dict(prior["receipt"], status="timeout"))),
+                    ("wrong stored native session", dict(
+                        prior, session_identity=dict(identity, native_session_id="grok-other"),
+                    )),
+                    ("wrong receipt native session", dict(
+                        prior, receipt=dict(prior["receipt"], session_identity=dict(
+                            identity, native_session_id="grok-other",
+                        )),
+                    )),
+                ]
+                bad_priors.extend(
+                    (f"stored {key}", dict(
+                        prior, session_identity=dict(identity, **{key: value}),
+                    ))
+                    for key, value in replacements.items()
+                )
+                for name, bad_prior in bad_priors:
+                    (prior_dir / "job.json").write_text(json.dumps(bad_prior))
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid)
+                    self.assertEqual(status, 400, name)
+                    self.assertEqual(payload["code"], "untraceable_resume_session", name)
+
+                for provider, model in (("openai", "grok-4.6"), ("xai", "grok-other")):
+                    body = json.dumps({
+                        "prompt": "x", "cwd": "scratch", "launcher": "grok",
+                        "provider": provider, "model": model,
+                    }).encode()
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                    self.assertEqual(status, 400, (provider, model))
+                    self.assertEqual(payload["code"], "bad_model_identity")
+
     def test_agent_run_rejects_launcher_state_mismatches(self):
         session = "gwslice-" + ("ab" * 16)
         resume_job_id = "cd" * 16
@@ -687,6 +809,15 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "not_implemented")
 
+    def test_grok_agent_run_missing_binary_is_typed(self):
+        with mock.patch.object(server, "GROK_BIN", Path("/nope/grok")):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/run", {}, True,
+                b'{"prompt":"x","cwd":"scratch","launcher":"grok"}',
+            )
+        self.assertEqual(status, 501)
+        self.assertEqual(payload["code"], "missing_binary")
+
     def test_wrap_prompt_locks_cwd(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
         self.assertIn("/home/tim/work/gw-real-slice", text)
@@ -814,6 +945,346 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(initial_err)
         self.assertIsNotNone(initial_proc)
         self.assertNotIn("--resume", initial_cmd)
+
+    def _write_grok_acp_fixture(self, root: Path) -> Path:
+        fixture = root / "grok-fixture"
+        fixture.write_text("""#!/usr/bin/env python3
+import json, os, sys, time
+cfg = json.loads(os.environ.get("ACP_TEST_FIXTURE", "{}"))
+capture = os.environ["ACP_TEST_CAPTURE"]
+seen = {"pid":os.getpid(), "argv":sys.argv[1:], "cwd":os.getcwd(), "env":{key:os.environ.get(key) for key in ["GROK_DISABLE_AUTOUPDATER","PWD","TERMINAL_CWD","GRAPHWING_JOB_ID","GIT_TERMINAL_PROMPT","GH_PROMPT_DISABLED"]}, "requests":[]}
+def save():
+    with open(capture, "w") as fh: json.dump(seen, fh)
+def send(value):
+    print(json.dumps(value), flush=True)
+def response_id(request):
+    if cfg.get("response_id_method") == request["method"]:
+        return cfg["response_id"]
+    return request["id"]
+save()
+if cfg.get("stderr_bytes"):
+    sys.stderr.write("x" * cfg["stderr_bytes"]); sys.stderr.flush()
+while True:
+    if cfg.get("stop_reading_after") == len(seen["requests"]):
+        time.sleep(2); continue
+    line = sys.stdin.readline()
+    if not line: break
+    request = json.loads(line)
+    seen["requests"].append(request); save()
+    method = request["method"]
+    if cfg.get("exit_method") == method: sys.exit(cfg.get("exit_code", 7))
+    if cfg.get("malformed_method") == method:
+        print("not-json", flush=True); continue
+    if cfg.get("missing_result_method") == method:
+        send({"jsonrpc":"2.0","id":response_id(request)}); continue
+    if cfg.get("error_method") == method:
+        send({"jsonrpc":"2.0","id":response_id(request),"error":{"code":-32000,"message":"fixture error"}})
+        if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
+        continue
+    if method == "initialize":
+        auth_methods = cfg["auth_methods"] if "auth_methods" in cfg else [{"id":"xai.api_key"},{"id":"cached_token"}]
+        result = {"protocolVersion":cfg.get("protocol_version", 1),"authMethods":auth_methods,"agentCapabilities":{"loadSession":cfg.get("load_session", True)}}
+        if cfg.get("omit_auth_methods"):
+            result.pop("authMethods")
+        if cfg.get("omit_protocol_version"):
+            result.pop("protocolVersion")
+        if cfg.get("initialize_padding_bytes"):
+            result["fixturePadding"] = "x" * cfg["initialize_padding_bytes"]
+    elif method == "authenticate": result = {}
+    elif method == "session/new": result = {} if cfg.get("missing_session") else {"sessionId":cfg.get("session_id", "grok-123")}
+    elif method == "session/load":
+        for text in cfg.get("replay_chunks", []):
+            send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":request["params"]["sessionId"],"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}})
+        result = cfg.get("load_result", {})
+    elif method == "session/prompt":
+        if cfg.get("sleep"): time.sleep(cfg["sleep"])
+        sid = cfg.get("update_session_id", request["params"]["sessionId"])
+        if cfg.get("malformed_update"):
+            send({"jsonrpc":"2.0","method":"session/update","params":{}})
+        if cfg.get("foreign_update"):
+            send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"grok-other","update":{"sessionUpdate":"plan"}}})
+        if cfg.get("invalid_update_envelope"):
+            send({"jsonrpc":"2.0","id":999,"method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"plan"}}})
+        if cfg.get("untyped_update"):
+            send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{}}})
+        for text in cfg.get("chunks", ['{"status":"ok","sha":null,"pr_url":null,"summary":"done"}']):
+            send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":cfg.get("chunk_content_type", "text"),"text":text}}}})
+        result = {"stopReason":cfg.get("stop_reason", "end_turn")}
+    else: result = {}
+    send({"jsonrpc":"2.0","id":response_id(request),"result":result})
+    if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
+    if cfg.get("hang_after_method") == method:
+        while True: time.sleep(1)
+""")
+        fixture.chmod(0o755)
+        return fixture
+
+    def _run_grok_fixture(self, cfg=None, resume=False, api_key=True, prompt="fixture prompt"):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        jobs = root / "jobs"
+        job_id = "12" * 16
+        jdir = jobs / job_id
+        jdir.mkdir(parents=True)
+        fixture = self._write_grok_acp_fixture(root)
+        capture = root / "capture.json"
+        native_session_id = "grok-123" if resume else None
+        identity = {
+            "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+            "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+            "native_session_id": native_session_id,
+        }
+        job = {
+            "job_id": job_id, "status": "queued", "profile": "graphwing",
+            "repo": "scratch", "cwd": str(root), "prompt": prompt,
+            "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+            "session_identity": identity, "hermes_session": None, "created_at": "t",
+            "started_at": None, "finished_at": None, "max_turns": 1,
+            "run_budget_seconds": (cfg or {}).get("budget", 30), "receipt": None,
+            "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+            "response_webhook_url": None,
+        }
+        (jdir / "job.json").write_text(json.dumps(job))
+        (jdir / "prompt.txt").write_text(prompt)
+        env = {
+            "ACP_TEST_FIXTURE": json.dumps(cfg or {}),
+            "ACP_TEST_CAPTURE": str(capture),
+        }
+        if api_key:
+            env["XAI_API_KEY"] = "fixture-key"
+        with mock.patch.object(server, "JOBS_DIR", jobs), \
+             mock.patch.object(server, "GROK_BIN", fixture), \
+             mock.patch.dict(os.environ, env, clear=False):
+            if not api_key:
+                os.environ.pop("XAI_API_KEY", None)
+            server.run_agent_job(job_id)
+        return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
+
+    def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
+        saved, capture, jdir = self._run_grok_fixture()
+        self.assertEqual(capture["argv"], ["agent", "--always-approve", "--model", "grok-4.6", "stdio"])
+        self.assertEqual(capture["cwd"], str(jdir.parent.parent.resolve()))
+        self.assertEqual(capture["env"], {
+            "GROK_DISABLE_AUTOUPDATER": "1", "PWD": str(jdir.parent.parent.resolve()),
+            "TERMINAL_CWD": str(jdir.parent.parent.resolve()), "GRAPHWING_JOB_ID": "12" * 16,
+            "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1",
+        })
+        requests = capture["requests"]
+        self.assertEqual([r["jsonrpc"] for r in requests], ["2.0"] * 4)
+        self.assertEqual([r["id"] for r in requests], [1, 2, 3, 4])
+        self.assertEqual([r["method"] for r in requests], [
+            "initialize", "authenticate", "session/new", "session/prompt",
+        ])
+        self.assertEqual(requests[0]["params"], {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
+        })
+        self.assertEqual(requests[1]["params"], {"methodId": "xai.api_key", "_meta": {"headless": True}})
+        self.assertEqual(requests[2]["params"], {"cwd": str(jdir.parent.parent.resolve()), "mcpServers": []})
+        self.assertEqual(requests[3]["params"], {
+            "sessionId": "grok-123", "prompt": [{"type": "text", "text": "fixture prompt"}],
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["session_identity"]["native_session_id"], "grok-123")
+        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual((jdir / "last-message.txt").read_text(), '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}')
+
+    def test_grok_acp_initializer_disables_unsupported_client_methods(self):
+        _, capture, _ = self._run_grok_fixture()
+        initialize = next(r for r in capture["requests"] if r["method"] == "initialize")
+        self.assertEqual(initialize["params"]["clientCapabilities"], {
+            "fs": {"readTextFile": False, "writeTextFile": False},
+            "terminal": False,
+        })
+
+    def test_grok_acp_accepts_structured_message_above_file_limit(self):
+        saved, _, jdir = self._run_grok_fixture({
+            "initialize_padding_bytes": server.FILE_MAX_BYTES,
+        })
+        first_line = (jdir / "stdout.log").read_bytes().splitlines()[0]
+        self.assertGreater(len(first_line), server.FILE_MAX_BYTES)
+        self.assertLess(len(first_line), server.CMD_MAX_BYTES)
+        self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_resume_loads_only_after_capability_and_ignores_replay(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "replay_chunks": ['{"status":"error","summary":"replayed"}'],
+            "chunks": ['{"status":"ok","sha":null,"pr_url":null,"summary":"current"}'],
+        }, resume=True)
+        requests = capture["requests"]
+        self.assertEqual([r["method"] for r in requests], [
+            "initialize", "authenticate", "session/load", "session/prompt",
+        ])
+        self.assertEqual(requests[2]["params"], {
+            "sessionId": "grok-123", "cwd": str(Path(saved["cwd"]).resolve()), "mcpServers": [],
+        })
+        self.assertEqual(saved["receipt"]["summary"], "current")
+        changed, _, _ = self._run_grok_fixture({
+            "load_result": {"sessionId": "grok-other"},
+        }, resume=True)
+        self.assertEqual(changed["status"], "failed")
+        self.assertIn("changed during load", changed["receipt"]["summary"])
+
+    def test_grok_acp_uses_cached_auth_without_api_key(self):
+        saved, capture, _ = self._run_grok_fixture(api_key=False)
+        auth = next(r for r in capture["requests"] if r["method"] == "authenticate")
+        self.assertEqual(auth["params"]["methodId"], "cached_token")
+        self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_allows_omitted_auth_methods_without_authenticate(self):
+        saved, capture, _ = self._run_grok_fixture({"omit_auth_methods": True})
+        self.assertEqual(saved["status"], "completed")
+        self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_rejects_malformed_auth_methods(self):
+        malformed = [
+            False,
+            {},
+            "xai.api_key",
+            [False],
+            [{}],
+            [{"id": ""}],
+            [{"id": "   "}],
+            [{"id": 7}],
+            [{"id": "xai.api_key"}, {"id": "xai.api_key"}],
+        ]
+        for auth_methods in malformed:
+            with self.subTest(auth_methods=auth_methods):
+                saved, capture, _ = self._run_grok_fixture({"auth_methods": auth_methods})
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(
+                    saved["receipt"]["summary"],
+                    "malformed Grok ACP authentication methods",
+                )
+                self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_rejects_selected_terminal_or_unknown_authentication(self):
+        for method_type in ("terminal", "future-method"):
+            with self.subTest(method_type=method_type):
+                saved, capture, _ = self._run_grok_fixture({
+                    "auth_methods": [{"id": "xai.api_key", "type": method_type}],
+                })
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(
+                    saved["receipt"]["summary"],
+                    "unsupported Grok ACP authentication",
+                )
+                self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_rejects_boolean_response_id_for_integer_request(self):
+        saved, _, _ = self._run_grok_fixture({
+            "response_id_method": "initialize", "response_id": True,
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
+
+    def test_grok_acp_rejects_non_text_agent_message_chunk(self):
+        saved, _, _ = self._run_grok_fixture({"chunk_content_type": "image"})
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("malformed Grok agent message chunk", saved["receipt"]["summary"])
+
+    def test_grok_acp_fail_closed_fixtures(self):
+        cases = {
+            "nonzero": ({"exit_method": "session/prompt"}, "process exited"),
+            "jsonrpc_error": ({"error_method": "session/prompt"}, "session/prompt error"),
+            "prose_only": ({"chunks": ["I finished the task"]}, "missing or invalid final receipt"),
+            "status_only_receipt": ({"chunks": ['{"status":"ok"}']}, "missing or invalid final receipt"),
+            "wrong_type_receipt": ({"chunks": ['{"status":"ok","sha":7,"pr_url":null,"summary":"done"}']}, "missing or invalid final receipt"),
+            "non_string_pr_url_receipt": ({"chunks": ['{"status":"ok","sha":null,"pr_url":7,"summary":"done"}']}, "missing or invalid final receipt"),
+            "non_string_summary_receipt": ({"chunks": ['{"status":"ok","sha":null,"pr_url":null,"summary":7}']}, "missing or invalid final receipt"),
+            "blank_summary_receipt": ({"chunks": ['{"status":"ok","sha":null,"pr_url":null,"summary":"   "}']}, "missing or invalid final receipt"),
+            "extra_field_receipt": ({"chunks": ['{"status":"ok","sha":null,"pr_url":null,"summary":"done","extra":true}']}, "missing or invalid final receipt"),
+            "malformed_wire": ({"malformed_method": "initialize"}, "malformed Grok ACP wire"),
+            "missing_result": ({"missing_result_method": "initialize"}, "invalid Grok ACP initialize response"),
+            "missing_protocol_version": ({"omit_protocol_version": True}, "unsupported Grok ACP protocol version"),
+            "unsupported_protocol_version": ({"protocol_version": 2}, "unsupported Grok ACP protocol version"),
+            "boolean_protocol_version": ({"protocol_version": True}, "unsupported Grok ACP protocol version"),
+            "missing_session": ({"missing_session": True}, "missing structured Grok session identity"),
+            "changed_session": ({"update_session_id": "grok-other"}, "malformed or changed Grok session update"),
+            "foreign_update": ({"foreign_update": True}, "malformed or changed Grok session update"),
+            "malformed_update": ({"malformed_update": True}, "malformed or changed Grok session update"),
+            "invalid_update_envelope": ({"invalid_update_envelope": True}, "malformed Grok session update"),
+            "untyped_update": ({"untyped_update": True}, "malformed or changed Grok session update"),
+            "non_end_turn": ({"stop_reason": "cancelled"}, "did not end_turn"),
+            "unsupported_auth": ({"auth_methods": [{"id": "other"}]}, "unsupported Grok ACP authentication"),
+        }
+        for name, (fixture, summary) in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture(fixture)
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["status"], "error")
+                self.assertIn(summary, saved["receipt"]["summary"])
+                if name in {
+                    "malformed_wire", "missing_result", "missing_protocol_version",
+                    "unsupported_protocol_version", "boolean_protocol_version", "unsupported_auth",
+                }:
+                    self.assertNotIn("session/prompt", [r["method"] for r in capture["requests"]])
+                if name in {
+                    "status_only_receipt", "wrong_type_receipt", "non_string_pr_url_receipt",
+                    "non_string_summary_receipt", "blank_summary_receipt", "extra_field_receipt",
+                }:
+                    self.assertIsNone(saved["session_identity"]["native_session_id"])
+
+    def test_grok_acp_rejects_nonzero_exit_after_valid_prompt_result(self):
+        saved, _, _ = self._run_grok_fixture({"exit_after_method": "session/prompt", "exit_code": 7})
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["returncode"], 7)
+        self.assertIn("exited 7", saved["receipt"]["summary"])
+
+    def test_grok_acp_protocol_error_preserves_summary_and_child_exit(self):
+        saved, _, _ = self._run_grok_fixture({
+            "error_method": "session/prompt",
+            "exit_after_method": "session/prompt",
+            "exit_code": 7,
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["returncode"], 7)
+        self.assertEqual(saved["receipt"]["summary"], "Grok ACP session/prompt error")
+
+    def test_grok_acp_bounds_stderr_log(self):
+        saved, _, jdir = self._run_grok_fixture({"stderr_bytes": server.FILE_MAX_BYTES * 2})
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual((jdir / "stderr.log").stat().st_size, server.FILE_MAX_BYTES)
+
+    def test_grok_acp_bounds_failed_stderr_and_preserves_protocol_summary(self):
+        saved, _, jdir = self._run_grok_fixture({
+            "stderr_bytes": server.FILE_MAX_BYTES * 2,
+            "error_method": "session/prompt",
+        })
+        stderr = (jdir / "stderr.log").read_bytes()
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["receipt"]["summary"], "Grok ACP session/prompt error")
+        self.assertEqual(len(stderr), server.FILE_MAX_BYTES)
+        self.assertTrue(stderr.endswith(b"Grok ACP session/prompt error\n"))
+
+    def test_grok_acp_timeout_fails_closed_and_cleans_up(self):
+        saved, capture, _ = self._run_grok_fixture({"budget": 1, "sleep": 1.2})
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["receipt"]["status"], "timeout")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(capture["pid"], 0)
+
+    def test_grok_acp_cleanup_timeout_fails_valid_turn_and_kills_child(self):
+        saved, capture, _ = self._run_grok_fixture({"hang_after_method": "session/prompt"})
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["receipt"]["status"], "timeout")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(capture["pid"], 0)
+
+    def test_grok_acp_deadline_bounds_blocked_prompt_write(self):
+        saved, capture, _ = self._run_grok_fixture(
+            {"budget": 1, "stop_reading_after": 3},
+            prompt="x" * server.PROMPT_MAX_CHARS,
+        )
+        self.assertEqual(saved["receipt"]["status"], "timeout")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(capture["pid"], 0)
+
+    def test_grok_resume_requires_load_capability(self):
+        saved, capture, _ = self._run_grok_fixture({"load_session": False}, resume=True)
+        self.assertEqual(saved["status"], "failed")
+        self.assertNotIn("session/load", [r["method"] for r in capture["requests"]])
 
     def test_hermes_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
@@ -1057,12 +1528,14 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("response_webhook_token", props)
         self.assertIn("session_identity", props)
         self.assertIn("resume_job_id", props)
+        self.assertEqual(set(props["launcher"]["enum"]), {"hermes", "claude", "codex", "grok"})
+        self.assertEqual(set(props["provider"]["enum"]), {"openai", "anthropic", "xai"})
         identity = spec["components"]["schemas"]["SessionIdentity"]["properties"]
-        self.assertEqual(set(identity["launcher"]["enum"]), {"codex", "claude"})
-        self.assertEqual(set(identity["provider"]["enum"]), {"openai", "anthropic"})
+        self.assertEqual(set(identity["launcher"]["enum"]), {"codex", "claude", "grok"})
+        self.assertEqual(set(identity["provider"]["enum"]), {"openai", "anthropic", "xai"})
         self.assertEqual(
             set(identity["model"]["enum"]),
-            {"gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5"},
+            {"gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"},
         )
         self.assertIn("/v1/git/status", spec["paths"])
         self.assertIn("/v1/git/checkout", spec["paths"])
