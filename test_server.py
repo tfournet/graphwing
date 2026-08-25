@@ -1245,6 +1245,21 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(seen["secret"], "shh")
         self.assertEqual(seen["body"], {"input": {"repo": "riftwing"}})
 
+    def test_pr_merge_field_is_not_called_method(self):
+        # The connector treats a config field named `method` as the HTTP verb,
+        # the same way it treats `path` as the URL path. The graph sent
+        # method: "squash" and Rewst issued `SQUASH /v1/gh/pr/merge`, which the
+        # server answered 501. Third reserved name found this way.
+        spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
+        props = spec["components"]["schemas"]["GhPrMergeRequest"]["properties"]
+        self.assertNotIn("method", props, "`method` is reserved by the connector")
+        self.assertIn("merge_method", props)
+
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        merge_cfg = {n["id"]: n for n in graph["spec"]["nodes"]}["merge"]["config"]
+        self.assertNotIn("method", merge_cfg)
+        self.assertEqual(merge_cfg.get("merge_method"), "squash")
+
     def test_pr_merge_reads_the_real_gh_shapes(self):
         # The first version of this endpoint read all_green out of
         # checks["data"], where annotate_pr_checks does not put it, so every

@@ -283,7 +283,7 @@
           "number": "{{ CTX.INPUT.pr_number }}",
           "auto_merge": "{{ CTX.INPUT.auto_merge }}",
           "run_id": "{{ CTX.RUN.id }}",
-          "method": "squash"
+          "merge_method": "squash"
         }
       },
       {

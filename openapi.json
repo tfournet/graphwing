@@ -1132,7 +1132,7 @@
           "number": { "type": "string" },
           "auto_merge": { "type": "boolean", "description": "Off unless this run was started with auto-merge" },
           "run_id": { "type": "string", "description": "Merge is only reachable from inside a run" },
-          "method": { "type": "string", "enum": ["squash", "merge", "rebase"] }
+          "merge_method": { "type": "string", "enum": ["squash", "merge", "rebase"], "description": "Not named `method`: the connector reads that as the HTTP verb." }
         }
       },
       "PrContinueRequest": {

@@ -1380,7 +1380,10 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     number = str(data.get("number") or data.get("pr") or "").strip()
     if not number:
         return 400, {"error": "number is required", "code": "missing_number"}
-    how = str(data.get("method") or "squash").strip()
+    # Not `method`: the connector reads a field of that name as the HTTP verb,
+    # so the graph's method: "squash" made Rewst issue `SQUASH /v1/gh/pr/merge`.
+    # Same trap as `path` being read as the URL path.
+    how = str(data.get("merge_method") or data.get("method") or "squash").strip()
     if how not in {"squash", "merge", "rebase"}:
         return 400, {"error": "method must be squash, merge, or rebase", "code": "bad_method"}
 
