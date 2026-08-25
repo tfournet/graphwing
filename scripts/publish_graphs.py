@@ -173,6 +173,7 @@ def resolve_stems(only: str) -> list[str]:
             "verify-stack",
             "implement-slice",
             "visual-evidence",
+            "visual-iteration",
             "pr-drive",
             "pr-status",
             "pre-pr-build",
@@ -228,6 +229,7 @@ def persist_published(install: dict, published: dict[str, dict]) -> None:
         "verify-stack": "verify_stack",
         "implement-slice": "implement_slice",
         "visual-evidence": "visual_evidence",
+        "visual-iteration": "visual_iteration",
         "pre-pr-build": "pre_pr_build",
         "build-completion-supervisor": "build_completion_supervisor",
     }

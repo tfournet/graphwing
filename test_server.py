@@ -8313,5 +8313,437 @@ class VisualEvidenceTests(unittest.TestCase):
         self.assertEqual(graph["canary"]["issue"], "https://github.com/tfournet/graphwing/issues/52")
 
 
+class VisualIterationTests(VisualEvidenceTests):
+    """One design turn resumes the writer and returns proof to planning."""
+
+    def _iteration_ready(self, turns=0):
+        self._visual_create()
+        doc = self._read_doc()
+        doc["writer_session"] = "gwslice-" + "a" * 32
+        change_id = server.build_change_id(self.repo, self.head)
+        doc["evidence_rounds"] = [{
+            "round": 1,
+            "status": "published",
+            "head": self.head,
+            "change_id": change_id,
+            "human_review": True,
+            "preview": {
+                "preview_id": "preview-one",
+                "stack": "preview-52",
+                "url": "http://127.0.0.1:4173/settings/billing",
+            },
+            "inspection": {"ok": True},
+            "review": {"reviewer": "sonnet", "findings": False, "summary": "clear"},
+            "published": {
+                "comment_url": "https://github.com/tfournet/graphwing/issues/52#issuecomment-123",
+                "uploads": [{
+                    "number": 1,
+                    "role": "candidate",
+                    "viewport": "desktop",
+                    "artifact_id": "b" * 32,
+                    "url": "https://github.com/tfournet/graphwing/assets/1",
+                }],
+            },
+        }]
+        doc["iteration"] = {
+            "state": "iterating",
+            "turns": [
+                {
+                    "turn": number,
+                    "source": "human",
+                    "status": "closed",
+                    "notes": f"prior {number}",
+                    "notes_digest": str(number),
+                    "decision": "reframe",
+                }
+                for number in range(1, turns + 1)
+            ],
+            "decisions": [],
+            "splits": [],
+            "returns": [],
+        }
+        self._write_doc(doc)
+        return change_id
+
+    def _iteration_post(self, operation, event_id, **body):
+        body.update(event_id=event_id, holder="planning-run")
+        return self._post_build(f"iteration/{operation}", **body)
+
+    def _claim(self, event_id="claim-initial", holder="rewst-run-1", kind="initial", **over):
+        return BuildStateTests._claim(self, event_id, holder, kind, **over)
+
+    def test_exact_feedback_replays_and_conflicting_reuse_changes_no_files(self):
+        self._iteration_ready()
+        notes = "Make the Save button 2px shorter.  Keep  this spacing.\n"
+        before = self._git("status", "--porcelain=v1")
+        first = self._iteration_post("feedback", "feedback-1", notes=notes, round=1)
+        self.assertEqual(first[0], 200, first[1])
+        self.assertEqual(first[1]["notes"], notes)
+        self.assertEqual(self._read_doc()["iteration"]["turns"][-1]["notes"], notes)
+        replay = self._iteration_post("feedback", "feedback-1", notes=notes, round=1)
+        self.assertEqual(replay[0], 200, replay[1])
+        self.assertTrue(replay[1]["replayed"])
+        conflict = self._iteration_post(
+            "feedback", "feedback-1", notes="Different words", round=1
+        )
+        self.assertEqual(conflict[0], 409, conflict[1])
+        self.assertEqual(conflict[1]["code"], "idempotency_conflict")
+        self.assertEqual(self._git("status", "--porcelain=v1"), before)
+
+    def test_stale_and_second_feedback_are_refused_without_a_writer_claim(self):
+        self._iteration_ready()
+        stale = self._iteration_post("feedback", "feedback-old", notes="Old", round=2)
+        self.assertEqual(stale[0], 409, stale[1])
+        self.assertEqual(stale[1]["code"], "stale_feedback")
+        self.assertTrue(stale[1]["files_unchanged"])
+        self.assertEqual(
+            self._iteration_post("feedback", "feedback-open", notes="First", round=1)[0],
+            200,
+        )
+        duplicate = self._iteration_post(
+            "feedback", "feedback-duplicate", notes="First", round=1
+        )
+        conflict = self._iteration_post(
+            "feedback", "feedback-conflict", notes="Second", round=1
+        )
+        self.assertEqual(duplicate[1]["code"], "duplicate_feedback")
+        self.assertEqual(conflict[1]["code"], "feedback_conflict")
+        self.assertIsNone(self._read_doc().get("writer_claim"))
+
+    def test_design_claim_and_brief_resume_the_same_writer_without_strikes(self):
+        self._iteration_ready()
+        notes = "Tighten the card and keep the current labels."
+        self.assertEqual(
+            self._iteration_post("feedback", "feedback-resume", notes=notes, round=1)[0],
+            200,
+        )
+        session = self._read_doc()["writer_session"]
+        claim = self._claim("claim-design", holder="planning-run", kind="design")
+        self.assertEqual(claim[0], 200, claim[1])
+        self.assertEqual(claim[1]["claim"]["writer_session"], session)
+        brief = self._post_build("brief")
+        self.assertEqual(brief[0], 200, brief[1])
+        self.assertTrue(brief[1]["resume"])
+        self.assertEqual(brief[1]["hermes_session"], session)
+        self.assertIn(notes, brief[1]["prompt"])
+        self.assertEqual(claim[1]["receipt"]["strikes"], {"test": 0, "reviewer": 0, "retry": 0})
+        self.assertTrue(claim[1]["receipt"]["strike_free"])
+
+    def test_turn_requires_checks_round_review_screenshots_comment_and_exact_pane_report(self):
+        change_id = self._iteration_ready()
+        doc = self._read_doc()
+        turn = {
+            "turn": 1,
+            "source": "human",
+            "status": "written",
+            "notes": "Reduce the card padding",
+            "notes_digest": "digest",
+            "writer_session": doc["writer_session"],
+            "writer_result": {"summary": "Reduced card padding"},
+            "change_id": change_id,
+        }
+        doc["iteration"]["turns"] = [turn]
+        self._write_doc(doc)
+        self.assertEqual(server.build_iteration_step(doc, change_id)[0], "checks")
+        doc["checks"] = {"fast": {
+            "ok": True,
+            "change_id": change_id,
+            "required": ["changed-area", "typecheck"],
+            "changed_paths": ["ui/card.tsx"],
+            "verdicts": {
+                "changed-area": {"ok": True, "coverage": True},
+                "typecheck": {"ok": True, "coverage": True},
+            },
+        }}
+        rnd = doc["evidence_rounds"][-1]
+        rnd["status"] = "superseded"
+        self.assertEqual(server.build_iteration_step(doc, change_id)[0], "round")
+        rnd["change_id"] = change_id
+        rnd["status"] = "published"
+        report = server.build_iteration_report_text(doc, turn, rnd)
+        for text in (
+            "Open: <http://127.0.0.1:4173/settings/billing>",
+            "How to get there:",
+            "Reduce the card padding",
+            "changed\\-area, typecheck",
+            "Automated UI review",
+            "Screenshots:",
+            "Evidence comment:",
+        ):
+            self.assertIn(text, report)
+        self.assertEqual(self._contract()["planning_pane"], "w1:p3")
+
+    def test_generic_fast_receipt_cannot_advance_a_design_candidate(self):
+        change_id = self._iteration_ready()
+        doc = self._read_doc()
+        doc["iteration"]["turns"] = [{
+            "turn": 1, "source": "human", "status": "written", "notes": "Adjust spacing",
+            "writer_session": doc["writer_session"], "change_id": change_id,
+        }]
+        # This is deliberately green but has only generic/unit proof.  It must
+        # not stand in for the two design-turn proofs, regardless of a happy
+        # generic fast receipt.
+        doc["checks"] = {"fast": {
+            "ok": True, "change_id": change_id, "required": ["unit"],
+            "verdicts": {"unit": {"ok": True, "coverage": True}},
+        }}
+        doc["evidence_rounds"][-1]["prompted_at"] = server.utcnow()
+        self._write_doc(doc)
+        step, reason = server.build_iteration_step(doc, change_id)
+        self.assertEqual(step, "checks")
+        self.assertIn("changed-area tests and typecheck", reason)
+        refused_report = self._iteration_post("report", "generic-report")
+        self.assertEqual(refused_report[0], 409, refused_report[1])
+        self.assertEqual(refused_report[1]["code"], "report_not_due")
+        doc = self._read_doc()
+        doc["iteration"]["turns"][-1]["status"] = "reported"
+        self._write_doc(doc)
+        refused_ready = self._iteration_post("decision", "generic-ready", decision="design_ready")
+        self.assertEqual(refused_ready[0], 409, refused_ready[1])
+        self.assertEqual(refused_ready[1]["code"], "not_design_ready")
+        self.assertIn("changed-area tests and typecheck", refused_ready[1]["error"])
+
+    def test_later_round_refuses_before_capture_and_graph_bypasses_it(self):
+        change_id = self._iteration_ready()
+        doc = self._read_doc()
+        second = server.build_visual_round_start(doc, {"head": self.head, "change_id": change_id})
+        self.assertEqual(second["round"], 2)
+        self.assertEqual(second["supersedes"], 1)
+        with mock.patch.object(server, "run_cmd") as browser:
+            status, payload = server.build_visual_scenario_result(
+                {"doc": doc, "change_id": change_id}, "before", None, {"scratch": str(self.repo)}
+            )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "role_not_required")
+        browser.assert_not_called()
+        self.assertEqual(second["captures"], [])
+        graph = json.loads((Path(server.__file__).resolve().parent / "graphs" / "visual-evidence.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["before_required"]["config"]["rules"][0]["value"], 1)
+        targets = {(edge["source"], edge["sourceHandle"]): edge["target"] for edge in graph["spec"]["edges"]}
+        self.assertEqual(targets[("before_required", "pass")], "wait_before")
+        self.assertEqual(targets[("before_required", "fail")], "join_candidate_capture")
+        self.assertEqual(targets[("before_ok", "pass")], "join_candidate_capture")
+        self.assertEqual(targets[("join_candidate_capture", "out")], "wait_candidate")
+
+    def test_feedback_graph_refuses_missing_round_before_feedback_api(self):
+        graph = json.loads((Path(server.__file__).resolve().parent / "graphs" / "visual-iteration.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["feedback_round_required"]["type"], "logic.filter")
+        rule = nodes["feedback_round_required"]["config"]["rules"][0]
+        self.assertEqual((rule["path"], rule["op"], rule["value"]), ("CTX.INPUT.round", "greater_than", 0))
+        targets = {(edge["source"], edge["sourceHandle"]): edge["target"] for edge in graph["spec"]["edges"]}
+        self.assertEqual(targets[("input_switch", "case-feedback")], "feedback_round_required")
+        self.assertEqual(targets[("feedback_round_required", "pass")], "feedback")
+        self.assertEqual(targets[("feedback_round_required", "fail")], "join_fail")
+        # The API remains authoritative as well: no round reaches neither a
+        # writer claim nor a feedback turn.
+        self._iteration_ready()
+        result = self._iteration_post("feedback", "missing-round", notes="No identity")
+        self.assertEqual(result[0], 400, result[1])
+        self.assertEqual(result[1]["code"], "missing_round")
+        self.assertIsNone(self._read_doc().get("writer_claim"))
+
+    def test_return_reframe_or_split_cannot_resurrect_pre_return_candidate(self):
+        for decision in ("reframe", "split"):
+            with self.subTest(decision=decision):
+                self.tearDown()
+                self.setUp()
+                change_id = self._iteration_ready()
+                doc = self._read_doc()
+                doc["checks"] = {"fast": {
+                    "ok": True, "change_id": change_id,
+                    "required": ["changed-area", "typecheck"],
+                    "verdicts": {
+                        "changed-area": {"ok": True, "coverage": True},
+                        "typecheck": {"ok": True, "coverage": True},
+                    },
+                }}
+                doc["evidence_rounds"][-1]["prompted_at"] = server.utcnow()
+                self._write_doc(doc)
+                self.assertEqual(
+                    self._iteration_post("decision", "ready-before-return", decision="design_ready")[0], 200
+                )
+                returned = self._iteration_post(
+                    "return", "return-before-reframe", finding="Visible final-gate defect", gate="final-review"
+                )
+                self.assertEqual(returned[0], 200, returned[1])
+                body = {"decision": decision}
+                if decision == "split":
+                    body["note"] = "Follow up in a separate issue"
+                reframed = self._iteration_post(f"decision", f"{decision}-after-return", **body)
+                self.assertEqual(reframed[0], 200, reframed[1])
+                refused = self._iteration_post("decision", f"ready-after-{decision}", decision="design_ready")
+                self.assertEqual(refused[0], 409, refused[1])
+                self.assertEqual(refused[1]["code"], "return_requires_new_candidate")
+                persisted = self._read_doc()
+                self.assertEqual(persisted["iteration"]["returned_candidate_change_id"], change_id)
+                self.assertIsNone(persisted["iteration"]["returned_candidate_writer_change_id"])
+                gaps = server.build_visual_human_path_gaps(persisted, change_id)
+                self.assertTrue(gaps)
+                self.assertIn("new writer-produced candidate", gaps[0])
+
+    def test_turn_20_is_one_checkpoint_and_turn_21_has_no_ceiling(self):
+        change_id = self._iteration_ready(turns=19)
+        opened = self._iteration_post("feedback", "feedback-20", notes="One more turn", round=1)
+        self.assertEqual(opened[0], 200, opened[1])
+        self.assertEqual(opened[1]["turn"], 20)
+        self.assertTrue(opened[1]["checkpoint"])
+        self.assertEqual(server.build_iteration_step(self._read_doc(), change_id)[0], "checkpoint")
+        continued = self._iteration_post("decision", "continue-20", decision="continue")
+        self.assertEqual(continued[0], 200, continued[1])
+        doc = self._read_doc()
+        self.assertFalse(server.build_iteration_checkpoint_due(doc))
+        doc["iteration"]["turns"][-1]["status"] = "closed"
+        doc["evidence_rounds"][-1].pop("feedback", None)
+        self._write_doc(doc)
+        turn_21 = self._iteration_post("feedback", "feedback-21", notes="Past twenty", round=1)
+        self.assertEqual(turn_21[0], 200, turn_21[1])
+        self.assertEqual(turn_21[1]["turn"], 21)
+        self.assertFalse(turn_21[1]["checkpoint"])
+        public = server.build_iteration_public(self._read_doc())
+        self.assertIsNone(public["turn_ceiling"])
+
+    def test_decisions_have_distinct_states_and_split_history(self):
+        expected = {
+            "reframe": "reframed",
+            "split": "split",
+            "park": "parked",
+            "stop": "stopped",
+        }
+        for decision, state in expected.items():
+            with self.subTest(decision=decision):
+                self.tearDown()
+                self.setUp()
+                self._iteration_ready()
+                self.assertEqual(
+                    self._iteration_post(
+                        "feedback", f"feedback-{decision}", notes="Change it", round=1
+                    )[0],
+                    200,
+                )
+                body = {"decision": decision}
+                if decision == "split":
+                    body["note"] = "Move the table to issue #53"
+                result = self._iteration_post("decision", f"decision-{decision}", **body)
+                self.assertEqual(result[0], 409 if decision in ("park", "stop") else 200, result[1])
+                doc = self._read_doc()
+                self.assertEqual(doc["iteration"]["state"], state)
+                self.assertEqual(doc["iteration"]["decisions"][-1]["decision"], decision)
+                if decision == "split":
+                    self.assertEqual(doc["iteration"]["splits"][-1]["note"], body["note"])
+
+    def test_design_ready_and_final_gate_return_are_durable_and_block_commit(self):
+        change_id = self._iteration_ready()
+        doc = self._read_doc()
+        doc["checks"] = {"fast": {
+            "ok": True,
+            "change_id": change_id,
+            "required": ["changed-area", "typecheck"],
+            "verdicts": {
+                "changed-area": {"ok": True, "coverage": True},
+                "typecheck": {"ok": True, "coverage": True},
+            },
+        }}
+        doc["evidence_rounds"][-1]["prompted_at"] = server.utcnow()
+        self._write_doc(doc)
+        ready = self._iteration_post("decision", "design-ready", decision="design_ready")
+        self.assertEqual(ready[0], 200, ready[1])
+        self.assertEqual(ready[1]["state"], "design_ready")
+        self.assertEqual(ready[1]["gate"], "review")
+        returned = self._iteration_post(
+            "return",
+            "visible-return",
+            finding="The final gate needs a visible focus-ring fix",
+            gate="final-review",
+        )
+        self.assertEqual(returned[0], 200, returned[1])
+        self.assertEqual(returned[1]["to"], "evidence")
+        self.assertIn("human path", returned[1]["commit_blocked_until"])
+        doc = self._read_doc()
+        self.assertEqual(doc["iteration"]["returns"][-1]["gate"], "final-review")
+        self.assertIsNone(doc["iteration"]["design_ready"])
+        self.assertTrue(server.build_visual_human_path_gaps(doc, change_id))
+
+    def test_iteration_composes_with_sensitive_route_and_keeps_stack_history(self):
+        self._iteration_ready()
+        doc = self._read_doc()
+        self.assertEqual(doc["route"]["class"], "visual")
+        doc["route"]["class"] = "sensitive"
+        doc["route"]["model"] = "opus"
+        doc["stacks"] = ["preview-52"]
+        self._write_doc(doc)
+        result = self._iteration_post("feedback", "sensitive-feedback", notes="Adjust contrast", round=1)
+        self.assertEqual(result[0], 200, result[1])
+        self.assertEqual(self._read_doc()["route"]["class"], "sensitive")
+        self.assertEqual(self._read_doc()["stacks"], ["preview-52"])
+        self.assertEqual(len(self._read_doc()["evidence_rounds"]), 1)
+
+    def test_openapi_graph_publisher_install_catalog_readme_and_ticket_are_complete(self):
+        root = Path(server.__file__).resolve().parent
+        spec = json.loads((root / "openapi.json").read_text())
+        operations = {
+            "/v1/build/iteration/next": ("get", "buildIterationNext", None),
+            "/v1/build/iteration/feedback": ("post", "buildIterationFeedback", "BuildIterationFeedbackRequest"),
+            "/v1/build/iteration/report": ("post", "buildIterationReport", "BuildIterationEventRequest"),
+            "/v1/build/iteration/decision": ("post", "buildIterationDecision", "BuildIterationDecisionRequest"),
+            "/v1/build/iteration/return": ("post", "buildIterationReturn", "BuildIterationReturnRequest"),
+        }
+        for route, (method, operation_id, schema_name) in operations.items():
+            op = spec["paths"][route][method]
+            self.assertEqual(op["operationId"], operation_id)
+            if schema_name:
+                ref = op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                self.assertEqual(ref, f"#/components/schemas/{schema_name}")
+                self.assertFalse(spec["components"]["schemas"][schema_name]["additionalProperties"])
+        graph = json.loads((root / "graphs" / "visual-iteration.json").read_text())
+        self.assertEqual(graph["slug"], "graphwing-visual-iteration")
+        graph_text = json.dumps(graph).lower()
+        for text in ("github", "changed-area", "typecheck", "planning", "design_ready", "final_gates"):
+            self.assertIn(text, graph_text)
+        self.assertNotIn("shortcut", graph_text)
+        self.assertNotIn("strike", graph_text)
+        ticket = (root / "slices" / "issue-52-pre-pr-build" / "04-visual-iteration.md").read_text().lower()
+        self.assertIn("github issue #52", ticket)
+        self.assertIn("ticket-03", ticket)
+        self.assertNotIn("shortcut", ticket)
+        self.assertIn("visual-iteration", (root / "scripts" / "publish_graphs.py").read_text())
+        self.assertIn("graphs/visual-iteration.json", (root / "install.py").read_text())
+        self.assertIn("graphwing-visual-iteration", (root / "README.md").read_text())
+        self.assertIn("visual_iteration", (root / "server.py").read_text())
+
+    def test_visual_iteration_graph_is_acyclic_bounded_per_turn_and_has_canary(self):
+        graph = json.loads(
+            (Path(server.__file__).resolve().parent / "graphs" / "visual-iteration.json").read_text()
+        )
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        incoming = {name: [] for name in nodes}
+        outgoing = {name: [] for name in nodes}
+        for edge in edges:
+            incoming[edge["target"]].append(edge["source"])
+            outgoing[edge["source"]].append(edge["target"])
+        indegree = {name: len(sources) for name, sources in incoming.items()}
+        queue = [name for name, degree in indegree.items() if degree == 0]
+        seen = []
+        while queue:
+            name = queue.pop()
+            seen.append(name)
+            for target in outgoing[name]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    queue.append(target)
+        self.assertEqual(len(seen), len(nodes))
+        for node_id, sources in incoming.items():
+            if len(sources) > 1:
+                self.assertEqual(nodes[node_id]["type"], "logic.join.any", node_id)
+        text = json.dumps(graph)
+        self.assertNotIn("/v1/git/commit", text)
+        self.assertNotIn("/v1/git/push", text)
+        self.assertNotIn("/v1/build/finalize", text)
+        self.assertEqual(graph["canary"]["issue"], "https://github.com/tfournet/graphwing/issues/52")
+        self.assertEqual(graph["canary"]["turn"], 21)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -246,11 +246,11 @@ BUILD_SENSITIVE_REVIEWER = {
 # `opus` and `claude-opus-5` are the same declaration.
 BUILD_SENSITIVE_WRITER_ALIAS = "opus"
 BUILD_SENSITIVE_WRITER_VENDOR = "anthropic"
-# The two ways a writer is launched, and the two things a reservation can be
-# taken for. `initial` opens the session, `correction` resumes the one already
-# recorded. Both charge a job before the agent exists, so a run that dies
-# between the claim and the launch has already paid for the turn it started.
-BUILD_CLAIM_KINDS = ("initial", "correction")
+# A design turn, like a correction, resumes the recorded writer session. It is
+# visual feedback rather than a failure and therefore is not a strike; all three
+# claim kinds still charge a job before an agent is launched.
+BUILD_CLAIM_KINDS = ("initial", "correction", "design")
+
 # A story branch is never one of these. A build that finds itself on trunk is
 # about to commit and push straight to it, which is the one outcome the whole
 # pre-PR path exists to prevent.
@@ -370,6 +370,57 @@ BUILD_ARTIFACT_GRANT_TOKENS: dict[tuple[str, str], str] = {}
 # issues, and the comment is posted by Rewst's own GitHub integration — the
 # laptop never holds a GitHub token, an upload capability, or a callback URL.
 BUILD_ISSUE_RE = re.compile(r"^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)$")
+# One design turn, step by step. Read off the durable document exactly like the
+# mechanical and visual steps: a run that died after its writer finished comes
+# back and is told `checks`, not `write`.
+BUILD_ITERATION_STEPS = (
+    "feedback",
+    "checkpoint",
+    "write",
+    "checks",
+    "round",
+    "report",
+    "decision",
+    "final_gates",
+    "done",
+    "parked",
+)
+# What a turn can be. `open` is notes with no writer result yet, `written` is a
+# candidate on disk, `reported` is a candidate the planning session has seen.
+# Only a decision closes one.
+BUILD_ITERATION_TURN_STATUSES = ("open", "written", "reported", "closed")
+BUILD_ITERATION_OPEN_STATUSES = frozenset({"open", "written", "reported"})
+# The six answers a planning session can give, each with its own durable state.
+# `continue` exists only to answer the checkpoint; the other five close a turn.
+BUILD_ITERATION_DECISIONS = ("continue", "design_ready", "reframe", "split", "park", "stop")
+BUILD_ITERATION_STATES = (
+    "iterating", "reframed", "split", "design_ready", "parked", "stopped",
+)
+# Which park reason each ending writes. Distinct on purpose: "the user parked
+# the design" and "the user stopped the design" are different answers, and a
+# shared reason would make the receipts indistinguishable a week later.
+BUILD_ITERATION_PARK_REASONS = {"park": "design_parked", "stop": "design_stopped"}
+# Advisory, not a ceiling. Turn 20 pauses for a decision because twenty rounds
+# of visual feedback with no one asking "is this still the same change?" is how
+# a slice becomes an epic. Once answered it never fires again: the story asks
+# for a checkpoint, not a limit, and re-arming it at 40 would be a limit worn
+# as a question.
+BUILD_ITERATION_CHECKPOINT_TURN = 20
+BUILD_ITERATION_TURNS_SHOWN = 8
+# Notes are stored exactly as typed, so an overlong note is refused rather than
+# truncated. A truncated note is a different note, and the writer would be
+# resumed with instructions the user never finished giving.
+BUILD_ITERATION_NOTES_MAX = 2000
+# Where a turn's notes came from. `human` is the planning session; `final_gate`
+# is a late check whose fix can change what the page looks like, which the
+# story says returns here rather than being quietly patched at the gate.
+BUILD_ITERATION_SOURCES = ("human", "final_gate")
+BUILD_ITERATION_SPLITS_MAX = 32
+# The claim kind a design turn reserves the writer under. Named rather than
+# spelled inline because it is the one value that decides which path an op is
+# on: `initial` and `correction` stay mechanical, `design` runs on a build that
+# declared visual proof whatever class it was routed as.
+BUILD_DESIGN_CLAIM_KIND = "design"
 SECRET_KEY_PARTS = frozenset(
     {
         "secret", "secrets", "token", "tokens", "password", "passwd", "pass",
@@ -760,7 +811,10 @@ def list_install_run_stubs(limit: int) -> list[dict[str, Any]]:
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
-    for key in ("implement_slice", "visual_evidence", "pr_drive", "pr_status", "verify_stack"):
+    for key in (
+        "implement_slice", "visual_evidence", "visual_iteration", "pr_drive", "pr_status",
+        "verify_stack",
+    ):
         item = install.get(key)
         if not isinstance(item, dict):
             continue
@@ -4398,6 +4452,10 @@ def build_public(doc: dict[str, Any]) -> dict[str, Any]:
         # list stays above as history: a superseded round is never removed, so
         # "which one is live" cannot be read off the length.
         "visual_round": build_visual_round_public(doc),
+        # The design conversation over those rounds: which turn is open, what
+        # the planning session last decided, and the three strike ledgers a
+        # design turn is not allowed to move. None until the first turn.
+        "iteration": build_iteration_public(doc),
         "budget": doc.get("budget"),
         "budget_left": build_budget_left(doc),
         "verified_boundary": doc.get("verified_boundary"),
@@ -5846,6 +5904,57 @@ def build_sensitive_route_gaps(doc: dict[str, Any]) -> list[str]:
             continue
         vendors[vendor] = named
     return gaps
+def build_open_writer(build_id: Any, kind: str) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Open a build for a writer turn, on the path that turn belongs to.
+
+    A design turn is the visual iteration's, so it runs on any build that
+    declared visual proof — a sensitive UI change writes with Opus and still
+    iterates on how the page looks. Every other kind stays on the mechanical
+    path, so a visual build still cannot run an `initial` or `correction` turn
+    and reach review without its evidence round.
+    """
+    if kind == BUILD_DESIGN_CLAIM_KIND:
+        return build_open_visual(build_id)
+    return build_open_mechanical(build_id)
+
+
+def build_current_claim_kind(build_id: Any) -> str:
+    """What kind of turn the current reservation is for, or "" when unreadable.
+
+    Read before the path is chosen, because which opener is correct is a
+    property of the reservation on disk rather than of anything the caller
+    sent. An unreadable build answers "" and takes the mechanical refusal,
+    which is the one that names the real problem.
+    """
+    doc, err = build_open(build_id)
+    if err or doc is None:
+        return ""
+    claim = build_claim(doc)
+    return str(claim.get("kind") or "") if isinstance(claim, dict) else ""
+
+
+def build_open_checks(build_id: Any) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Open a build for a deterministic check phase, on either path it runs on.
+
+    Checks are the one gate both paths share. A design turn reruns the
+    changed-area recipes for every candidate it produces, and refusing them
+    here because the build is routed visual would leave the only turn that
+    edits code during iteration with no way to be told it broke something.
+
+    Deliberately narrow: the visual build is admitted only at `evidence`, which
+    is where iteration happens. Anywhere else it takes the mechanical refusal,
+    so nothing here lets a visual build walk the mechanical path.
+    """
+    doc, err = build_open(build_id)
+    if err:
+        return None, err
+    assert doc is not None
+    if build_class(doc) == BUILD_MECHANICAL_CLASS:
+        return doc, None
+    if build_needs_visual(doc) and doc.get("stage") == "evidence":
+        return doc, None
+    return build_open_mechanical(build_id)
+
 
 
 def build_recipe_cwd(
@@ -7207,7 +7316,7 @@ def build_claim_request(data: dict[str, Any]) -> tuple[dict[str, Any] | None, di
     if kind not in BUILD_CLAIM_KINDS:
         return None, {
             "ok": False,
-            "error": "kind must be initial or correction",
+            "error": "kind must be initial, correction, or design",
             "code": "bad_claim_kind",
             "allowed": list(BUILD_CLAIM_KINDS),
         }
@@ -7250,7 +7359,7 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
     )
 
     with BUILD_LOCK:
-        doc, open_err = build_open_mechanical(data.get("build_id"))
+        doc, open_err = build_open_writer(data.get("build_id"), kind)
         if open_err:
             return open_err
         assert doc is not None
@@ -7293,9 +7402,14 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             # An unbounded correction loop has no floor: a reviewer that keeps
             # finding things resumes the writer forever and the only thing that
             # ends it is somebody noticing. Refuse the launch, not the build.
+            #
+            # A design turn has the same floor for a different reason. Its turn
+            # count is deliberately unbounded — the story says so — so the job
+            # budget is the only thing standing between "the user keeps asking
+            # for changes" and a laptop that writes code all night.
             out = build_public(doc)
             out["ok"] = False
-            out["error"] = "a mechanical build needs a finite budget.jobs_max before a writer is launched"
+            out["error"] = "a build needs a finite budget.jobs_max before a writer is launched"
             out["code"] = "no_job_budget"
             return 409, out
 
@@ -7308,8 +7422,16 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             out["code"] = "writer_claimed"
             return 409, out
 
-        step, reason = build_path_step(doc, change_id)
-        wanted = "preflight" if kind == "initial" else "fix"
+        if kind == BUILD_DESIGN_CLAIM_KIND:
+            # Design turns are governed by the visual-iteration state at the
+            # evidence stage. Every other turn remains on the shared
+            # mechanical/sensitive path so sensitive routing is never bypassed.
+            step, reason = build_iteration_step(doc, change_id)
+            wanted = "write"
+        else:
+            step, reason = build_path_step(doc, change_id)
+            wanted = "preflight" if kind == "initial" else "fix"
+
         if step != wanted:
             # The document, not the caller, says which turn is due. A
             # correction claim on a build whose review is clean is a graph
@@ -7335,10 +7457,14 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             return 409, out
 
         session = doc.get("writer_session")
-        if kind == "correction" and not (isinstance(session, str) and session.strip()):
+        if kind != "initial" and not (isinstance(session, str) and session.strip()):
             out = build_public(doc)
             out["ok"] = False
-            out["error"] = "a correction turn must resume the writer that made the change"
+            out["error"] = (
+                "a correction turn must resume the writer that made the change"
+                if kind == "correction"
+                else "a design turn must resume the writer that made the change under review"
+            )
             out["code"] = "no_writer_session"
             return 409, out
 
@@ -7362,11 +7488,17 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             "step": step,
             "head": live["head"],
             "change_id": change_id,
-            # Initial reservations open the session; correction reservations
-            # bind the one already recorded, so a resumed turn can never be
-            # pointed at a different agent than the one that wrote the files.
-            "writer_session": session if kind == "correction" else reserved_session,
+            # Initial reservations open the session; correction and design
+            # reservations bind the one already recorded, so a resumed turn can
+            # never be pointed at a different agent than the one that wrote the
+            # files. The user's note is about the page that writer built.
+            "writer_session": reserved_session if kind == "initial" else session,
             "jobs_spent": 1,
+            # Only a correction is a strike. A design turn spends a job and
+            # nothing else: it is the user iterating, and counting it against
+            # the change would make asking for a smaller button look like the
+            # writer had failed twice.
+            "strike_free": kind == BUILD_DESIGN_CLAIM_KIND,
             "consumed": False,
             "superseded": superseded,
             "expires_epoch": now + int(request["lease_seconds"]),
@@ -7375,6 +7507,11 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             ).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         doc["writer_claim"] = claim
+        if kind == BUILD_DESIGN_CLAIM_KIND:
+            turn = build_iteration_open_turn(doc)
+            if turn is not None:
+                turn["claim_id"] = event_id
+                turn["claimed_at"] = utcnow()
         doc["lease"] = {
             "holder": holder,
             "acquired_at": utcnow(),
@@ -7396,6 +7533,8 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             "jobs_spent": 1,
             "budget_left": build_budget_left(doc),
             "superseded": superseded,
+            "strike_free": claim["strike_free"],
+            "strikes": build_strike_counts(doc),
         }
         build_record_event(doc, event_id, fingerprint, receipt, 200)
         write_err = write_build(doc, build_id)
@@ -7612,12 +7751,28 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     if finding is not None and not isinstance(finding, str):
         return 400, {"error": "finding must be a string", "code": "bad_finding"}
     with BUILD_LOCK:
-        doc, open_err = build_open_mechanical(data.get("build_id"))
+        doc, open_err = build_open_writer(
+            data.get("build_id"), build_current_claim_kind(data.get("build_id"))
+        )
         if open_err:
             return open_err
         assert doc is not None
         claim = build_claim_live(doc, time.time())
-        wanted = "correction" if finding else "initial"
+        # A design brief carries no finding: the user's note is on the turn, not
+        # in the request, so a caller cannot put words in the planning session's
+        # mouth by sending its own.
+        wanted = (
+            BUILD_DESIGN_CLAIM_KIND
+            if isinstance(claim, dict) and claim.get("kind") == BUILD_DESIGN_CLAIM_KIND
+            else ("correction" if finding else "initial")
+        )
+        if wanted == BUILD_DESIGN_CLAIM_KIND and finding:
+            return 409, {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "error": "a design turn's instructions are the recorded user notes, not a supplied finding",
+                "code": "claim_mismatch",
+            }
         if claim is None:
             return 409, {
                 "ok": False,
@@ -7663,12 +7818,20 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         }
 
     session = doc.get("writer_session")
-    if finding and not session:
+    if (finding or wanted == BUILD_DESIGN_CLAIM_KIND) and not session:
         return 409, {
             "ok": False,
             "build_id": doc.get("build_id"),
             "error": "a correction turn must resume the writer that made the change",
             "code": "no_writer_session",
+        }
+    turn = build_iteration_open_turn(doc) if wanted == BUILD_DESIGN_CLAIM_KIND else None
+    if wanted == BUILD_DESIGN_CLAIM_KIND and turn is None:
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "error": "no design turn is open; a design brief has no notes to hand the writer",
+            "code": "no_open_turn",
         }
 
     verification = doc.get("verification") or {}
@@ -7704,6 +7867,8 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
                 redact_secrets(finding.strip())[:COMPACT_MAX_CHARS],
             ]
         )
+    if turn is not None:
+        lines.extend(build_iteration_brief_lines(doc, turn))
 
     route = doc.get("route") or {}
     return 200, {
@@ -7712,7 +7877,8 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         "repo": doc.get("repo"),
         "ticket": ticket,
         "prompt": "\n".join(lines)[:PROMPT_MAX_CHARS],
-        "resume": bool(finding),
+        "resume": bool(finding) or turn is not None,
+        "turn": turn.get("turn") if turn is not None else None,
         "claim_id": claim.get("claim_id"),
         "hermes_session": session,
         "launcher": route.get("launcher"),
@@ -7753,7 +7919,8 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
 
     # Compose from the durable build and claim rather than accepting a prompt,
     # cwd, session, model, or budget from the graph.
-    preview, preview_err = build_open_mechanical(data.get("build_id"))
+    launch_kind = build_current_claim_kind(data.get("build_id"))
+    preview, preview_err = build_open_writer(data.get("build_id"), launch_kind)
     if preview_err:
         return preview_err
     assert preview is not None
@@ -7779,7 +7946,7 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
 
     created = False
     with BUILD_LOCK:
-        doc, open_err = build_open_mechanical(data.get("build_id"))
+        doc, open_err = build_open_writer(data.get("build_id"), launch_kind)
         if open_err:
             return open_err
         assert doc is not None
@@ -7940,7 +8107,9 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
     )
 
     with BUILD_LOCK:
-        doc, open_err = build_open_mechanical(data.get("build_id"))
+        doc, open_err = build_open_writer(
+            data.get("build_id"), build_current_claim_kind(data.get("build_id"))
+        )
         if open_err:
             return open_err
         assert doc is not None
@@ -8013,6 +8182,11 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         frm = doc.get("stage")
         to = frm
         action = "writer_error"
+        turn = (
+            build_iteration_open_turn(doc)
+            if claim.get("kind") == BUILD_DESIGN_CLAIM_KIND
+            else None
+        )
         if status == "ok" and claim.get("kind") == "initial":
             if frm != "writing":
                 return 409, {"ok": False, "error": "initial writer is not at writing", "code": "invalid_transition"}
@@ -8020,8 +8194,30 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
             to = build_transition_target(doc, "writer_done")
             doc["stage"] = to
             doc["head"] = live["head"]
+        elif status == "ok" and claim.get("kind") == BUILD_DESIGN_CLAIM_KIND:
+            # A design turn never moves the stage. The candidate it produced is
+            # the next thing a person looks at, so the build stays at `evidence`
+            # and the turn owes changed-area checks and a fresh round before
+            # anybody is asked what they think of it.
+            action = "design_turn_done"
         elif status == "ok":
             action = "correction_done"
+        if turn is not None:
+            turn["writer_result"] = {
+                k: result.get(k) for k in ("claim_id", "job_id", "status", "summary", "at")
+            }
+            turn["writer_status"] = status
+            if status == "ok":
+                turn["status"] = "written"
+                turn["change_id"] = live["change_id"]
+                turn["written_at"] = utcnow()
+                record = build_iteration(doc)
+                returned_change = record.get("returned_candidate_change_id")
+                if returned_change and live["change_id"] != returned_change:
+                    # Only the resumed design writer may discharge a final-gate
+                    # return.  A manually moved worktree head cannot turn the
+                    # pre-return evidence back into a commit candidate.
+                    record["returned_candidate_writer_change_id"] = live["change_id"]
 
         receipt = {
             "event_id": event_id,
@@ -8332,7 +8528,7 @@ def build_checks_job(job_id: str) -> None:
     job["started_at"] = utcnow()
     write_job(job)
     with BUILD_LOCK:
-        doc, open_err = build_open_mechanical(job["build_id"])
+        doc, open_err = build_open_checks(job["build_id"])
         if open_err:
             status, payload = open_err
         else:
@@ -8399,13 +8595,13 @@ def build_checks(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
 
     if not webhook_url:
         with BUILD_LOCK:
-            doc, open_err = build_open_mechanical(data.get("build_id"))
+            doc, open_err = build_open_checks(data.get("build_id"))
             if open_err:
                 return open_err
             assert doc is not None
             return build_checks_result(doc, phase, only, stack, repos)
 
-    doc, open_err = build_open_mechanical(data.get("build_id"))
+    doc, open_err = build_open_checks(data.get("build_id"))
     if open_err:
         return open_err
     assert doc is not None
@@ -8963,6 +9159,11 @@ def build_finalize_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
             gaps.append(why)
     gaps.extend(build_review_gaps(doc, change_id))
     gaps.extend(build_visual_gaps(doc, change_id))
+    if build_needs_visual(doc):
+        # In addition to the normal evidence contract, a design candidate (and
+        # especially a final-gate return) must complete its own human path.
+        gaps.extend(build_visual_human_path_gaps(doc, change_id))
+
     return gaps
 
 
@@ -12573,6 +12774,18 @@ def build_visual_scenario_result(
             "error": "no round is open for the change on disk; run buildPreviewStack first",
             "code": "no_open_round",
         }
+    if role not in build_visual_required_roles(rnd):
+        return 409, {
+            "ok": False,
+            "build_id": doc.get("build_id"),
+            "round": rnd.get("round"),
+            "role": role,
+            "error": (
+                f"round {rnd.get('round')} uses its prior published round as before history; "
+                f"it must capture candidate only"
+            ),
+            "code": "role_not_required",
+        }
     preview = rnd.get("preview")
     if not isinstance(preview, dict):
         return 409, {
@@ -14226,6 +14439,1329 @@ def build_visual_prompt(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
         )
 
 
+# --- pre-PR visual iteration ------------------------------------------------
+#
+# A visual round proves what the page looks like. This is what happens next: a
+# person looks at it and wants it different, and says so, and the change goes
+# round again. The story calls that expected design work, so three things hold
+# here that do not hold anywhere else on the pre-PR path.
+#
+# Feedback is not a strike. A red check and a reviewer finding are both the
+# change failing to be what it claimed; "make the button smaller" is not. The
+# strike ledgers stay exactly where they were across a design turn, and the
+# only thing a turn spends is one job of budget — which is the floor, because
+# the turn count deliberately has none.
+#
+# There is no turn ceiling. Turn 20 pauses and asks continue, reframe, split,
+# or park, and once that is answered it never asks again. A checkpoint that
+# re-armed at 40 would be a limit wearing a question's clothes.
+#
+# Nothing here tears down the preview or commits anything. Park, stop, split
+# and reframe all leave the branch, the state, the stack, and every published
+# round exactly where they are, because the whole value of stopping is being
+# able to pick it back up.
+
+
+def build_iteration(doc: dict[str, Any]) -> dict[str, Any]:
+    """The durable design-iteration record, created in memory if absent.
+
+    Lazily shaped rather than written at create, so a build opened before this
+    existed reads as an iteration that has not started instead of parking on a
+    state version it cannot understand.
+    """
+    record = doc.get("iteration")
+    if not isinstance(record, dict):
+        record = {"state": "iterating"}
+        doc["iteration"] = record
+    for key in ("turns", "decisions", "splits", "returns"):
+        if not isinstance(record.get(key), list):
+            record[key] = []
+    if record.get("state") not in BUILD_ITERATION_STATES:
+        record["state"] = "iterating"
+    return record
+
+
+def build_iteration_turns(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every design turn this build has ever had, oldest first.
+
+    Never trimmed. The turn list is the record of what a person asked for and
+    what came back, and a build that dropped turn 3 would be unable to say why
+    the button is the size it is.
+    """
+    return [t for t in build_iteration(doc)["turns"] if isinstance(t, dict)]
+
+
+def build_iteration_open_turn(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """The turn currently in flight, or None.
+
+    Only the last turn can be open: a decision closes one before the next set
+    of notes may be recorded, so two turns are never in flight at once and the
+    writer is never resumed twice for two different sets of instructions.
+    """
+    turns = build_iteration_turns(doc)
+    last = turns[-1] if turns else None
+    if isinstance(last, dict) and last.get("status") in BUILD_ITERATION_OPEN_STATUSES:
+        return last
+    return None
+
+
+def build_iteration_checkpoint_due(doc: dict[str, Any]) -> bool:
+    """True when the advisory checkpoint is owed an answer.
+
+    Once answered, never again. `continue` is a decision about whether this is
+    still one change, not a quota that refills.
+    """
+    record = build_iteration(doc)
+    checkpoint = record.get("checkpoint")
+    if isinstance(checkpoint, dict) and checkpoint.get("decision"):
+        return False
+    return len(build_iteration_turns(doc)) >= BUILD_ITERATION_CHECKPOINT_TURN
+
+
+def build_strike_counts(doc: dict[str, Any]) -> dict[str, int]:
+    """The three ledgers a design turn must never move.
+
+    Derived from the durable record rather than incremented alongside it. A
+    parallel counter is one more thing that can disagree with what it is
+    supposed to summarize, and the claim this makes — "feedback cost the change
+    nothing" — is only worth making if it is read off the same evidence a
+    reviewer would read.
+    """
+    checks = doc.get("checks") or {}
+    reviews = [r for r in (doc.get("reviews") or []) if isinstance(r, dict)]
+    corrections = 0
+    for record in (doc.get("event_seen") or {}).values():
+        receipt = record.get("receipt") if isinstance(record, dict) else None
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("action") == "claim"
+            and receipt.get("kind") == "correction"
+        ):
+            corrections += 1
+    return {
+        "test": len(
+            [
+                phase
+                for phase in BUILD_CHECK_PHASES
+                if isinstance(checks.get(phase), dict) and not checks[phase].get("ok")
+            ]
+        ),
+        "reviewer": len([r for r in reviews if r.get("verdict") != "PASS"]),
+        "retry": corrections,
+    }
+
+
+def build_iteration_checks_clean(doc: dict[str, Any], change_id: str) -> tuple[bool, str]:
+    """Whether a design candidate has its two non-substitutable fast proofs.
+
+    Plans and path rules still determine the full fast recipe union.  Design
+    iteration adds one narrow invariant: its candidate cannot be shown as a
+    completed turn on the strength of a generic unit receipt.  Both named
+    proofs must therefore be among that union and have passed for this exact
+    change; additional declared or path-mandated recipes remain required by
+    ``build_checks_clean`` as usual.
+    """
+    clean, why = build_checks_clean(doc, "fast", change_id)
+    if not clean:
+        return clean, why
+    entry = build_checks_entry(doc, "fast") or {}
+    required = {name for name in (entry.get("required") or []) if isinstance(name, str)}
+    missing = [name for name in ("changed-area", "typecheck") if name not in required]
+    if missing:
+        return False, (
+            "design iteration requires changed-area tests and typecheck; fast checks "
+            "did not require: " + ", ".join(missing)
+        )
+    return True, ""
+
+
+def build_iteration_design_ready(doc: dict[str, Any], change_id: str) -> dict[str, Any] | None:
+    """The design-ready decision for the candidate on disk, or None.
+
+    Pinned to the change id for the same reason a review is: design ready for
+    the candidate the user saw says nothing about the one the writer produced
+    afterwards.
+    """
+    record = doc.get("iteration")
+    ready = record.get("design_ready") if isinstance(record, dict) else None
+    if isinstance(ready, dict) and ready.get("change_id") == change_id:
+        return ready
+    return None
+
+
+def build_visual_human_path_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
+    """What the visible candidate on disk still owes a person before a commit.
+
+    This is the line the story draws at the end: a final gate that required a
+    fix which could change the UI sends the build back to iteration, and the
+    resulting candidate cannot be committed until it has been through the human
+    path its own plan asked for. Enforced here, at the commit, because that is
+    the only place where skipping it would actually ship something.
+    """
+    record = doc.get("iteration")
+    if isinstance(record, dict) and record.get("returned_candidate_change_id"):
+        replacement = record.get("returned_candidate_writer_change_id")
+        if replacement != change_id:
+            return [
+                "a final-gate return still requires a new writer-produced candidate before any "
+                "candidate can complete the human visual path"
+            ]
+    rnd = build_visual_round_current(doc)
+    if not isinstance(rnd, dict) or rnd.get("change_id") != change_id:
+        return [
+            "the candidate on disk has no visual evidence round; a visible change commits "
+            "only after its own round is published"
+        ]
+    if rnd.get("status") != "published":
+        return [f"evidence round {rnd.get('round')} for this change is not published"]
+    if not rnd.get("human_review"):
+        return []
+    if not rnd.get("prompted_at"):
+        return [f"round {rnd.get('round')} still owes the planning session its report"]
+    if build_iteration_design_ready(doc, change_id) is None:
+        return [
+            f"round {rnd.get('round')} has no design-ready decision for this candidate; "
+            "the human visual path is not complete"
+        ]
+    return []
+
+
+def build_iteration_step(doc: dict[str, Any], change_id: str) -> tuple[str, str]:
+    """Name the one step this invocation may run, and why.
+
+    Same contract as the mechanical and visual switches: a function of the
+    durable document and the change on disk, consulting nothing the caller
+    sent and writing nothing, so an invocation that dies right after asking has
+    cost the build nothing.
+    """
+    stage = doc.get("stage")
+    record = build_iteration(doc)
+    if stage == "parked":
+        return "parked", str(doc.get("park_reason") or "parked")
+    if doc.get("pr_ready") or stage == "pr_opened":
+        return "done", "this build has already produced its PR-ready commit"
+    if record.get("state") == "stopped":
+        return "done", "the planning session stopped design iteration"
+    if stage in ("verifying", "review", "ready"):
+        return "final_gates", (
+            f"the design is ready and the build is at '{stage}'; it runs its final gates, and a "
+            "fix that could change the UI returns here"
+        )
+    if stage != "evidence":
+        return "parked", f"visual iteration runs at stage 'evidence'; this build is at '{stage}'"
+    if build_budget_left(doc) == 0:
+        return "parked", "budget_exhausted"
+    turn = build_iteration_open_turn(doc)
+    if turn is None:
+        rnd = build_visual_round_current(doc)
+        if (
+            isinstance(rnd, dict)
+            and rnd.get("status") == "published"
+            and rnd.get("change_id") == change_id
+        ):
+            return "feedback", (
+                f"round {rnd.get('round')} is published and awaits the planning session's notes"
+            )
+        return "feedback", "no design turn is open; the next one starts with the user's exact notes"
+    if build_iteration_checkpoint_due(doc):
+        return "checkpoint", (
+            f"turn {turn.get('turn')} reached the advisory checkpoint; continue, reframe, split, "
+            "or park before any more code is written"
+        )
+    status = turn.get("status")
+    if status == "open":
+        why = "the open turn's notes have not been handed to the writer yet"
+        if turn.get("writer_status") in ("error", "timeout"):
+            why = "the writer stopped before success; its files and session are recoverable"
+        return "write", why
+    if status == "written":
+        if turn.get("change_id") != change_id:
+            return "write", "the writer has not produced the current candidate yet"
+        clean, why = build_iteration_checks_clean(doc, change_id)
+        if not clean:
+            return "checks", why
+        rnd = build_visual_round_current(doc)
+        if not (
+            isinstance(rnd, dict)
+            and rnd.get("status") == "published"
+            and rnd.get("change_id") == change_id
+        ):
+            return "round", (
+                "the changed-area checks are clean; this turn still owes a published visual "
+                "evidence round for its candidate"
+            )
+        return "report", (
+            f"round {rnd.get('round')} is published; the planning session owes its exact report"
+        )
+    return "decision", (
+        "the planning session has this turn's report and owes continue, design ready, reframe, "
+        "split, park, or stop"
+    )
+
+
+def build_iteration_public(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """A compact view of the design conversation, or None when none has started.
+
+    Deliberately small and deliberately read-only: this rides on every state
+    response, and the durable turns carry the user's full notes and every
+    writer summary. A poll loop should not move all of that to learn a number.
+    """
+    record = doc.get("iteration")
+    if not isinstance(record, dict):
+        return None
+    turns = [t for t in (record.get("turns") or []) if isinstance(t, dict)]
+    last = turns[-1] if turns else None
+    checkpoint = record.get("checkpoint") if isinstance(record.get("checkpoint"), dict) else None
+    return {
+        "state": record.get("state"),
+        "turns": len(turns),
+        "turn": last.get("turn") if last else None,
+        "turn_status": last.get("status") if last else None,
+        "turn_source": last.get("source") if last else None,
+        "checkpoint_turn": BUILD_ITERATION_CHECKPOINT_TURN,
+        "checkpoint": (
+            {k: checkpoint.get(k) for k in ("turn", "decision", "at")} if checkpoint else None
+        ),
+        # No `turn_max`: the story says there is no total ceiling, and a field
+        # named like one would be read as a limit by the first graph author who
+        # saw it.
+        "turn_ceiling": None,
+        "history": [
+            {
+                k: t.get(k)
+                for k in ("turn", "source", "status", "round", "decision", "at", "notes_digest")
+            }
+            for t in turns[-BUILD_ITERATION_TURNS_SHOWN:]
+        ],
+        "splits": [s for s in (record.get("splits") or []) if isinstance(s, dict)][
+            -BUILD_ITERATION_TURNS_SHOWN:
+        ],
+        "returns": len([r for r in (record.get("returns") or []) if isinstance(r, dict)]),
+        "design_ready": record.get("design_ready"),
+        "strikes": build_strike_counts(doc),
+    }
+
+
+def build_open_iteration(
+    build_id: Any, stages: tuple[str, ...]
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Load a build for an iteration op and check it is at a stage that runs one.
+
+    No class check, exactly like the visual round and for the same reason: a
+    sensitive UI change routes to sensitive models and still has a person
+    looking at the page. Gating this on class would exclude the changes that
+    most need the conversation.
+    """
+    doc, err = build_open_visual(build_id)
+    if err:
+        return None, err
+    assert doc is not None
+    stage = doc.get("stage")
+    if stage not in stages:
+        return None, (
+            409,
+            {
+                "ok": False,
+                "build_id": doc.get("build_id"),
+                "stage": stage,
+                "error": (
+                    f"this transition runs at stage {' or '.join(stages)}; this build is at '{stage}'"
+                ),
+                "code": "invalid_transition",
+            },
+        )
+    return doc, None
+
+
+def build_iteration_event(
+    data: dict[str, Any],
+    action: str,
+    extra: dict[str, Any],
+    repos: dict[str, str],
+    stages: tuple[str, ...],
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    """Open one idempotent iteration transition, or hand back the refusal.
+
+    Same four things every state-changing op needs established first — the
+    build exists and wants visual proof, this event id has not already run and
+    is not being reused for different input, nobody else holds the lease, and
+    the worktree is still the one the build was opened on — plus the stage,
+    because the ops in this section deliberately do not all run at the same one.
+    """
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return None, (400, {"ok": False, "error": "event_id is required", "code": "bad_event_id"})
+    holder = data.get("holder")
+    if not isinstance(holder, str) or not holder.strip():
+        return None, (400, {"ok": False, "error": "holder is required", "code": "missing_holder"})
+    holder = holder.strip()[:BUILD_NAME_MAX]
+    holder_err = reject_secret_text(holder, "holder")
+    if holder_err:
+        return None, (400, holder_err)
+    fingerprint = event_fingerprint(
+        {"build_id": data.get("build_id"), "action": action, "holder": holder, **extra}
+    )
+
+    doc, open_err = build_open_iteration(data.get("build_id"), stages)
+    if open_err:
+        return None, open_err
+    assert doc is not None
+
+    seen = build_event_seen(doc)
+    if event_id in seen:
+        record = seen.get(event_id) or {}
+        out = build_public(doc)
+        out["replayed"] = record.get("fingerprint") == fingerprint
+        if not out["replayed"]:
+            out["ok"] = False
+            out["error"] = "event_id was already used with different input"
+            out["code"] = "idempotency_conflict"
+            return None, (409, out)
+        out["ok"] = int(record.get("status") or 200) == 200
+        out["receipt"] = record.get("receipt")
+        return None, (int(record.get("status") or 200), out)
+
+    live, park = build_identity_park(doc, action, data.get("worktree"), None, None, repos)
+    if park is not None:
+        reason, detail = park
+        return None, build_park(doc, reason, detail, event_id, fingerprint, holder)
+    assert live is not None
+    change_id = build_change_id(Path(str(doc.get("worktree"))), live["head"])
+    live = {**live, "change_id": change_id}
+
+    lease = build_lease_live(doc, time.time())
+    if lease is not None and lease.get("holder") != holder:
+        out = build_public(doc)
+        out["ok"] = False
+        out["error"] = "another caller holds the build lease"
+        out["code"] = "lease_held"
+        return None, (409, out)
+
+    return {
+        "doc": doc,
+        "event_id": event_id,
+        "holder": holder,
+        "fingerprint": fingerprint,
+        "action": action,
+        "live": live,
+        "change_id": change_id,
+    }, None
+
+
+def build_iteration_notes(data: dict[str, Any], field: str) -> tuple[str | None, dict[str, Any] | None]:
+    """Validate the exact text a person typed, without changing a character.
+
+    Refused rather than truncated or redacted. The story says the event records
+    the user's exact notes, so a note this service would have to alter is a note
+    it declines to accept: a truncated instruction is a different instruction,
+    and a note with a token in it is one nobody should be storing at all.
+    """
+    notes = data.get(field)
+    if not isinstance(notes, str) or not notes.strip():
+        return None, {"ok": False, "error": f"{field} is required", "code": f"missing_{field}"}
+    if len(notes) > BUILD_ITERATION_NOTES_MAX:
+        return None, {
+            "ok": False,
+            "error": (
+                f"{field} is longer than {BUILD_ITERATION_NOTES_MAX} characters; it is stored "
+                "exactly as written, so it is refused rather than shortened"
+            ),
+            "code": f"{field}_too_long",
+        }
+    secret = reject_secret_text(notes, field)
+    if secret:
+        return None, secret
+    return notes, None
+
+
+def build_iteration_stale_gap(
+    doc: dict[str, Any], rnd: dict[str, Any] | None, round_no: int, change_id: str
+) -> tuple[str, str] | None:
+    """Why this feedback is about something other than the candidate on disk.
+
+    Read-only and called before anything is written. Feedback naming an older
+    round is a person answering a page that has already been replaced, and
+    acting on it would resume the writer with instructions about a UI that no
+    longer exists.
+    """
+    if not isinstance(rnd, dict):
+        return "stale_feedback", "this build has published no visual evidence round to respond to"
+    if rnd.get("status") != "published":
+        return "stale_feedback", (
+            f"round {rnd.get('round')} has not published its evidence yet; there is nothing to "
+            "give feedback on"
+        )
+    if rnd.get("change_id") != change_id:
+        return "stale_feedback", (
+            f"round {rnd.get('round')} was captured at another change; the files on disk have "
+            "moved since that page was photographed"
+        )
+    if int(rnd.get("round") or 0) != round_no:
+        return "stale_feedback", (
+            f"this feedback answers round {round_no}; the live round is {rnd.get('round')}"
+        )
+    return None
+
+
+def build_iteration_feedback(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Record one design turn's exact notes, or refuse without touching a file.
+
+    The refusals are the point. Stale feedback answers a page that has been
+    replaced; duplicate feedback is the same reply arriving twice through a
+    retried graph; conflicting feedback is two different instructions racing for
+    one writer. Each one returns before any claim, any charge, and any writer,
+    so the worktree is exactly as it was.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "notes", "round", "worktree"}
+    stray = sorted(set(data) - allowed)
+    if stray:
+        return 400, {"ok": False, "error": f"unknown field: {stray[0]}", "code": "extra_field"}
+    notes, notes_err = build_iteration_notes(data, "notes")
+    if notes_err:
+        return 400, notes_err
+    assert notes is not None
+    round_no, round_err = parse_optional_int(data, "round", 1, BUILD_JOBS_MAX)
+    if round_err:
+        return 400, round_err
+    if round_no is None:
+        return 400, {
+            "ok": False,
+            "error": "round is required; feedback names the round it is answering",
+            "code": "missing_round",
+        }
+    digest = hashlib.sha256(notes.encode()).hexdigest()
+
+    with BUILD_LOCK:
+        ctx, refusal = build_iteration_event(
+            data,
+            "visual_feedback",
+            {"notes": notes, "round": round_no},
+            repos,
+            ("evidence",),
+        )
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        record = build_iteration(doc)
+        session = doc.get("writer_session")
+        if not (isinstance(session, str) and session.strip()):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="no_writer_session",
+                error="a design turn resumes the writer that made the change; this build has none",
+            )
+            return 409, out
+        rnd = build_visual_round_current(doc)
+        stale = build_iteration_stale_gap(doc, rnd, round_no, ctx["change_id"])
+        if stale:
+            code, detail = stale
+            out = build_public(doc)
+            out.update(ok=False, code=code, error=detail, files_unchanged=True)
+            return 409, out
+        assert rnd is not None
+        open_turn = build_iteration_open_turn(doc)
+        if open_turn is not None:
+            same = open_turn.get("notes_digest") == digest
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="duplicate_feedback" if same else "feedback_conflict",
+                turn=open_turn.get("turn"),
+                error=(
+                    f"turn {open_turn.get('turn')} already carries this note and is still open"
+                    if same
+                    else (
+                        f"turn {open_turn.get('turn')} is open with different notes; one turn "
+                        "answers one set of instructions"
+                    )
+                ),
+                files_unchanged=True,
+            )
+            return 409, out
+        answered = rnd.get("feedback")
+        if isinstance(answered, dict):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="duplicate_feedback",
+                turn=answered.get("turn"),
+                error=(
+                    f"round {rnd.get('round')} was already answered by turn {answered.get('turn')}; "
+                    "the next note answers the round that turn produces"
+                ),
+                files_unchanged=True,
+            )
+            return 409, out
+
+        turn = {
+            "turn": len(build_iteration_turns(doc)) + 1,
+            "source": "human",
+            "status": "open",
+            "notes": notes,
+            "notes_digest": digest,
+            "feedback_id": ctx["event_id"],
+            "holder": ctx["holder"],
+            "responds_to_round": int(rnd.get("round") or round_no),
+            "responds_to_change_id": ctx["change_id"],
+            "writer_session": session,
+            "at": utcnow(),
+            "claim_id": None,
+            "writer_result": None,
+            "writer_status": None,
+            "change_id": None,
+            "round": None,
+            "report": None,
+            "reported_at": None,
+            "decision": None,
+            # Stated on the record, not only in the docstring. A later reader
+            # asking "did all this feedback count against the change?" gets the
+            # answer from the turn itself.
+            "strike_free": True,
+            "strikes_at_open": build_strike_counts(doc),
+        }
+        record["turns"].append(turn)
+        record["state"] = "iterating"
+        rnd["feedback"] = {"turn": turn["turn"], "at": turn["at"], "notes_digest": digest}
+        checkpoint_due = build_iteration_checkpoint_due(doc)
+        if checkpoint_due:
+            record["checkpoint"] = {
+                "turn": turn["turn"],
+                "at": utcnow(),
+                "decision": None,
+                "why": (
+                    f"turn {turn['turn']} reached the advisory checkpoint; the planning session "
+                    "chooses continue, reframe, split, or park before more code is written"
+                ),
+            }
+        step, reason = build_iteration_step(doc, ctx["change_id"])
+        return build_iteration_commit(
+            ctx,
+            {
+                "turn": turn["turn"],
+                "action": "visual_feedback",
+                "notes_digest": digest,
+                "responds_to_round": turn["responds_to_round"],
+                "writer_session": session,
+                "jobs_spent": 0,
+                "strike_free": True,
+                "strikes": build_strike_counts(doc),
+                "checkpoint": checkpoint_due,
+            },
+            200,
+            {
+                "ok": True,
+                "turn": turn["turn"],
+                "notes": notes,
+                "notes_digest": digest,
+                "responds_to_round": turn["responds_to_round"],
+                "writer_session": session,
+                "checkpoint": checkpoint_due,
+                "step": step,
+                "step_reason": reason,
+                "strikes": build_strike_counts(doc),
+                "pre_commit": not doc.get("pr_ready"),
+            },
+        )
+
+
+def build_iteration_commit(
+    ctx: dict[str, Any], receipt: dict[str, Any], status: int, out: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Record the event and persist, so a retry replays instead of repeating."""
+    doc = ctx["doc"]
+    receipt = {
+        "event_id": ctx["event_id"],
+        "action": ctx["action"],
+        "at": utcnow(),
+        "holder": ctx["holder"],
+        "build_id": doc.get("build_id"),
+        "head": ctx["live"]["head"],
+        "change_id": ctx["change_id"],
+        "stage": doc.get("stage"),
+        "budget_left": build_budget_left(doc),
+        **receipt,
+    }
+    build_record_event(doc, ctx["event_id"], ctx["fingerprint"], receipt, status)
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
+    payload = build_public(doc)
+    payload.update(out)
+    payload["replayed"] = False
+    payload["receipt"] = receipt
+    payload["change_id"] = ctx["change_id"]
+    return status, payload
+
+
+def build_iteration_brief_lines(doc: dict[str, Any], turn: dict[str, Any]) -> list[str]:
+    """The design-turn half of the writer's prompt.
+
+    The notes go in verbatim and last. Everything above them is the standing
+    contract — the ticket, the recipes, the route — and a design turn that
+    paraphrased the user's words would be a writer solving a slightly different
+    request every round until nobody could say what was asked for.
+    """
+    contract = build_visual_contract(doc) or {}
+    rnd = build_visual_round_current(doc)
+    lines = [
+        "",
+        f"DESIGN FEEDBACK — turn {turn.get('turn')}. This is visual iteration, not a correction.",
+        "Nothing failed. A person looked at the page you built and wants it different.",
+        "The files are on disk. Continue this change in the same session; do not start over.",
+        f"Route under review: {contract.get('route')}   Scenario: {contract.get('scenario')}",
+    ]
+    if isinstance(rnd, dict) and rnd.get("round"):
+        lines.append(f"They are responding to evidence round {rnd.get('round')}.")
+    if turn.get("source") == "final_gate":
+        lines.append(
+            "This turn came back from a final gate: the fix can change what the page looks "
+            "like, so it returns through visual iteration rather than being patched at the gate."
+        )
+    lines += ["", "Their exact words:", str(turn.get("notes") or "")]
+    lines.append(
+        "Change only what they asked for. The round's checks and its browser scenario run "
+        "again over whatever you leave on disk."
+    )
+    return lines
+
+
+def build_iteration_report_text(
+    doc: dict[str, Any], turn: dict[str, Any], rnd: dict[str, Any]
+) -> str:
+    """The exact text the planning session is handed, saved verbatim on the turn.
+
+    Five things, because the story names five: where to open it, how to get to
+    the state, what changed in this round, what to look at, and the pictures.
+    Saved rather than reconstructed later, for the same reason the round's first
+    prompt is: it is the thing a person answered.
+    """
+    contract = build_visual_contract(doc) or {}
+    preview = rnd.get("preview") or {}
+    published = rnd.get("published") or {}
+    review = rnd.get("review") or {}
+    checks = build_checks_entry(doc, "fast") or {}
+    writer = turn.get("writer_result") or {}
+    safe = github_markdown_text
+    lines = [
+        f"Design turn {turn.get('turn')} — round {rnd.get('round')} of build {safe(doc.get('build_id'))}.",
+        "",
+        f"Open: {github_markdown_url(preview.get('url'))}",
+        f"Route: {safe(contract.get('route'))}   Scenario: {safe(contract.get('scenario'))}",
+        f"Tenant / project shown: {safe(contract.get('tenant'))}",
+        "",
+        "How to get there:",
+    ]
+    lines += [f"  - {safe(step)}" for step in (contract.get("setup") or [])]
+    lines += [f"  - {safe(step)}" for step in (contract.get("navigation") or [])]
+    lines += [
+        "",
+        "What changed in this round:",
+        f"  You asked: {safe(turn.get('notes'))}",
+    ]
+    if writer.get("summary"):
+        lines.append(f"  Writer: {safe(writer.get('summary'))}")
+    for path in [p for p in (checks.get("changed_paths") or []) if isinstance(p, str)][:12]:
+        lines.append(f"  changed: {safe(path)}")
+    lines += ["", "What to inspect:"]
+    lines += [f"  [ ] {safe(item)}" for item in (contract.get("checklist") or [])]
+    lines += [f"  [ ] {safe(item)}" for item in (contract.get("expected") or [])]
+    lines.append(
+        f"  Changed-area checks ({safe(', '.join(str(n) for n in (checks.get('required') or [])))}): "
+        + ("clean" if checks.get("ok") else "red")
+    )
+    lines.append(
+        f"  Automated UI review ({safe(review.get('reviewer'))}): "
+        + ("findings" if review.get("findings") else "acknowledged")
+        + f" — {safe(review.get('summary'))}"
+    )
+    lines += ["", "Screenshots:"]
+    for upload in published.get("uploads") or []:
+        durable = (
+            github_markdown_url(upload.get("url"))
+            if upload.get("url")
+            else safe(upload.get("ref"))
+        )
+        lines.append(
+            f"  {upload.get('number')}. [{safe(upload.get('role'))}/{safe(upload.get('viewport'))}] "
+            f"{durable}"
+        )
+    lines += [
+        "",
+        f"Evidence comment: {github_markdown_url(published.get('comment_url'))}",
+        "",
+        "Nothing is committed and the preview stack stays up.",
+        f"This is design turn {turn.get('turn')}. Feedback is iteration, not a strike, and there "
+        "is no total turn limit.",
+    ]
+    if build_iteration_checkpoint_due(doc):
+        lines.append(
+            f"Turn {BUILD_ITERATION_CHECKPOINT_TURN} checkpoint: choose continue, reframe, split, "
+            "or park before any more code is written."
+        )
+    lines.append(
+        "Reply with one of: change <what to change>, design ready, reframe, split <what to "
+        "split off>, park, stop."
+    )
+    return "\n".join(lines)
+
+
+def build_iteration_report(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Hand the planning session this turn's candidate, with the preview alive.
+
+    Refuses unless the turn has actually produced one: clean changed-area
+    checks and a published round for the change on disk. Reporting a candidate
+    whose checks have not run would put a person in front of a page that may not
+    even compile and ask them what they think of the spacing.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "worktree"}
+    stray = sorted(set(data) - allowed)
+    if stray:
+        return 400, {"ok": False, "error": f"unknown field: {stray[0]}", "code": "extra_field"}
+    with BUILD_LOCK:
+        ctx, refusal = build_iteration_event(data, "iteration_report", {}, repos, ("evidence",))
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        contract = build_visual_contract(doc) or {}
+        turn = build_iteration_open_turn(doc)
+        if turn is None:
+            out = build_public(doc)
+            out.update(ok=False, code="no_open_turn", error="no design turn is open to report")
+            return 409, out
+        step, reason = build_iteration_step(doc, ctx["change_id"])
+        if step != "report":
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="report_not_due",
+                step=step,
+                step_reason=reason,
+                turn=turn.get("turn"),
+                error=f"this turn is at step '{step}', not 'report'",
+            )
+            return 409, out
+        rnd = build_visual_round_current(doc)
+        assert isinstance(rnd, dict)
+        pane = str(contract.get("planning_pane") or "")
+        if not pane:
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="missing_planning_pane",
+                error="the contract names no planning pane to report to",
+            )
+            return 409, out
+        if doc.get("pr_ready"):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="not_pre_commit",
+                error="design iteration happens before any commit; this build is past it",
+            )
+            return 409, out
+        preview = rnd.get("preview") or {}
+        # Checked, never touched. The person is going to open this URL, and a
+        # teardown here would leave them reading about a page that is gone.
+        status = stack_status(str(preview.get("stack") or ""))
+        probe = probe_loopback(
+            str(preview.get("url") or ""),
+            allow_login=bool(contract.get("allow_login_redirect")),
+        )
+        if not status.get("healthy") or not probe.get("ok"):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="preview_unhealthy",
+                error="the saved preview is not serving the round's URL for this report",
+            )
+            return 409, out
+        if not herdr_enabled() or not herdr_exact_pane(pane):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="planning_pane_missing",
+                error="the exact saved planning pane is not live",
+            )
+            return 409, out
+        report = build_iteration_report_text(doc, turn, rnd)
+        sent = herdr_send(pane, report)
+        if not sent.get("ok"):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="planning_send_failed",
+                error=str(sent.get("error") or "Herdr send failed"),
+            )
+            return 409, out
+        turn["report"] = report
+        turn["reported_at"] = utcnow()
+        turn["reported_pane"] = pane
+        turn["round"] = rnd.get("round")
+        turn["status"] = "reported"
+        # The round's own human-review debt is settled by this report. Recording
+        # it here keeps the visual switch from asking for a second prompt about
+        # the same pictures, and it is what the commit gate reads later.
+        rnd["planning_prompt"] = report
+        rnd["prompted_at"] = turn["reported_at"]
+        rnd["prompted_pane"] = pane
+        rnd["prompt_delivered"] = True
+        return build_iteration_commit(
+            ctx,
+            {
+                "turn": turn["turn"],
+                "round": rnd.get("round"),
+                "pane": pane,
+                "delivered": True,
+                "jobs_spent": 0,
+                "strike_free": True,
+            },
+            200,
+            {
+                "ok": True,
+                "turn": turn["turn"],
+                "round": rnd.get("round"),
+                "pane": pane,
+                "delivered": True,
+                "report": report,
+                "url": preview.get("url"),
+                "decisions": list(BUILD_ITERATION_DECISIONS),
+                "checkpoint": build_iteration_checkpoint_due(doc),
+                "pre_commit": not doc.get("pr_ready"),
+                "preview_running": True,
+                "preview": {k: preview.get(k) for k in ("preview_id", "stack", "url")},
+            },
+        )
+
+
+def build_iteration_decision_gap(
+    doc: dict[str, Any], decision: str, turn: dict[str, Any] | None, change_id: str
+) -> tuple[str, str] | None:
+    """Why this answer cannot be given right now, or None.
+
+    Split out because each decision is refused for its own reason and folding
+    them into one condition is how `stop` quietly acquires `design_ready`'s
+    evidence requirement.
+    """
+    if decision == "continue":
+        if not build_iteration_checkpoint_due(doc):
+            return "no_checkpoint", (
+                "continue answers the advisory checkpoint, and no checkpoint is waiting"
+            )
+        return None
+    if decision == "design_ready":
+        record = build_iteration(doc)
+        returned_change = record.get("returned_candidate_change_id")
+        if returned_change and record.get("returned_candidate_writer_change_id") != change_id:
+            return "return_requires_new_candidate", (
+                "the final-gate return still requires a new writer-produced candidate before it can "
+                "become design ready again"
+            )
+        if turn is not None and turn.get("status") != "reported":
+            return "turn_in_flight", (
+                f"turn {turn.get('turn')} has not been reported to the planning session yet; "
+                "design ready would skip the candidate nobody has seen"
+            )
+        gaps = build_visual_human_path_gaps(doc, change_id)
+        # The design-ready decision is itself the missing piece here, so the
+        # gap that asks for one is the one answer this must not require.
+        gaps = [g for g in gaps if "design-ready decision" not in g]
+        if gaps:
+            return "not_design_ready", gaps[0]
+        clean, why = build_iteration_checks_clean(doc, change_id)
+        if not clean:
+            return "not_design_ready", why
+        return None
+    if decision in ("reframe", "split") and turn is None:
+        return "no_open_turn", f"{decision} closes the open design turn, and none is open"
+    return None
+
+
+def build_iteration_decision(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Record what the planning session decided, in its own durable state.
+
+    Six answers, six states, six receipts. They are deliberately not collapsed:
+    a build that was split is not a build that was parked, and a reader six
+    weeks later needs to be able to tell which one happened without inferring it
+    from what did not happen next.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "decision", "note", "worktree"}
+    stray = sorted(set(data) - allowed)
+    if stray:
+        return 400, {"ok": False, "error": f"unknown field: {stray[0]}", "code": "extra_field"}
+    decision = data.get("decision")
+    if decision not in BUILD_ITERATION_DECISIONS:
+        return 400, {
+            "ok": False,
+            "error": "decision must name one of the recorded planning answers",
+            "code": "bad_decision",
+            "allowed": list(BUILD_ITERATION_DECISIONS),
+        }
+    note: str | None = None
+    if decision == "split" or data.get("note") is not None:
+        note, note_err = build_iteration_notes(data, "note")
+        if note_err:
+            return 400, note_err
+
+    with BUILD_LOCK:
+        ctx, refusal = build_iteration_event(
+            data,
+            "iteration_decision",
+            {"decision": decision, "note": note},
+            repos,
+            ("evidence",),
+        )
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        record = build_iteration(doc)
+        turn = build_iteration_open_turn(doc)
+        gap = build_iteration_decision_gap(doc, decision, turn, ctx["change_id"])
+        if gap:
+            code, detail = gap
+            out = build_public(doc)
+            out.update(ok=False, code=code, error=detail, decision=decision)
+            return 409, out
+
+        rnd = build_visual_round_current(doc)
+        entry = {
+            "decision": decision,
+            "at": utcnow(),
+            "holder": ctx["holder"],
+            "event_id": ctx["event_id"],
+            "turn": turn.get("turn") if turn else None,
+            "round": rnd.get("round") if isinstance(rnd, dict) else None,
+            "change_id": ctx["change_id"],
+            "note": note,
+        }
+        record["decisions"] = [
+            d for d in (record.get("decisions") or []) if isinstance(d, dict)
+        ] + [entry]
+
+        if decision == "continue":
+            checkpoint = record.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                checkpoint = {"turn": turn.get("turn") if turn else None}
+                record["checkpoint"] = checkpoint
+            checkpoint["decision"] = "continue"
+            checkpoint["decided_at"] = entry["at"]
+            checkpoint["decided_by"] = ctx["holder"]
+            record["state"] = "iterating"
+        else:
+            # Every other answer closes the turn it was given about. The
+            # checkpoint, if one was waiting, is answered by the same act: a
+            # user who reframed at turn 20 has said the thing the checkpoint was
+            # asking for, and asking again would be a loop.
+            if turn is not None:
+                turn["status"] = "closed"
+                turn["decision"] = decision
+                turn["closed_at"] = entry["at"]
+            checkpoint = record.get("checkpoint")
+            if isinstance(checkpoint, dict) and not checkpoint.get("decision"):
+                checkpoint["decision"] = decision
+                checkpoint["decided_at"] = entry["at"]
+                checkpoint["decided_by"] = ctx["holder"]
+
+        gate = None
+        if decision == "design_ready":
+            record["state"] = "design_ready"
+            record["returned_candidate_change_id"] = None
+            record["returned_candidate_writer_change_id"] = None
+            record["design_ready"] = {
+                "at": entry["at"],
+                "turn": entry["turn"],
+                "round": entry["round"],
+                "change_id": ctx["change_id"],
+                "holder": ctx["holder"],
+                "head": ctx["live"]["head"],
+            }
+            moved = build_gate_transition(
+                doc,
+                "evidence_captured",
+                ctx["change_id"],
+                "buildIterationDecision",
+                f"the planning session called round {entry['round']} design ready",
+            )
+            gate = moved["to"] if moved else None
+        elif decision == "reframe":
+            record["state"] = "reframed"
+        elif decision == "split":
+            record["state"] = "split"
+            record["splits"] = (
+                [s for s in (record.get("splits") or []) if isinstance(s, dict)]
+                + [{**entry, "split_id": hashlib.sha256(
+                    f"{doc.get('build_id')}\0{ctx['event_id']}".encode()
+                ).hexdigest()[:16]}]
+            )[-BUILD_ITERATION_SPLITS_MAX:]
+
+        if decision in BUILD_ITERATION_PARK_REASONS:
+            record["state"] = "parked" if decision == "park" else "stopped"
+            reason = BUILD_ITERATION_PARK_REASONS[decision]
+            detail = (
+                f"the planning session chose {decision} at design turn {entry['turn']}; the "
+                "branch, the build state, the preview stack, and every published round are "
+                "preserved"
+            )
+            # build_park writes the document, records the receipt under this
+            # event id, and answers 409. The mutations above are already on the
+            # in-memory document, so they persist with it.
+            status, out = build_park(
+                doc, reason, detail, ctx["event_id"], ctx["fingerprint"], ctx["holder"]
+            )
+            out["decision"] = decision
+            out["turn"] = entry["turn"]
+            out["preserved"] = {
+                "branch": doc.get("branch"),
+                "worktree": doc.get("worktree"),
+                "preview": (rnd.get("preview") or {}).get("preview_id") if isinstance(rnd, dict) else None,
+                "rounds": len(build_visual_rounds(doc)),
+                "turns": len(build_iteration_turns(doc)),
+            }
+            return status, out
+
+        step, reason = build_iteration_step(doc, ctx["change_id"])
+        return build_iteration_commit(
+            ctx,
+            {
+                "decision": decision,
+                "turn": entry["turn"],
+                "round": entry["round"],
+                "state": record["state"],
+                "gate": gate,
+                "note": note,
+                "jobs_spent": 0,
+                "strike_free": True,
+                "checkpoint": record.get("checkpoint"),
+            },
+            200,
+            {
+                "ok": True,
+                "decision": decision,
+                "turn": entry["turn"],
+                "round": entry["round"],
+                "state": record["state"],
+                "gate": gate,
+                "step": step,
+                "step_reason": reason,
+                "strikes": build_strike_counts(doc),
+                "pre_commit": not doc.get("pr_ready"),
+            },
+        )
+
+
+def build_iteration_return(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Send a final-gate fix that can change the UI back through iteration.
+
+    The alternative is patching it at the gate, which produces a candidate that
+    passed every check and that no person has ever seen. That candidate then
+    commits on the strength of a human review of a different picture, which is
+    the exact failure the visual path exists to prevent — so the return is a
+    real transition with a receipt, and the commit gate refuses until the new
+    candidate has been through the human path itself.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "holder", "finding", "gate", "worktree"}
+    stray = sorted(set(data) - allowed)
+    if stray:
+        return 400, {"ok": False, "error": f"unknown field: {stray[0]}", "code": "extra_field"}
+    finding, finding_err = build_iteration_notes(data, "finding")
+    if finding_err:
+        return 400, finding_err
+    assert finding is not None
+    gate_name = data.get("gate")
+    if gate_name is not None and (not isinstance(gate_name, str) or not gate_name.strip()):
+        return 400, {"ok": False, "error": "gate must be a name", "code": "bad_gate"}
+    gate_name = gate_name.strip()[:BUILD_NAME_MAX] if isinstance(gate_name, str) else None
+
+    with BUILD_LOCK:
+        ctx, refusal = build_iteration_event(
+            data,
+            "iteration_return",
+            {"finding": finding, "gate": gate_name},
+            repos,
+            ("verifying", "review", "ready"),
+        )
+        if refusal:
+            return refusal
+        assert ctx is not None
+        doc = ctx["doc"]
+        if doc.get("pr_ready"):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="already_committed",
+                error="this build already produced its PR-ready commit; there is nothing pre-commit to return",
+            )
+            return 409, out
+        session = doc.get("writer_session")
+        if not (isinstance(session, str) and session.strip()):
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="no_writer_session",
+                error="a returned turn resumes the writer that made the change; this build has none",
+            )
+            return 409, out
+        record = build_iteration(doc)
+        if build_iteration_open_turn(doc) is not None:
+            out = build_public(doc)
+            out.update(
+                ok=False,
+                code="turn_in_flight",
+                error="a design turn is already open; the return would be a second set of instructions",
+            )
+            return 409, out
+        frm = doc.get("stage")
+        rnd = build_visual_round_current(doc)
+        turn = {
+            "turn": len(build_iteration_turns(doc)) + 1,
+            "source": "final_gate",
+            "status": "open",
+            "notes": finding,
+            "notes_digest": hashlib.sha256(finding.encode()).hexdigest(),
+            "feedback_id": ctx["event_id"],
+            "holder": ctx["holder"],
+            "gate": gate_name,
+            "returned_from": frm,
+            "responds_to_round": rnd.get("round") if isinstance(rnd, dict) else None,
+            "responds_to_change_id": ctx["change_id"],
+            "writer_session": session,
+            "at": utcnow(),
+            "claim_id": None,
+            "writer_result": None,
+            "writer_status": None,
+            "change_id": None,
+            "round": None,
+            "report": None,
+            "reported_at": None,
+            "decision": None,
+            "strike_free": True,
+            "strikes_at_open": build_strike_counts(doc),
+        }
+        record["turns"].append(turn)
+        record["state"] = "iterating"
+        record["design_ready"] = None
+        # A reframe or split can close this turn, but it cannot resurrect the
+        # candidate that final gates returned.  Keep the exact returned change
+        # as durable debt until another candidate completes the full path and
+        # earns a new design-ready decision.
+        record["returned_candidate_change_id"] = ctx["change_id"]
+        record["returned_candidate_writer_change_id"] = None
+        record["returns"] = [
+            r for r in (record.get("returns") or []) if isinstance(r, dict)
+        ] + [
+            {
+                "at": turn["at"],
+                "from": frm,
+                "gate": gate_name,
+                "turn": turn["turn"],
+                "event_id": ctx["event_id"],
+                "change_id": ctx["change_id"],
+            }
+        ]
+        build_gate_record(
+            doc,
+            "visual_return",
+            "evidence",
+            ctx["change_id"],
+            "buildIterationReturn",
+            f"a {gate_name or frm} finding can change visible output; the candidate returns to iteration",
+        )
+        doc["stage"] = "evidence"
+        # The verified boundary pinned where verification ended, so that a lease
+        # takeover could not roll it back. This is the authorized rollback: the
+        # change is deliberately going back to be rewritten, and leaving the
+        # boundary would park the next gate on a head that is supposed to move.
+        doc["returned_boundary"] = doc.get("verified_boundary")
+        doc["verified_boundary"] = None
+        doc["pending_finalize"] = None
+        step, reason = build_iteration_step(doc, ctx["change_id"])
+        return build_iteration_commit(
+            ctx,
+            {
+                "action": "visual_return",
+                "from": frm,
+                "to": "evidence",
+                "turn": turn["turn"],
+                "gate": gate_name,
+                "jobs_spent": 0,
+                "strike_free": True,
+            },
+            200,
+            {
+                "ok": True,
+                "turn": turn["turn"],
+                "from": frm,
+                "to": "evidence",
+                "gate": gate_name,
+                "step": step,
+                "step_reason": reason,
+                "commit_blocked_until": "the returned candidate completes its required human path",
+                "pre_commit": not doc.get("pr_ready"),
+            },
+        )
+
+
+def build_iteration_next(qs: dict[str, list[str]], repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """The iteration stage switch. Read durable state, name the next allowed step.
+
+    Read-only, like the other two switches: the graph calls this first on every
+    invocation, so it has to be safe to call from a run that is about to be
+    abandoned.
+    """
+    doc, err = build_open_visual(first_query(qs, "build_id"))
+    if err:
+        return err
+    assert doc is not None
+    live, park_detail = build_live_change(doc, repos)
+    if live is None:
+        out = build_public(doc)
+        out.update(ok=False, step="parked", step_reason=str(park_detail), code="worktree_mismatch")
+        return 409, out
+    step, reason = build_iteration_step(doc, live["change_id"])
+    turn = build_iteration_open_turn(doc)
+    rnd = build_visual_round_current(doc)
+    out = build_public(doc)
+    out["ok"] = step != "parked"
+    out["step"] = step
+    out["step_reason"] = reason
+    out["live_head"] = live["head"]
+    out["live_branch"] = live["branch"]
+    out["change_id"] = live["change_id"]
+    out["class"] = build_class(doc)
+    out["turn"] = turn.get("turn") if turn else None
+    out["turn_status"] = turn.get("status") if turn else None
+    out["turn_notes"] = turn.get("notes") if turn else None
+    out["turn_source"] = turn.get("source") if turn else None
+    out["round"] = rnd.get("round") if isinstance(rnd, dict) else None
+    out["round_status"] = rnd.get("status") if isinstance(rnd, dict) else None
+    out["checkpoint"] = build_iteration_checkpoint_due(doc)
+    out["checkpoint_turn"] = BUILD_ITERATION_CHECKPOINT_TURN
+    out["decisions"] = list(BUILD_ITERATION_DECISIONS)
+    out["strikes"] = build_strike_counts(doc)
+    if step == "parked":
+        out["code"] = doc.get("park_reason") or "parked"
+    return (200 if out["ok"] else 409), out
+
+
 def json_out(status: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
     return status, payload, "application/json"
 
@@ -14407,6 +15943,21 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/build/visual/prompt":
         status, payload = build_visual_prompt(body, repos)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/build/iteration/next":
+        status, payload = build_iteration_next(qs, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/iteration/feedback":
+        status, payload = build_iteration_feedback(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/iteration/report":
+        status, payload = build_iteration_report(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/iteration/decision":
+        status, payload = build_iteration_decision(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/iteration/return":
+        status, payload = build_iteration_return(body, repos)
         return json_out(status, payload)
 
     if path.startswith("/v1/git/") or path.startswith("/v1/gh/") or path == "/v1/file/head":

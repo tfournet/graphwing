@@ -52,7 +52,7 @@
       "id": "04-visual-iteration",
       "path": "slices/issue-52-pre-pr-build/04-visual-iteration.md",
       "kind": "build",
-      "status": "open",
+      "status": "done",
       "blocked_by": [
         "03-visual-evidence"
       ]

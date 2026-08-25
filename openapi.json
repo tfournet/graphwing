@@ -916,6 +916,46 @@
         "responses": { "200": { "description": "planning prompt recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildVisualResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Error" } }
       }
     },
+    "/v1/build/iteration/next": {
+      "get": {
+        "operationId": "buildIterationNext", "tags": ["build"],
+        "summary": "Read the durable design conversation and return exactly one bounded next step. Turn 20 is a one-time checkpoint; there is no later turn ceiling.",
+        "parameters": [{ "name": "build_id", "in": "query", "required": true, "schema": { "type": "string", "minLength": 8, "maxLength": 64 } }],
+        "responses": { "200": { "description": "next design-iteration step", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/iteration/feedback": {
+      "post": {
+        "operationId": "buildIterationFeedback", "tags": ["build"],
+        "summary": "Record the planning session's exact notes against one published round. Stale, duplicate, and conflicting feedback return before a writer claim or file change.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationFeedbackRequest" } } } },
+        "responses": { "200": { "description": "feedback turn opened or exact event replayed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/iteration/report": {
+      "post": {
+        "operationId": "buildIterationReport", "tags": ["build"],
+        "summary": "Send the verified candidate report to the exact saved planning pane after changed-area checks, browser scenario, UI review, screenshots, and GitHub issue comment are complete.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationEventRequest" } } } },
+        "responses": { "200": { "description": "report delivered to the exact pane", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/iteration/decision": {
+      "post": {
+        "operationId": "buildIterationDecision", "tags": ["build"],
+        "summary": "Record continue, design_ready, reframe, split, park, or stop as distinct durable planning decisions.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationDecisionRequest" } } } },
+        "responses": { "200": { "description": "decision recorded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/build/iteration/return": {
+      "post": {
+        "operationId": "buildIterationReturn", "tags": ["build"],
+        "summary": "Return a final-gate finding that can change visible output to the same writer and require the resulting candidate to complete the human visual path before commit.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationReturnRequest" } } } },
+        "responses": { "200": { "description": "candidate returned to visual iteration", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildIterationResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+      }
+    },
     "/v1/artifact/{artifact_id}": {
       "get": {
         "operationId": "artifactFetch", "tags": ["build"], "security": [],
@@ -1718,7 +1758,7 @@
           "build_id": { "type": "string" },
           "event_id": { "type": "string" },
           "holder": { "type": "string" },
-          "kind": { "type": "string", "enum": ["initial", "correction"], "default": "initial" },
+          "kind": { "type": "string", "enum": ["initial", "correction", "design"], "default": "initial", "description": "Design resumes the saved writer for exact human visual feedback and does not count as a correction." },
           "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 }
         }
       },
@@ -1984,6 +2024,73 @@
           "parent": { "type": "string" },
           "author": { "type": "string" },
           "committer": { "type": "string" }
+        }
+      },
+      "BuildIterationEventRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      },
+      "BuildIterationFeedbackRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "notes", "round"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "notes": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Stored byte-for-byte as supplied. Whitespace is not normalized." },
+          "round": { "type": "integer", "minimum": 1, "maximum": 500 }
+        }
+      },
+      "BuildIterationDecisionRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "decision"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "decision": { "type": "string", "enum": ["continue", "design_ready", "reframe", "split", "park", "stop"] },
+          "note": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Required for split; optional explanation for other decisions." }
+        }
+      },
+      "BuildIterationReturnRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["build_id", "event_id", "holder", "finding"],
+        "properties": {
+          "build_id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "holder": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "worktree": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "finding": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "gate": { "type": "string", "minLength": 1, "maxLength": 256 }
+        }
+      },
+      "BuildIterationResponse": {
+        "type": "object",
+        "required": ["ok", "build_id", "stage"],
+        "additionalProperties": true,
+        "properties": {
+          "ok": { "type": "boolean" },
+          "build_id": { "type": "string" },
+          "stage": { "type": "string" },
+          "step": { "type": "string", "enum": ["feedback", "checkpoint", "write", "checks", "round", "report", "decision", "final_gates", "done", "parked"] },
+          "turn": { "type": ["integer", "null"] },
+          "round": { "type": ["integer", "null"] },
+          "decision": { "type": "string", "enum": ["continue", "design_ready", "reframe", "split", "park", "stop"] },
+          "state": { "type": "string", "enum": ["iterating", "reframed", "split", "design_ready", "parked", "stopped"] },
+          "checkpoint": {},
+          "checkpoint_turn": { "type": "integer", "enum": [20] },
+          "replayed": { "type": "boolean" },
+          "pre_commit": { "type": "boolean" },
+          "error": { "type": "string" },
+          "code": { "type": "string" }
         }
       },
       "BuildVisualEventRequest": {
