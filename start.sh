@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# graphwing on a clean machine: optional Hermes/herdr/cloudflared, then start the API.
+# graphwing on a clean machine: optional herdr/cloudflared, then start the API.
 set -euo pipefail
 
 GRAPHWING_REPO_URL="${GRAPHWING_REPO_URL:-https://github.com/tfournet/graphwing.git}"
-HERMES_INSTALL_URL="${HERMES_INSTALL_URL:-https://hermes-agent.nousresearch.com/install.sh}"
 HERDR_INSTALL_URL="${HERDR_INSTALL_URL:-https://herdr.dev/install.sh}"
 
 export PATH="${HOME}/.local/bin:${PATH}"
@@ -26,8 +25,6 @@ Or on an empty box:
 
 Options:
   --yes                 no prompts (skips optional extras unless --with-*)
-  --with-hermes         install Hermes Agent if missing (agentRun)
-  --no-hermes           never install Hermes
   --with-herdr          install herdr if missing
   --no-herdr            never install herdr
   --tunnel none|demo|named   default none when --yes
@@ -35,7 +32,6 @@ Options:
   --home DIR            GRAPHWING_HOME (default ~/.graphwing)
   --unit-dir DIR        systemd user unit dir
   --no-units            do not write systemd units
-  --no-cli              do not install ~/.local/bin/graphwing or graphwing-idea
   --port N              listen port (default 8645)
   --foreground          run the API in this terminal (default)
   --daemon              enable systemd --user units instead
@@ -73,7 +69,6 @@ is_repo() {
 }
 
 YES=0
-WITH_HERMES=auto
 WITH_HERDR=auto
 WITH_CLOUDFLARED=auto
 TUNNEL=auto
@@ -81,15 +76,12 @@ START=foreground
 HOME_DIR="${GRAPHWING_HOME:-$HOME/.graphwing}"
 UNIT_DIR=""
 NO_UNITS=0
-NO_CLI=0
 PORT="${GRAPHWING_PORT:-8645}"
 REPOS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --yes|-y) YES=1 ;;
-    --with-hermes) WITH_HERMES=yes ;;
-    --no-hermes) WITH_HERMES=no ;;
     --with-herdr) WITH_HERDR=yes ;;
     --no-herdr) WITH_HERDR=no ;;
     --with-cloudflared) WITH_CLOUDFLARED=yes ;;
@@ -109,7 +101,6 @@ while [[ $# -gt 0 ]]; do
       UNIT_DIR="${1:-}"
       ;;
     --no-units) NO_UNITS=1 ;;
-    --no-cli) NO_CLI=1 ;;
     --port)
       shift
       PORT="${1:-}"
@@ -135,11 +126,10 @@ done
 
 if [[ "$YES" == 0 && ! -t 0 ]]; then
   YES=1
-  log "stdin is not a TTY; non-interactive defaults (pass --with-hermes etc. if you want extras)"
+  log "stdin is not a TTY; non-interactive defaults"
 fi
 
 if [[ "$YES" == 1 ]]; then
-  [[ "$WITH_HERMES" == auto ]] && WITH_HERMES=no
   [[ "$WITH_HERDR" == auto ]] && WITH_HERDR=no
   [[ "$WITH_CLOUDFLARED" == auto ]] && WITH_CLOUDFLARED=no
   [[ "$TUNNEL" == auto ]] && TUNNEL=none
@@ -167,8 +157,6 @@ else
   if [[ -z "$HERE" || "$HERE" != "$REPO" ]]; then
     relaunch=(bash "$REPO/start.sh")
     [[ "$YES" == 1 ]] && relaunch+=(--yes)
-    [[ "$WITH_HERMES" == yes ]] && relaunch+=(--with-hermes)
-    [[ "$WITH_HERMES" == no ]] && relaunch+=(--no-hermes)
     [[ "$WITH_HERDR" == yes ]] && relaunch+=(--with-herdr)
     [[ "$WITH_HERDR" == no ]] && relaunch+=(--no-herdr)
     [[ "$WITH_CLOUDFLARED" == yes ]] && relaunch+=(--with-cloudflared)
@@ -176,7 +164,6 @@ else
     relaunch+=(--tunnel "${TUNNEL:-none}" --home "$HOME_DIR" --port "$PORT")
     [[ -n "$UNIT_DIR" ]] && relaunch+=(--unit-dir "$UNIT_DIR")
     [[ "$NO_UNITS" == 1 ]] && relaunch+=(--no-units)
-    [[ "$NO_CLI" == 1 ]] && relaunch+=(--no-cli)
     [[ "$START" == foreground ]] && relaunch+=(--foreground)
     [[ "$START" == daemon ]] && relaunch+=(--daemon)
     [[ "$START" == no ]] && relaunch+=(--no-start)
@@ -191,22 +178,11 @@ need python3
 have git || log "warning: git not on PATH (git nodes will 501)"
 have curl || log "warning: curl not on PATH (optional fetches disabled)"
 
-if [[ "$WITH_HERMES" == auto ]]; then
-  if have hermes || [[ -x "$HOME/.local/bin/hermes" ]]; then
-    WITH_HERMES=no
-    log "hermes already on PATH"
-  elif yes "Install Hermes Agent (needed for POST /v1/agent/run)?" "Y"; then
-    WITH_HERMES=yes
-  else
-    WITH_HERMES=no
-  fi
-fi
-
 if [[ "$WITH_HERDR" == auto ]]; then
   if have herdr || [[ -x "$HOME/.local/bin/herdr" ]]; then
     WITH_HERDR=no
     log "herdr already on PATH"
-  elif yes "Install herdr (human session)?" "n"; then
+  elif yes "Install herdr (optional job dashboard)?" "n"; then
     WITH_HERDR=yes
   else
     WITH_HERDR=no
@@ -236,17 +212,6 @@ fi
 
 already() {
   have "$1" || [[ -x "$HOME/.local/bin/$1" ]]
-}
-
-install_hermes() {
-  if already hermes; then
-    return 0
-  fi
-  have curl || die "curl required to install Hermes"
-  log "installing Hermes Agent from $HERMES_INSTALL_URL"
-  curl -fsSL "$HERMES_INSTALL_URL" | bash -s -- --skip-browser --skip-computer-use
-  export PATH="${HOME}/.local/bin:${PATH}"
-  already hermes || die "hermes install finished but hermes is not on PATH (try: export PATH=\"\$HOME/.local/bin:\$PATH\")"
 }
 
 install_herdr() {
@@ -281,7 +246,6 @@ install_cloudflared() {
   chmod +x "$dest"
 }
 
-[[ "$WITH_HERMES" == yes ]] && install_hermes
 [[ "$WITH_HERDR" == yes ]] && install_herdr
 [[ "$WITH_CLOUDFLARED" == yes ]] && install_cloudflared
 
@@ -296,7 +260,6 @@ for spec in "${REPOS[@]+"${REPOS[@]}"}"; do
 done
 [[ -n "$UNIT_DIR" ]] && install_args+=(--unit-dir "$UNIT_DIR")
 [[ "$NO_UNITS" == 1 ]] && install_args+=(--no-units)
-[[ "$NO_CLI" == 1 ]] && install_args+=(--no-cli)
 [[ "$START" == daemon && "$NO_UNITS" != 1 ]] && install_args+=(--start)
 
 log "installing catalog into $HOME_DIR"
@@ -305,7 +268,7 @@ python3 "$REPO/install.py" "${install_args[@]}"
 key_file="$HOME_DIR/api.key"
 log "API http://127.0.0.1:${PORT}"
 log "header X-Graphwing-Key from $key_file (or GRAPHWING_KEY)"
-log "agentRun needs hermes; skipped extras stay optional"
+log "native model launchers must already be installed"
 
 if [[ "$START" == no ]]; then
   log "not starting (--no-start)"

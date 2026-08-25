@@ -622,24 +622,6 @@
         }
       }
     },
-    "/v1/agent/profiles": {
-      "get": {
-        "operationId": "agentProfiles",
-        "tags": ["agent"],
-        "summary": "Allowlisted seats from profiles.json. ~/.hermes/profiles is not dumped.",
-        "responses": {
-          "200": {
-            "description": "profiles",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/AgentProfiles" }
-              }
-            }
-          },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
-        }
-      }
-    },
     "/v1/agent/run": {
       "post": {
         "operationId": "agentRun",
@@ -1294,19 +1276,15 @@
       },
       "AgentRunRequest": {
         "type": "object",
-        "required": ["prompt"],
+        "required": ["prompt", "launcher", "provider", "model"],
+        "additionalProperties": false,
         "properties": {
-          "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
-          "launcher": { "type": "string", "enum": ["hermes", "claude", "codex", "grok"], "default": "hermes" },
+          "launcher": { "type": "string", "enum": ["claude", "codex", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string" },
           "max_turns": { "type": "integer" },
           "run_budget_seconds": { "type": "integer" },
-          "hermes_session": {
-            "type": "string",
-            "description": "Named Hermes session gwslice-<32 hex>. Used by Hermes jobs only."
-          },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "resume_job_id": {
             "type": "string",
@@ -1336,34 +1314,12 @@
           "ok": { "type": "boolean" },
           "job_id": { "type": "string" },
           "status": { "type": "string" },
-          "profile": { "type": "string" },
           "repo": { "type": "string" },
-          "hermes_session": { "type": ["string", "null"] },
           "launcher": { "type": "string" },
-          "provider": { "type": ["string", "null"] },
-          "model": { "type": ["string", "null"] },
-          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
+          "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "poll": { "type": "string" }
-        }
-      },
-      "AgentProfiles": {
-        "type": "object",
-        "properties": {
-          "ok": { "type": "boolean" },
-          "profiles": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string" },
-                "kind": { "type": "string" },
-                "hermes_home": { "type": "string" },
-                "herdr_session": { "type": "string" },
-                "herdr_agent": { "type": "string" },
-                "runnable": { "type": "boolean" }
-              }
-            }
-          }
         }
       },
       "SessionIdentity": {
@@ -1384,8 +1340,7 @@
         "properties": {
           "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
           "job_id": { "type": "string" },
-          "profile": { "type": "string" },
-          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
+          "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
           "log_ref": { "type": "string" },
@@ -1398,14 +1353,13 @@
           "ok": { "type": "boolean" },
           "job_id": { "type": "string" },
           "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
-          "profile": { "type": "string" },
           "repo": { "type": "string" },
           "cwd": { "type": "string" },
           "prompt": { "type": "string" },
           "launcher": { "type": "string" },
-          "provider": { "type": ["string", "null"] },
-          "model": { "type": ["string", "null"] },
-          "session_identity": { "oneOf": [{ "$ref": "#/components/schemas/SessionIdentity" }, { "type": "null" }] },
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
+          "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "created_at": { "type": "string" },
           "started_at": { "type": ["string", "null"] },
           "finished_at": { "type": ["string", "null"] },

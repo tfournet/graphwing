@@ -27,13 +27,10 @@ CATALOG = (
     "test_server.py",
     "scripts.json",
     "tests.json",
-    "profiles.json",
-    "SOUL.md",
     "README.md",
 )
 LOCAL_KEEP = (
     "api.key",
-    "auth.json",
     "cloudflared.token",
     "cloudflared-meta.json",
     "repos.json",
@@ -94,15 +91,6 @@ def copy_file(src: Path, dest: Path) -> None:
     if src.resolve() == dest.resolve():
         return
     shutil.copy2(src, dest)
-
-
-def install_soul(home: Path) -> None:
-    src = REPO / "SOUL.md"
-    dest = home / "SOUL.md"
-    text = src.read_text().replace("$GRAPHWING_HOME", str(home))
-    if src.resolve() == dest.resolve():
-        return
-    dest.write_text(text)
 
 
 def apply_openapi_url(home: Path, port: int) -> str:
@@ -253,18 +241,6 @@ def bin_ok(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
-def install_cli(home: Path) -> Path:
-    dest_dir = Path.home() / ".local/bin"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / "graphwing"
-    copy_file(REPO / "bin" / "graphwing", dest)
-    dest.chmod(0o755)
-    idea = dest_dir / "graphwing-idea"
-    copy_file(REPO / "scripts" / "herdr-idea.sh", idea)
-    idea.chmod(0o755)
-    return dest
-
-
 def install_claude_plugin(non_interactive: bool, opt_in: bool | None) -> None:
     """Offer to register the operator-loop skills with Claude Code.
 
@@ -384,7 +360,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--unit-dir", type=Path, default=None, help="systemd user unit dir")
     p.add_argument("--non-interactive", action="store_true")
     p.add_argument("--no-units", action="store_true")
-    p.add_argument("--no-cli", action="store_true")
     p.add_argument("--tunnel", choices=("none", "demo", "named"), default=None)
     p.add_argument("--start", action="store_true", help="enable --now units after writing them")
     p.add_argument("--port", type=int, default=int(os.environ.get("GRAPHWING_PORT", "8645")))
@@ -435,11 +410,7 @@ def main() -> None:
     ni = args.non_interactive
 
     for name in CATALOG:
-        if name == "SOUL.md":
-            continue
         copy_file(REPO / name, home / name)
-    install_soul(home)
-    copy_file(REPO / "bin" / "graphwing", home / "bin" / "graphwing")
     copy_file(REPO / "setup_tunnel.py", home / "setup_tunnel.py")
     copy_file(REPO / "examples" / "tunnel.env.example", home / "tunnel.env.example")
     copy_file(REPO / "examples" / "rr.example.json", home / "rr.example.json")
@@ -450,10 +421,6 @@ def main() -> None:
     key_path = ensure_key(home)
     ensure_repos(home, REPO, ni, extra=args.repo)
     ensure_stacks(home, args.port)
-
-    if not args.no_cli:
-        cli = install_cli(home)
-        print("cli", cli)
 
     mapping = mapping_for(home, args.port)
     cf_bin = Path(mapping["CLOUDFLARED"])

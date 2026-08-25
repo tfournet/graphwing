@@ -1,6 +1,6 @@
 # Graphwing
 
-Rewst workflows run in the cloud. They cannot `git checkout` a repo on your disk, cannot run your local test command, and cannot start Hermes. Graphwing is a small HTTP server on the computer where those repos live. Rewst calls it.
+Rewst workflows run in the cloud. They cannot `git checkout` a repo on your disk, cannot run your local test command, and cannot start native model launchers. Graphwing is a small HTTP server on the computer where those repos live. Rewst calls it.
 
 That is the product.
 
@@ -12,7 +12,7 @@ One chat session that writes code, runs git, judges its own work, and opens a PR
 - **Graphwing** performs each step when Rewst hits a URL (`/v1/git/checkout`, `/v1/test/run`, `/v1/agent/run`, …).
 - **You** still decide what to build, write the ticket files, start the workflow, and merge the PR.
 
-GitHub and Shortcut stay Rewst's integrations. Graphwing does not hold those keys.
+Cloud issue and pull-request operations stay in Rewst integrations. Graphwing does not hold those keys.
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ You start a published workflow with a JSON body. Example: which repo (a short na
 Rewst walks its step list:
 
 1. Short calls return immediately. `gitStatus`, `testRun`, `fileHead` of the ticket file.
-2. `agentRun` is slow. Graphwing starts one Hermes or Claude job and returns 202. Rewst waits on a callback URL. When the job ends, Graphwing POSTs `{ status, summary, sha, … }` and Rewst continues.
+2. `agentRun` is slow. Graphwing starts one native Codex, Claude, or Grok job and returns 202. Rewst waits on a callback URL. When the job ends, Graphwing POSTs `{ status, summary, sha, … }` and Rewst continues.
 3. If tests fail, files stay on disk. Graphwing does not `git restore`. After a few failed retries it stops and waits for you.
 4. If the ticket is done, Graphwing commits and pushes. The workflow then POSTs *itself* with the next ticket. That is a new run. Rewst will not let one run loop forever.
 
@@ -66,19 +66,17 @@ How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules for the 
 | Place | Contents |
 |---|---|
 | This git repo | Server, OpenAPI spec, workflow JSON, docs |
-| `~/.graphwing` | API key, tunnel token, jobs, Hermes state. Never commit this. |
+| `~/.graphwing` | API key, tunnel token, jobs, local runtime state. Never commit this. |
 
 `repos.json` in that home directory maps short names (`riftwing`) to real paths. Graphwing refuses anything else.
 
 ## Install
 
 ```bash
-git clone https://github.com/tfournet/graphwing.git
-cd graphwing
-./start.sh
+git clone https://github.com/tfournet/graphwing.git && cd graphwing && ./start.sh
 ```
 
-Optional flags: `--yes --with-hermes`, `--no-start`, `--daemon`.
+Optional flags: `--yes`, `--with-herdr`, `--with-cloudflared`, `--no-start`, `--daemon`. Install `codex`, `claude`, or `grok` separately before selecting that launcher.
 
 The API listens on `127.0.0.1:8645`. Send `X-Graphwing-Key` from `$GRAPHWING_HOME/api.key`. `/v1/health` and `/openapi.json` need no key. `GET /v1/watch` is the bar snapshot (units + jobs); it needs the key.
 

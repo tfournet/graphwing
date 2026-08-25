@@ -233,16 +233,10 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(status, 200, payload)
             self.assertTrue(payload["show"])
 
-    def test_agent_profiles(self):
+    def test_agent_profiles_endpoint_is_removed(self):
         status, payload, _ = server.dispatch("GET", "/v1/agent/profiles", {}, True, b"")
-        self.assertEqual(status, 200, payload)
-        ids = [p["id"] for p in payload["profiles"]]
-        self.assertEqual(ids, ["graphwing"])
-        self.assertEqual(payload["profiles"][0]["herdr_session"], "graphwing")
-        self.assertEqual(payload["profiles"][0]["hermes_home"], str(server.HOME.resolve()))
-        self.assertTrue(payload["profiles"][0]["runnable"])
-        for banned in ("executor", "fable", "cheap-exec"):
-            self.assertNotIn(banned, ids)
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["code"], "not_found")
 
     def test_agent_run_requires_auth(self):
         status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, False, b'{"prompt":"x"}')
@@ -254,12 +248,29 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "missing_prompt")
 
-    def test_agent_run_unknown_profile(self):
+    def test_agent_run_requires_explicit_native_identity(self):
+        required = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+        }
+        for missing in required:
+            body = {"prompt": "x", **required}
+            del body[missing]
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/run", {}, True, json.dumps(body).encode()
+            )
+            self.assertEqual(status, 400, missing)
+            self.assertEqual(payload["code"], f"missing_{missing}", missing)
+
+    def test_agent_run_rejects_unknown_fields(self):
+        body = {
+            "prompt": "x", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "seat": "legacy",
+        }
         status, payload, _ = server.dispatch(
-            "POST", "/v1/agent/run", {}, True, b'{"profile":"nope","prompt":"x"}'
+            "POST", "/v1/agent/run", {}, True, json.dumps(body).encode()
         )
         self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_profile")
+        self.assertEqual(payload["code"], "unexpected_fields")
 
     def test_agent_run_path_cwd_rejected(self):
         status, payload, _ = server.dispatch(
@@ -298,7 +309,9 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
-            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+            codex = Path(td) / "codex"
+            codex.write_text("fixture")
+            with mock.patch.object(server, "CODEX_BIN", codex), mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
                 with mock.patch.object(server, "JOBS_DIR", jobs):
                     with mock.patch.object(server, "enqueue_agent", lambda job: None):
                         status, payload, _ = server.dispatch(
@@ -306,16 +319,14 @@ class DispatchTests(unittest.TestCase):
                             "/v1/agent/run",
                             {},
                             True,
-                            b'{"prompt":"ping","cwd":"scratch"}',
+                            b'{"prompt":"ping","cwd":"scratch","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
                         )
             self.assertEqual(status, 202, payload)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["status"], "queued")
-            self.assertEqual(payload["profile"], "graphwing")
             self.assertEqual(payload["repo"], "scratch")
             job_id = payload["job_id"]
             self.assertRegex(job_id, r"^[0-9a-f]{32}$")
-            self.assertEqual(payload["hermes_session"], f"gwslice-{job_id}")
             self.assertEqual(payload["poll"], f"/v1/agent/jobs/{job_id}")
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 gstatus, gp, _ = server.dispatch(
@@ -324,35 +335,8 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(gstatus, 200, gp)
             self.assertEqual(gp["status"], "queued")
             self.assertEqual(gp["prompt"], "ping")
-            self.assertEqual(gp["hermes_session"], f"gwslice-{job_id}")
             self.assertNotIn("response_webhook_token", gp)
             self.assertNotIn("resume_url", gp)
-
-    def test_agent_run_rejects_bad_hermes_session(self):
-        status, payload, _ = server.dispatch(
-            "POST",
-            "/v1/agent/run",
-            {},
-            True,
-            b'{"prompt":"x","hermes_session":"../evil"}',
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "bad_hermes_session")
-
-    def test_agent_run_accepts_hermes_session(self):
-        session = "gwslice-" + ("ab" * 16)
-        with tempfile.TemporaryDirectory() as td:
-            repo = self._scratch_git(Path(td))
-            jobs = Path(td) / "jobs"
-            body = json.dumps({"prompt": "ping", "cwd": "scratch", "hermes_session": session}).encode()
-            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
-                with mock.patch.object(server, "JOBS_DIR", jobs):
-                    with mock.patch.object(server, "enqueue_agent", lambda job: None):
-                        status, payload, _ = server.dispatch(
-                            "POST", "/v1/agent/run", {}, True, body
-                        )
-            self.assertEqual(status, 202, payload)
-            self.assertEqual(payload["hermes_session"], session)
 
     def test_codex_agent_run_records_git_bound_session_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -377,7 +361,6 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(identity["model"], "gpt-5.6-sol")
             self.assertEqual(identity["repo"], "scratch")
             self.assertIsNone(identity["native_session_id"])
-            self.assertIsNone(payload["hermes_session"])
 
     def test_claude_agent_run_records_git_bound_session_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -402,7 +385,6 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(payload["session_identity"]["model"], model)
                     self.assertEqual(payload["session_identity"]["repo"], "scratch")
                     self.assertIsNone(payload["session_identity"]["native_session_id"])
-                    self.assertIsNone(payload["hermes_session"])
                 for provider, model in (
                     ("openai", "claude-opus-5"),
                     ("anthropic", "gpt-5.6-sol"),
@@ -431,7 +413,10 @@ class DispatchTests(unittest.TestCase):
                 ["git", "-C", str(repo), "rev-parse", "HEAD"],
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
-            body = json.dumps({"prompt": "ping", "cwd": "scratch", "launcher": "grok"}).encode()
+            body = json.dumps({
+                "prompt": "ping", "cwd": "scratch", "launcher": "grok",
+                "provider": "xai", "model": "grok-4.6",
+            }).encode()
             with mock.patch.object(server, "GROK_BIN", grok), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
@@ -537,47 +522,6 @@ class DispatchTests(unittest.TestCase):
                     status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
                     self.assertEqual(status, 400, (provider, model))
                     self.assertEqual(payload["code"], "bad_model_identity")
-
-    def test_agent_run_rejects_launcher_state_mismatches(self):
-        session = "gwslice-" + ("ab" * 16)
-        resume_job_id = "cd" * 16
-        identity = {
-            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-            "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
-            "native_session_id": "codex-123",
-        }
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            repo = self._scratch_git(root)
-            jobs = root / "jobs"
-            codex = root / "codex"
-            hermes = root / "hermes"
-            codex.write_text("fixture")
-            hermes.write_text("fixture")
-            with mock.patch.object(server, "CODEX_BIN", codex), \
-                 mock.patch.object(server, "HERMES_BIN", hermes), \
-                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
-                 mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "enqueue_agent", lambda job: None):
-                cases = [
-                    {"launcher": "codex", "hermes_session": session},
-                    {"launcher": "hermes", "session_identity": identity},
-                    {"launcher": "hermes", "resume_job_id": resume_job_id},
-                    {"launcher": "codex", "resume_job_id": resume_job_id},
-                ]
-                for case in cases:
-                    body = json.dumps({"prompt": "ping", "cwd": "scratch", **case}).encode()
-                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
-                    self.assertEqual(status, 400, case)
-                    self.assertEqual(payload["code"], "launcher_state_mismatch")
-
-                body = json.dumps({
-                    "prompt": "ping", "cwd": "scratch", "launcher": "hermes",
-                    "hermes_session": session, "resume_job_id": resume_job_id,
-                }).encode()
-                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
-            self.assertEqual(status, 202, payload)
-            self.assertEqual(payload["hermes_session"], session)
 
     def test_codex_resume_requires_graphwing_recorded_successful_provenance(self):
         with tempfile.TemporaryDirectory() as td:
@@ -781,7 +725,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(server.parse_receipt_text(failed))
 
     def test_receipt_and_codex_session_fail_closed(self):
-        job = {"job_id": "ab" * 16, "profile": "graphwing", "launcher": "codex", "log_ref": "/tmp/log", "session_identity": {"native_session_id": "codex-123"}}
+        job = {"job_id": "ab" * 16, "launcher": "codex", "log_ref": "/tmp/log", "session_identity": {"native_session_id": "codex-123"}}
         parsed = {"status": "ok", "summary": "done"}
         self.assertEqual(server.normalize_receipt(job, None, 0, False)["status"], "error")
         self.assertEqual(server.normalize_receipt(job, parsed, 2, False)["status"], "error")
@@ -792,7 +736,7 @@ class DispatchTests(unittest.TestCase):
 
     def test_receipt_and_claude_session_fail_closed(self):
         job = {
-            "job_id": "ab" * 16, "profile": "graphwing", "launcher": "claude",
+            "job_id": "ab" * 16, "launcher": "claude",
             "log_ref": "/tmp/log", "session_identity": {"native_session_id": "claude-123"},
         }
         parsed = {"status": "ok", "summary": "done"}
@@ -802,18 +746,19 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(job["session_identity"]["native_session_id"], "claude-123")
 
     def test_agent_run_missing_binary(self):
-        with mock.patch.object(server, "HERMES_BIN", Path("/nope/hermes")):
+        with mock.patch.object(server, "CODEX_BIN", Path("/nope/codex")):
             status, payload, _ = server.dispatch(
-                "POST", "/v1/agent/run", {}, True, b'{"prompt":"x"}'
+                "POST", "/v1/agent/run", {}, True,
+                b'{"prompt":"x","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
             )
         self.assertEqual(status, 501)
-        self.assertEqual(payload["code"], "not_implemented")
+        self.assertEqual(payload["code"], "provider_unavailable")
 
     def test_grok_agent_run_missing_binary_is_typed(self):
         with mock.patch.object(server, "GROK_BIN", Path("/nope/grok")):
             status, payload, _ = server.dispatch(
                 "POST", "/v1/agent/run", {}, True,
-                b'{"prompt":"x","cwd":"scratch","launcher":"grok"}',
+                b'{"prompt":"x","cwd":"scratch","launcher":"grok","provider":"xai","model":"grok-4.6"}',
             )
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "missing_binary")
@@ -826,44 +771,6 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("relative paths only", text)
         self.assertIn("Do not git commit, git push", text)
         self.assertIn("Do not `git checkout`", text)
-
-    def test_spawn_hermes_continues_named_session(self):
-        captured: dict = {}
-
-        class FakePopen:
-            pid = 7
-
-            def __init__(self, cmd, **kwargs):
-                captured["cmd"] = list(cmd)
-
-        with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs"
-            job_id = "ab" * 16
-            session = "gwslice-" + job_id
-            jdir = jobs / job_id
-            jdir.mkdir(parents=True)
-            (jdir / "prompt.txt").write_text("x")
-            hermes = Path(td) / "hermes"
-            hermes.write_text("#!/bin/sh\n")
-            job = {
-                "job_id": job_id,
-                "cwd": td,
-                "max_turns": 1,
-                "run_budget_seconds": 5,
-                "hermes_session": session,
-            }
-            with mock.patch.object(server, "JOBS_DIR", jobs):
-                with mock.patch.object(server, "HERMES_BIN", hermes):
-                    with mock.patch.object(server.subprocess, "Popen", FakePopen):
-                        proc, err = server.spawn_hermes(job)
-            self.assertIsNone(err)
-            self.assertIsNotNone(proc)
-            cmd = captured["cmd"]
-            self.assertIn("--continue", cmd)
-            self.assertEqual(cmd[cmd.index("--continue") + 1], session)
-            self.assertIn("--create-if-missing", cmd)
-            self.assertIn("--source", cmd)
-            self.assertEqual(cmd[cmd.index("--source") + 1], "tool")
 
     def test_spawn_codex_uses_supported_fixture_contract(self):
         captured = {}
@@ -1037,10 +944,10 @@ while True:
             "native_session_id": native_session_id,
         }
         job = {
-            "job_id": job_id, "status": "queued", "profile": "graphwing",
-            "repo": "scratch", "cwd": str(root), "prompt": prompt,
+            "job_id": job_id, "status": "queued", "repo": "scratch",
+            "cwd": str(root), "prompt": prompt,
             "launcher": "grok", "provider": "xai", "model": "grok-4.6",
-            "session_identity": identity, "hermes_session": None, "created_at": "t",
+            "session_identity": identity, "created_at": "t",
             "started_at": None, "finished_at": None, "max_turns": 1,
             "run_budget_seconds": (cfg or {}).get("budget", 30), "receipt": None,
             "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
@@ -1287,69 +1194,14 @@ while True:
         self.assertEqual(saved["status"], "failed")
         self.assertNotIn("session/load", [r["method"] for r in capture["requests"]])
 
-    def test_hermes_job_env_overrides_terminal_cwd(self):
+    def test_native_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
-            env = server.hermes_job_env(
+            env = server.native_job_env(
                 {"job_id": "ab" * 16, "cwd": "/home/tim/work/gw-real-slice"}
             )
         self.assertEqual(env["TERMINAL_CWD"], "/home/tim/work/gw-real-slice")
         self.assertEqual(env["PWD"], "/home/tim/work/gw-real-slice")
         self.assertNotEqual(env.get("TERMINAL_CWD"), "/home/tim/rewst/riftwing")
-
-    def test_run_agent_completes_receipt(self):
-        with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs"
-            job_id = "ab" * 16
-            jdir = jobs / job_id
-            jdir.mkdir(parents=True)
-            job = {
-                "job_id": job_id,
-                "status": "queued",
-                "profile": "graphwing",
-                "repo": "riftwing",
-                "cwd": str(td),
-                "prompt": "ping",
-                "hermes_session": "gwslice-" + ("ab" * 16),
-                "response_webhook_url": "https://example.com/resume",
-                "response_webhook_token": "tok_secret",
-                "created_at": "t",
-                "started_at": None,
-                "finished_at": None,
-                "max_turns": 1,
-                "run_budget_seconds": 5,
-                "receipt": None,
-                "log_ref": str(jdir / "stdout.log"),
-                "error": None,
-                "webhook": None,
-            }
-            (jdir / "job.json").write_text(json.dumps(job))
-            (jdir / "prompt.txt").write_text("x")
-
-            class FakeProc:
-                pid = 4242
-                returncode = 0
-
-                def wait(self, timeout=None):
-                    (jdir / "stdout.log").write_text(
-                        '{"status":"ok","sha":null,"pr_url":null,"summary":"pong"}'
-                    )
-                    return 0
-
-            with mock.patch.object(server, "JOBS_DIR", jobs):
-                with mock.patch.object(server, "spawn_hermes", return_value=(FakeProc(), None)):
-                    with mock.patch.object(
-                        server, "post_receipt", return_value={"ok": True, "status": 200}
-                    ) as posted:
-                        server.run_agent_job(job_id)
-            saved = json.loads((jdir / "job.json").read_text())
-            self.assertEqual(saved["status"], "completed")
-            self.assertEqual(saved["receipt"]["summary"], "pong")
-            self.assertEqual(saved["receipt"]["job_id"], job_id)
-            self.assertEqual(saved["receipt"]["hermes_session"], "gwslice-" + ("ab" * 16))
-            posted.assert_called_once()
-            _args, kwargs = posted.call_args
-            self.assertEqual(_args[0], "https://example.com/resume")
-            self.assertEqual(kwargs.get("token"), "tok_secret")
 
     def test_run_agent_preserves_specific_spawn_error_in_saved_and_posted_receipt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1358,10 +1210,10 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             job = {
-                "job_id": job_id, "status": "queued", "profile": "graphwing",
-                "repo": "scratch", "cwd": str(td), "prompt": "ping",
+                "job_id": job_id, "status": "queued", "repo": "scratch",
+                "cwd": str(td), "prompt": "ping",
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-                "session_identity": {"native_session_id": None}, "hermes_session": None,
+                "session_identity": {"native_session_id": None},
                 "response_webhook_url": "https://example.invalid/resume",
                 "response_webhook_token": "tok_secret", "created_at": "t",
                 "started_at": None, "finished_at": None, "max_turns": 1,
@@ -1387,7 +1239,7 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": "0" * 40, "native_session_id": None}
-            job = {"job_id": job_id, "status": "queued", "profile": "graphwing", "repo": "scratch", "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity, "hermes_session": None, "created_at": "t", "started_at": None, "finished_at": None, "max_turns": 1, "run_budget_seconds": 30, "receipt": None, "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None, "response_webhook_url": None}
+            job = {"job_id": job_id, "status": "queued", "repo": "scratch", "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t", "started_at": None, "finished_at": None, "max_turns": 1, "run_budget_seconds": 30, "receipt": None, "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None, "response_webhook_url": None}
             (jdir / "job.json").write_text(json.dumps(job))
             (jdir / "prompt.txt").write_text("x")
             class FakeProc:
@@ -1421,10 +1273,10 @@ while True:
                 "native_session_id": None,
             }
             job = {
-                "job_id": job_id, "status": "queued", "profile": "graphwing",
-                "repo": "scratch", "cwd": td, "prompt": "x", "launcher": "claude",
+                "job_id": job_id, "status": "queued", "repo": "scratch",
+                "cwd": td, "prompt": "x", "launcher": "claude",
                 "provider": "anthropic", "model": "claude-opus-5",
-                "session_identity": identity, "hermes_session": None, "created_at": "t",
+                "session_identity": identity, "created_at": "t",
                 "started_at": None, "finished_at": None, "max_turns": 1,
                 "run_budget_seconds": 30, "receipt": None,
                 "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
@@ -1457,14 +1309,19 @@ while True:
     def test_agent_run_stores_webhook_hides_token(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
+            codex = Path(td) / "codex"
+            codex.write_text("fixture")
             body = json.dumps(
                 {
                     "prompt": "ping",
+                    "launcher": "codex",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
                     "response_webhook_url": "https://app.rewst.ai/api/callbacks/11111111-1111-1111-1111-111111111111",
                     "response_webhook_token": "tok_secret",
                 }
             ).encode()
-            with mock.patch.object(server, "JOBS_DIR", jobs):
+            with mock.patch.object(server, "CODEX_BIN", codex), mock.patch.object(server, "JOBS_DIR", jobs):
                 with mock.patch.object(server, "enqueue_agent", lambda job: None):
                     status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
             self.assertEqual(status, 202, payload)
@@ -1507,6 +1364,25 @@ while True:
         headers = {k.lower(): v for k, v in captured["headers"].items()}
         self.assertEqual(headers.get("x-rewst-token"), "tok_secret")
 
+    def test_active_runtime_has_no_retired_model_runtime(self):
+        root = Path(__file__).resolve().parent
+        retired = "her" + "mes"
+        active = [root / "server.py", root / "openapi.json", root / "install.py", root / "start.sh"]
+        active.extend(sorted((root / "graphs").glob("*.json")))
+        for path in active:
+            self.assertNotIn(retired, path.read_text().lower(), str(path))
+
+    def test_model_graph_nodes_pin_native_identity(self):
+        root = Path(__file__).resolve().parent
+        for graph_path in sorted((root / "graphs").glob("*.json")):
+            graph = json.loads(graph_path.read_text())
+            for node in graph["spec"]["nodes"]:
+                if node["type"].endswith(("/v1/agent/run", "/v1/review/run")):
+                    config = node.get("config", {})
+                    for field in ("launcher", "provider", "model"):
+                        self.assertIsInstance(config.get(field), str, (graph_path.name, node["id"], field))
+                        self.assertTrue(config[field].strip(), (graph_path.name, node["id"], field))
+
     def test_openapi_file(self):
         status, payload, ctype = server.dispatch("GET", "/openapi.json", {}, False, b"")
         self.assertEqual(status, 200)
@@ -1529,7 +1405,18 @@ while True:
         self.assertIn("response_webhook_token", props)
         self.assertIn("session_identity", props)
         self.assertIn("resume_job_id", props)
-        self.assertEqual(set(props["launcher"]["enum"]), {"hermes", "claude", "codex", "grok"})
+        self.assertEqual(set(props["launcher"]["enum"]), {"claude", "codex", "grok"})
+        request_schema = spec["components"]["schemas"]["AgentRunRequest"]
+        self.assertEqual(
+            set(request_schema["required"]),
+            {"prompt", "launcher", "provider", "model"},
+        )
+        self.assertFalse(request_schema["additionalProperties"])
+        for schema_name in ("AgentRunAccepted", "AgentJob", "AgentReceipt"):
+            identity = spec["components"]["schemas"][schema_name]["properties"]["session_identity"]
+            self.assertEqual(identity["$ref"], "#/components/schemas/SessionIdentity")
+        self.assertNotIn("profile", props)
+        self.assertNotIn("/v1/agent/profiles", spec["paths"])
         self.assertEqual(set(props["provider"]["enum"]), {"openai", "anthropic", "xai"})
         identity = spec["components"]["schemas"]["SessionIdentity"]["properties"]
         self.assertEqual(set(identity["launcher"]["enum"]), {"codex", "claude", "grok"})
@@ -2260,39 +2147,6 @@ while True:
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "missing_number")
 
-    def test_agent_run_executor_unknown(self):
-        status, payload, _ = server.dispatch(
-            "POST", "/v1/agent/run", {}, True, b'{"profile":"executor","prompt":"x"}'
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_profile")
-
-    def test_agent_run_listed_not_runnable(self):
-        fake = [
-            {
-                "id": "graphwing",
-                "kind": "home",
-                "hermes_home": "/tmp/graphwing",
-                "herdr_session": "graphwing",
-                "herdr_agent": "graphwing",
-                "runnable": True,
-            },
-            {
-                "id": "executor",
-                "kind": "seat",
-                "hermes_home": "/tmp/hermes-executor",
-                "herdr_session": "executor",
-                "herdr_agent": "executor",
-                "runnable": False,
-            },
-        ]
-        with mock.patch.object(server, "load_profiles", return_value=fake):
-            status, payload, _ = server.dispatch(
-                "POST", "/v1/agent/run", {}, True, b'{"profile":"executor","prompt":"x"}'
-            )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "not_runnable")
-
     def _scratch_git(self, root: Path) -> Path:
         repo = root / "repo"
         remote = root / "remote.git"
@@ -2766,8 +2620,7 @@ while True:
         self.assertFalse(server.review_said_nothing("VERDICT: NACK\nmissing a case"))
 
     def test_review_turn_budget_is_not_one(self):
-        # The claude branch hardcoded --max-turns 1 while hermes used 8. One
-        # turn cannot read a diff and answer.
+        # A one-turn review cannot read the ticket and diff.
         self.assertGreaterEqual(server.REVIEW_MAX_TURNS, 8)
 
     def test_direct_reviewer_routes_are_always_vendor_independent(self):
@@ -2868,10 +2721,9 @@ while True:
 
     def test_pr_drive_pins_its_writer_instead_of_inheriting_the_seat(self):
         # implement-slice pins model and launcher from sliceRoute. pr-drive
-        # pinned neither, so its writer took whatever the seat's sticky hermes
-        # profile pointed at — job.json recorded model: null. A `hermes profile
-        # use` anywhere on the box silently changed which model fixes PRs, and
-        # the closed class table did not apply to that writer at all.
+        # pinned neither, so its writer inherited ambient launcher state and
+        # job.json recorded model: null. Local model changes silently changed
+        # which model fixes PRs, and the closed class table did not apply.
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
@@ -2995,13 +2847,11 @@ while True:
             config = nodes[node_id]["config"]
             self.assertEqual(config["session_identity"], f"{{{{ TASKS.{receipt}.session_identity }}}}")
             self.assertEqual(config["resume_job_id"], f"{{{{ TASKS.{receipt}.resume_job_id }}}}")
-            self.assertNotIn("hermes_session", config)
             self.assertEqual(config["provider"], "{{ TASKS.route.data.provider }}")
         for receipt in ("record", "record2"):
             outputs = {m["output"] for m in nodes[receipt]["config"]["mappings"]}
             self.assertIn("session_identity", outputs)
             self.assertIn("resume_job_id", outputs)
-            self.assertNotIn("hermes_session", outputs)
 
     def test_implement_slice_routes_direct_native_reviewers(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -3223,28 +3073,6 @@ while True:
 
     def test_herdr_linger_is_configurable(self):
         self.assertGreaterEqual(server.HERDR_TAB_LINGER_SECONDS, 0)
-
-    def test_finished_writer_pane_shows_the_real_session(self):
-        # The pane tails stdout.log while the job runs because the headless
-        # process owns the session. Once it is done the tail is a dead file,
-        # so the linger window should show the session you can actually read.
-        sent = []
-        job = {"job_id": "cd" * 16, "status": "completed", "herdr_pane_id": "w1:p3",
-               "hermes_session": "gwslice-" + "a" * 32, "cwd": "/tmp"}
-        with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append((pane, text))):
-            server.herdr_show_session(job)
-        self.assertEqual(sent[0], ("w1:p3", "\x03"), "must stop tail -F first")
-        self.assertIn("--resume", sent[1][1])
-        self.assertIn("gwslice-" + "a" * 32, sent[1][1])
-
-    def test_non_writer_panes_keep_the_tail(self):
-        # test and review jobs are not hermes and have no session to resume.
-        sent = []
-        with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append(text)):
-            server.herdr_show_session({"herdr_pane_id": "w1:p3", "kind": "test", "hermes_session": None})
-            server.herdr_show_session({"herdr_pane_id": "w1:p3", "hermes_session": "not-a-gwslice-name"})
-            server.herdr_show_session({"hermes_session": "gwslice-" + "b" * 32})
-        self.assertEqual(sent, [])
 
     def test_git_checkout_path_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3731,12 +3559,6 @@ while True:
         with mock.patch.dict(os.environ, {"GRAPHWING_PUBLIC_URL": "https://override.example"}):
             self.assertEqual(server.public_base_url(), "https://override.example")
 
-    def test_catalog_soul_is_agnostic(self):
-        text = (Path(__file__).resolve().parent / "SOUL.md").read_text()
-        self.assertIn("$GRAPHWING_HOME", text)
-        self.assertNotIn("/home/tim", text)
-        self.assertNotIn("tim-graphwing", text)
-
     def test_graphs_fan_in_targets_are_joins(self):
         graphs = Path(__file__).resolve().parent / "graphs"
         for graph_path in sorted(graphs.glob("*.json")):
@@ -3814,7 +3636,6 @@ while True:
         self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
-        self.assertNotIn("hermes_session", agent2["config"])
         self.assertEqual(agent2["config"]["session_identity"], "{{ TASKS.record.session_identity }}")
         self.assertEqual(agent2["config"]["resume_job_id"], "{{ TASKS.record.resume_job_id }}")
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
@@ -3982,8 +3803,6 @@ class InstallTests(unittest.TestCase):
             "start.sh",
             "setup_tunnel.py",
             "scripts/publish_graphs.py",
-            "SOUL.md",
-            "bin/graphwing",
             "systemd/graphwing-api.service",
             "systemd/graphwing-herdr.service",
             "systemd/graphwing-tunnel.service",
@@ -4006,7 +3825,8 @@ class InstallTests(unittest.TestCase):
                     "--unit-dir",
                     str(units),
                     "--non-interactive",
-                    "--no-cli",
+                    "--no-claude-plugin",
+                    "--no-omarchy-plugin",
                     "--tunnel",
                     "none",
                 ],
@@ -4037,10 +3857,9 @@ class InstallTests(unittest.TestCase):
             self.assertFalse((home / "rewst-install.json").exists())
             self.assertTrue((home / "rewst-install.example.json").is_file())
             self.assertTrue((home / "doorbell.example.json").is_file())
-            soul = (home / "SOUL.md").read_text()
-            self.assertIn(str(home), soul)
-            self.assertNotIn("$GRAPHWING_HOME", soul)
-            self.assertNotIn("tim-graphwing", soul)
+            self.assertFalse((home / "SOUL.md").exists())
+            self.assertFalse((home / "profiles.json").exists())
+            self.assertFalse((home / "bin" / "graphwing").exists())
 
     def test_ensure_repos_noninteractive_empty(self):
         import install
@@ -4070,7 +3889,7 @@ class InstallTests(unittest.TestCase):
         subprocess.run(["bash", "-n", str(script)], check=True)
         text = script.read_text()
         self.assertNotIn("/home/tim", text)
-        self.assertIn("hermes-agent.nousresearch.com/install.sh", text)
+        self.assertNotIn("model install", text.lower())
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "gw"
             units = Path(td) / "units"
@@ -4079,7 +3898,6 @@ class InstallTests(unittest.TestCase):
                     "bash",
                     str(script),
                     "--yes",
-                    "--no-hermes",
                     "--no-herdr",
                     "--tunnel",
                     "none",
@@ -4087,12 +3905,12 @@ class InstallTests(unittest.TestCase):
                     str(home),
                     "--unit-dir",
                     str(units),
-                    "--no-cli",
                     "--no-start",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
+                env={**os.environ, "HOME": td},
             )
             self.assertTrue((home / "server.py").is_file())
             self.assertTrue((home / "api.key").read_text().strip())
@@ -4100,7 +3918,7 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((home / "rr.example.json").is_file())
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertIn("not starting", proc.stdout)
-            self.assertNotIn("installing Hermes", proc.stdout)
+            self.assertIn("native model launchers must already be installed", proc.stdout)
             self.assertNotIn("installing herdr", proc.stdout)
 
 

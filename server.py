@@ -26,7 +26,6 @@ from urllib.request import Request, urlopen
 HOME = Path(os.environ.get("GRAPHWING_HOME", Path.home() / ".graphwing"))
 OPENAPI_PATH = HOME / "openapi.json"
 REPOS_PATH = HOME / "repos.json"
-PROFILES_PATH = HOME / "profiles.json"
 SCRIPTS_PATH = HOME / "scripts.json"
 STACKS_PATH = HOME / "stacks.json"
 TESTS_PATH = HOME / "tests.json"
@@ -54,7 +53,6 @@ HERDR_JOB_TAB_MAX = 8
 # The tab-count cap still wins: a burst of jobs evicts lingering tabs early.
 HERDR_TAB_LINGER_SECONDS = int(os.environ.get("GRAPHWING_HERDR_TAB_LINGER", "180"))
 HERDR_LOCK = threading.Lock()
-HOME_PROFILE = "graphwing"
 
 
 def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
@@ -67,18 +65,15 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
     return fallback
 
 
-HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
 CODEX_BIN = resolve_executable("codex", "GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex")
 CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
 GROK_BIN = resolve_executable("grok", "GRAPHWING_GROK_BIN", Path.home() / ".local" / "bin" / "grok")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
-HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
 AGENT_MAX_TURNS = 30
 AGENT_RUN_BUDGET = 300
 AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
 NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 NATIVE_LAUNCHERS = {
     "codex": {"provider": "openai", "models": ("gpt-5.6-sol",)},
@@ -495,38 +490,6 @@ def verify_github_oidc(token: str, config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(expires, (int, float)) or expires <= time.time():
         raise ValueError("expired JWT")
     return claims
-
-
-def load_profiles() -> list[dict[str, Any]]:
-    data = json.loads(PROFILES_PATH.read_text())
-    if isinstance(data, dict) and isinstance(data.get("profiles"), list):
-        raw = data["profiles"]
-    elif isinstance(data, list):
-        raw = data
-    else:
-        raise RuntimeError(f"profiles.json must list profiles: {PROFILES_PATH}")
-    profiles: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        pid = str(item.get("id") or "").strip()
-        if not pid or pid in seen:
-            continue
-        seen.add(pid)
-        profiles.append(
-            {
-                "id": pid,
-                "kind": str(item.get("kind") or "home"),
-                "hermes_home": str(resolve_under_home(item.get("hermes_home") or HOME)),
-                "herdr_session": str(item.get("herdr_session") or ""),
-                "herdr_agent": str(item.get("herdr_agent") or pid),
-                "runnable": bool(item.get("runnable")),
-            }
-        )
-    if not profiles:
-        raise RuntimeError(f"profiles.json has no profiles: {PROFILES_PATH}")
-    return profiles
 
 
 def _allowed_cwds(repos: dict[str, str] | None = None) -> set[str]:
@@ -2387,29 +2350,8 @@ def herdr_follow_job(job: dict[str, Any]) -> None:
         job["herdr_pane_id"] = pane_id
         job["herdr_tab_id"] = tab_id
         write_job(job)
-        herdr_report(pane_id, label, "working", job.get("script") or job.get("profile") or "job")
+        herdr_report(pane_id, label, "working", job.get("script") or job.get("launcher") or "job")
         herdr_send(pane_id, f"tail -F '{log_path}'\n")
-
-
-def herdr_show_session(job: dict[str, Any]) -> None:
-    """Swap a finished writer's pane from the log tail to its real session.
-
-    While the job runs, the headless process owns that Hermes session, so the
-    pane tails stdout.log instead. Once it is done the tail is a frozen file
-    and the session is fully readable, which is what the linger window is for.
-    Only writer jobs have one; test and review are not Hermes, so they keep
-    the tail.
-    """
-    if HERDR_TAB_LINGER_SECONDS <= 0:
-        return
-    pane_id = str(job.get("herdr_pane_id") or "")
-    session = job.get("hermes_session")
-    if not pane_id or not isinstance(session, str) or not HERMES_SESSION_RE.fullmatch(session):
-        return
-    cwd = str(job.get("cwd") or HOME)
-    # Ctrl-C stops tail -F before the pane runs anything else.
-    herdr_send(pane_id, "\x03")
-    herdr_send(pane_id, f"{HERMES_BIN} --resume '{session}' --in '{cwd}' --no-restore-cwd\n")
 
 
 def herdr_job_done(job: dict[str, Any]) -> None:
@@ -2427,7 +2369,6 @@ def herdr_job_done(job: dict[str, Any]) -> None:
             if isinstance(tab, dict) and str(tab.get("label") or "") == label:
                 tab_id = str(tab.get("tab_id") or "")
                 break
-    herdr_show_session(job)
     herdr_close_tab_later(tab_id, HERDR_TAB_LINGER_SECONDS)
 
 
@@ -2435,7 +2376,7 @@ def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str
     bits = [path, str(status)]
     if not isinstance(payload, dict):
         return " ".join(bits)
-    for key in ("repo", "name", "profile", "job_id", "branch", "code"):
+    for key in ("repo", "name", "job_id", "branch", "code"):
         val = payload.get(key)
         if val not in (None, ""):
             bits.append(str(val)[:48])
@@ -2463,8 +2404,6 @@ def herdr_announce(method: str, path: str, status: int, payload: dict[str, Any] 
     if not herdr_enabled():
         return
     if status == 401 or path in _ANNOUNCE_SKIP or path.startswith(_ANNOUNCE_SKIP_PREFIX):
-        return
-    if method == "GET" and path == "/v1/agent/profiles":
         return
     line = summarize_op(path, status, payload)
 
@@ -2512,11 +2451,9 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "job_id",
         "status",
-        "profile",
         "repo",
         "cwd",
         "prompt",
-        "hermes_session",
         "launcher",
         "provider",
         "model",
@@ -2532,10 +2469,6 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     out = {k: job.get(k) for k in keys}
     out["ok"] = True
     return out
-
-
-def list_agent_profiles() -> dict[str, Any]:
-    return {"ok": True, "profiles": load_profiles()}
 
 
 def active_job_count() -> int:
@@ -2832,18 +2765,6 @@ def parse_webhook_fields(data: dict[str, Any]) -> tuple[str | None, str | None, 
     return url, token, None
 
 
-def parse_hermes_session(data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    raw = data.get("hermes_session")
-    if raw in ("", None):
-        return None, None
-    if not isinstance(raw, str):
-        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
-    name = raw.strip()
-    if not HERMES_SESSION_RE.fullmatch(name):
-        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
-    return name, None
-
-
 def current_branch_head(repo: Path) -> tuple[str | None, str | None, dict[str, Any] | None]:
     branch = run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
     head = run_git(repo, ["rev-parse", "HEAD"])
@@ -3037,8 +2958,6 @@ def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, return
     rec = {
         "status": status,
         "job_id": job["job_id"],
-        "profile": job["profile"],
-        "hermes_session": job.get("hermes_session"),
         "session_identity": identity,
         "sha": None,
         "pr_url": None,
@@ -3078,13 +2997,12 @@ def deliver_webhook(job: dict[str, Any], receipt: dict[str, Any]) -> dict[str, A
     return post_receipt(str(url), receipt, token=job.get("response_webhook_token"))
 
 
-def hermes_job_env(job: dict[str, Any]) -> dict[str, str]:
-    """Graph cwd wins over Hermes config.yaml terminal.cwd and inherited TERMINAL_CWD."""
+def native_job_env(job: dict[str, Any]) -> dict[str, str]:
+    """Graph cwd wins over inherited terminal state."""
     cwd = str(Path(job["cwd"]).resolve())
     env = {k: v for k, v in os.environ.items() if k not in ("TERMINAL_CWD", "PWD")}
     env.update(
         {
-            "HERMES_HOME": str(HOME),
             "GRAPHWING_JOB_ID": str(job["job_id"]),
             "GIT_TERMINAL_PROMPT": "0",
             "GH_PROMPT_DISABLED": "1",
@@ -3093,54 +3011,6 @@ def hermes_job_env(job: dict[str, Any]) -> dict[str, str]:
         }
     )
     return env
-
-
-def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if not HERMES_BIN.is_file():
-        return None, {"error": f"missing hermes binary: {HERMES_BIN}", "code": "missing_binary"}
-    prompt_path = job_dir(job["job_id"]) / "prompt.txt"
-    stdout_path = job_dir(job["job_id"]) / "stdout.log"
-    stderr_path = job_dir(job["job_id"]) / "stderr.log"
-    stdout_f = stdout_path.open("wb")
-    stderr_f = stderr_path.open("wb")
-    cwd = str(Path(job["cwd"]).resolve())
-    env = hermes_job_env(job)
-    cmd = [
-        str(HERMES_BIN),
-        "chat",
-        "-Q",
-        "--query-file",
-        str(prompt_path),
-        "--in",
-        cwd,
-        "--no-restore-cwd",
-        "--max-turns",
-        str(job["max_turns"]),
-        "--run-budget",
-        str(job["run_budget_seconds"]),
-        "--yolo",
-        "--source",
-        "tool",
-    ]
-    session = job.get("hermes_session")
-    if isinstance(session, str) and HERMES_SESSION_RE.fullmatch(session):
-        cmd.extend(["--continue", session, "--create-if-missing"])
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            cwd=cwd,
-            env=env,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        stdout_f.close()
-        stderr_f.close()
-        return None, {"error": f"spawn failed: {exc}", "code": "spawn_failed"}
-    stdout_f.close()
-    stderr_f.close()
-    return proc, None
 
 
 def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
@@ -3221,7 +3091,7 @@ def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, di
     try:
         proc = subprocess.Popen(
             codex_command(job, prompt_path, cwd), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
-            cwd=cwd, env=hermes_job_env(job), start_new_session=True,
+            cwd=cwd, env=native_job_env(job), start_new_session=True,
         )
     except OSError as exc:
         stdin_f.close()
@@ -3240,7 +3110,7 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
     stdout_path = path / "stdout.log"
     stderr_path = path / "stderr.log"
     cwd = str(Path(job["cwd"]).resolve())
-    env = hermes_job_env(job)
+    env = native_job_env(job)
     env["GROK_DISABLE_AUTOUPDATER"] = "1"
     try:
         proc = subprocess.Popen(
@@ -3456,7 +3326,7 @@ def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
         return spawn_codex(job)
     if job.get("launcher") == "claude":
         return spawn_claude(job)
-    return spawn_hermes(job)
+    return None, {"error": "unknown native launcher", "code": "bad_launcher"}
 
 
 def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
@@ -3724,27 +3594,14 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if err:
         return 400, err
     assert data is not None
-    profile = str(data.get("profile") or HOME_PROFILE).strip() or HOME_PROFILE
-    if profile in ("home", "default"):
-        profile = HOME_PROFILE
-    seats = {p["id"]: p for p in load_profiles()}
-    if profile not in seats:
-        return 400, {
-            "error": f"unknown profile '{profile}'",
-            "code": "unknown_profile",
-            "allowed": [p["id"] for p in load_profiles()],
-        }
-    seat = seats[profile]
-    if not seat.get("runnable"):
-        return 400, {"error": f"profile '{profile}' is not runnable", "code": "not_runnable"}
-    hermes_home = Path(str(seat.get("hermes_home") or HOME)).resolve()
-    try:
-        hermes_home.relative_to(HERMES_PROFILES_ROOT.resolve())
-        under_hermes_profiles = True
-    except ValueError:
-        under_hermes_profiles = False
-    if under_hermes_profiles or profile != HOME_PROFILE or hermes_home != HOME.resolve():
-        return 400, {"error": f"profile '{profile}' cannot be executed", "code": "not_runnable"}
+    allowed = {
+        "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
+        "session_identity", "resume_job_id", "cwd", "response_webhook_url",
+        "response_webhook_token", "resume_url",
+    }
+    unexpected = sorted(set(data) - allowed)
+    if unexpected:
+        return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return 400, {"error": "prompt is required", "code": "missing_prompt"}
@@ -3760,87 +3617,68 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
-    session, session_err = parse_hermes_session(data)
-    if session_err:
-        return 400, session_err
-    launcher = str(data.get("launcher") or "hermes").strip()
-    if launcher != "hermes" and launcher not in NATIVE_LAUNCHERS:
-        return 400, {"error": "launcher must be hermes, claude, codex, or grok", "code": "bad_launcher"}
-    native = launcher in NATIVE_LAUNCHERS
-    if native and session is not None:
-        return 400, {"error": f"{launcher} launcher cannot use hermes_session", "code": "launcher_state_mismatch"}
-    raw_session_identity = data.get("session_identity")
-    if not native and raw_session_identity not in (None, ""):
-        return 400, {"error": "session_identity is only valid for native launchers", "code": "launcher_state_mismatch"}
-    raw_resume_job_id = data.get("resume_job_id")
-    if raw_resume_job_id not in (None, ""):
-        if native and raw_session_identity in (None, ""):
-            return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
-        if not native and session is None:
-            return 400, {"error": "resume_job_id requires launcher resume state", "code": "launcher_state_mismatch"}
+    launcher = data.get("launcher")
+    if not isinstance(launcher, str) or not launcher.strip():
+        return 400, {"error": "launcher is required", "code": "missing_launcher"}
+    launcher = launcher.strip()
+    native_spec = NATIVE_LAUNCHERS.get(launcher)
+    if native_spec is None:
+        return 400, {"error": "launcher must be claude, codex, or grok", "code": "bad_launcher"}
+    provider = data.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return 400, {"error": "provider is required", "code": "missing_provider"}
+    provider = provider.strip()
+    model = data.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return 400, {"error": "model is required", "code": "missing_model"}
+    model = model.strip()
+    if len(model) > 80:
+        return 400, {"error": "model is invalid", "code": "bad_model"}
+    if provider != native_spec["provider"] or model not in native_spec["models"]:
+        return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
     budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
     if budget_err:
         return 400, budget_err
-    native_spec = NATIVE_LAUNCHERS.get(launcher)
-    model = data.get("model")
-    if model in ("", None):
-        model = native_spec["models"][0] if native_spec else None
-    elif not isinstance(model, str) or not model.strip() or len(model) > 80:
-        return 400, {"error": "model is invalid", "code": "bad_model"}
-    else:
-        model = model.strip()
-    provider = data.get("provider")
-    if provider in ("", None):
-        provider = native_spec["provider"] if native_spec else None
-    elif not isinstance(provider, str):
-        return 400, {"error": "provider is invalid", "code": "bad_provider"}
-    else:
-        provider = provider.strip()
-    if native_spec and (provider != native_spec["provider"] or model not in native_spec["models"]):
-        return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
-    binary = {"hermes": HERMES_BIN, "claude": CLAUDE_BIN, "codex": CODEX_BIN, "grok": GROK_BIN}[launcher]
+    binary = {"claude": CLAUDE_BIN, "codex": CODEX_BIN, "grok": GROK_BIN}[launcher]
     if not binary.is_file():
-        code = "missing_binary" if launcher == "grok" else ("provider_unavailable" if native else "not_implemented")
+        code = "missing_binary" if launcher == "grok" else "provider_unavailable"
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": code}
-    session_identity = None
-    if native:
-        branch, head, git_err = current_branch_head(resolved)
-        if git_err:
-            return 400, git_err
-        requested_identity, identity_err = parse_session_identity(raw_session_identity)
-        if identity_err:
-            return 400, identity_err
-        session_identity = {
-            "launcher": launcher, "provider": provider, "model": model,
-            "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
-        }
-        if requested_identity is not None:
-            if requested_identity.get("native_session_id") is None:
-                return 400, {"error": "resume session_identity requires native_session_id", "code": "missing_native_session"}
-            expected = dict(session_identity, native_session_id=requested_identity.get("native_session_id"))
-            if requested_identity != expected:
-                return 400, {"error": f"session_identity does not match the current {launcher} job", "code": "session_identity_mismatch"}
-            provenance_err = validate_native_resume_provenance(data, requested_identity, launcher)
-            if provenance_err:
-                return 400, provenance_err
-            session_identity = requested_identity
+    branch, head, git_err = current_branch_head(resolved)
+    if git_err:
+        return 400, git_err
+    requested_identity, identity_err = parse_session_identity(data.get("session_identity"))
+    if identity_err:
+        return 400, identity_err
+    session_identity = {
+        "launcher": launcher, "provider": provider, "model": model,
+        "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
+    }
+    if requested_identity is not None:
+        if requested_identity.get("native_session_id") is None:
+            return 400, {"error": "resume session_identity requires native_session_id", "code": "missing_native_session"}
+        expected = dict(session_identity, native_session_id=requested_identity.get("native_session_id"))
+        if requested_identity != expected:
+            return 400, {"error": f"session_identity does not match the current {launcher} job", "code": "session_identity_mismatch"}
+        provenance_err = validate_native_resume_provenance(data, requested_identity, launcher)
+        if provenance_err:
+            return 400, provenance_err
+        session_identity = requested_identity
+    elif data.get("resume_job_id") not in (None, ""):
+        return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
         log_ref = str(job_dir(job_id) / "stdout.log")
-        hermes_session = None if native else (session or f"gwslice-{job_id}")
         job = {
             "job_id": job_id,
             "status": "queued",
-            "profile": profile,
             "repo": repo_name,
             "cwd": str(resolved),
             "prompt": prompt,
-            "hermes_session": hermes_session,
             "launcher": launcher,
             "provider": provider,
             "model": model,
@@ -3866,9 +3704,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "ok": True,
         "job_id": job_id,
         "status": "queued",
-        "profile": profile,
         "repo": repo_name,
-        "hermes_session": hermes_session,
         "launcher": launcher,
         "provider": provider,
         "model": model,
@@ -4072,8 +3908,6 @@ def dispatch_inner(
     if method == "POST" and path == "/v1/gh/pr/merge":
         status, payload = gh_pr_merge(body, repos)
         return json_out(status, payload)
-    if method == "GET" and path == "/v1/agent/profiles":
-        return json_out(200, list_agent_profiles())
     if method == "POST" and path == "/v1/agent/run":
         status, payload = agent_run(body, repos)
         return json_out(status, payload)
@@ -4151,7 +3985,6 @@ def main() -> None:
     except Exception as exc:
         raise SystemExit(f"API key missing: set GRAPHWING_KEY or write {KEY_PATH}") from exc
     load_repos()
-    load_profiles()
     load_scripts()
     load_tests()
     if RR_PATH.is_file():
