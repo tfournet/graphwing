@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Thin Shortcut REST wrapper. Reads SHORTCUT_API_TOKEN from the environment.
 #
-# Exists because the Shortcut MCP server is only reachable from an interactive
-# hermes session: a `--source tool` run reports the tools unavailable, so no
-# automated step in the loop can read or write a story through it.
+# Legacy seat-side helper. Automated graph nodes do not use it.
 #
 #   sc show <id>              story name, type, state, epic, branches, PRs
 #   sc states                 workflow states for the story's board

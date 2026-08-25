@@ -2,11 +2,11 @@
 
 This git repo is the **node catalog** source of truth. It is not a mega-agent and not the runtime.
 
-- Runtime is `$GRAPHWING_HOME` (default `~/.graphwing`). Secrets, jobs, Hermes state stay there. Do not commit them.
+- Runtime is `$GRAPHWING_HOME` (default `~/.graphwing`). Secrets, jobs, and local runtime state stay there. Do not commit them.
 - Rewst Graph owns topology. graphwing exposes named OpenAPI ops. `agentRun` is one bounded job.
 - Prefer a new deterministic op over an agent loop. New workflow JSON only when **edges** change; loop iterations are run `input`.
-- This host only: git, local `gh`, file head, units, Herdr, allowlisted scripts/tests. Cloud GitHub/Shortcut stay Rewst integrations.
-- Clean machine: `./start.sh`. Optionally grabs Hermes Agent / herdr / cloudflared. `rr` is a drop-in `rr.json` plugin if you already have the binary; tests stay local (`testRun` / `test_server.py`).
+- This host only: git, local `gh`, file head, units, Herdr, allowlisted scripts/tests, and preinstalled native model launchers. Cloud integrations stay on Rewst Graph.
+- Clean machine: `./start.sh`. It can optionally install herdr and cloudflared, but model launchers must already be installed. `rr` is a drop-in `rr.json` plugin; tests stay local (`testRun` / `test_server.py`).
 - Do not install this on Rewst Internal. Do not ship as a platform package.
 
 ## Where to edit
@@ -15,10 +15,8 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 |---|---|
 | HTTP ops | `server.py` + `openapi.json` + `test_server.py` |
 | Published graphs | `graphs/*.json` then `scripts/publish_graphs.py` (reads `$GRAPHWING_HOME/rewst-install.json` + public URL from tunnel meta) |
-| Hermes seat text | `SOUL.md` (copied to `$GRAPHWING_HOME` with `$GRAPHWING_HOME` substituted) |
 | Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. First run: `docs/USING.md`. Do not duplicate them here. |
-| Herdr idea spaces | `scripts/herdr-idea.sh` (`graphwing-idea` after install) |
-| Install / units | `start.sh` (clean machine), `install.py`, `systemd/`, `bin/graphwing` |
+| Install / units | `start.sh` (clean machine), `install.py`, `systemd/` |
 | Omarchy bar | `plugins/graphwing.watch/` then `install.py` (copies into `~/.config/omarchy/plugins/`) |
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.
@@ -37,4 +35,4 @@ Start a Graph run with `{ "input": { ... } }`. `response_webhook_url` is resume 
 
 ## Human surface
 
-Herdr session `graphwing`. Tab `graph` is the dashboard. One idea = one space via `scripts/herdr-idea.sh` (`graphwing-idea` after install). Do not type into the Hermes chat pane or tab `graph`. Operator lock: `docs/HUMAN-LOOP.md`.
+Herdr session `graphwing` and tab `graph` remain an optional deterministic job dashboard. Do not chat there. Use your normal editor or terminal for operator work. Operator lock: `docs/HUMAN-LOOP.md`.

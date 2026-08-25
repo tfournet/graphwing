@@ -6,14 +6,7 @@ Operator lock: [HUMAN-LOOP.md](HUMAN-LOOP.md). Do not implement in the grill pan
 
 ## Sit down
 
-```bash
-herdr --session graphwing
-graphwing-idea open --label NAME --repo riftwing
-```
-
-The planner is tab `plan` in that space: hermes on `riftwing-planner` with the
-`grilling` skill preloaded. Tab `graph` is the dashboard (`gw-*` logs). Do not
-type there.
+Use your normal editor or terminal; optional Herdr session `graphwing`, tab `graph`, is a read-only job dashboard.
 
 Allowlisted short names are `$GRAPHWING_HOME/repos.json`. Graph `cwd` / `repo` fields use those names, not paths.
 
@@ -77,8 +70,6 @@ scripts/fire-slice.sh payload.json
 It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst trigger. The URL and `hook_secret` stay in `$GRAPHWING_HOME/rewst-install.json`. Needs `implement_slice_hook_url` recorded there; without it the endpoint answers 503 naming the key to set.
 
 `kick_url` is this workflow's own webhook. After a green slice, `sliceContinue` POSTs the next ticket there. Without it, this run does one slice and stops.
-
-Watch tab `graph`. Do not chat there.
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
@@ -158,9 +149,7 @@ Two parameter names to avoid: the connector treats a query parameter called `pat
 
 ## Shortcut from the seat
 
-The Shortcut MCP server only answers inside an interactive hermes session; a
-`--source tool` run reports its tools unavailable, so no automated step can reach it.
-`scripts/sc` is a thin REST wrapper over `SHORTCUT_API_TOKEN` for that reason.
+Legacy seat-side tracker calls use `scripts/sc`; Graphwing model jobs do not depend on it.
 
 ```bash
 sc show SC-110290            # name, type, state, epic, branches, PRs
