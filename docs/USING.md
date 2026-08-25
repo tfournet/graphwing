@@ -11,7 +11,9 @@ herdr --session graphwing
 graphwing-idea open --label NAME --repo riftwing
 ```
 
-Claude is tab `claude` in that space. Tab `graph` is the dashboard (`gw-*` logs). Do not type there.
+The planner is tab `plan` in that space: hermes on `riftwing-planner` with the
+`grilling` skill preloaded. Tab `graph` is the dashboard (`gw-*` logs). Do not
+type there.
 
 Allowlisted short names are `$GRAPHWING_HOME/repos.json`. Graph `cwd` / `repo` fields use those names, not paths.
 

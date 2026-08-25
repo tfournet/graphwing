@@ -18,18 +18,18 @@ Two different "graphs". Do not smash them:
 
 - Session: `herdr --session graphwing` (only session).
 - Dashboard: space `graphwing`, tab `graph`. Job logs `gw-*`. Do not chat there.
-- One idea = one **space** (`graphwing-idea open --label NAME --repo riftwing`). Claude is tab `claude`.
+- One idea = one **space** (`graphwing-idea open --label NAME --repo riftwing`). The planner is tab `plan`: hermes on `riftwing-planner` (`gpt-5.6-sol`) with `grilling` preloaded, against `HERMES_HOME=$GRAPHWING_HOME`. `GRAPHWING_PLAN_KIND=claude` restores a Claude pane in tab `claude`.
 - Pre-platform notes: Obsidian `Epics/`, `Notes/`, `projects/riftwing/`. Mission Control is **retired** (archive: `/home/tim/archive/riftwing-mission-control-20260821`). Do not recreate it.
 - **Shortcut** = inbound **idea** (external handle). Not the implementation queue.
 - **Progress** = markdown slice map in the app worktree. Do not mirror ACs onto the Shortcut card.
 
 ## Flow
 
-1. **Grill.** Tab `claude`, `/grill-with-docs`. Steps 1, 3 and 5 ship in the `graphwing-loop` plugin (`plugins/graphwing-loop/`); `install.py` offers it, or `claude plugin marketplace add <checkout> && claude plugin install graphwing-loop@graphwing`. A same-named skill in `~/.claude/skills/` **wins over the plugin**, so remove any leftover `grilling` / `to-spec` / `to-tickets` there. Seat skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills` supplies `/grill-with-docs` and `domain-modeling`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`); both ride in `index.json`, never on the tracker card.
+1. **Grill.** Tab `plan`, skill already loaded. `graphwing-idea` starts it; nothing to type first. Steps 1, 3 and 5 ship in the `graphwing-loop` plugin (`plugins/graphwing-loop/`); `install.py` offers it, or `claude plugin marketplace add <checkout> && claude plugin install graphwing-loop@graphwing`. A same-named skill in `~/.claude/skills/` **wins over the plugin**, so remove any leftover `grilling` / `to-spec` / `to-tickets` there. Seat skills: `rewst-obsidian-staging`, `rewst-graph-handoff` (`~/.claude/skills/`). Matt plugin `mattpocock-skills` supplies `/grill-with-docs` and `domain-modeling`. Do not `/implement` or `/build` here. Grill stamps a **class** (`mechanical` / `visual` / `sensitive`) and a story size **floor** (`S` / `M` / `L`); both ride in `index.json`, never on the tracker card.
 2. **UI.** Storybook throwaways; the engineer picks. Then agents may build.
 3. **Spec.** `/to-spec` onto Shortcut. The Shortcut story is the external idea, not the slice list.
 4. **Ready** (Shortcut). Spec is good enough to **Structure**. Graph does **not** write yet.
-5. **Structure.** Same tab `claude`, `/to-tickets`. Writes the slice map in the worktree. The engineer approves once. Graph never Structures.
+5. **Structure.** Same tab `plan`, `/to-tickets`. Writes the slice map in the worktree. The engineer approves once. Graph never Structures.
 6. **Write.** A **frontier** ticket path fires `graphwing-implement-slice`. Graph **walks serially** until the map is empty, a slice **fails** the valve, or the next ticket is a **`decision`**. Watch tab `graph`; do not chat there.
 7. **E2E.** After the map is empty, **before** PR/CI: named smoke/e2e on the seat. Green is supposed to comment `slices complete` (Graph does not post it yet). Red goes back to slices (below).
 8. **Proof.** Bug: the failing command is green. UI: drive a live stack. Minor UI: before/after on the story. You, not Graph.
