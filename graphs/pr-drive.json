@@ -23,6 +23,8 @@
             "kick_url": { "type": "string", "required": false },
             "kick_token": { "type": "string", "required": false },
             "test": { "type": "string", "required": true },
+            "class": { "type": "string", "required": false, "description": "mechanical | visual | sensitive; absent means mechanical" },
+            "size": { "type": "string", "required": false },
             "prompt": { "type": "string", "required": false },
             "commit_message": { "type": "string", "required": true }
           }
@@ -177,6 +179,8 @@
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
           "prompt": "{{ TASKS.findings.data.brief | default(CTX.INPUT.prompt) }}",
+          "launcher": "{{ TASKS.route.data.launcher }}",
+          "model": "{{ TASKS.route.data.model }}",
           "_comment": "Without these the writer takes AGENT_RUN_BUDGET=300 and is SIGINTed at 300+60. Three laps ran 260s, 335s and 363s, so a fix round is L-sized work, not M. wait is 960, which clears 600+60 with room.",
           "max_turns": "50",
           "run_budget_seconds": "600",
@@ -346,6 +350,18 @@
         }
       },
       {
+        "id": "route",
+        "type": "action.graphwing.POST:/v1/slice/route",
+        "label": "sliceRoute",
+        "position": { "x": 1180, "y": 240 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 15,
+          "class": "{{ CTX.INPUT.class }}",
+          "size": "{{ CTX.INPUT.size }}"
+        }
+      },
+      {
         "id": "findings",
         "type": "action.graphwing.GET:/v1/gh/pr/findings",
         "label": "PR findings",
@@ -458,7 +474,8 @@
       { "id": "e3", "source": "view", "sourceHandle": "success", "target": "checks", "targetHandle": "in" },
       { "id": "e3f", "source": "view", "sourceHandle": "failure", "target": "herdr_no_pr", "targetHandle": "in" },
       { "id": "e4", "source": "checks", "sourceHandle": "success", "target": "findings", "targetHandle": "in" },
-      { "id": "e4b", "source": "findings", "sourceHandle": "success", "target": "drive_snap", "targetHandle": "in" },
+      { "id": "e4b", "source": "findings", "sourceHandle": "success", "target": "route", "targetHandle": "in" },
+      { "id": "e4r", "source": "route", "sourceHandle": "success", "target": "drive_snap", "targetHandle": "in" },
       { "id": "e4c", "source": "drive_snap", "sourceHandle": "out", "target": "switch_checks", "targetHandle": "in" },
       { "id": "e4f", "source": "checks", "sourceHandle": "failure", "target": "herdr_checks1", "targetHandle": "in" },
       { "id": "e5", "source": "switch_checks", "sourceHandle": "case-1", "target": "review_snap", "targetHandle": "in" },

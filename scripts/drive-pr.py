@@ -140,6 +140,9 @@ def main() -> int:
     ap.add_argument("--test", default="riftwing-local-gates")
     ap.add_argument("--auto-merge", action="store_true")
     ap.add_argument("--max-attempts", default="3")
+    ap.add_argument("--class", dest="klass", default="mechanical",
+                    choices=["mechanical", "visual", "sensitive"])
+    ap.add_argument("--size", default="M", choices=["S", "M", "L"])
     ap.add_argument("--wait", type=int, default=0,
                     help="seconds to poll one run; defaults to the graph's own worst case")
     ap.add_argument("--message", default="fix: address review findings",
@@ -174,6 +177,10 @@ def main() -> int:
         "max_attempts": str(args.max_attempts),
         "auto_merge": "true" if args.auto_merge else "false",
         "commit_message": args.message,
+        # sliceRoute governs which model fixes the PR. Absent class means
+        # mechanical, matching the grill and the lock.
+        "class": args.klass,
+        "size": args.size,
     }
     # The loop lives here, not in the graph. The graph's `continue` node kicks
     # the next attempt at kick_url, which is a Rewst webhook, and a

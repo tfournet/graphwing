@@ -1728,6 +1728,24 @@ class DispatchTests(unittest.TestCase):
                 self.assertGreater(n["config"]["timeoutSeconds"], longest_budget,
                                    f"{n_id} can time out on work that is still succeeding")
 
+    def test_pr_drive_pins_its_writer_instead_of_inheriting_the_seat(self):
+        # implement-slice pins model and launcher from sliceRoute. pr-drive
+        # pinned neither, so its writer took whatever the seat's sticky hermes
+        # profile pointed at — job.json recorded model: null. A `hermes profile
+        # use` anywhere on the box silently changed which model fixes PRs, and
+        # the closed class table did not apply to that writer at all.
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        self.assertIn("route", nodes, "pr-drive must consult sliceRoute")
+        self.assertTrue(nodes["route"]["type"].endswith("/v1/slice/route"))
+        cfg = nodes["agent"]["config"]
+        self.assertIn("TASKS.route.data.model", cfg.get("model", ""))
+        self.assertIn("TASKS.route.data.launcher", cfg.get("launcher", ""))
+        # route has to run before the writer, not merely exist.
+        order = {e["source"]: e["target"] for e in edges}
+        self.assertTrue(any(e["target"] == "route" for e in edges), "route is unreachable")
+
     def test_pr_drive_gates_never_read_an_artifact_stub(self):
         # A node returning more than ~20KB has its output replaced by an
         # artifact stub, and a filter fed that stub evaluates nothing while
