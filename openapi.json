@@ -1442,7 +1442,7 @@
             "pattern": "^[0-9a-f]{32}$",
             "description": "Required with native session_identity resume. Must reference a prior completed successful Graphwing job from the same launcher whose receipt session_identity exactly matches."
           },
-          "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
+          "cwd": { "type": "string", "description": "Allowlisted repo short name, not a filesystem path. Omit for the server policy default." },
           "response_webhook_url": {
             "type": "string",
             "format": "uri",
