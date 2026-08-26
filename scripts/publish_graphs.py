@@ -25,6 +25,73 @@ BASE = os.environ.get("GRAPHWING_REWST_API", "https://app.rewst.ai/api").rstrip(
 TENANT = ""
 
 
+_VOLATILE_READBACK_FIELDS = frozenset({
+    "createdAt", "updatedAt", "created_at", "updated_at", "publishedAt",
+    "published_at", "lastPublishedAt", "last_published_at", "etag",
+    "revision", "versionId", "version_id", "lastModified", "last_modified",
+})
+
+
+def normalize_catalog(value):
+    """Remove only known API metadata, preserving every catalog semantic key."""
+    if isinstance(value, dict):
+        return {
+            key: normalize_catalog(item) for key, item in value.items()
+            if key not in _VOLATILE_READBACK_FIELDS
+        }
+    if isinstance(value, list):
+        return [normalize_catalog(item) for item in value]
+    return value
+
+
+def canonical_catalog_bytes(value) -> bytes:
+    """The committed catalog parity contract: recursively sorted JSON bytes.
+
+    Hashing a request body proves only what was submitted.  This canonical form
+    is applied independently to the catalog object and a fresh API readback,
+    and never persisted as a snapshot.
+    """
+    return json.dumps(normalize_catalog(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def catalog_hash(value) -> str:
+    import hashlib
+    return hashlib.sha256(canonical_catalog_bytes(value)).hexdigest()
+
+
+def require_catalog_parity(expected, live, label: str) -> dict:
+    """Fail closed on unreadable or normalized catalog/readback mismatch."""
+    if not isinstance(live, (dict, list)):
+        raise SystemExit(f"{label} live readback is unreadable; no parity receipt")
+    expected_sha, live_sha = catalog_hash(expected), catalog_hash(live)
+    if expected_sha != live_sha:
+        raise SystemExit(f"{label} live catalog mismatch; no parity receipt ({expected_sha} != {live_sha})")
+    return {
+        "live_source": "fresh_post_publish_api_read",
+        "normalized_catalog_sha": expected_sha,
+        "normalized_live_sha": live_sha,
+    }
+
+
+def workflow_readback_spec(body: dict) -> dict | None:
+    """Extract a workflow spec only from the post-publish API response."""
+    if not isinstance(body, dict):
+        return None
+    envelope = body.get("data") if isinstance(body.get("data"), dict) else body
+    workflow = envelope.get("workflow") if isinstance(envelope.get("workflow"), dict) else envelope
+    current = workflow.get("currentVersion") or workflow.get("current_version")
+    if isinstance(current, dict) and isinstance(current.get("spec"), dict):
+        return current["spec"]
+    return workflow.get("spec") if isinstance(workflow.get("spec"), dict) else None
+
+
+def verify_workflow_parity(mcp: str, workflow_id: str, expected_spec: dict, slug: str) -> dict:
+    status, body = api(mcp, "GET", f"/workflows/{workflow_id}?include=spec")
+    if status != 200:
+        raise SystemExit(f"{slug} live readback HTTP {status}; no parity receipt")
+    return require_catalog_parity(expected_spec, workflow_readback_spec(body), slug)
+
+
 def load_install() -> dict:
     path = HOME / "rewst-install.json"
     if not path.is_file():
@@ -217,7 +284,11 @@ def publish_selected(
         wid, vid, slug = upsert_workflow(
             mcp, g["name"], g["slug"], g["description"], g["spec"], g.get("tags") or []
         )
-        published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
+        # Publishing is not proof that the server kept the graph we sent.
+        # Read it again only after publication and stop before persisting any
+        # success-shaped result if normalization disagrees.
+        parity = verify_workflow_parity(mcp, wid, g["spec"], slug)
+        published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug, "parity": parity}
         if stem == "pre-pr-build":
             source_workflow_id = wid
     return published

@@ -18,10 +18,10 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -72,16 +72,16 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
     return fallback
 
 
-HERMES_BIN = resolve_executable("hermes", "GRAPHWING_HERMES_BIN", Path.home() / ".local" / "bin" / "hermes")
+CODEX_BIN = resolve_executable("codex", "GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex")
 CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
+GROK_BIN = resolve_executable("grok", "GRAPHWING_GROK_BIN", Path.home() / ".local" / "bin" / "grok")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
-HERMES_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
 AGENT_MAX_TURNS = 30
 AGENT_RUN_BUDGET = 300
 AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-HERMES_SESSION_RE = re.compile(r"^gwslice-[0-9a-f]{32}$")
+HARNESS_SESSION_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_TICKET_CORE_KEYS = frozenset({"id", "path", "kind", "status", "blocked_by"})
@@ -90,16 +90,13 @@ SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_SIZES = ("S", "M", "L")
 # Spec-review turn budget. Was hardcoded to 1 for the claude reviewers, so
 # every review died on "Reached max turns (1)" and parsed as a NACK without
-# reading anything (SC-110290's first run nacked twice that way). The hermes
-# reviewer already used 8. Read the diff, think, answer, and leave slack for a
+# reading anything (SC-110290's first run nacked twice that way). Direct
+# harnesses get enough turns to read the diff, think, answer, and leave slack for a
 # provider hiccup or a dropped connection costing a turn.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
 # Spec-review is read-only. The claude reviewers get --permission-mode plan,
-# which enforces that in the runner. Hermes has no equivalent flag, so the sol
-# reviewer is restricted by toolset instead: the ticket and diff are already in
-# the prompt, so it needs no file or terminal tools to answer. An empty -t is
-# silently ignored (hermes falls back to the config default), so name a real
-# harmless toolset.
+# which enforces that in the runner. Codex and Grok are explicitly in
+# read-only/plan mode and no path invokes a broker or implicit fallback.
 REVIEW_TOOLSETS = os.environ.get("GRAPHWING_REVIEW_TOOLSETS", "todo")
 SLICE_BUDGET = {
     ("mechanical", "S"): (10, 120),
@@ -274,7 +271,10 @@ BUILD_PATH_RULES_MAX = 16
 BUILD_CHANGED_PATHS_MAX = 256
 # Silence is a provider blip, not an opinion. Retry it; only a reviewer that
 # finished and still said no is a finding.
-BUILD_REVIEW_SILENCE_RETRIES = 2
+# A lost provider is a terminal attempt outcome.  Re-running it in this
+# process conceals the primary failure from the workflow, which is the exact
+# decision Rewst—not the daemon—must make for ticket 07.
+BUILD_REVIEW_SILENCE_RETRIES = 0
 BUILD_REVIEW_ROUNDS_KEPT = 32
 # Which vendor answers to which reviewer name. A reviewer from the writer's own
 # vendor is not an independent review, so the two are compared before a review
@@ -286,6 +286,22 @@ BUILD_REVIEWER_VENDOR = {
     "sol": "openai",
     "terra": "openai",
     "grok": "xai",
+}
+BUILD_REVIEWER_PROVIDER = {
+    "sonnet": "anthropic",
+    "opus": "anthropic",
+    "fable": "anthropic",
+    "sol": "openai",
+    "terra": "openai",
+    "grok": "xai",
+}
+BUILD_REVIEWER_MODEL = {
+    "sonnet": "sonnet",
+    "opus": "opus",
+    "fable": "claude-fable-5",
+    "sol": "gpt-5.6-sol",
+    "terra": "gpt-5.6-terra",
+    "grok": "grok-4.6",
 }
 # Which vendor a writer model belongs to. The route names a model the way an
 # operator says it out loud -- "sonnet", "grok-4.6", "gpt-5.6-terra" -- so a
@@ -310,6 +326,21 @@ BUILD_WRITER_VENDOR_ALIASES = (
 # model is a writer whose independence cannot be established and fails closed.
 BUILD_VENDOR_UNKNOWN = "unknown"
 BUILD_GATE_RECORDS_KEPT = 32
+# Ticket 07 is a proof overlay on the existing build receipt.  It deliberately
+# lives in the build document rather than introducing a second store, runner,
+# or service: the controller supplies external canary evidence and this API
+# makes the finalization boundary fail closed until the census is complete.
+BUILD_ROLLOUT_TICKET = "github_issue_52"
+BUILD_ROLLOUT_RECEIPT_KINDS = (
+    "catalog_parity",
+    "mechanical",
+    "sensitive",
+    "visual",
+    "checkpoint",
+    "lifecycle",
+)
+BUILD_ROLLOUT_RECEIPT_KIND_SET = frozenset(BUILD_ROLLOUT_RECEIPT_KINDS)
+BUILD_ROLLOUT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # What a stack is for, declared by the catalog entry rather than guessed from
 # its name. Only `clean` may carry a build's final integration run: it is a
 # disposable stack brought up from its own checkout, so a pass on it is a claim
@@ -1017,7 +1048,7 @@ def load_profiles() -> list[dict[str, Any]]:
             {
                 "id": pid,
                 "kind": str(item.get("kind") or "home"),
-                "hermes_home": str(resolve_under_home(item.get("hermes_home") or HOME)),
+                "harness_home": str(resolve_under_home(item.get("harness_home") or HOME)),
                 "herdr_session": str(item.get("herdr_session") or ""),
                 "herdr_agent": str(item.get("herdr_agent") or pid),
                 "runnable": bool(item.get("runnable")),
@@ -2012,7 +2043,7 @@ def slice_route_lookup(
     sized = bump_slice_size(size_floor, class_name, ac_count, seams)
     turns, wait = SLICE_BUDGET[(class_name, sized)]
     if class_name == "mechanical":
-        launcher, model = "hermes", "grok-4.6"
+        launcher, model = "grok", "grok-4.6"
         reviewer1, reviewer2 = ("none", "none") if sized == "S" else ("sonnet", "none")
     elif class_name == "visual":
         # Every review crosses vendors, and all three vendors are in the loop:
@@ -2276,7 +2307,144 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
-def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
+CANONICAL_HARNESS_MODELS = {
+    "openai": {},
+    "anthropic": {"sonnet": "claude-sonnet-5", "opus": "claude-opus-5", "claude-fable-5": "claude-fable-5"},
+    "xai": {"grok-4.6": "grok-4.6-build"},
+}
+
+
+def harness_canonical_model(provider: str, model: str) -> str:
+    return CANONICAL_HARNESS_MODELS.get(provider, {}).get(model, model)
+
+
+def _native_error(code: str) -> tuple[str, None, str]:
+    return "", None, code
+
+
+def codex_session_metadata(thread_id: str) -> dict[str, Any] | None:
+    """Select one Codex session by its emitted thread id, never latest/time."""
+    root = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "sessions"
+    matches: list[list[dict[str, Any]]] = []
+    try:
+        paths = root.rglob("*.jsonl")
+        for path in paths:
+            rows = []
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+            if any(isinstance(r.get("payload"), dict) and r.get("payload", {}).get("session_id", r.get("payload", {}).get("id")) == thread_id
+                   for r in rows):
+                matches.append(rows)
+    except OSError:
+        return None
+    if len(matches) != 1:
+        return None
+    rows = matches[0]
+    meta = next((r.get("payload") for r in rows if r.get("type") == "session_meta" and isinstance(r.get("payload"), dict)), None)
+    context = next((r.get("payload") for r in rows if r.get("type") == "turn_context" and isinstance(r.get("payload"), dict)), None)
+    complete = next((r.get("payload") for r in reversed(rows) if r.get("type") == "task_complete" and isinstance(r.get("payload"), dict)), None)
+    if not isinstance(meta, dict) or not isinstance(context, dict) or not isinstance(complete, dict):
+        return None
+    return {"session_id": meta.get("session_id", meta.get("id")), "originator": meta.get("originator"),
+            "source": meta.get("source"), "model_provider": meta.get("model_provider"),
+            "turn_id": context.get("turn_id"), "model": context.get("model"),
+            "complete_turn_id": complete.get("turn_id"), "last_agent_message": complete.get("last_agent_message")}
+
+
+def native_harness_receipt(
+    launcher: str, stdout: str, requested_model: str, expected_session: str | None,
+    meta_reader: Callable[[str], dict[str, Any] | None] = codex_session_metadata,
+) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Validate a native harness shape and only then normalize it for Graphwing."""
+    provider = {"codex": "openai", "claude": "anthropic", "grok": "xai"}.get(launcher)
+    if not provider or not requested_model:
+        return _native_error("missing_transport_provenance")
+    canonical = harness_canonical_model(provider, requested_model)
+    try:
+        if launcher == "claude":
+            raw = json.loads(stdout)
+            usage = raw.get("usage") if isinstance(raw, dict) else None
+            models = raw.get("modelUsage") if isinstance(raw, dict) else None
+            if not isinstance(raw, dict) or raw.get("session_id") != expected_session:
+                return _native_error("unrelated_transport_receipt")
+            if raw.get("is_error") is not False or raw.get("terminal_reason") != "completed" or raw.get("subtype") != "success":
+                return _native_error("fallback_or_incomplete_transport")
+            if not isinstance(raw.get("result"), str) or not isinstance(raw.get("num_turns"), int) or raw["num_turns"] < 1:
+                return _native_error("malformed_transport_provenance")
+            if not isinstance(usage, dict) or not isinstance(usage.get("iterations"), list) or not usage["iterations"]:
+                return _native_error("malformed_transport_provenance")
+            if not isinstance(models, dict) or len(models) != 1:
+                return _native_error("multiple_or_incomplete_transport")
+            identity = next(iter(models.values()))
+            if not isinstance(identity, dict) or identity.get("provider") != "firstParty" or identity.get("canonicalModel") != canonical:
+                return _native_error("unexpected_execution")
+            return raw["result"], {"transport": launcher, "session_id": expected_session, "provider": provider,
+                "model": requested_model, "canonical_model": canonical, "native_receipt": raw, "fallback_disabled": True}, None
+        if launcher == "grok":
+            raw = json.loads(stdout)
+            models = raw.get("modelUsage") if isinstance(raw, dict) else None
+            if not isinstance(raw, dict) or raw.get("sessionId") != expected_session:
+                return _native_error("unrelated_transport_receipt")
+            if raw.get("stopReason") != "end_turn" or not isinstance(raw.get("requestId"), str) or not raw["requestId"]:
+                return _native_error("fallback_or_incomplete_transport")
+            if not isinstance(raw.get("text"), str) or not isinstance(raw.get("num_turns"), int) or raw["num_turns"] < 1:
+                return _native_error("malformed_transport_provenance")
+            if not isinstance(models, dict) or list(models) != [canonical]:
+                return _native_error("multiple_or_incomplete_transport")
+            identity = models[canonical]
+            if not isinstance(identity, dict) or not isinstance(identity.get("modelCalls"), int) or identity["modelCalls"] < 1:
+                return _native_error("malformed_transport_provenance")
+            return raw["text"], {"transport": launcher, "session_id": expected_session, "provider": provider,
+                "model": requested_model, "canonical_model": canonical, "native_receipt": raw, "fallback_disabled": True}, None
+        events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        started = [e for e in events if isinstance(e, dict) and e.get("type") == "thread.started" and isinstance(e.get("thread_id"), str)]
+        turns = [e for e in events if isinstance(e, dict) and e.get("type") == "turn.started"]
+        completed = [e for e in events if isinstance(e, dict) and e.get("type") == "turn.completed"]
+        messages = [e.get("item") for e in events if isinstance(e, dict) and e.get("type") == "item.completed" and isinstance(e.get("item"), dict) and e["item"].get("type") == "agent_message" and isinstance(e["item"].get("text"), str)]
+        if len(started) != 1 or len(turns) != 1 or len(completed) != 1 or len(messages) != 1:
+            return _native_error("malformed_transport_provenance")
+        thread_id = started[0]["thread_id"]
+        if expected_session not in (None, "", thread_id):
+            return _native_error("unrelated_transport_receipt")
+        meta = meta_reader(thread_id)
+        if not isinstance(meta, dict) or any(meta.get(k) != v for k, v in {
+            "session_id": thread_id, "originator": "codex_exec", "source": "exec", "model_provider": "openai", "model": canonical,
+        }.items()):
+            return _native_error("unrelated_transport_receipt")
+        if not isinstance(meta.get("turn_id"), str) or meta.get("complete_turn_id") != meta["turn_id"] or meta.get("last_agent_message") != messages[0]["text"]:
+            return _native_error("malformed_transport_provenance")
+        return messages[0]["text"], {"transport": launcher, "session_id": thread_id, "provider": provider,
+            "model": requested_model, "canonical_model": canonical, "native_receipt": {"events": events, "session_meta": meta}, "fallback_disabled": True}, None
+    except (ValueError, TypeError):
+        return _native_error("malformed_transport_provenance")
+
+
+def review_transport_provenance(transport: str, receipt_path: Path, attempt_id: str, provider: str, model: str) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, ValueError):
+        return None, "missing_transport_provenance"
+    if not isinstance(receipt, dict) or receipt.get("transport") != transport:
+        return None, "malformed_transport_provenance"
+    expected = {"openai": "codex", "anthropic": "claude", "xai": "grok"}.get(provider)
+    if expected != transport or (receipt.get("provider"), receipt.get("model")) != (provider, model):
+        return None, "unexpected_execution"
+    if receipt.get("canonical_model") != harness_canonical_model(provider, model) or not receipt.get("session_id"):
+        return None, "unrelated_transport_receipt"
+    if transport != "codex" and receipt.get("session_id") != str(uuid.UUID(hex=attempt_id)):
+        return None, "unrelated_transport_receipt"
+    return receipt, None
+
+def review_result(
+    reviewer: str, prompt: str, resolved: Path,
+    requested_provider: str | None = None, requested_model: str | None = None,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
     """Run one spec-review to completion and return its verdict payload."""
     diff = git_diff(resolved, "HEAD", None)
     diff_text = str(diff.get("diff") or "")[:12000]
@@ -2285,55 +2453,33 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
         f"Ticket:\n{prompt[:8000]}\n\nDiff:\n{diff_text}\n"
     )
-    if reviewer in {"sonnet", "opus", "fable"}:
-        if not CLAUDE_BIN.is_file():
-            return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                    "error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
-        model = {"sonnet": "sonnet", "opus": "opus", "fable": "claude-fable-5"}[reviewer]
-        cmd = [
-            str(CLAUDE_BIN),
-            "-p",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "plan",
-            "--max-turns",
-            str(REVIEW_MAX_TURNS),
-            "--model",
-            model,
-            body_prompt,
-        ]
-        env = {k: v for k, v in os.environ.items()}
+    provider = requested_provider or BUILD_REVIEWER_PROVIDER.get(reviewer)
+    model = requested_model or BUILD_REVIEWER_MODEL.get(reviewer)
+    attempt_id = attempt_id or uuid.uuid4().hex
+    receipt_path = job_dir(attempt_id) / "transport-provenance.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.unlink(missing_ok=True)
+    transport = {"openai": "codex", "anthropic": "claude", "xai": "grok"}.get(provider)
+    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}.get(transport or "")
+    if not transport or not model or not binary or not binary.is_file():
+        return {"ok": False, "verdict": None, "no_verdict": True, "reviewer": reviewer,
+                "error": "requested provider/model direct harness is unavailable", "code": "unavailable_provider",
+                "executed_provider": None, "executed_model": None}
+    session_id = None if transport == "codex" else str(uuid.UUID(hex=attempt_id))
+    if transport == "claude":
+        cmd = [str(CLAUDE_BIN), "-p", "--output-format", "json", "--permission-mode", "plan",
+               "--max-turns", str(REVIEW_MAX_TURNS), "--model", model, "--session-id", str(session_id), body_prompt]
+    elif transport == "grok":
+        cmd = [str(GROK_BIN), "-p", body_prompt, "--output-format", "json", "--permission-mode", "plan",
+               "--no-subagents", "--max-turns", str(REVIEW_MAX_TURNS), "--model", model,
+               "--session-id", str(session_id), "--cwd", str(resolved)]
     else:
-        if not HERMES_BIN.is_file():
-            return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                    "error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
-        # Name the model. Without -m every hermes reviewer silently takes the
-        # seat's default profile, so "grok reviewed it" and "terra reviewed it"
-        # would both mean "whatever config.yaml said today".
-        model = {"sol": "gpt-5.6-sol", "grok": "grok-4.6", "terra": "gpt-5.6-terra"}[reviewer]
-        cmd = [
-            str(HERMES_BIN),
-            "chat",
-            "-Q",
-            "-m",
-            model,
-            "--query",
-            body_prompt,
-            "--in",
-            str(resolved),
-            "--no-restore-cwd",
-            "-t",
-            REVIEW_TOOLSETS,
-            "--max-turns",
-            str(REVIEW_MAX_TURNS),
-            "--run-budget",
-            "180",
-            "--yolo",
-            "--source",
-            "tool",
-        ]
-        env = hermes_job_env({"job_id": "review", "cwd": str(resolved)})
+        # Codex's JSONL trace is the direct OpenAI harness receipt.  It does
+        # not offer a fallback option and `--json` keeps every event available
+        # for validation; a missing bound session is terminal below.
+        cmd = [str(CODEX_BIN), "exec", "--json", "--sandbox", "read-only", "--cd", str(resolved),
+               "--model", model, body_prompt]
+    env = harness_job_env({"job_id": attempt_id, "cwd": str(resolved)})
     try:
         proc = subprocess.run(
             cmd,
@@ -2344,8 +2490,24 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                "error": "review timed out", "code": "timeout", "reviewer": reviewer}
+                "error": "review timed out", "code": "timeout", "reviewer": reviewer,
+                "executed_provider": None, "executed_model": None}
     text = (proc.stdout or b"").decode("utf-8", "replace")
+    if proc.returncode != 0:
+        return {"ok": False, "verdict": None, "no_verdict": True, "reviewer": reviewer,
+                "error": "review transport exited nonzero", "code": "transport_exit",
+                "returncode": proc.returncode, "executed_provider": None, "executed_model": None}
+    text, harness_receipt, native_error = native_harness_receipt(transport, text, model, session_id)
+    if native_error:
+        return {"ok": False, "verdict": None, "no_verdict": True, "reviewer": reviewer,
+                "error": native_error, "code": native_error, "executed_provider": None, "executed_model": None}
+    assert harness_receipt is not None
+    receipt_path.write_text(json.dumps(harness_receipt))
+    provenance, provenance_error = review_transport_provenance(transport, receipt_path, attempt_id, provider, model)
+    if provenance_error:
+        return {"ok": False, "verdict": None, "no_verdict": True, "reviewer": reviewer,
+                "error": provenance_error, "code": provenance_error, "returncode": proc.returncode,
+                "executed_provider": None, "executed_model": None}
     verdict, summary = parse_review_verdict(text)
     return {
         "ok": verdict == "PASS",
@@ -2359,6 +2521,13 @@ def review_result(reviewer: str, prompt: str, resolved: Path) -> dict[str, Any]:
         "summary": summary,
         "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": ""}),
         "returncode": proc.returncode,
+        # These are the completed launcher's immutable command axes, not a
+        # reviewer alias or model-generated prose.  A caller still compares
+        # them to its requested axes before a verdict can count.
+        "executed_provider": provenance["provider"],
+        "executed_model": provenance["model"],
+        "fallback_disabled": provenance["fallback_disabled"],
+        "transport_provenance": provenance,
     }
 
 
@@ -2381,7 +2550,7 @@ def run_review_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    result = review_result(job["reviewer"], job["prompt"], Path(job["cwd"]))
+    result = review_result(job["reviewer"], job["prompt"], Path(job["cwd"]), attempt_id=job_id)
     receipt = review_receipt(job, result)
     job = read_job(job_id) or job
     job["finished_at"] = utcnow()
@@ -2448,6 +2617,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "kind": "review",
             "status": "queued",
             "reviewer": reviewer,
+            "attempt_id": job_id,
             "repo": name,
             "cwd": str(resolved),
             "prompt": prompt,
@@ -3038,24 +3208,27 @@ def herdr_follow_job(job: dict[str, Any]) -> None:
 
 
 def herdr_show_session(job: dict[str, Any]) -> None:
-    """Swap a finished writer's pane from the log tail to its real session.
-
-    While the job runs, the headless process owns that Hermes session, so the
-    pane tails stdout.log instead. Once it is done the tail is a frozen file
-    and the session is fully readable, which is what the linger window is for.
-    Only writer jobs have one; test and review are not Hermes, so they keep
-    the tail.
-    """
+    """Swap a finished writer tail to the recorded direct harness session."""
     if HERDR_TAB_LINGER_SECONDS <= 0:
         return
     pane_id = str(job.get("herdr_pane_id") or "")
-    session = job.get("hermes_session")
-    if not pane_id or not isinstance(session, str) or not HERMES_SESSION_RE.fullmatch(session):
+    session = job.get("harness_session")
+    if not pane_id or not isinstance(session, str) or not HARNESS_SESSION_RE.fullmatch(session):
         return
     cwd = str(job.get("cwd") or HOME)
+    launcher = str(job.get("launcher") or "")
+    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}.get(launcher)
+    if not binary:
+        return
     # Ctrl-C stops tail -F before the pane runs anything else.
     herdr_send(pane_id, "\x03")
-    herdr_send(pane_id, f"{HERMES_BIN} --resume '{session}' --in '{cwd}' --no-restore-cwd\n")
+    if launcher == "codex":
+        command = f"{binary} resume '{session}'"
+    elif launcher == "claude":
+        command = f"{binary} --resume '{session}'"
+    else:
+        command = f"{binary} --resume '{session}' --cwd '{cwd}'"
+    herdr_send(pane_id, command + "\n")
 
 
 def herdr_job_done(job: dict[str, Any]) -> None:
@@ -3162,7 +3335,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "repo",
         "cwd",
         "prompt",
-        "hermes_session",
+        "harness_session",
         "created_at",
         "started_at",
         "finished_at",
@@ -3524,15 +3697,15 @@ def parse_webhook_fields(data: dict[str, Any]) -> tuple[str | None, str | None, 
     return url, token, None
 
 
-def parse_hermes_session(data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    raw = data.get("hermes_session")
+def parse_harness_session(data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    raw = data.get("harness_session")
     if raw in ("", None):
         return None, None
     if not isinstance(raw, str):
-        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
+        return None, {"error": "harness_session must be a canonical UUID", "code": "bad_harness_session"}
     name = raw.strip()
-    if not HERMES_SESSION_RE.fullmatch(name):
-        return None, {"error": "hermes_session must be gwslice-<32 hex>", "code": "bad_hermes_session"}
+    if not HARNESS_SESSION_RE.fullmatch(name):
+        return None, {"error": "harness_session must be a canonical UUID", "code": "bad_harness_session"}
     return name, None
 
 
@@ -3619,7 +3792,7 @@ def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, return
         "status": status,
         "job_id": job["job_id"],
         "profile": job["profile"],
-        "hermes_session": job.get("hermes_session"),
+        "harness_session": job.get("harness_session"),
         "sha": None,
         "pr_url": None,
         "log_ref": job["log_ref"],
@@ -3658,13 +3831,12 @@ def deliver_webhook(job: dict[str, Any], receipt: dict[str, Any]) -> dict[str, A
     return post_receipt(str(url), receipt, token=job.get("response_webhook_token"))
 
 
-def hermes_job_env(job: dict[str, Any]) -> dict[str, str]:
-    """Graph cwd wins over Hermes config.yaml terminal.cwd and inherited TERMINAL_CWD."""
+def harness_job_env(job: dict[str, Any]) -> dict[str, str]:
+    """Graph cwd wins over inherited terminal state for direct harnesses."""
     cwd = str(Path(job["cwd"]).resolve())
     env = {k: v for k, v in os.environ.items() if k not in ("TERMINAL_CWD", "PWD")}
     env.update(
         {
-            "HERMES_HOME": str(HOME),
             "GRAPHWING_JOB_ID": str(job["job_id"]),
             "GIT_TERMINAL_PROMPT": "0",
             "GH_PROMPT_DISABLED": "1",
@@ -3675,57 +3847,12 @@ def hermes_job_env(job: dict[str, Any]) -> dict[str, str]:
     return env
 
 
-def spawn_hermes(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if not HERMES_BIN.is_file():
-        return None, {"error": f"missing hermes binary: {HERMES_BIN}", "code": "missing_binary"}
-    prompt_path = job_dir(job["job_id"]) / "prompt.txt"
-    stdout_path = job_dir(job["job_id"]) / "stdout.log"
-    stderr_path = job_dir(job["job_id"]) / "stderr.log"
-    stdout_f = stdout_path.open("wb")
-    stderr_f = stderr_path.open("wb")
-    cwd = str(Path(job["cwd"]).resolve())
-    env = hermes_job_env(job)
-    cmd = [
-        str(HERMES_BIN),
-        "chat",
-        "-Q",
-        "--query-file",
-        str(prompt_path),
-        "--in",
-        cwd,
-        "--no-restore-cwd",
-        "--max-turns",
-        str(job["max_turns"]),
-        "--run-budget",
-        str(job["run_budget_seconds"]),
-        "--yolo",
-        "--source",
-        "tool",
-    ]
-    session = job.get("hermes_session")
-    if isinstance(session, str) and HERMES_SESSION_RE.fullmatch(session):
-        cmd.extend(["--continue", session, "--create-if-missing"])
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            cwd=cwd,
-            env=env,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        stdout_f.close()
-        stderr_f.close()
-        return None, {"error": f"spawn failed: {exc}", "code": "spawn_failed"}
-    stdout_f.close()
-    stderr_f.close()
-    return proc, None
-
-
-def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if not CLAUDE_BIN.is_file():
-        return None, {"error": f"missing claude binary: {CLAUDE_BIN}", "code": "missing_binary"}
+def spawn_harness(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    """Launch exactly one configured provider harness, never a broker."""
+    launcher = str(job.get("launcher") or "")
+    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}.get(launcher)
+    if not binary or not binary.is_file():
+        return None, {"error": "configured direct harness is unavailable", "code": "unavailable_provider"}
     prompt_path = job_dir(job["job_id"]) / "prompt.txt"
     stdout_path = job_dir(job["job_id"]) / "stdout.log"
     stderr_path = job_dir(job["job_id"]) / "stderr.log"
@@ -3736,23 +3863,27 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     stdout_f = stdout_path.open("wb")
     stderr_f = stderr_path.open("wb")
     cwd = str(Path(job["cwd"]).resolve())
-    env = {k: v for k, v in os.environ.items()}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "PWD": cwd})
-    cmd = [
-        str(CLAUDE_BIN),
-        "-p",
-        "--output-format",
-        "text",
-        "--permission-mode",
-        "acceptEdits",
-        "--max-turns",
-        str(job["max_turns"]),
-        "--add-dir",
-        cwd,
-        "--model",
-        str(job.get("model") or "claude-opus-5"),
-        prompt,
-    ]
+    env = harness_job_env(job)
+    session = job.get("harness_session")
+    if launcher != "codex" and (not isinstance(session, str) or not HARNESS_SESSION_RE.fullmatch(session)):
+        return None, {"error": "missing preassigned harness session", "code": "bad_harness_session"}
+    model = str(job.get("model") or "")
+    if not model:
+        return None, {"error": "missing configured model", "code": "unavailable_provider"}
+    if launcher == "claude":
+        cmd = [str(CLAUDE_BIN), "-p", "--output-format", "json", "--permission-mode", "acceptEdits",
+               "--max-turns", str(job["max_turns"]), "--add-dir", cwd, "--model", model,
+               "--session-id", str(session), prompt]
+    elif launcher == "grok":
+        cmd = [str(GROK_BIN), "-p", "--prompt-file", str(prompt_path), "--output-format", "json",
+               "--permission-mode", "acceptEdits", "--no-subagents", "--max-turns", str(job["max_turns"]),
+               "--model", model, "--session-id", str(session), "--cwd", cwd]
+    else:
+        if isinstance(session, str) and HARNESS_SESSION_RE.fullmatch(session):
+            cmd = [str(CODEX_BIN), "exec", "resume", "--json", "--model", model, session, prompt]
+        else:
+            cmd = [str(CODEX_BIN), "exec", "--json", "--sandbox", "workspace-write", "--cd", cwd,
+                   "--model", model, prompt]
     try:
         proc = subprocess.Popen(
             cmd,
@@ -3772,9 +3903,7 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
 
 
 def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if job.get("launcher") == "claude":
-        return spawn_claude(job)
-    return spawn_hermes(job)
+    return spawn_harness(job)
 
 
 def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
@@ -3790,6 +3919,18 @@ def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
         except OSError:
             proc.kill()
         proc.wait(timeout=5)
+
+
+def harness_terminal_output(job: dict[str, Any], stdout: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Validate native direct-harness output before accepting its final message."""
+    launcher = str(job.get("launcher") or "")
+    provider = {"codex": "openai", "claude": "anthropic", "grok": "xai"}.get(launcher)
+    model = str(job.get("model") or "")
+    raw_session = job.get("harness_session")
+    session = raw_session if isinstance(raw_session, str) else None
+    if not provider or not model or (launcher != "codex" and (not session or not HARNESS_SESSION_RE.fullmatch(session))):
+        return "", None, "missing_transport_provenance"
+    return native_harness_receipt(launcher, stdout, model, session)
 
 
 def run_agent_job(job_id: str) -> None:
@@ -3833,17 +3974,59 @@ def run_agent_job(job_id: str) -> None:
         stdout = stdout_path.read_text(errors="replace")[-CMD_MAX_BYTES:]
     except OSError:
         stdout = ""
-    parsed = parse_receipt_text(stdout)
+    harness_text, provenance, provenance_error = harness_terminal_output(job, stdout)
+    if provenance is not None and job.get("launcher") == "codex":
+        # The JSONL's emitted thread id is the only initial Codex session
+        # authority. Bind it while this durable job is still exclusively
+        # running; a different preexisting value is an unrelated receipt.
+        generated = provenance.get("session_id")
+        if not isinstance(generated, str) or not HARNESS_SESSION_RE.fullmatch(generated):
+            provenance_error = "malformed_transport_provenance"
+            provenance = None
+        else:
+            with JOB_LOCK:
+                current = read_job(job_id) or job
+                prior = current.get("harness_session")
+                if prior not in (None, "", generated):
+                    provenance_error = "unrelated_transport_receipt"
+                    provenance = None
+                else:
+                    current["harness_session"] = generated
+                    current["harness_session_state"] = "bound"
+                    write_job(current)
+                    job = current
+            build_id = job.get("build_id")
+            claim_id = job.get("claim_id")
+            if isinstance(build_id, str) and isinstance(claim_id, str):
+                with BUILD_LOCK:
+                    doc = read_build(build_id)
+                    claim = build_claim(doc) if isinstance(doc, dict) else None
+                    if not isinstance(doc, dict) or not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
+                        provenance_error = "unrelated_transport_receipt"
+                        provenance = None
+                    elif claim.get("writer_session") not in (None, "", generated):
+                        provenance_error = "unrelated_transport_receipt"
+                        provenance = None
+                    else:
+                        claim["writer_session"] = generated
+                        doc["writer_session"] = generated
+                        write_build(doc, build_id)
+    parsed = parse_receipt_text(harness_text) if provenance_error is None else None
+    if provenance_error is not None:
+        parsed = {"status": "error", "summary": provenance_error}
     receipt = normalize_receipt(job, parsed, returncode, timed_out)
+    if provenance_error is not None:
+        receipt["status"] = "error"
     job = read_job(job_id) or job
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
+    job["transport_provenance"] = provenance
     job["receipt"] = receipt
     job["status"] = "completed" if receipt["status"] == "ok" else "failed"
     if timed_out:
         job["error"] = "agent run budget exceeded"
     elif receipt["status"] != "ok" and not job.get("error"):
-        job["error"] = receipt.get("summary") or f"hermes exited {returncode}"
+        job["error"] = receipt.get("summary") or f"direct harness exited {returncode}"
     hook = deliver_webhook(job, receipt)
     if hook is not None:
         job["webhook"] = hook
@@ -4034,13 +4217,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     seat = seats[profile]
     if not seat.get("runnable"):
         return 400, {"error": f"profile '{profile}' is not runnable", "code": "not_runnable"}
-    hermes_home = Path(str(seat.get("hermes_home") or HOME)).resolve()
-    try:
-        hermes_home.relative_to(HERMES_PROFILES_ROOT.resolve())
-        under_hermes_profiles = True
-    except ValueError:
-        under_hermes_profiles = False
-    if under_hermes_profiles or profile != HOME_PROFILE or hermes_home != HOME.resolve():
+    harness_home = Path(str(seat.get("harness_home") or HOME)).resolve()
+    if profile != HOME_PROFILE or harness_home != HOME.resolve():
         return 400, {"error": f"profile '{profile}' cannot be executed", "code": "not_runnable"}
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -4060,12 +4238,12 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     supervised_source_run_id, supervised_err = parse_supervised_source_run_id(data)
     if supervised_err:
         return 400, supervised_err
-    session, session_err = parse_hermes_session(data)
+    session, session_err = parse_harness_session(data)
     if session_err:
         return 400, session_err
-    launcher = str(data.get("launcher") or "hermes").strip()
-    if launcher not in {"hermes", "claude"}:
-        return 400, {"error": "launcher must be hermes or claude", "code": "bad_launcher"}
+    launcher = str(data.get("launcher") or "grok").strip()
+    if launcher not in {"codex", "claude", "grok"}:
+        return 400, {"error": "launcher must be codex, claude, or grok", "code": "bad_launcher"}
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
@@ -4079,13 +4257,12 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, {"error": "model is invalid", "code": "bad_model"}
     else:
         model = model.strip()
-    if launcher == "hermes" and not HERMES_BIN.is_file():
-        return 501, {"error": f"hermes binary missing: {HERMES_BIN}", "code": "not_implemented"}
-    if launcher == "claude" and not CLAUDE_BIN.is_file():
-        return 501, {"error": f"claude binary missing: {CLAUDE_BIN}", "code": "not_implemented"}
+    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}[launcher]
+    if not binary.is_file():
+        return 501, {"error": "configured direct harness is unavailable", "code": "unavailable_provider"}
     job_id = uuid.uuid4().hex
     log_ref = str(job_dir(job_id) / "stdout.log")
-    hermes_session = session or f"gwslice-{job_id}"
+    harness_session = session or (None if launcher == "codex" else str(uuid.UUID(hex=job_id)))
     job = {
         "job_id": job_id,
         "kind": "agent",
@@ -4094,7 +4271,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "repo": repo_name,
         "cwd": str(resolved),
         "prompt": prompt,
-        "hermes_session": hermes_session,
+        "harness_session": harness_session,
+        "harness_session_state": "pending" if launcher == "codex" and harness_session is None else "bound",
         "launcher": launcher,
         "model": model,
         "max_turns": turns or AGENT_MAX_TURNS,
@@ -4123,7 +4301,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "status": "queued",
         "profile": profile,
         "repo": repo_name,
-        "hermes_session": hermes_session,
+        "harness_session": harness_session,
+        "harness_session_state": "pending" if launcher == "codex" and harness_session is None else "bound",
         "launcher": launcher,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
@@ -4452,6 +4631,7 @@ def build_public(doc: dict[str, Any]) -> dict[str, Any]:
         "gates": doc.get("gates") or [],
         "index": doc.get("index"),
         "ticket": doc.get("ticket"),
+        "rollout": build_rollout_public(doc),
         "route": doc.get("route"),
         "verification": doc.get("verification"),
         "writer_session": doc.get("writer_session"),
@@ -4705,6 +4885,28 @@ def parse_build_verification(container: dict[str, Any]) -> tuple[dict[str, Any] 
             return None, contract_err
         out["visual"] = contract
     return out, None
+
+
+def parse_build_rollout(container: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Parse the explicit ticket-07 proof overlay, or leave ordinary builds alone.
+
+    A rollout proof is opt-in because this catalog also serves bounded normal
+    pre-PR builds.  Once selected it has exactly one tracker identity; accepting
+    a free-form tracker would revive the stale Shortcut evidence path.
+    """
+    if "rollout" not in container:
+        return None, None
+    raw = container.get("rollout")
+    if not isinstance(raw, dict):
+        return None, {"error": "rollout must be an object", "code": "bad_rollout"}
+    if set(raw) - {"ticket"}:
+        return None, {"error": "rollout contains an unsupported field", "code": "bad_rollout"}
+    if raw.get("ticket") != BUILD_ROLLOUT_TICKET:
+        return None, {
+            "error": "ticket-07 rollout proof is bound to GitHub issue #52",
+            "code": "bad_rollout_ticket",
+        }
+    return {"ticket": BUILD_ROLLOUT_TICKET, "status": "open", "receipts": [], "identity": None}, None
 
 
 def parse_build_path_rules(raw: Any) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
@@ -5234,6 +5436,9 @@ def build_create(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
     verification, ver_err = parse_build_verification(data)
     if ver_err:
         return 400, ver_err
+    rollout, rollout_err = parse_build_rollout(data)
+    if rollout_err:
+        return 400, rollout_err
     stacks, stacks_err = parse_build_stacks(data)
     if stacks_err:
         return 400, stacks_err
@@ -5279,6 +5484,7 @@ def build_create(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             # The raw row, not the redacted one: see parse_build_route.
             "route": route_raw,
             "verification": verification,
+            "rollout": rollout,
             "stacks": stacks,
             "jobs_max": jobs_max,
         }
@@ -5324,6 +5530,7 @@ def build_create(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "ticket": ticket,
             "route": route,
             "verification": verification,
+            "rollout": rollout,
             "writer_session": None,
             "stacks": stacks,
             "reviews": [],
@@ -5450,12 +5657,12 @@ def build_advance(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, An
         payload = {}
     session = payload.get("writer_session")
     if session not in (None, "") and not (
-        isinstance(session, str) and HERMES_SESSION_RE.fullmatch(session.strip())
+        isinstance(session, str) and HARNESS_SESSION_RE.fullmatch(session.strip())
     ):
         # The writer session is the handle that resumes one agent. Anything
         # that is not a real session id is either a typo that would strand the
         # writer or free text that has no business on disk.
-        return 400, {"error": "writer_session must be a gwslice session id", "code": "bad_writer_session"}
+        return 400, {"error": "writer_session must be a canonical harness UUID", "code": "bad_writer_session"}
     if session not in (None, "") and action != "start_writer":
         # The session handle names the agent this build started. A later
         # transition that repointed it would strand the real writer and hand
@@ -6769,7 +6976,7 @@ def build_claim_has_launch(claim: dict[str, Any] | None) -> bool:
 
 def build_writer_ids(build_id: str, claim_id: str) -> tuple[str, str]:
     digest = hashlib.sha256(f"{build_id}\0{claim_id}".encode()).hexdigest()[:32]
-    return digest, f"gwslice-{digest}"
+    return digest, str(uuid.UUID(hex=digest))
 
 
 def build_gate_record(doc: dict[str, Any], action: str, target: str, change_id: str, by: str, why: str) -> dict[str, Any]:
@@ -7489,6 +7696,7 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             else None
         )
         _job_id, reserved_session = build_writer_ids(build_id, event_id)
+        initial_session = None if (doc.get("route") or {}).get("launcher") == "codex" else reserved_session
         claim = {
             "claim_id": event_id,
             "kind": kind,
@@ -7502,7 +7710,7 @@ def build_claim_op(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
             # reservations bind the one already recorded, so a resumed turn can
             # never be pointed at a different agent than the one that wrote the
             # files. The user's note is about the page that writer built.
-            "writer_session": reserved_session if kind == "initial" else session,
+            "writer_session": initial_session if kind == "initial" else session,
             "jobs_spent": 1,
             # Only a correction is a strike. A design turn spends a job and
             # nothing else: it is the user iterating, and counting it against
@@ -7890,7 +8098,7 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         "resume": bool(finding) or turn is not None,
         "turn": turn.get("turn") if turn is not None else None,
         "claim_id": claim.get("claim_id"),
-        "hermes_session": session,
+        "harness_session": session,
         "launcher": route.get("launcher"),
         "model": route.get("model"),
         "max_turns": route.get("max_turns"),
@@ -7947,10 +8155,10 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
     )
     if brief_status != 200:
         return brief_status, brief
-    if brief.get("launcher") != "hermes":
+    if brief.get("launcher") not in {"codex", "claude", "grok"}:
         return 409, {
             "ok": False,
-            "error": "the build writer must use Hermes so correction turns can resume one session",
+            "error": "the build writer must use a direct resumable harness",
             "code": "writer_not_resumable",
         }
 
@@ -7978,11 +8186,12 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
 
         job_id, reserved_session = build_writer_ids(build_id, claim_id)
         session = claim.get("writer_session")
+        codex_initial = brief.get("launcher") == "codex" and claim.get("kind") == "initial"
         if (
             claim.get("job_id") not in (None, job_id)
-            or not isinstance(session, str)
-            or not HERMES_SESSION_RE.fullmatch(session)
-            or (claim.get("kind") == "initial" and session != reserved_session)
+            or (not codex_initial and (not isinstance(session, str) or not HARNESS_SESSION_RE.fullmatch(session)))
+            or (claim.get("kind") == "initial" and not codex_initial and session != reserved_session)
+            or (codex_initial and session is not None)
         ):
             return 409, {"ok": False, "error": "claim launch identity conflicts", "code": "launch_conflict"}
         if not claim.get("job_id"):
@@ -8013,8 +8222,9 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
                     "repo": doc.get("repo"),
                     "cwd": doc.get("worktree"),
                     "prompt": brief["prompt"],
-                    "hermes_session": session,
-                    "launcher": "hermes",
+                    "harness_session": session,
+                    "harness_session_state": "pending" if codex_initial else "bound",
+                    "launcher": brief.get("launcher"),
                     "model": brief.get("model"),
                     "max_turns": brief.get("max_turns") or AGENT_MAX_TURNS,
                     "run_budget_seconds": brief.get("run_budget_seconds") or AGENT_RUN_BUDGET,
@@ -8044,7 +8254,7 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
                 if (
                     job.get("build_id") != build_id
                     or job.get("claim_id") != claim_id
-                    or job.get("hermes_session") != session
+                    or job.get("harness_session") != session
                 ):
                     return 409, {"ok": False, "error": "deterministic job id conflicts", "code": "job_conflict"}
                 job["response_webhook_url"] = webhook_url
@@ -8074,7 +8284,7 @@ def build_writer_launch(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
         "claim_id": claim_id,
         "job_id": job_id,
         "status": job.get("status"),
-        "hermes_session": session,
+        "harness_session": session,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
 
@@ -8085,14 +8295,14 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
     if err:
         return 400, err
     assert data is not None
-    allowed = {"build_id", "event_id", "holder", "claim_id", "job_id", "hermes_session", "callback"}
+    allowed = {"build_id", "event_id", "holder", "claim_id", "job_id", "harness_session", "callback"}
     extra = sorted(set(data) - allowed)
     if extra:
         return 400, {"ok": False, "error": f"unknown field: {extra[0]}", "code": "extra_field"}
     event_id = data.get("event_id")
     claim_id = data.get("claim_id")
     job_id = data.get("job_id")
-    session = data.get("hermes_session")
+    session = data.get("harness_session")
     holder = data.get("holder")
     callback = data.get("callback")
     if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
@@ -8101,8 +8311,8 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         return 400, {"ok": False, "error": "claim_id is required", "code": "bad_claim_id"}
     if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
         return 400, {"ok": False, "error": "job_id is invalid", "code": "bad_job_id"}
-    if not isinstance(session, str) or not HERMES_SESSION_RE.fullmatch(session):
-        return 400, {"ok": False, "error": "hermes_session is invalid", "code": "bad_hermes_session"}
+    if not isinstance(session, str) or not HARNESS_SESSION_RE.fullmatch(session):
+        return 400, {"ok": False, "error": "harness_session is invalid", "code": "bad_harness_session"}
     if not isinstance(holder, str) or not holder.strip():
         return 400, {"ok": False, "error": "holder is required", "code": "missing_holder"}
     holder = holder.strip()[:BUILD_NAME_MAX]
@@ -8113,7 +8323,7 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         return 400, {"ok": False, "error": "callback must be a terminal writer receipt", "code": "bad_callback"}
     fingerprint = event_fingerprint(
         {"build_id": data.get("build_id"), "action": "writer_complete", "holder": holder,
-         "claim_id": claim_id, "job_id": job_id, "hermes_session": session, "callback": callback}
+         "claim_id": claim_id, "job_id": job_id, "harness_session": session, "callback": callback}
     )
 
     with BUILD_LOCK:
@@ -8146,7 +8356,8 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         if claim.get("consumed"):
             return 409, {"ok": False, "error": "claim was already completed", "code": "claim_consumed"}
         expected_job_id, reserved_session = build_writer_ids(str(doc.get("build_id")), claim_id)
-        if job_id != expected_job_id or (claim.get("kind") == "initial" and session != reserved_session):
+        codex_initial = (doc.get("route") or {}).get("launcher") == "codex" and claim.get("kind") == "initial"
+        if job_id != expected_job_id or (claim.get("kind") == "initial" and not codex_initial and session != reserved_session):
             return 409, {"ok": False, "error": "writer identity is not deterministic", "code": "completion_mismatch"}
         live, detail = build_live_change(doc, repos)
         if live is None:
@@ -8161,7 +8372,7 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         if (
             job.get("build_id") != doc.get("build_id")
             or job.get("claim_id") != claim_id
-            or job.get("hermes_session") != session
+            or job.get("harness_session") != session
         ):
             return 409, {"ok": False, "error": "job does not belong to this claim", "code": "completion_mismatch"}
         authoritative = job.get("receipt")
@@ -8174,7 +8385,7 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         result = {
             "claim_id": claim_id,
             "job_id": job_id,
-            "hermes_session": session,
+            "harness_session": session,
             "kind": claim.get("kind"),
             "status": status,
             "summary": str(authoritative.get("summary") or "")[:500],
@@ -8239,7 +8450,7 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
             "build_id": doc.get("build_id"),
             "claim_id": claim_id,
             "job_id": job_id,
-            "hermes_session": session,
+            "harness_session": session,
             "status": status,
             "change_id": live["change_id"],
             "jobs_spent": 0,
@@ -8750,14 +8961,18 @@ def build_parse_review_verdict(text: str) -> tuple[str | None, str]:
     return found[-1], f"VERDICT: {found[-1]}"
 
 
-def build_review_round_result(reviewer: str, prompt: str, worktree: Path) -> dict[str, Any]:
+def build_review_round_result(
+    reviewer: str, prompt: str, worktree: Path,
+    requested_provider: str | None = None, requested_model: str | None = None,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
     """Run one review and read its verdict off the transcript, strictly.
 
     Deliberately not `review_result`'s own verdict field: that one is shared
     with /v1/review/run and parses leniently on purpose. The pre-PR gate is the
     caller that cannot afford lenient, so it re-reads the raw text here.
     """
-    raw = review_result(reviewer, prompt, worktree)
+    raw = review_result(reviewer, prompt, worktree, requested_provider, requested_model, attempt_id)
     if raw.get("no_verdict") or raw.get("code") in ("timeout", "not_implemented"):
         # The provider never finished. Not an opinion, and never a finding.
         return {**raw, "verdict": None, "no_verdict": True}
@@ -8860,11 +9075,82 @@ def build_review_prompt(doc: dict[str, Any], role: str = BUILD_REVIEW_BEHAVIOR_R
     return "\n".join(lines + ["", "Ticket:", str(doc.get("ticket") or "(none)")])
 
 
+def build_review_attempts(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    attempts = doc.get("review_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+        doc["review_attempts"] = attempts
+    return attempts
+
+
+def build_open_review_attempt(
+    doc: dict[str, Any], *, attempt_id: str, transition_id: str, role: str,
+    reviewer: str, requested_provider: str, requested_model: str,
+    head: str, change_id: str, evidence_id: str, source_failure_id: str | None,
+) -> dict[str, Any]:
+    """Persist the durable dispatch authority before calling a provider."""
+    attempt = {
+        "attempt_id": attempt_id, "transition_id": transition_id, "status": "open",
+        "opened_at": utcnow(),
+        "deadline": (datetime.now(timezone.utc) + timedelta(seconds=200)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "role": role, "reviewer": reviewer,
+        "requested_provider": requested_provider, "requested_model": requested_model,
+        "head": head, "change_id": change_id, "evidence_id": evidence_id,
+        "source_failure_id": source_failure_id,
+    }
+    build_review_attempts(doc).append(attempt)
+    return attempt
+
+
+def build_terminal_review_attempt(
+    attempt: dict[str, Any], result: dict[str, Any]
+) -> str:
+    """Terminalize one open attempt exactly once from launcher evidence."""
+    if attempt.get("status") != "open":
+        return str(attempt.get("failure_class") or attempt.get("verdict") or "terminal")
+    executed_provider = result.get("executed_provider")
+    executed_model = result.get("executed_model")
+    attempt["executed_provider"] = executed_provider
+    attempt["executed_model"] = executed_model
+    attempt["fallback_disabled"] = result.get("fallback_disabled") is True
+    attempt["transport_provenance"] = result.get("transport_provenance")
+    if result.get("code") == "timeout":
+        failure = "timeout"
+    elif result.get("code") in ("crash", "missing_terminal_receipt"):
+        failure = str(result.get("code"))
+    elif result.get("fallback_disabled") is not True:
+        failure = "missing_transport_provenance"
+    elif executed_provider not in (None, attempt.get("requested_provider")) or executed_model not in (None, attempt.get("requested_model")):
+        failure = "unexpected_execution"
+    elif result.get("code") in ("not_implemented", "unavailable_provider"):
+        failure = "unavailable_provider"
+    elif result.get("no_verdict"):
+        failure = "no_verdict"
+    elif result.get("verdict") in {"PASS", "NACK"}:
+        failure = None
+    else:
+        failure = "explicit_failure"
+    attempt.update({
+        "status": "terminal", "terminal_at": utcnow(), "verdict": result.get("verdict"),
+        "failure_class": failure, "summary": str(result.get("summary") or result.get("error") or "")[:BUILD_REDACT_MAX_STRING],
+    })
+    return failure or "success"
+
+
+def build_find_review_attempt(doc: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
+    return next((a for a in build_review_attempts(doc) if a.get("attempt_id") == attempt_id), None)
+
+
 def build_review_result(
     doc: dict[str, Any],
     reviewer: str,
     repos: dict[str, str],
     role: str = BUILD_REVIEW_BEHAVIOR_ROLE,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+    transition_id: str | None = None,
+    source_failure_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the micro-review, retrying silence, and record the round.
 
@@ -8905,26 +9191,56 @@ def build_review_result(
     worktree = Path(str(doc.get("worktree")))
     prompt = build_review_prompt(doc, role)
     evidence_id = build_evidence_identity(doc, change_id)
+    requested_provider = requested_provider or BUILD_REVIEWER_PROVIDER.get(reviewer)
+    requested_model = requested_model or BUILD_REVIEWER_MODEL.get(reviewer)
+    if not isinstance(requested_provider, str) or not requested_provider or not isinstance(requested_model, str) or not requested_model:
+        return 409, {"ok": False, "build_id": doc.get("build_id"), "code": "unavailable_provider",
+                     "error": "the requested provider/model is not available on the authorized reviewer transport"}
+    if source_failure_id:
+        source = build_find_review_attempt(doc, source_failure_id)
+        if not isinstance(source, dict) or source.get("status") != "terminal" or not source.get("failure_class"):
+            return 409, {"ok": False, "build_id": doc.get("build_id"), "code": "invalid_source_failure",
+                         "error": "source failure does not exist as a terminal failed attempt in this build"}
+        if source.get("consumed_by"):
+            return 409, {"ok": False, "build_id": doc.get("build_id"), "code": "source_failure_consumed",
+                         "error": "source failure was already consumed by a failover dispatch"}
+        if any(source.get(key) != value for key, value in {
+            "role": role, "head": head, "change_id": change_id, "evidence_id": evidence_id,
+        }.items()):
+            return 409, {"ok": False, "build_id": doc.get("build_id"), "code": "failover_identity_mismatch",
+                         "error": "failover role/head/change/evidence must equal its source failure"}
+        if (source.get("requested_provider"), source.get("requested_model")) == (requested_provider, requested_model):
+            return 409, {"ok": False, "build_id": doc.get("build_id"), "code": "failover_not_distinct",
+                         "error": "workflow failover must name a different configured provider/model"}
 
     park = build_charge(doc, 1)
     if park:
         return park
 
-    attempts: list[dict[str, Any]] = []
-    result: dict[str, Any] = {}
-    for _ in range(BUILD_REVIEW_SILENCE_RETRIES + 1):
-        result = build_review_round_result(reviewer, prompt, worktree)
-        attempts.append({"no_verdict": bool(result.get("no_verdict")), "code": result.get("code")})
-        if not result.get("no_verdict"):
-            break
+    attempt_id = attempt_id or uuid.uuid4().hex
+    transition_id = transition_id or attempt_id
+    attempt = build_open_review_attempt(
+        doc, attempt_id=attempt_id, transition_id=transition_id, role=role, reviewer=reviewer,
+        requested_provider=requested_provider, requested_model=requested_model, head=head,
+        change_id=change_id, evidence_id=evidence_id, source_failure_id=source_failure_id,
+    )
+    # This write is deliberately before launch.  A hard death after it leaves
+    # an auditable open attempt that buildReviewReconcile must terminalize.
+    if source_failure_id:
+        source = build_find_review_attempt(doc, source_failure_id)
+        assert source is not None
+        source["consumed_by"] = attempt_id
+        source["consumed_at"] = utcnow()
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
+    result = build_review_round_result(reviewer, prompt, worktree, requested_provider, requested_model, attempt_id)
+    terminal = build_terminal_review_attempt(attempt, result)
+    write_err = write_build(doc, doc.get("build_id"))
+    if write_err:
+        return int(write_err["status"]), write_err
 
-    if result.get("no_verdict"):
-        # Nothing is recorded. A round that produced no opinion is not a round
-        # of review, and writing it down as one would let `next` read it as a
-        # finding and send the writer off to answer a reviewer that never spoke.
-        write_err = write_build(doc, doc.get("build_id"))
-        if write_err:
-            return int(write_err["status"]), write_err
+    if terminal != "success":
         return 200, {
             "ok": False,
             "build_id": doc.get("build_id"),
@@ -8936,9 +9252,13 @@ def build_review_result(
             "verdict": None,
             "no_verdict": True,
             "finding": False,
-            "attempts": len(attempts),
-            "error": f"{reviewer} returned no verdict after {len(attempts)} attempts",
-            "code": "no_verdict",
+            "attempt_id": attempt_id,
+            "transition_id": transition_id,
+            "requested_provider": requested_provider, "requested_model": requested_model,
+            "executed_provider": attempt.get("executed_provider"), "executed_model": attempt.get("executed_model"),
+            "attempts": 1,
+            "error": str(attempt.get("summary") or terminal),
+            "code": terminal,
             "budget_left": build_budget_left(doc),
         }
 
@@ -8950,12 +9270,27 @@ def build_review_result(
         "at": utcnow(),
         "reviewer": reviewer,
         "role": role,
+        # This field is authored only after Graphwing selected the seat and
+        # parsed its completed verdict.  It is deliberately not copied from
+        # model output or a Rewst request body.
+        "authority": {
+            "author": "graphwing",
+            "provider": attempt.get("executed_provider"),
+            "model": attempt.get("executed_model"),
+            "role": role,
+        },
         "evidence_id": evidence_id,
         "verdict": result.get("verdict"),
         "no_verdict": False,
         "summary": str(result.get("summary") or "")[:BUILD_REDACT_MAX_STRING],
         "compact": str(result.get("compact") or "")[:COMPACT_MAX_CHARS],
-        "attempts": len(attempts),
+        "attempt_id": attempt_id,
+        "transition_id": transition_id,
+        "requested_provider": requested_provider,
+        "requested_model": requested_model,
+        "executed_provider": attempt.get("executed_provider"),
+        "executed_model": attempt.get("executed_model"),
+        "attempts": 1,
     }
     doc["reviews"] = rounds[-(BUILD_REVIEW_ROUNDS_KEPT - 1):] + [entry]
     gate = None
@@ -8974,6 +9309,7 @@ def build_review_result(
         "gate": gate,
         "reviewer": reviewer,
         "role": role,
+        "authority": entry["authority"],
         "head": head,
         "change_id": change_id,
         "evidence_id": evidence_id,
@@ -8983,7 +9319,13 @@ def build_review_result(
         "finding": entry["verdict"] != "PASS",
         "summary": entry["summary"],
         "compact": entry["compact"],
-        "attempts": len(attempts),
+        "attempt_id": attempt_id,
+        "transition_id": transition_id,
+        "requested_provider": requested_provider,
+        "requested_model": requested_model,
+        "executed_provider": attempt.get("executed_provider"),
+        "executed_model": attempt.get("executed_model"),
+        "attempts": 1,
         "budget_left": build_budget_left(doc),
     }
 
@@ -9002,7 +9344,9 @@ def build_review_job(job_id: str) -> None:
         else:
             assert doc is not None
             status, payload = build_review_result(
-                doc, job["reviewer"], load_repos(), job["role"]
+                doc, job["reviewer"], load_repos(), job["role"],
+                job.get("requested_provider"), job.get("requested_model"),
+                job.get("transition_id"), job.get("source_failure_id"), job_id,
             )
     receipt = {
         "status": "ok" if payload.get("ok") else "nack",
@@ -9013,7 +9357,8 @@ def build_review_job(job_id: str) -> None:
             k: payload.get(k)
             for k in (
                 "ok", "role", "reviewer", "evidence_id", "verdict", "no_verdict",
-                "finding", "round", "summary", "compact", "code", "error",
+                "finding", "round", "summary", "compact", "code", "error", "attempt_id",
+                "transition_id", "requested_provider", "requested_model", "executed_provider", "executed_model",
             )
         },
     }
@@ -9098,6 +9443,20 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    source_failure_id = data.get("source_failure_id")
+    if source_failure_id is not None and (not isinstance(source_failure_id, str) or not BUILD_ROLLOUT_ID_RE.fullmatch(source_failure_id)):
+        return 400, {"ok": False, "code": "bad_source_failure_id", "error": "source_failure_id must name a server attempt"}
+    transition_id = data.get("transition_id")
+    if transition_id is not None and (not isinstance(transition_id, str) or not BUILD_ROLLOUT_ID_RE.fullmatch(transition_id)):
+        return 400, {"ok": False, "code": "bad_transition_id", "error": "transition_id is invalid"}
+    requested_provider = data.get("provider") or BUILD_REVIEWER_PROVIDER.get(reviewer)
+    requested_model = data.get("model") or BUILD_REVIEWER_MODEL.get(reviewer)
+    if source_failure_id and (not isinstance(data.get("provider"), str) or not data.get("provider").strip()
+                              or not isinstance(data.get("model"), str) or not data.get("model").strip()):
+        return 400, {"ok": False, "code": "missing_failover_route",
+                     "error": "an explicit failover requires configured provider and model"}
+    if not isinstance(requested_provider, str) or not requested_provider or not isinstance(requested_model, str) or not requested_model:
+        return 400, {"ok": False, "code": "bad_provider_model", "error": "provider and model must be non-empty strings"}
 
     if not webhook_url:
         with BUILD_LOCK:
@@ -9105,7 +9464,8 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             if open_err:
                 return open_err
             assert doc is not None
-            return build_review_result(doc, reviewer, repos, role)
+            return build_review_result(doc, reviewer, repos, role, requested_provider, requested_model,
+                                       transition_id, source_failure_id)
 
     with JOB_LOCK:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
@@ -9118,6 +9478,10 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
             "build_id": doc.get("build_id"),
             "reviewer": reviewer,
             "role": role,
+            "requested_provider": requested_provider,
+            "requested_model": requested_model,
+            "transition_id": transition_id or job_id,
+            "source_failure_id": source_failure_id,
             "cwd": str(doc.get("worktree")),
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
@@ -9149,8 +9513,209 @@ def build_review(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
         "build_id": doc.get("build_id"),
         "reviewer": reviewer,
         "role": role,
+        "transition_id": job["transition_id"],
+        "requested_provider": requested_provider,
+        "requested_model": requested_model,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
+
+
+def build_rollout(doc: dict[str, Any]) -> dict[str, Any] | None:
+    rollout = doc.get("rollout")
+    if not isinstance(rollout, dict) or rollout.get("ticket") != BUILD_ROLLOUT_TICKET:
+        return None
+    if not isinstance(rollout.get("receipts"), list):
+        rollout["receipts"] = []
+    return rollout
+
+
+def build_review_reconcile(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Convert abandoned existing review jobs/open records into terminal receipts.
+
+    This is reconciliation over the existing build and job ledgers; it neither
+    launches a model nor routes a retry.  Rewst may call it after a wait
+    timeout, and the completion supervisor can call the same deterministic op.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    build_id = data.get("build_id")
+    if not valid_build_id(build_id):
+        return 400, {"ok": False, "code": "bad_build_id", "error": "invalid build_id"}
+    with BUILD_LOCK:
+        doc, open_err = load_build(str(build_id))
+        if open_err:
+            return int(open_err["status"]), open_err
+        if doc is None:
+            return 404, {"ok": False, "code": "unknown_build", "error": "unknown build"}
+        if doc.get("version") != BUILD_STATE_VERSION:
+            return 409, build_version_park(doc)
+        now = datetime.now(timezone.utc)
+        terminalized: list[str] = []
+        for attempt in build_review_attempts(doc):
+            if attempt.get("status") != "open":
+                continue
+            job = read_job(str(attempt.get("attempt_id") or ""))
+            deadline_raw = str(attempt.get("deadline") or "")
+            try:
+                deadline = datetime.strptime(deadline_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                deadline = now
+            if isinstance(job, dict) and job.get("status") == "completed" and not isinstance(job.get("receipt"), dict):
+                result = {"code": "missing_terminal_receipt", "no_verdict": True,
+                          "error": "completed job has no terminal receipt"}
+            elif now >= deadline:
+                result = {"code": "timeout", "no_verdict": True,
+                          "error": "attempt deadline elapsed without terminal receipt"}
+            else:
+                continue
+            build_terminal_review_attempt(attempt, result)
+            terminalized.append(str(attempt.get("attempt_id")))
+        write_err = write_build(doc, str(build_id))
+        if write_err:
+            return int(write_err["status"]), write_err
+        return 200, {**build_public(doc), "ok": True, "terminalized_attempt_ids": terminalized}
+
+
+def build_rollout_receipts(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    rollout = build_rollout(doc)
+    if rollout is None:
+        return []
+    return [entry for entry in rollout["receipts"] if isinstance(entry, dict)]
+
+
+def build_rollout_public(doc: dict[str, Any]) -> dict[str, Any] | None:
+    rollout = build_rollout(doc)
+    if rollout is None:
+        return None
+    receipts = build_rollout_receipts(doc)
+    return {
+        "ticket": BUILD_ROLLOUT_TICKET,
+        "status": rollout.get("status") or "open",
+        "identity": rollout.get("identity"),
+        "receipt_kinds": [entry.get("kind") for entry in receipts],
+        "gaps": build_rollout_gaps(doc),
+    }
+
+
+def rollout_proof_gap(kind: str, proof: dict[str, Any], served_commit_sha: str | None = None) -> str | None:
+    """Validate the non-forgeable shape required for one receipt class.
+
+    Values originate with the controller's external readbacks, while this
+    server binds their identity and census.  There is intentionally no local
+    snapshot/cache of a live integration or workflow.
+    """
+    if kind == "catalog_parity":
+        if proof.get("live_source") != "fresh_post_publish_api_read":
+            return "catalog parity did not come from a fresh post-publish API read"
+        if proof.get("normalized_catalog_sha") != proof.get("normalized_live_sha"):
+            return "normalized live catalog parity mismatched"
+    elif kind == "mechanical":
+        required = {
+            "named_disposable_branch", "fresh_clone", "empty_build_state",
+            "correction", "acknowledgement", "merge_base", "remote_ref",
+        }
+        if any(proof.get(name) in (None, "", False) for name in required):
+            return "mechanical proof is missing branch/fresh-state/correction/readback evidence"
+        if proof.get("pushed_commit_count") != 1 or proof.get("force_push") is not False:
+            return "mechanical proof must show exactly one remote-readback commit and no force-push"
+    elif kind == "sensitive":
+        if proof.get("final_diff_sha") in (None, "") or proof.get("evidence_id") in (None, ""):
+            return "sensitive proof lacks final diff or evidence identity"
+        reviews = proof.get("reviews")
+        if not isinstance(reviews, list) or len(reviews) != 2:
+            return "sensitive proof requires Terra and Grok server-authored receipts"
+        expected = {"behavior": "terra", "security": "grok"}
+        seen: set[str] = set()
+        for review in reviews:
+            if not isinstance(review, dict):
+                return "sensitive proof receipt is malformed"
+            role, reviewer = review.get("role"), review.get("reviewer")
+            if expected.get(role) != reviewer or review.get("author") != "graphwing":
+                return "sensitive review identity is not server-authored Terra/Grok authority"
+            if review.get("no_verdict") or review.get("verdict") != "PASS":
+                return "sensitive review is missing, no_verdict, or not passing"
+            if review.get("final_diff_sha") != proof.get("final_diff_sha") or review.get("evidence_id") != proof.get("evidence_id"):
+                return "sensitive reviewers did not bind the same final diff and evidence"
+            seen.add(str(role))
+        if seen != set(expected):
+            return "sensitive proof does not contain both required review roles"
+    elif kind == "visual":
+        artifacts = proof.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            return "visual proof has no screenshot/a11y artifacts"
+        required = {"served_commit_sha", "preview_url", "preview_port", "writer_session", "round", "evidence_id"}
+        if any(not isinstance(a, dict) or any(a.get(k) in (None, "") for k in required) for a in artifacts):
+            return "visual artifact lacks served SHA, preview, writer session, round, or evidence identity"
+        rounds = proof.get("human_rounds")
+        if not isinstance(rounds, list) or len(rounds) < 2:
+            return "visual proof requires two human feedback rounds"
+        first = rounds[0] if isinstance(rounds[0], dict) else {}
+        if not first.get("writer_session") or not first.get("preview_url"):
+            return "visual human-round identity is incomplete"
+        if any(not isinstance(r, dict) or r.get("writer_session") != first.get("writer_session") or r.get("preview_url") != first.get("preview_url") for r in rounds[:2]):
+            return "visual human rounds must share writer session and preview"
+        if proof.get("final_gate_return") is not True or proof.get("post_change_artifacts") is not True:
+            return "visual final-gate return lacks fresh post-change artifacts"
+        if served_commit_sha is not None:
+            if any(a.get("served_commit_sha") != served_commit_sha for a in artifacts):
+                return "visual artifact served SHA is stale for this canary receipt"
+            if proof.get("post_change_served_commit_sha") != served_commit_sha:
+                return "visual final-gate return lacks fresh artifacts at the current served SHA"
+    elif kind == "checkpoint":
+        if proof.get("decision_path") != "build_iteration_checkpoint_due":
+            return "checkpoint proof did not invoke the live decision path"
+        if proof.get("choices") != ["continue", "reframe", "split", "park"]:
+            return "checkpoint proof does not cover the four deterministic choices"
+        if proof.get("live_advisory") is not True or proof.get("no_later_ceiling") is not True:
+            return "checkpoint live canary did not prove advisory continuation without a later ceiling"
+    elif kind == "lifecycle":
+        if proof.get("pane_exact") is not True or proof.get("no_answer_preserves_preview") is not True:
+            return "lifecycle close proof lacks exact-pane or no-answer preservation"
+        if proof.get("cleanup_readback") is not True:
+            return "lifecycle proof lacks independent cleanup readback"
+    return None
+
+
+def build_rollout_gaps(doc: dict[str, Any], change_id: str | None = None) -> list[str]:
+    rollout = build_rollout(doc)
+    if rollout is None:
+        return []
+    receipts = build_rollout_receipts(doc)
+    by_kind = {str(entry.get("kind")): entry for entry in receipts}
+    gaps: list[str] = []
+    if len(by_kind) != len(receipts):
+        gaps.append("rollout receipt census contains duplicate kinds")
+    source_builds = {entry.get("source_build_id") for entry in receipts if entry.get("source_build_id")}
+    if receipts and len(source_builds) < 2:
+        gaps.append("rollout census requires distinct source canary builds")
+    if any(not isinstance(entry.get("source_build_id"), str) or not entry.get("source_build_id") for entry in receipts):
+        gaps.append("rollout receipt lacks its source build identity")
+    if any(not isinstance(entry.get("canary_run_id"), str) or not entry.get("canary_run_id") for entry in receipts):
+        gaps.append("rollout receipt lacks its current canary run identity")
+    transition_ids = [entry.get("transition_id") for entry in receipts]
+    if len(transition_ids) != len(set(transition_ids)):
+        gaps.append("rollout receipt census reuses a transition identity")
+    for kind in BUILD_ROLLOUT_RECEIPT_KINDS:
+        receipt = by_kind.get(kind)
+        if receipt is None:
+            gaps.append(f"rollout receipt census lacks {kind}")
+            continue
+        if receipt.get("readback_id") in (None, "") or receipt.get("readback_id") == receipt.get("transition_id"):
+            gaps.append(f"{kind} receipt lacks a separate post-transition readback")
+            continue
+        proof = receipt.get("proof")
+        if not isinstance(proof, dict):
+            gaps.append(f"{kind} receipt has no proof")
+            continue
+        proof_gap = rollout_proof_gap(kind, proof, str(receipt.get("commit_sha") or ""))
+        if proof_gap:
+            gaps.append(proof_gap)
+    # The holder is an issue-level census, not a source canary.  Its own HEAD
+    # must never invalidate a completed source receipt or make every source
+    # finish a finalization before it can be counted.
+    return gaps
 
 
 def build_finalize_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
@@ -9173,6 +9738,7 @@ def build_finalize_gaps(doc: dict[str, Any], change_id: str) -> list[str]:
         # In addition to the normal evidence contract, a design candidate (and
         # especially a final-gate return) must complete its own human path.
         gaps.extend(build_visual_human_path_gaps(doc, change_id))
+    gaps.extend(build_rollout_gaps(doc, change_id))
 
     return gaps
 
@@ -12068,7 +12634,12 @@ def build_visual_round_start(doc: dict[str, Any], live: dict[str, str]) -> dict[
         "round": len(rounds) + 1,
         "opened_at": utcnow(),
         "head": live["head"],
+        "served_commit_sha": live["head"],
         "change_id": live["change_id"],
+        "writer_session": doc.get("writer_session"),
+        "evidence_id": hashlib.sha256(
+            f"{doc.get('build_id')}\0{len(rounds) + 1}\0{live['change_id']}".encode()
+        ).hexdigest()[:32],
         "supersedes": prior.get("round") if isinstance(prior, dict) else None,
         "status": "open",
         "human_review": bool((build_visual_contract(doc) or {}).get("human_review")),
@@ -12526,6 +13097,8 @@ def build_visual_preview(body: bytes, repos: dict[str, str]) -> tuple[int, dict[
             "role": entry.get("role"),
             "base_url": entry["base_url"],
             "url": url,
+            "port": urlsplit(url).port,
+            "served_commit_sha": ctx["live"]["head"],
             "route": contract["route"],
             "healthy": healthy,
             "http_status": probe.get("status"),
@@ -12894,6 +13467,15 @@ def build_visual_scenario_result(
         captures, image_gaps = build_visual_capture_images(
             observation, contract, out_dir, role, ctx["change_id"]
         )
+        for capture in captures:
+            capture.update({
+                "served_commit_sha": rnd.get("served_commit_sha"),
+                "preview_url": preview.get("url"),
+                "preview_port": preview.get("port"),
+                "writer_session": rnd.get("writer_session"),
+                "round": rnd.get("round"),
+                "evidence_id": rnd.get("evidence_id"),
+            })
         gaps.extend(image_gaps)
         if not captures:
             gaps.append("no readable screenshot survived capture")
@@ -12905,6 +13487,11 @@ def build_visual_scenario_result(
         "at": utcnow(),
         "change_id": ctx["change_id"],
         "url": preview.get("url"),
+        "served_commit_sha": rnd.get("served_commit_sha"),
+        "preview_port": preview.get("port"),
+        "writer_session": rnd.get("writer_session"),
+        "round": rnd.get("round"),
+        "evidence_id": rnd.get("evidence_id"),
         "scenario": contract.get("scenario"),
         "viewports": [v["name"] for v in viewports],
         "recipe": spec.get("name"),
@@ -14449,6 +15036,143 @@ def build_visual_prompt(body: bytes, repos: dict[str, str]) -> tuple[int, dict[s
         )
 
 
+# --- ticket-07 rollout proof ------------------------------------------------
+
+
+def build_rollout_receipt(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Accept one controller-read receipt and bind it to this live build.
+
+    This is intentionally a receipt census, not a canary runner.  Rewst owns
+    the external calls and people own their review input; Graphwing only
+    accepts a post-transition readback for the live checkout and refuses a
+    final push until every required class is present and coherent.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    allowed = {"build_id", "event_id", "kind", "source_build_id", "canary_run_id", "transition_id", "readback_id", "proof"}
+    stray = sorted(set(data) - allowed)
+    if stray:
+        return 400, {"ok": False, "code": "extra_field", "error": f"unknown field: {stray[0]}"}
+    build_id, event_id, kind = data.get("build_id"), data.get("event_id"), data.get("kind")
+    if not valid_build_id(build_id):
+        return 400, {"ok": False, "code": "bad_build_id", "error": "invalid build_id"}
+    if not isinstance(event_id, str) or not BUILD_EVENT_ID_RE.fullmatch(event_id):
+        return 400, {"ok": False, "code": "bad_event_id", "error": "event_id is required"}
+    if kind not in BUILD_ROLLOUT_RECEIPT_KIND_SET:
+        return 400, {"ok": False, "code": "bad_rollout_kind", "error": "unknown rollout receipt kind"}
+    source_build_id = data.get("source_build_id")
+    if not valid_build_id(source_build_id):
+        return 400, {"ok": False, "code": "bad_source_build_id", "error": "source_build_id is required"}
+    for field in ("canary_run_id", "transition_id", "readback_id"):
+        if not isinstance(data.get(field), str) or not BUILD_ROLLOUT_ID_RE.fullmatch(data[field]):
+            return 400, {"ok": False, "code": f"bad_{field}", "error": f"{field} is required"}
+    if data["readback_id"] == data["transition_id"]:
+        return 400, {"ok": False, "code": "readback_not_separate", "error": "readback_id must name a separate post-transition read"}
+    proof = data.get("proof")
+    if not isinstance(proof, dict):
+        return 400, {"ok": False, "code": "bad_rollout_proof", "error": "proof must be an object"}
+    # Hashes are deliberately hex strings and would trip the generic
+    # credential-shaped-value guard; reject secret-shaped *keys* instead.
+    # Proof data is bounded facts, not a capability transport.
+    if len(canonical_json(proof)) > FILE_MAX_BYTES:
+        return 400, {"ok": False, "code": "proof_too_large", "error": "rollout proof is too large"}
+    def proof_has_secret_key(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(secret_shaped_key(str(key)) or proof_has_secret_key(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(proof_has_secret_key(item) for item in value)
+        return False
+    if proof_has_secret_key(proof):
+        return 400, {"ok": False, "code": "secret_in_rollout_proof", "error": "rollout proof contains a secret-shaped field"}
+    fingerprint = event_fingerprint({
+        "build_id": build_id, "source_build_id": source_build_id, "kind": kind, "canary_run_id": data["canary_run_id"],
+        "transition_id": data["transition_id"], "readback_id": data["readback_id"], "proof": proof,
+    })
+    with BUILD_LOCK:
+        doc, open_err = load_build(str(build_id))
+        if open_err:
+            return int(open_err["status"]), open_err
+        if doc is None:
+            return 404, {"ok": False, "code": "unknown_build", "error": "unknown build", "build_id": build_id}
+        if doc.get("version") != BUILD_STATE_VERSION:
+            return 409, build_version_park(doc)
+        rollout = build_rollout(doc)
+        if rollout is None:
+            return 409, {"ok": False, "code": "rollout_not_requested", "error": "this build did not request ticket-07 rollout proof"}
+        seen = build_event_seen(doc)
+        if event_id in seen:
+            previous = seen[event_id]
+            if previous.get("fingerprint") != fingerprint:
+                return 409, {**build_public(doc), "ok": False, "code": "idempotency_conflict", "error": "event_id was already used with different input"}
+            return int(previous.get("status") or 200), {**build_public(doc), "replayed": True, "receipt": previous.get("receipt")}
+        if len(seen) >= BUILD_EVENT_HARD_MAX:
+            return 409, {"ok": False, "code": "event_history_full", "error": "build has used its whole event history"}
+        if source_build_id == build_id:
+            return 409, {**build_public(doc), "ok": False, "code": "rollout_holder_is_source",
+                         "error": "issue-level rollout holder cannot count itself as a source canary"}
+        source_doc, source_err = load_build(str(source_build_id))
+        if source_err:
+            return int(source_err["status"]), source_err
+        if source_doc is None or source_doc.get("version") != BUILD_STATE_VERSION:
+            return 409, {**build_public(doc), "ok": False, "code": "unknown_source_build",
+                         "error": "source canary build is missing or unreadable"}
+        live, live_error = build_live_change(source_doc, repos)
+        if live is None:
+            return 409, {**build_public(doc), "ok": False, "code": "source_identity_unreadable",
+                         "error": str(live_error)}
+        source_transition = build_event_seen(source_doc).get(data["transition_id"])
+        if not isinstance(source_transition, dict) or not isinstance(source_transition.get("receipt"), dict):
+            return 409, {**build_public(doc), "ok": False, "code": "missing_source_transition",
+                         "error": "transition_id is not a durable source-build transition receipt"}
+        source_evidence_id = build_evidence_identity(source_doc, live["change_id"])
+        if kind == "sensitive":
+            # Do not accept provider/model/role claims from the reviewing
+            # model or controller.  Project only the receipt fields this
+            # server authored when it routed and completed the two reviews.
+            authority_reviews = []
+            for role in BUILD_REVIEW_ROLES:
+                review = build_last_review(source_doc, live["change_id"], role)
+                authority = review.get("authority") if isinstance(review, dict) else None
+                if not isinstance(authority, dict):
+                    authority_reviews = []
+                    break
+                authority_reviews.append({
+                    "author": authority.get("author"), "provider": authority.get("provider"),
+                    "model": authority.get("model"), "role": authority.get("role"),
+                    "reviewer": review.get("reviewer"), "verdict": review.get("verdict"),
+                    "no_verdict": bool(review.get("no_verdict")),
+                    "final_diff_sha": proof.get("final_diff_sha"), "evidence_id": review.get("evidence_id"),
+                })
+            proof = {**proof, "final_diff_sha": live["change_id"], "evidence_id": source_evidence_id,
+                     "reviews": authority_reviews}
+        proof_gap = rollout_proof_gap(str(kind), proof, live["head"])
+        if proof_gap:
+            return 409, {"ok": False, "code": "invalid_rollout_proof", "error": proof_gap}
+        identity = {"commit_sha": live["head"], "change_id": live["change_id"],
+                    "evidence_id": source_evidence_id}
+        receipts = build_rollout_receipts(doc)
+        if any(entry.get("kind") == kind for entry in receipts):
+            return 409, {**build_public(doc), "ok": False, "code": "duplicate_rollout_kind", "error": "a receipt kind may satisfy the census once only"}
+        if any(entry.get("transition_id") == data["transition_id"] for entry in receipts):
+            return 409, {**build_public(doc), "ok": False, "code": "duplicate_transition_receipt", "error": "a transition receipt may satisfy the census once only"}
+        receipt = {
+            "event_id": event_id, "action": "rollout_receipt", "kind": kind, "at": utcnow(),
+            "source_build_id": source_build_id, **identity, "canary_run_id": data["canary_run_id"], "transition_id": data["transition_id"], "readback_id": data["readback_id"],
+            "readback_after_transition": True, "proof": proof,
+        }
+        rollout["receipts"] = receipts + [receipt]
+        rollout["status"] = "open"
+        build_record_event(doc, event_id, fingerprint, receipt, 200)
+        write_err = write_build(doc, str(build_id))
+        if write_err:
+            return int(write_err["status"]), write_err
+        out = build_public(doc)
+        out.update(ok=True, replayed=False, receipt=receipt)
+        return 200, out
+
+
 # --- PR lifecycle -----------------------------------------------------------
 #
 # A lifecycle event is a durable build event, not a second controller.  The
@@ -14713,7 +15437,14 @@ def build_lifecycle(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
                 receipt = {**receipt_base, "code": "missing_planning_pane", "error": "closed without merge has no exact saved planning pane"}
                 return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
             delivery = herdr_plan_deliver(pane, f"PR #{pr['number']} closed without merge for build {build_id}; choose keep or stop for {preview['url']}.")
-            receipt = {**receipt_base, "preview": preview, "outcome": "close_choice_requested", "delivery": delivery}
+            receipt = {
+                **receipt_base, "preview": preview, "pane": pane,
+                "outcome": "close_choice_requested", "delivery": delivery,
+                # A missing answer is intentionally not a stop instruction.
+                # The pending record below is durable and no teardown path is
+                # reached until a later event supplies keep/stop at this pane.
+                "no_answer_preserves_preview": True,
+            }
             if not delivery.get("ok"):
                 receipt.update(code="planning_send_failed", error="the exact planning pane could not be reached")
                 return lifecycle_response(doc, event_id, fingerprint, receipt, 409)
@@ -16173,6 +16904,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/build/lifecycle":
         status, payload = build_lifecycle(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/rollout/receipt":
+        status, payload = build_rollout_receipt(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/build/review/reconcile":
+        status, payload = build_review_reconcile(body, repos)
         return json_out(status, payload)
     if method == "GET" and path == "/v1/build/state":
         status, payload = build_state_op(qs)

@@ -21,7 +21,7 @@
             "ticket": { "type": "string", "required": false, "description": "Optional ticket path; must already be on the frontier. Omit to take the next build." },
             "commit_message": { "type": "string", "required": true },
             "test": { "type": "string", "required": true },
-            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same Hermes session with a compact test signal" },
+            "iters_left": { "type": "string", "required": false, "description": "Set to 2 to resume the same direct-harness session with a compact test signal" },
             "class": { "type": "string", "required": false, "description": "mechanical (default), visual, or sensitive" },
             "size": { "type": "string", "required": false, "description": "S, M (default), or L floor" },
             "ac_count": { "type": "string", "required": false },
@@ -245,7 +245,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "harness_session": "{{ TASKS.wait.request.body.harness_session }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
@@ -338,7 +338,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "harness_session": "{{ TASKS.wait.request.body.harness_session }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
@@ -467,7 +467,7 @@
             { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.sha" } },
             { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
-            { "id": "m7", "output": "hermes_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.hermes_session" } }
+            { "id": "m7", "output": "harness_session", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.harness_session" } }
           ]
         }
       },
@@ -531,12 +531,12 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "harness_session": "{{ TASKS.wait.request.body.harness_session }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same direct-harness session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"
         }
@@ -602,12 +602,12 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "hermes_session": "{{ TASKS.wait.request.body.hermes_session }}",
+          "harness_session": "{{ TASKS.wait.request.body.harness_session }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "model": "{{ TASKS.route.data.model }}",
           "max_turns": "{{ TASKS.route.data.max_turns }}",
           "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
-          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same Hermes session. Do not restart from a blank plan.",
+          "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same direct-harness session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"
         }

@@ -2,7 +2,7 @@
   "slug": "graphwing-pre-pr-build",
   "name": "graphwing-pre-pr-build",
   "tags": ["graphwing-supervised"],
-  "description": "One bounded invocation of the shared mechanical-and-sensitive pre-PR path. buildNext names the one step and, for review, the exact role and reviewer this run may use; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and reviews run behind wait webhooks and apply their own successful gates with the verdict write. Sensitive runs Terra behavior review and Grok security review as separate invocations against the same durable change and evidence identity. A sensitive visible build terminates at an explicit visual-evidence handoff until that separate path records its required proof. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Missing verdict, stale head, failed check, review finding, route gap, recipe gap, dirty worktree, trunk branch, a held lease, an existing writer reservation, an exhausted budget, and a non-clean integration stack each end at their own terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
+  "description": "One bounded invocation of the shared mechanical-and-sensitive pre-PR path. buildNext names the one step and, for review, the exact role and reviewer this run may use; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and reviews run behind wait webhooks and apply their own successful gates with the verdict write; a primary terminal provider failure stays visible while Rewst alone routes one explicit failover transition. Sensitive runs Terra behavior review and Grok security review as separate invocations against the same durable change and evidence identity. A sensitive visible build terminates at an explicit visual-evidence handoff until that separate path records its required proof. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Missing verdict, stale head, failed check, review finding, route gap, recipe gap, dirty worktree, trunk branch, a held lease, an existing writer reservation, an exhausted budget, and a non-clean integration stack each end at their own terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -21,6 +21,8 @@
             "commit_message": { "type": "string", "required": true },
             "stack": { "type": "string", "required": false, "description": "Clean stack for phase=integration. Never a dev or preview stack, never one of the build's own." },
             "reviewer": {"type": "string", "required": true, "description": "Spec reviewer"},
+            "failover_provider": {"type": "string", "required": false, "description": "Configured provider for the one explicit workflow failover."},
+            "failover_model": {"type": "string", "required": false, "description": "Configured model for the one explicit workflow failover."},
             "plan_pane": {"type": "string", "required": true, "description": "The exact saved planning pane every supervision report goes to. There is no default and no fallback tab."},
             "expected_stage": {"type": "string", "required": true, "description": "created, writing, verifying, evidence, review, ready, or pr_opened"},
             "deadline": {"type": "string", "required": true, "description": "UTC instant like 2026-08-25T13:00:00Z. An instant, not a duration."},
@@ -293,7 +295,7 @@
           "holder": "event:{{ CTX.INPUT.event_id }}",
           "claim_id": "{{ CTX.INPUT.event_id }}.claim-initial",
           "job_id": "{{ TASKS.agent.data.job_id }}",
-          "hermes_session": "{{ TASKS.agent.data.hermes_session }}",
+          "harness_session": "{{ TASKS.agent.data.harness_session }}",
           "callback": "{{ TASKS.wait_write.request.body }}"
         }
       },
@@ -369,7 +371,7 @@
           "holder": "event:{{ CTX.INPUT.event_id }}",
           "claim_id": "{{ CTX.INPUT.event_id }}.claim-correction",
           "job_id": "{{ TASKS.agent_fix.data.job_id }}",
-          "hermes_session": "{{ TASKS.agent_fix.data.hermes_session }}",
+          "harness_session": "{{ TASKS.agent_fix.data.harness_session }}",
           "callback": "{{ TASKS.wait_fix.request.body }}"
         }
       },
@@ -559,6 +561,36 @@
           "response_webhook_url": "{{ TASKS.wait_review.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_review.pending.resumeToken }}"
         }
+      },
+      {
+        "id": "wait_failover_review",
+        "type": "action.wait.webhook",
+        "label": "Wait explicit workflow failover verdict",
+        "position": { "x": 1120, "y": 880 },
+        "config": { "alias": "wait_failover_review", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 1800 }
+      },
+      {
+        "id": "failover_review",
+        "type": "action.graphwing.POST:/v1/build/review",
+        "label": "Rewst one-shot failover review",
+        "position": { "x": 1120, "y": 1000 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60,
+          "build_id": "{{ CTX.INPUT.build_id }}", "reviewer": "{{ TASKS.next.data.review_reviewer }}",
+          "provider": "{{ CTX.INPUT.failover_provider }}", "model": "{{ CTX.INPUT.failover_model }}",
+          "transition_id": "{{ CTX.WORKFLOW.runId }}:failover:{{ TASKS.wait_review.request.body.attempt_id }}",
+          "source_failure_id": "{{ TASKS.wait_review.request.body.attempt_id }}",
+          "response_webhook_url": "{{ TASKS.wait_failover_review.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_failover_review.pending.resumeToken }}"
+        }
+      },
+      {
+        "id": "if_failover_review",
+        "type": "logic.filter", "label": "failover PASS?", "position": { "x": 1260, "y": 880 },
+        "config": { "group": "AND", "rules": [
+          { "path": "request.body.status", "op": "equals", "value": "ok" },
+          { "path": "request.body.ok", "op": "equals", "value": true }
+        ] }
       },
       {
         "id": "if_review",
@@ -965,7 +997,7 @@
       { "id": "fast_green", "type": "action.noop", "label": "Fast checks clean; next invocation runs the review", "position": { "x": 1400, "y": 280 }, "config": {} },
       { "id": "fast_green_recovered", "type": "action.noop", "label": "Recovered fast-check gate; next invocation runs the review", "position": { "x": 1680, "y": 280 }, "config": {} },
       { "id": "correction_pending", "type": "action.noop", "label": "Correction state: reviewer finding recorded; next invocation runs fix", "position": { "x": 1120, "y": 820 }, "config": {} },
-      { "id": "review_no_verdict", "type": "action.noop", "label": "Provider silence: not a finding, no round written; retry the same step", "position": { "x": 1120, "y": 880 }, "config": {} },
+      { "id": "review_no_verdict", "type": "logic.join.any", "label": "Primary terminal failure remains visible; Rewst may route one explicit failover", "position": { "x": 1120, "y": 880 }, "config": { "stopOnFirst": true } },
       { "id": "reviewer_is_writer", "type": "action.noop", "label": "Herdr: reviewer shares a vendor with the writer; name another", "position": { "x": 980, "y": 940 }, "config": {} },
       { "id": "review_green", "type": "action.noop", "label": "Review clean; next invocation runs integration", "position": { "x": 1400, "y": 700 }, "config": {} },
       { "id": "review_green_recovered", "type": "action.noop", "label": "Recovered review gate; next invocation runs integration", "position": { "x": 1680, "y": 700 }, "config": {} },
@@ -1169,7 +1201,13 @@
       { "id": "e_rev_pass", "source": "if_review", "sourceHandle": "pass", "target": "review_green", "targetHandle": "in" },
       { "id": "e_rev_fail", "source": "if_review", "sourceHandle": "fail", "target": "map_review_red", "targetHandle": "in" },
       { "id": "e_revred_map", "source": "map_review_red", "sourceHandle": "out", "target": "switch_review_red", "targetHandle": "in" },
-      { "id": "e_revred_silence", "source": "switch_review_red", "sourceHandle": "case-0", "target": "review_no_verdict", "targetHandle": "in" },
+      { "id": "e_revred_silence", "source": "switch_review_red", "sourceHandle": "case-0", "target": "wait_failover_review", "targetHandle": "in" },
+      { "id": "e_wfailover_pending", "source": "wait_failover_review", "sourceHandle": "pending", "target": "failover_review", "targetHandle": "in" },
+      { "id": "e_wfailover_out", "source": "wait_failover_review", "sourceHandle": "out", "target": "if_failover_review", "targetHandle": "in" },
+      { "id": "e_wfailover_timeout", "source": "wait_failover_review", "sourceHandle": "timeout", "target": "review_no_verdict", "targetHandle": "in" },
+      { "id": "e_wfailover_failure", "source": "wait_failover_review", "sourceHandle": "failure", "target": "review_no_verdict", "targetHandle": "in" },
+      { "id": "e_failover_pass", "source": "if_failover_review", "sourceHandle": "pass", "target": "join_review_passed", "targetHandle": "in" },
+      { "id": "e_failover_fail", "source": "if_failover_review", "sourceHandle": "fail", "target": "review_no_verdict", "targetHandle": "in" },
       { "id": "e_revred_finding", "source": "switch_review_red", "sourceHandle": "case-1", "target": "correction_pending", "targetHandle": "in" },
       { "id": "e_revred_other", "source": "switch_review_red", "sourceHandle": "default", "target": "join_review_stuck", "targetHandle": "in" },
 

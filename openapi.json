@@ -479,7 +479,7 @@
       "post": {
         "operationId": "reviewRun",
         "tags": ["review"],
-        "summary": "Opposing-vendor spec-review of git diff HEAD. Plan-mode Claude for sonnet/opus; Hermes for sol. Does not commit.",
+        "summary": "Opposing-vendor spec-review of git diff HEAD. Direct Codex, Claude, or Grok Build only; each receives an exact provider/model/session contract. Does not commit.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunRequest" } } }
@@ -554,6 +554,24 @@
         "responses": { "200": {"description": "durable lifecycle receipt or replay", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"description": "refusal, partial cleanup, identity conflict, or out-of-order event", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}} }
       }
     },
+    "/v1/build/rollout/receipt": {
+      "post": {
+        "operationId": "buildRolloutReceipt",
+        "tags": ["build"],
+        "summary": "Record one ticket-07 issue-level census receipt against an existing distinct source build. The server binds the source’s live commit/change/evidence identity and durable transition receipt; source canaries may finish before census acceptance.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["build_id", "event_id", "kind", "source_build_id", "canary_run_id", "transition_id", "readback_id", "proof"], "properties": { "build_id": {"type": "string"}, "event_id": {"type": "string"}, "kind": {"type": "string", "enum": ["catalog_parity", "mechanical", "sensitive", "visual", "checkpoint", "lifecycle"]}, "source_build_id": {"type": "string"}, "canary_run_id": {"type": "string"}, "transition_id": {"type": "string"}, "readback_id": {"type": "string", "description": "A separately issued post-transition readback id."}, "proof": {"type": "object", "additionalProperties": true, "description": "Bounded controller readback facts; never credentials, screenshot bytes, or model self-claims."} } } } } },
+        "responses": { "200": {"description": "server-bound receipt or replay", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"description": "invalid proof, replay, duplicate receipt, stale identity, or other fail-closed refusal", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BuildState"}}}} }
+      }
+    },
+    "/v1/build/review/reconcile": {
+      "post": {
+        "operationId": "buildReviewReconcile",
+        "tags": ["build"],
+        "summary": "Terminalize overdue or receipt-less durable review attempts from existing build/job ledgers; never dispatches or retries a provider.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["build_id"], "properties": { "build_id": {"type": "string"} } } } } },
+        "responses": { "200": {"description": "reconciled terminal attempts"}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"} }
+      }
+    },
     "/v1/build/claim": {
       "post": {
         "operationId": "buildClaim",
@@ -577,7 +595,7 @@
       "post": {
         "operationId": "buildWriterLaunch",
         "tags": ["build"],
-        "summary": "Create or recover the one deterministic local Hermes writer job owned by build_id plus claim_id. The initial claim already reserves its stable session; correction claims resume the bound session. Replays attach their webhook to the same job and never launch another.",
+        "summary": "Create or recover the one deterministic local direct-harness writer job owned by build_id plus claim_id. The initial claim already reserves its stable session; correction claims resume the bound session. Replays attach their webhook to the same job and never launch another.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildWriterLaunchRequest" } } }
@@ -722,7 +740,7 @@
       "post": {
         "operationId": "buildReview",
         "tags": ["build"],
-        "summary": "Run the one server-selected micro-review due for this change. Mechanical uses the behavior-and-test lens. Sensitive runs Terra for behavior and tests, then Grok for security and tenant isolation; both roles must PASS the same change and evidence identity. Provider silence is retried and returned as no_verdict with finding=false, with no review round written. With response_webhook_url delivery is async and answers 202 with ok=false.",
+        "summary": "Run one exact requested provider/model review attempt. The server writes attempt-open before dispatch, disables fallback, records executed transport provenance, and terminalizes provider silence as no_verdict. Rewst alone may route one validated failover from that terminal receipt. With response_webhook_url delivery is async and answers 202 with ok=false.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BuildReviewRequest" } } }
@@ -1097,7 +1115,7 @@
       "get": {
         "operationId": "agentProfiles",
         "tags": ["agent"],
-        "summary": "Allowlisted seats from profiles.json. ~/.hermes/profiles is not dumped.",
+        "summary": "Allowlisted seats from profiles.json. legacy profile roots is not dumped.",
         "responses": {
           "200": {
             "description": "profiles",
@@ -1115,7 +1133,7 @@
       "post": {
         "operationId": "agentRun",
         "tags": ["agent"],
-        "summary": "Queue one bounded Hermes loop. Returns 202 + job_id; does not block.",
+        "summary": "Queue one bounded direct provider harness job. Returns 202 + job_id; does not block.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1137,7 +1155,7 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/Error" },
           "501": {
-            "description": "spawn failed closed (hermes binary missing)",
+            "description": "spawn failed closed (configured direct harness unavailable)",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" }
@@ -1824,21 +1842,21 @@
           "claim_id": { "type": "string" },
           "job_id": { "type": "string" },
           "status": { "type": "string" },
-          "hermes_session": { "type": "string" },
+          "harness_session": { "type": "string" },
           "poll": { "type": "string" }
         }
       },
       "BuildWriterCompleteRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["build_id", "event_id", "holder", "claim_id", "job_id", "hermes_session", "callback"],
+        "required": ["build_id", "event_id", "holder", "claim_id", "job_id", "harness_session", "callback"],
         "properties": {
           "build_id": { "type": "string" },
           "event_id": { "type": "string" },
           "holder": { "type": "string" },
           "claim_id": { "type": "string" },
           "job_id": { "type": "string" },
-          "hermes_session": { "type": "string" },
+          "harness_session": { "type": "string" },
           "callback": { "$ref": "#/components/schemas/AgentReceipt" }
         }
       },
@@ -1906,7 +1924,7 @@
           "ticket": { "type": "string" },
           "prompt": { "type": "string", "description": "The approved ticket, the named recipes that judge it, and the instruction to stage but never commit. The slice index and the neighbouring tickets are deliberately absent: a prompt assembled from templates acquires them one convenient interpolation at a time, and the writer starts solving the epic." },
           "resume": { "type": "boolean" },
-          "hermes_session": { "type": ["string", "null"] },
+          "harness_session": { "type": ["string", "null"] },
           "launcher": { "type": ["string", "null"] },
           "model": { "type": ["string", "null"] },
           "max_turns": { "type": ["integer", "null"] },
@@ -1970,6 +1988,10 @@
         "properties": {
           "build_id": { "type": "string" },
           "reviewer": { "type": "string", "enum": ["sonnet", "opus", "fable", "sol", "terra", "grok"], "description": "Optional mechanical override. Sensitive review roles and reviewers are selected by the server from durable state; a conflicting assertion is refused." },
+          "provider": { "type": "string", "description": "Exact configured provider; recorded before dispatch and compared to launcher evidence." },
+          "model": { "type": "string", "description": "Exact configured model; recorded before dispatch and compared to launcher evidence." },
+          "transition_id": { "type": "string", "description": "Workflow transition identifier for this distinct attempt." },
+          "source_failure_id": { "type": "string", "description": "Terminal failed attempt ID consumed once for an explicit Rewst failover." },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
@@ -1988,6 +2010,13 @@
           "head": { "type": "string" },
           "change_id": { "type": "string" },
           "evidence_id": { "type": "string", "description": "Identity of the visual evidence set acknowledged by this review, or none when no visual evidence is required." },
+          "attempt_id": { "type": "string" },
+          "transition_id": { "type": "string" },
+          "requested_provider": { "type": "string" },
+          "requested_model": { "type": "string" },
+          "executed_provider": { "type": ["string", "null"] },
+          "executed_model": { "type": ["string", "null"] },
+          "transport_provenance": { "type": ["object", "null"], "additionalProperties": true, "description": "Attempt-bound normalized receipt produced only after the corresponding native Codex, Claude, or Grok Build adapter validates its real structured output; absent, mixed, stale, or malformed provenance is terminal failure." },
           "round": { "type": "integer" },
           "verdict": { "type": ["string", "null"], "enum": ["PASS", "NACK", null] },
           "no_verdict": { "type": "boolean", "description": "The reviewer ran out of turns or lost its connection. Nothing is recorded and finding stays false: treating silence as a finding resumes the writer to fix a problem nobody reported, spends a round of budget, and does it again next time." },
@@ -2226,6 +2255,7 @@
           "route": { "type": "object", "additionalProperties": true, "description": "sliceRoute row: launcher, model, reviewers, turns." },
           "verification": { "$ref": "#/components/schemas/BuildVerification" },
           "stacks": { "type": "array", "items": { "type": "string" } },
+          "rollout": { "type": "object", "additionalProperties": false, "required": ["ticket"], "properties": { "ticket": { "type": "string", "enum": ["github_issue_52"], "description": "Opt in to ticket-07 GitHub issue #52 proof. Shortcut is not a valid tracker." } } },
           "budget": {
             "type": "object",
             "properties": { "jobs_max": { "type": "integer", "minimum": 1, "maximum": 500 } }
@@ -2258,7 +2288,7 @@
           "data": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Transition payload. Secret-shaped keys and values are redacted before the write. Branch and head identity come from the live Git read of the allowlisted checkout, so no payload field can move them: a data.head is ignored. Unknown keys are dropped. The fields that fold into state are writer_session (a gwslice-<32 hex> session id, bound by start_writer only), stacks, round (evidence_captured), pr (pr_opened), and reason/detail (park). Review authority comes only from buildReview plus buildGate, never data.review."
+            "description": "Transition payload. Secret-shaped keys and values are redacted before the write. Branch and head identity come from the live Git read of the allowlisted checkout, so no payload field can move them: a data.head is ignored. Unknown keys are dropped. The fields that fold into state are writer_session (a canonical direct-harness UUID, bound by start_writer only), stacks, round (evidence_captured), pr (pr_opened), and reason/detail (park). Review authority comes only from buildReview plus buildGate, never data.review."
           }
         }
       },
@@ -2302,6 +2332,7 @@
           },
           "index": { "type": ["string", "null"] },
           "ticket": { "type": ["string", "null"] },
+          "rollout": { "type": ["object", "null"], "additionalProperties": true, "description": "Ticket-07 receipt census. It stays open until the controller obtains every live canary and cleanup readback; it never claims rollout completion." },
           "route": { "type": ["object", "null"], "additionalProperties": true },
           "verification": { "$ref": "#/components/schemas/BuildVerification" },
           "writer_session": { "type": ["string", "null"] },
@@ -2696,13 +2727,13 @@
           "profile": { "type": "string", "default": "graphwing", "description": "Seat from profiles.json. v0.4 executes graphwing home only. Listed runnable=false seats return 400." },
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
           "supervised_source_run_id": { "type": "string", "minLength": 8, "maxLength": 128, "description": "Optional registered source run. The newly persisted agent job is bound before 202 and before enqueue." },
-          "launcher": { "type": "string", "enum": ["hermes", "claude"], "default": "hermes" },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"], "default": "grok" },
           "model": { "type": "string" },
           "max_turns": { "type": "integer" },
           "run_budget_seconds": { "type": "integer" },
-          "hermes_session": {
+          "harness_session": {
             "type": "string",
-            "description": "Named Hermes session gwslice-<32 hex>. Omit to mint one. Retry passes the receipt value to resume the same session."
+            "description": "Preassigned canonical UUID for Claude/Grok. Codex initial execution omits it and is pending until its emitted thread ID is durably bound."
           },
           "cwd": { "type": "string", "default": "riftwing", "description": "Allowlisted repo short name, not a filesystem path." },
           "response_webhook_url": {
@@ -2729,7 +2760,8 @@
           "status": { "type": "string" },
           "profile": { "type": "string" },
           "repo": { "type": "string" },
-          "hermes_session": { "type": "string" },
+          "harness_session": { "type": ["string", "null"], "description": "Null/pending for an initial Codex exec; then the exact emitted thread ID." },
+          "harness_session_state": { "type": "string", "enum": ["pending", "bound"] },
           "poll": { "type": "string" }
         }
       },
@@ -2744,7 +2776,7 @@
               "properties": {
                 "id": { "type": "string" },
                 "kind": { "type": "string" },
-                "hermes_home": { "type": "string" },
+                "harness_home": { "type": "string" },
                 "herdr_session": { "type": "string" },
                 "herdr_agent": { "type": "string" },
                 "runnable": { "type": "boolean" }

@@ -27,6 +27,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import publish_graphs as pg  # noqa: E402
 
 
+def integration_readback_spec(body: dict) -> dict | None:
+    """Return only the live integration OpenAPI document, never request input."""
+    if not isinstance(body, dict):
+        return None
+    envelope = body.get("data") if isinstance(body.get("data"), dict) else body
+    integration = envelope.get("customIntegration") if isinstance(envelope.get("customIntegration"), dict) else envelope
+    for key in ("spec", "openapi", "document"):
+        value = integration.get(key)
+        if isinstance(value, dict):
+            return value
+    current = integration.get("currentVersion") or integration.get("current_version")
+    if isinstance(current, dict):
+        for key in ("spec", "openapi", "document"):
+            if isinstance(current.get(key), dict):
+                return current[key]
+    return None
+
+
+def verify_integration_parity(mcp: str, integration: str, catalog_spec: dict) -> dict:
+    status, live = pg.api(mcp, "GET", f"/custom-integrations/{integration}")
+    if status != 200:
+        raise SystemExit(f"integration live readback HTTP {status}; no parity receipt")
+    return pg.require_catalog_parity(catalog_spec, integration_readback_spec(live), "custom integration")
+
+
 def main() -> None:
     install = pg.load_install()
     pg.TENANT = pg.tenant_id(install)
@@ -47,6 +72,12 @@ def main() -> None:
     status, published = pg.api(mcp, "POST", f"/custom-integrations/{integration}/publish", {})
     pg.must(status, published, ok=(200, 201), label="publish integration")
 
+    # The live side is a fresh GET after publish, never the sourceUrl payload
+    # or the response to PUT/POST.  Failure deliberately leaves no success
+    # receipt for the controller to count.
+    catalog_spec = json.loads((pg.ROOT / "openapi.json").read_text())
+    parity = verify_integration_parity(mcp, integration, catalog_spec)
+
     version = published.get("version") or published.get("versionNumber")
     version_id = published.get("versionId") or published.get("id")
     print("published version", version, version_id)
@@ -55,7 +86,7 @@ def main() -> None:
     install["custom_integration_version_id"] = version_id
     pg.save_install(install)
     print("=== DONE ===")
-    print(json.dumps({"integration": integration, "version": version, "version_id": version_id}, indent=2))
+    print(json.dumps({"integration": integration, "version": version, "version_id": version_id, "parity": parity}, indent=2))
 
 
 if __name__ == "__main__":

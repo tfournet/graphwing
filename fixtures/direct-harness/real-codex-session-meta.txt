@@ -1,0 +1,6 @@
+Codex session metadata receipt for thread 01a03bce-4eb8-7420-9060-29e619aa4715:
+- durable path: /home/tim/.codex/sessions/2026/08/25/rollout-2026-08-25T21-02-51-01a03bce-4eb8-7420-9060-29e619aa4715.jsonl
+- ordinal 0 session_meta: session_id=01a03bce-4eb8-7420-9060-29e619aa4715, originator=codex_exec, source=exec, model_provider=openai
+- ordinal 7 turn_context: turn_id=01a03bce-4f48-71c1-af6c-eba0d9dce98d, model=gpt-5.6-terra, sandbox_policy=read-only
+- ordinal 14 task_complete: same turn_id, last_agent_message=PROBE_OK
+These values were read from the exact session path selected by the thread.started ID, not by time/latest lookup.

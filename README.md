@@ -1,6 +1,6 @@
 # Graphwing
 
-Rewst workflows run in the cloud. They cannot `git checkout` a repo on your disk, cannot run your local test command, and cannot start Hermes. Graphwing is a small HTTP server on the computer where those repos live. Rewst calls it.
+Rewst workflows run in the cloud. They cannot `git checkout` a repo on your disk, cannot run your local test command, and cannot start a local coding harness. Graphwing is a small HTTP server on the computer where those repos live. Rewst calls it.
 
 That is the product.
 
@@ -38,7 +38,7 @@ You start a published workflow with a JSON body. Example: which repo (a short na
 Rewst walks its step list:
 
 1. Short calls return immediately. `gitStatus`, `testRun`, `fileHead` of the ticket file.
-2. `agentRun` is slow. Graphwing starts one Hermes or Claude job and returns 202. Rewst waits on a callback URL. When the job ends, Graphwing POSTs `{ status, summary, sha, … }` and Rewst continues.
+2. `agentRun` is slow. Graphwing starts one configured Codex, Claude, or Grok Build job and returns 202. Rewst waits on a callback URL. When the job ends, Graphwing POSTs `{ status, summary, sha, … }` and Rewst continues.
 3. If tests fail, files stay on disk. Graphwing does not `git restore`. After a few failed retries it stops and waits for you.
 4. If the ticket is done, Graphwing commits and pushes. The workflow then POSTs *itself* with the next ticket. That is a new run. Rewst will not let one run loop forever.
 
@@ -59,6 +59,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 | `graphwing-visual-iteration` | build id, event id, one feedback, decision, return, or resume action | One bounded design turn. It records exact feedback, resumes the saved writer, reruns changed-area checks and typecheck, composes a real-browser evidence round, and reports the verified candidate to the exact planning pane. Turn 20 is a one-time checkpoint, not a ceiling. |
 | `graphwing-verify-stack` | stack, ports | Check that a local stack is up. |
 | `graphwing-pr-lifecycle` | build id, unique event id, event, PR identity, optional close choice | Records/replays the bounded PR lifecycle receipt; only recorded preview resources can be reclaimed. |
+| `buildRolloutReceipt` | ticket-07 holder and distinct source-build ids, canary/transition/readback ids, one proof class | Server-binds a controller's fresh readback to its current source build and fail-closes issue-level acceptance until the GitHub-#52 census is complete. It does not run canaries or claim rollout completion. |
 | `graphwing-pr-status` | PR number | Read GitHub checks. No writes. |
 | `graphwing-pr-drive` | repo, PR, test | One fix attempt when CI is red. |
 
@@ -69,7 +70,7 @@ How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules for the 
 | Place | Contents |
 |---|---|
 | This git repo | Server, OpenAPI spec, workflow JSON, docs |
-| `~/.graphwing` | API key, tunnel token, jobs, Hermes state. Never commit this. |
+| `~/.graphwing` | API key, tunnel token, jobs, direct-harness receipts. Never commit this. |
 
 `repos.json` in that home directory maps short names (`riftwing`) to real paths. Graphwing refuses anything else.
 

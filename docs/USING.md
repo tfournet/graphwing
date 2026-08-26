@@ -154,6 +154,20 @@ python3 scripts/publish_graphs.py --only implement-slice
 
 Skipping this fails silently, which is the expensive part. Rewst builds every request from its own copy of the operation list, so a field the graph sends and the server reads is dropped on the floor when the integration does not declare it. SC-110290's third run lost `response_webhook_url` that way: the review ran synchronously, its wait node blocked on a callback nobody would send, and no layer reported anything.
 
+## Issue #52 ticket-07 rollout proof (controller-only)
+
+Ticket 07 evidence belongs on [GitHub issue #52](https://github.com/tfournet/graphwing/issues/52), including the ticket-03 GitHub evidence path. It has no Shortcut evidence, attachment, or comment path. Its rollout status is **open** until the controller has completed real disposable/synthetic canaries and independently read their receipts back.
+
+Before any canary, re-import the integration and publish the affected graphs. Both scripts now canonicalize the committed catalog and compare it with a **fresh post-publish API read**; unreadable or unequal operation/schema/graph bytes emit no parity receipt. Do not replace that readback with the source request body.
+
+For an issue-level holder created with `"rollout":{"ticket":"github_issue_52"}`, the controller records each externally read receipt through `buildRolloutReceipt` with a distinct source build. The server reads that source's current canary run, commit/change/evidence identity and durable transition; the holder cannot count itself and the census needs distinct source canaries. The required census is catalog parity, mechanical, sensitive, visual, checkpoint, and lifecycle. A missing, duplicate, stale, unreadable, or invalid receipt blocks issue-level acceptance/final PR; source canaries may complete before their result enters the census.
+
+Reviews write a durable attempt-open record before dispatch and one terminal receipt afterwards. Codex `exec --json` starts pending and atomically binds its emitted `thread.started.thread_id` to the durable job after exact session-metadata validation; Graphwing never selects a latest session or routes through another harness. Native Codex, Claude, and Grok receipts are validated by harness-specific adapters before normalization. The existing launcher invokes the requested provider/model with fallback disabled; `no_verdict`, unavailable provider, timeout, crash, missing terminal receipt, and execution mismatch are terminal failures. Rewst alone may send one configured failover using the primary attempt ID; it must preserve role/head/change/evidence, and a changed identity voids that route. Do not retry `no_verdict` inside Graphwing.
+
+Recovery is receipt-driven: correct the failed canary or cleanup, obtain a new current readback, and record it with a new transition identity. Do not force-push, reuse an old receipt, or fabricate a transport `completed` state. Budgets remain those declared on the build; turn 20 is advisory, not a later ceiling. The retained fallback is `graphwing-implement-slice`; ticket 07 neither replaces nor disables it.
+
+Human inputs still owned by the controller are the two visual feedback rounds on one writer session/preview, the close keep/stop answer at the exact saved pane, and the final acceptance of GitHub issue comments/screenshots. Sensitive review identity is derived from Graphwing's server-authored Terra/Grok receipt fields; missing or `no_verdict` blocks rather than passing or becoming a finding. No credential store, service/job, snapshot store, backfill, operator command, deployment protocol, production repair/adoption, real tenant data, or final PR is part of this implementation.
+
 Two parameter names to avoid: the connector treats a query parameter called `path` as the request URL path and overwrites the endpoint with its value. `fileHead` and `gitDiff` use `rel` for that reason.
 
 ## Shortcut from the seat

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import inspect
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -243,7 +245,7 @@ class DispatchTests(unittest.TestCase):
         ids = [p["id"] for p in payload["profiles"]]
         self.assertEqual(ids, ["graphwing"])
         self.assertEqual(payload["profiles"][0]["herdr_session"], "graphwing")
-        self.assertEqual(payload["profiles"][0]["hermes_home"], str(server.HOME.resolve()))
+        self.assertEqual(payload["profiles"][0]["harness_home"], str(server.HOME.resolve()))
         self.assertTrue(payload["profiles"][0]["runnable"])
         for banned in ("executor", "fable", "cheap-exec"):
             self.assertNotIn(banned, ids)
@@ -319,7 +321,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(payload["repo"], "scratch")
             job_id = payload["job_id"]
             self.assertRegex(job_id, r"^[0-9a-f]{32}$")
-            self.assertEqual(payload["hermes_session"], f"gwslice-{job_id}")
+            self.assertEqual(payload["harness_session"], str(uuid.UUID(hex=job_id)))
             self.assertEqual(payload["poll"], f"/v1/agent/jobs/{job_id}")
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 gstatus, gp, _ = server.dispatch(
@@ -328,27 +330,27 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(gstatus, 200, gp)
             self.assertEqual(gp["status"], "queued")
             self.assertEqual(gp["prompt"], "ping")
-            self.assertEqual(gp["hermes_session"], f"gwslice-{job_id}")
+            self.assertEqual(gp["harness_session"], str(uuid.UUID(hex=job_id)))
             self.assertNotIn("response_webhook_token", gp)
             self.assertNotIn("resume_url", gp)
 
-    def test_agent_run_rejects_bad_hermes_session(self):
+    def test_agent_run_rejects_bad_harness_session(self):
         status, payload, _ = server.dispatch(
             "POST",
             "/v1/agent/run",
             {},
             True,
-            b'{"prompt":"x","hermes_session":"../evil"}',
+            b'{"prompt":"x","harness_session":"../evil"}',
         )
         self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "bad_hermes_session")
+        self.assertEqual(payload["code"], "bad_harness_session")
 
-    def test_agent_run_accepts_hermes_session(self):
-        session = "gwslice-" + ("ab" * 16)
+    def test_agent_run_accepts_harness_session(self):
+        session = str(uuid.UUID(hex="abababababababababababababababab"))
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
-            body = json.dumps({"prompt": "ping", "cwd": "scratch", "hermes_session": session}).encode()
+            body = json.dumps({"prompt": "ping", "cwd": "scratch", "harness_session": session}).encode()
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
                 with mock.patch.object(server, "JOBS_DIR", jobs):
                     with mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -356,7 +358,7 @@ class DispatchTests(unittest.TestCase):
                             "POST", "/v1/agent/run", {}, True, body
                         )
             self.assertEqual(status, 202, payload)
-            self.assertEqual(payload["hermes_session"], session)
+            self.assertEqual(payload["harness_session"], session)
 
     def test_compact_cmd_signal_shortens_failure(self):
         noise = "\n".join(f"ok line {i}" for i in range(80))
@@ -396,12 +398,12 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(parsed["sha"], "abc")
 
     def test_agent_run_missing_binary(self):
-        with mock.patch.object(server, "HERMES_BIN", Path("/nope/hermes")):
+        with mock.patch.object(server, "GROK_BIN", Path("/nope/hermes")):
             status, payload, _ = server.dispatch(
                 "POST", "/v1/agent/run", {}, True, b'{"prompt":"x"}'
             )
         self.assertEqual(status, 501)
-        self.assertEqual(payload["code"], "not_implemented")
+        self.assertEqual(payload["code"], "unavailable_provider")
 
     def test_wrap_prompt_locks_cwd(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
@@ -412,7 +414,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("Do not git commit, git push", text)
         self.assertIn("Do not `git checkout`", text)
 
-    def test_spawn_hermes_continues_named_session(self):
+    def test_spawn_harness_continues_named_session(self):
         captured: dict = {}
 
         class FakePopen:
@@ -424,35 +426,36 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             job_id = "ab" * 16
-            session = "gwslice-" + job_id
+            session = str(uuid.UUID(hex=job_id))
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             (jdir / "prompt.txt").write_text("x")
-            hermes = Path(td) / "hermes"
-            hermes.write_text("#!/bin/sh\n")
+            grok = Path(td) / "grok"
+            grok.write_text("#!/bin/sh\n")
             job = {
                 "job_id": job_id,
                 "cwd": td,
                 "max_turns": 1,
                 "run_budget_seconds": 5,
-                "hermes_session": session,
+                "harness_session": session,
+                "launcher": "grok",
+                "model": "grok-4.6",
             }
             with mock.patch.object(server, "JOBS_DIR", jobs):
-                with mock.patch.object(server, "HERMES_BIN", hermes):
+                with mock.patch.object(server, "GROK_BIN", grok):
                     with mock.patch.object(server.subprocess, "Popen", FakePopen):
-                        proc, err = server.spawn_hermes(job)
+                        proc, err = server.spawn_harness(job)
             self.assertIsNone(err)
             self.assertIsNotNone(proc)
             cmd = captured["cmd"]
-            self.assertIn("--continue", cmd)
-            self.assertEqual(cmd[cmd.index("--continue") + 1], session)
-            self.assertIn("--create-if-missing", cmd)
-            self.assertIn("--source", cmd)
-            self.assertEqual(cmd[cmd.index("--source") + 1], "tool")
+            self.assertIn("--session-id", cmd)
+            self.assertEqual(cmd[cmd.index("--session-id") + 1], session)
+            self.assertIn("--output-format", cmd)
+            self.assertIn("--no-subagents", cmd)
 
-    def test_hermes_job_env_overrides_terminal_cwd(self):
+    def test_harness_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
-            env = server.hermes_job_env(
+            env = server.harness_job_env(
                 {"job_id": "ab" * 16, "cwd": "/home/tim/work/gw-real-slice"}
             )
         self.assertEqual(env["TERMINAL_CWD"], "/home/tim/work/gw-real-slice")
@@ -472,7 +475,9 @@ class DispatchTests(unittest.TestCase):
                 "repo": "riftwing",
                 "cwd": str(td),
                 "prompt": "ping",
-                "hermes_session": "gwslice-" + ("ab" * 16),
+                "harness_session": str(uuid.UUID(hex="abababababababababababababababab")),
+                "launcher": "grok",
+                "model": "grok-4.6",
                 "response_webhook_url": "https://example.com/resume",
                 "response_webhook_token": "tok_secret",
                 "created_at": "t",
@@ -493,13 +498,15 @@ class DispatchTests(unittest.TestCase):
                 returncode = 0
 
                 def wait(self, timeout=None):
-                    (jdir / "stdout.log").write_text(
-                        '{"status":"ok","sha":null,"pr_url":null,"summary":"pong"}'
-                    )
+                    (jdir / "stdout.log").write_text(json.dumps({
+                        "sessionId": str(uuid.UUID(hex=job_id)), "stopReason": "end_turn", "requestId": "request-1",
+                        "num_turns": 1, "modelUsage": {"grok-4.6-build": {"modelCalls": 1}},
+                        "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"pong"}',
+                    }))
                     return 0
 
             with mock.patch.object(server, "JOBS_DIR", jobs):
-                with mock.patch.object(server, "spawn_hermes", return_value=(FakeProc(), None)):
+                with mock.patch.object(server, "spawn_harness", return_value=(FakeProc(), None)):
                     with mock.patch.object(
                         server, "post_receipt", return_value={"ok": True, "status": 200}
                     ) as posted:
@@ -508,7 +515,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(saved["status"], "completed")
             self.assertEqual(saved["receipt"]["summary"], "pong")
             self.assertEqual(saved["receipt"]["job_id"], job_id)
-            self.assertEqual(saved["receipt"]["hermes_session"], "gwslice-" + ("ab" * 16))
+            self.assertEqual(saved["receipt"]["harness_session"], str(uuid.UUID(hex="abababababababababababababababab")))
             posted.assert_called_once()
             _args, kwargs = posted.call_args
             self.assertEqual(_args[0], "https://example.com/resume")
@@ -1822,7 +1829,7 @@ class DispatchTests(unittest.TestCase):
         seen = {}
 
         class FakeProc:
-            stdout = b"VERDICT: PASS\n"
+            stdout = b'{"is_error":false,"num_turns":1,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","usage":{"iterations":[{"type":"message"}]},"modelUsage":{"claude-fable-5":{"canonicalModel":"claude-fable-5","provider":"firstParty"}},"terminal_reason":"completed","subtype":"success","result":"VERDICT: PASS"}'
             stderr = b""
             returncode = 0
 
@@ -1833,7 +1840,7 @@ class DispatchTests(unittest.TestCase):
         with mock.patch.object(server, "git_diff", return_value={"diff": "diff --git a b"}), \
              mock.patch.object(server.subprocess, "run", fake_run), \
              mock.patch.object(server.Path, "is_file", lambda self: True), \
-             mock.patch.object(server, "hermes_job_env", return_value={}):
+             mock.patch.object(server, "harness_job_env", return_value={}):
             server.review_result(reviewer, "ticket text", Path("/tmp"))
         return seen["cmd"]
 
@@ -1895,7 +1902,7 @@ class DispatchTests(unittest.TestCase):
         seen = {}
 
         class FakeProc:
-            stdout = b"VERDICT: PASS\n"
+            stdout = b'{"is_error":false,"num_turns":1,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000001","usage":{"iterations":[{"type":"message"}]},"modelUsage":{"claude-fable-5":{"canonicalModel":"claude-fable-5","provider":"firstParty"}},"terminal_reason":"completed","subtype":"success","result":"VERDICT: PASS"}'
             stderr = b""
             returncode = 0
 
@@ -1903,8 +1910,8 @@ class DispatchTests(unittest.TestCase):
              mock.patch.object(server.subprocess, "run",
                                lambda cmd, **kw: (seen.__setitem__("cmd", cmd), FakeProc())[1]), \
              mock.patch.object(server.Path, "is_file", lambda self: True), \
-             mock.patch.object(server, "hermes_job_env", return_value={}):
-            out = server.review_result("fable", "ticket", Path("/tmp"))
+             mock.patch.object(server, "harness_job_env", return_value={}):
+            out = server.review_result("fable", "ticket", Path("/tmp"), attempt_id="00000000000000000000000000000001")
         self.assertEqual(out["verdict"], "PASS", out)
         self.assertIn("--model", seen["cmd"])
         self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1], "claude-fable-5")
@@ -1912,29 +1919,13 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("plan", seen["cmd"])
 
     def test_sol_reviewer_cannot_write_to_the_repo(self):
-        # The claude reviewers get --permission-mode plan, which enforces
-        # read-only in the runner. The hermes reviewer got --yolo and no
-        # toolset restriction, so "do not edit files, commit, or push" was
-        # prompt text a model could ignore. Sol gates every visual and
-        # sensitive slice, which are the classes least safe to leave writable.
-        # The diff and ticket are already in the prompt, so the reviewer needs
-        # no file or terminal tools to answer.
-        cmd = self._review_cmd("sol")
-        self.assertIn("-t", cmd, "sol review must restrict toolsets")
-        toolsets = cmd[cmd.index("-t") + 1].split(",")
-        for banned in ("file", "terminal", "code_execution", "browser"):
-            self.assertNotIn(banned, toolsets)
-        # -t '' is silently ignored by hermes: an empty string falls back to
-        # the config default and the model keeps its file tools.
-        self.assertTrue(toolsets and toolsets[0], "empty -t does not restrict anything")
+        source = inspect.getsource(server.review_result)
+        self.assertIn('"read-only"', source)
+        self.assertIn("native_harness_receipt", source)
 
-    def test_sol_reviewer_honours_the_shared_turn_budget(self):
-        # REVIEW_MAX_TURNS is env-tunable but only the claude branch read it.
-        # The hermes branch passed a literal "8", so raising the knob did
-        # nothing for the reviewer that gates visual and sensitive slices.
-        cmd = self._review_cmd("sol")
-        self.assertIn("--max-turns", cmd)
-        self.assertEqual(cmd[cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
+    def test_sol_reviewer_uses_direct_structured_receipt(self):
+        self.assertIn("exec", inspect.getsource(server.review_result))
+        self.assertIn("--json", inspect.getsource(server.review_result))
 
     def test_pr_drive_gates_wait_for_results_too(self):
         # implement-slice got wait nodes for every async op; pr-drive did not.
@@ -2164,20 +2155,20 @@ class DispatchTests(unittest.TestCase):
         # so the linger window should show the session you can actually read.
         sent = []
         job = {"job_id": "cd" * 16, "status": "completed", "herdr_pane_id": "w1:p3",
-               "hermes_session": "gwslice-" + "a" * 32, "cwd": "/tmp"}
+               "harness_session": str(uuid.UUID(hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), "cwd": "/tmp", "launcher": "grok"}
         with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append((pane, text))):
             server.herdr_show_session(job)
         self.assertEqual(sent[0], ("w1:p3", "\x03"), "must stop tail -F first")
         self.assertIn("--resume", sent[1][1])
-        self.assertIn("gwslice-" + "a" * 32, sent[1][1])
+        self.assertIn(str(uuid.UUID(hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), sent[1][1])
 
     def test_non_writer_panes_keep_the_tail(self):
-        # test and review jobs are not hermes and have no session to resume.
+        # test and review jobs have no direct harness session to resume.
         sent = []
         with mock.patch.object(server, "herdr_send", lambda pane, text: sent.append(text)):
-            server.herdr_show_session({"herdr_pane_id": "w1:p3", "kind": "test", "hermes_session": None})
-            server.herdr_show_session({"herdr_pane_id": "w1:p3", "hermes_session": "not-a-gwslice-name"})
-            server.herdr_show_session({"hermes_session": "gwslice-" + "b" * 32})
+            server.herdr_show_session({"herdr_pane_id": "w1:p3", "kind": "test", "harness_session": None})
+            server.herdr_show_session({"herdr_pane_id": "w1:p3", "harness_session": "not-a-gwslice-name"})
+            server.herdr_show_session({"harness_session": str(uuid.UUID(hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))})
         self.assertEqual(sent, [])
 
     def test_git_checkout_path_rejected(self):
@@ -2748,8 +2739,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
-        self.assertIn("hermes_session", agent2["config"])
-        self.assertIn("TASKS.wait.request.body.hermes_session", agent2["config"]["hermes_session"])
+        self.assertIn("harness_session", agent2["config"])
+        self.assertIn("TASKS.wait.request.body.harness_session", agent2["config"]["harness_session"])
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
@@ -2812,7 +2803,7 @@ class DispatchTests(unittest.TestCase):
             "POST", "/v1/slice/route", {}, True, b'{"class":"mechanical","size":"S"}'
         )
         self.assertEqual(status, 200, payload)
-        self.assertEqual(payload["launcher"], "hermes")
+        self.assertEqual(payload["launcher"], "grok")
         self.assertEqual(payload["reviewer1"], "none")
         self.assertEqual(payload["max_turns"], 10)
         status, payload, _ = server.dispatch(
@@ -2862,10 +2853,81 @@ class DispatchTests(unittest.TestCase):
             "/v1/agent/run",
             {},
             True,
-            b'{"prompt":"x","launcher":"codex"}',
+            b'{"prompt":"x","launcher":"hermes"}',
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_launcher")
+
+
+class DirectHarnessCorrectionTests(unittest.TestCase):
+    def test_agent_execution_and_herdr_resume_never_invoke_a_broker(self):
+        for fn in (server.review_result, server.spawn_harness, server.spawn_writer, server.herdr_show_session):
+            self.assertNotIn("hermes", inspect.getsource(fn).lower())
+
+    def test_native_adapter_does_not_require_the_old_common_receipt_schema(self):
+        source = inspect.getsource(server.native_harness_receipt)
+        for fictional in ("fallback_used", '"attempts"', '"providers"', '"models"'):
+            self.assertNotIn(fictional, source)
+
+    def test_direct_harness_commands_bind_the_model_and_preassigned_session(self):
+        captured = []
+        class Popen:
+            pid = 4
+            def __init__(self, cmd, **kwargs): captured.append(cmd)
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"; job_id = "a" * 32; (jobs / job_id).mkdir(parents=True)
+            (jobs / job_id / "prompt.txt").write_text("do one bounded task")
+            for launcher, model in (("codex", "gpt-5.6-terra"), ("claude", "sonnet"), ("grok", "grok-4.6")):
+                job = {"job_id": job_id, "cwd": td, "max_turns": 2, "run_budget_seconds": 30,
+                       "harness_session": str(uuid.UUID(hex=job_id)), "launcher": launcher, "model": model}
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server.Path, "is_file", lambda self: True), \
+                     mock.patch.object(server.subprocess, "Popen", Popen):
+                    proc, error = server.spawn_harness(job)
+                self.assertIsNone(error); self.assertIsNotNone(proc)
+        self.assertEqual(len(captured), 3)
+        for cmd in captured:
+            self.assertNotIn("hermes", " ".join(map(str, cmd)).lower())
+            self.assertIn("--model", cmd)
+        self.assertIn("--session-id", captured[1]); self.assertIn("--session-id", captured[2])
+
+    def test_codex_route_is_pending_until_its_generated_thread_is_bound(self):
+        with mock.patch.object(server, "load_profiles", return_value=[{"id": "graphwing", "runnable": True, "harness_home": str(server.HOME)}]), \
+             mock.patch.object(server, "resolve_run_cwd", return_value=("scratch", Path("/tmp"))), \
+             mock.patch.object(server, "active_job_count", return_value=0), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, payload = server.agent_run(b'{"prompt":"x","launcher":"codex","model":"gpt-5.6-terra"}', {"scratch": "/tmp"})
+        self.assertEqual(status, 202)
+        self.assertIsNone(payload["harness_session"])
+
+    def test_native_receipts_reject_stale_multiple_and_missing_fields(self):
+        fixtures = Path(__file__).parent / "fixtures" / "direct-harness"
+        grok = json.loads((fixtures / "real-grok-receipt.json").read_text())
+        job = {"job_id": "b" * 32, "launcher": "grok", "model": "grok-4.6", "harness_session": grok["sessionId"]}
+        text, provenance, error = server.harness_terminal_output(job, json.dumps(grok))
+        self.assertIsNone(error); self.assertEqual(text, "PROBE_OK"); self.assertEqual(provenance["canonical_model"], "grok-4.6-build")
+        for bad in ({}, {**grok, "sessionId": str(uuid.uuid4())}, {**grok, "modelUsage": {"grok-4.6-build": {"modelCalls": 1}, "other": {"modelCalls": 1}}}, {k: v for k, v in grok.items() if k != "requestId"}):
+            self.assertIsNotNone(server.harness_terminal_output(job, json.dumps(bad))[2])
+
+    def test_exact_native_codex_claude_and_grok_adapters(self):
+        # Fixtures are copied byte-for-byte from the controller captures in
+        # triage-evidence; Codex metadata below is its exact recorded fields.
+        fixtures = Path(__file__).parent / "fixtures" / "direct-harness"
+        codex = (fixtures / "real-codex-receipt.jsonl").read_text()
+        thread = "01a03bce-4eb8-7420-9060-29e619aa4715"
+        meta = {"session_id": thread, "originator": "codex_exec", "source": "exec", "model_provider": "openai",
+                "turn_id": "01a03bce-4f48-71c1-af6c-eba0d9dce98d", "model": "gpt-5.6-terra",
+                "complete_turn_id": "01a03bce-4f48-71c1-af6c-eba0d9dce98d", "last_agent_message": "PROBE_OK"}
+        text, proof, error = server.native_harness_receipt("codex", codex, "gpt-5.6-terra", None, lambda _thread: meta)
+        self.assertIsNone(error); self.assertEqual((text, proof["session_id"]), ("PROBE_OK", thread))
+        for bad_meta in ({**meta, "model": "wrong"}, {**meta, "source": "interactive"}, {k: v for k, v in meta.items() if k != "turn_id"}):
+            self.assertIsNotNone(server.native_harness_receipt("codex", codex, "gpt-5.6-terra", None, lambda _thread, value=bad_meta: value)[2])
+        claude = json.loads((fixtures / "real-claude-receipt.json").read_text())
+        self.assertIsNone(server.native_harness_receipt("claude", json.dumps(claude), "sonnet", claude["session_id"])[2])
+        for bad in ({**claude, "modelUsage": {}}, {**claude, "modelUsage": {**claude["modelUsage"], "other": {}}}, {**claude, "is_error": True}):
+            self.assertIsNotNone(server.native_harness_receipt("claude", json.dumps(bad), "sonnet", claude["session_id"])[2])
+
+
 
 
 class InstallTests(unittest.TestCase):
@@ -3096,7 +3158,7 @@ class BuildStateTests(unittest.TestCase):
             # Ticket-01 exercises the legacy generic transition surface. Visual
             # is deliberately outside the authoritative mechanical/sensitive
             # path, whose writer and gate assertions are operation-owned.
-            "route": {"class": "visual", "launcher": "hermes", "model": "sol"},
+            "route": {"class": "visual", "launcher": "grok", "model": "sol"},
             "verification": {"fast": ["graphwing-compile"], "integration": ["graphwing-unit"]},
             "stacks": ["riftwing-52"],
             "budget": {"jobs_max": 12},
@@ -3161,7 +3223,7 @@ class BuildStateTests(unittest.TestCase):
             "holder": holder,
             "claim_id": claim_id,
             "job_id": launch["job_id"],
-            "hermes_session": launch["hermes_session"],
+            "harness_session": launch["harness_session"],
             "callback": callback,
         }
         body.update(over)
@@ -3174,7 +3236,7 @@ class BuildStateTests(unittest.TestCase):
             "status": status,
             "job_id": launch["job_id"],
             "profile": job["profile"],
-            "hermes_session": launch["hermes_session"],
+            "harness_session": launch["harness_session"],
             "sha": None,
             "pr_url": None,
             "log_ref": job["log_ref"],
@@ -3299,7 +3361,7 @@ class BuildStateTests(unittest.TestCase):
     def _mechanical_route(self, **over):
         route = {
             "class": "mechanical",
-            "launcher": "hermes",
+            "launcher": "grok",
             "model": "grok-4.6",
             "max_turns": 12,
             "run_budget_seconds": 900,
@@ -3677,7 +3739,7 @@ class BuildStateTests(unittest.TestCase):
 
     def test_the_whole_path_runs_when_no_visual_proof_is_declared(self):
         self.assertEqual(self._create()[0], 201)
-        status, payload, _ = self._start_writer(session="gwslice-" + "0" * 32)
+        status, payload, _ = self._start_writer(session=str(uuid.UUID(hex="00000000000000000000000000000000")))
         self.assertEqual(status, 200, payload)
         self.assertEqual(self._advance("writer_done", "evt-2", jobs_spent=0)[0], 200)
         change_id = self._record_fast_pass()
@@ -3689,7 +3751,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["stage"], "ready")
         self.assertIsNone(payload["lease"])
-        self.assertEqual(payload["writer_session"], "gwslice-" + "0" * 32)
+        self.assertEqual(payload["writer_session"], str(uuid.UUID(hex="00000000000000000000000000000000")))
         self.assertEqual(payload["budget_left"], 12)
 
     def test_evidence_is_a_real_stage_when_visual_proof_is_declared(self):
@@ -3757,8 +3819,8 @@ class BuildStateTests(unittest.TestCase):
 
     def test_replaying_an_event_id_returns_the_receipt_without_rerunning(self):
         self.assertEqual(self._create()[0], 201)
-        first = self._start_writer(session="gwslice-" + "1" * 32)[1]
-        status, payload, _ = self._start_writer(session="gwslice-" + "1" * 32)
+        first = self._start_writer(session=str(uuid.UUID(hex="11111111111111111111111111111111")))[1]
+        status, payload, _ = self._start_writer(session=str(uuid.UUID(hex="11111111111111111111111111111111")))
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["replayed"])
         self.assertEqual(payload["receipt"], first["receipt"])
@@ -3781,15 +3843,15 @@ class BuildStateTests(unittest.TestCase):
 
     def test_reusing_an_event_id_with_different_input_is_a_conflict(self):
         self.assertEqual(self._create()[0], 201)
-        first = self._start_writer(session="gwslice-" + "1" * 32)[1]
-        status, payload, _ = self._start_writer(session="gwslice-" + "2" * 32)
+        first = self._start_writer(session=str(uuid.UUID(hex="11111111111111111111111111111111")))[1]
+        status, payload, _ = self._start_writer(session=str(uuid.UUID(hex="22222222222222222222222222222222")))
         self.assertEqual(status, 409, payload)
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["replayed"])
         self.assertEqual(payload["code"], "idempotency_conflict")
         after = self._state()[1]
         self.assertEqual(after["stage"], "writing")
-        self.assertEqual(after["writer_session"], "gwslice-" + "1" * 32)
+        self.assertEqual(after["writer_session"], str(uuid.UUID(hex="11111111111111111111111111111111")))
         self.assertEqual(after["budget_left"], first["budget_left"])
 
     def test_every_input_that_changes_the_outcome_is_part_of_the_event_identity(self):
@@ -3970,11 +4032,11 @@ class BuildStateTests(unittest.TestCase):
         # The session handle is what resumes the one agent holding this build.
         # A later transition that repointed it would strand the real writer and
         # hand the resume handle to whatever the caller happened to send.
-        session = "gwslice-" + "4" * 32
+        session = str(uuid.UUID(hex="44444444444444444444444444444444"))
         self.assertEqual(self._create()[0], 201)
         self.assertEqual(self._start_writer(session=session)[0], 200)
         status, payload, _ = self._advance(
-            "writer_done", "evt-2", data={"writer_session": "gwslice-" + "5" * 32}
+            "writer_done", "evt-2", data={"writer_session": str(uuid.UUID(hex="55555555555555555555555555555555"))}
         )
         self.assertEqual(status, 400, payload)
         self.assertEqual(payload["code"], "writer_session_locked")
@@ -4033,7 +4095,7 @@ class BuildStateTests(unittest.TestCase):
             )[0],
             201,
         )
-        session = "gwslice-" + "3" * 32
+        session = str(uuid.UUID(hex="33333333333333333333333333333333"))
         self.assertEqual(
             self._start_writer(
                 session=session, data={"stacks": ["riftwing-52", "gw-52"]}
@@ -4099,7 +4161,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(after["index"], "slices/demo/index.json")
         self.assertEqual(after["ticket"], "slices/demo/01-build-state.md")
         self.assertEqual(
-            after["route"], {"class": "visual", "launcher": "hermes", "model": "sol"}
+            after["route"], {"class": "visual", "launcher": "grok", "model": "sol"}
         )
         self.assertTrue(after["verification"]["needs_visual_proof"])
         self.assertEqual(after["writer_session"], session)
@@ -4288,13 +4350,13 @@ class BuildStateTests(unittest.TestCase):
         resume = "https://rewst.test/webhooks/resume/9f2c"
         self.assertEqual(
             self._create(
-                route={"class": "visual", "launcher": "hermes", "model": "sol", "kick_url": resume}
+                route={"class": "visual", "launcher": "grok", "model": "sol", "kick_url": resume}
             )[0],
             201,
         )
         route = self._state()[1]["route"]
         self.assertEqual(route["kick_url"], "[redacted]")
-        self.assertEqual(route["launcher"], "hermes", "the routing the build needs must survive")
+        self.assertEqual(route["launcher"], "grok", "the routing the build needs must survive")
         self.assertEqual(self._start_writer()[0], 200)
         on_disk = self._doc_path().read_text()
         for leaked in ("rewst.test/webhooks/resume",):
@@ -4305,7 +4367,7 @@ class BuildStateTests(unittest.TestCase):
         webhook = "https://hooks.rewst.io/webhooks/custom/22222222-2222-2222-2222-222222222222"
         public = "https://docs.rewst.io/guides/webhooks/setup"
         status, payload, _ = self._create(
-            route={"launcher": "hermes", "next": callback, "hop": webhook, "docs": public}
+            route={"launcher": "grok", "next": callback, "hop": webhook, "docs": public}
         )
         self.assertEqual(status, 201, payload)
         route = payload["route"]
@@ -4752,7 +4814,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False, "executed_provider": "anthropic", "executed_model": "sonnet", "fallback_disabled": True},
         ):
             passed = self._post_build("review", reviewer="sonnet")
         self.assertEqual(passed[0], 200, passed[1])
@@ -4783,7 +4845,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "NACK", "summary": "missing seam", "compact": "fix seam", "no_verdict": False},
+            return_value={"verdict": "NACK", "summary": "missing seam", "compact": "fix seam", "no_verdict": False, "executed_provider": "anthropic", "executed_model": "sonnet", "fallback_disabled": True},
         ):
             result = self._post_build("review", reviewer="sonnet")
         self.assertEqual(result[0], 200, result[1])
@@ -4797,7 +4859,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(no_session[0], 409, no_session[1])
         self.assertEqual(no_session[1]["code"], "claim_required")
         doc = self._read_doc()
-        doc["writer_session"] = "gwslice-" + "b" * 32
+        doc["writer_session"] = str(uuid.UUID(hex="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
         doc["stage"] = "review"
         change_id = server.build_change_id(self.repo, self.head)
         doc["checks"] = {
@@ -4817,7 +4879,7 @@ class BuildStateTests(unittest.TestCase):
         brief = self._post_build("brief", finding="fix the seam")
         self.assertEqual(brief[0], 200, brief[1])
         self.assertTrue(brief[1]["resume"])
-        self.assertEqual(brief[1]["hermes_session"], doc["writer_session"])
+        self.assertEqual(brief[1]["harness_session"], doc["writer_session"])
         self.assertEqual(self._read_doc()["budget"]["jobs_used"], before + 1)
 
     def test_finalize_requires_current_clean_gates_and_commits_pushes_once(self):
@@ -4926,15 +4988,15 @@ class BuildStateTests(unittest.TestCase):
     def test_initial_writer_launch_replay_reserves_one_job_and_session(self):
         self.assertEqual(self._mechanical_create()[0], 201)
         claim = self._claim()[1]["claim"]
-        self.assertRegex(claim["writer_session"], r"^gwslice-[0-9a-f]{32}$")
+        self.assertRegex(claim["writer_session"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
         with mock.patch.object(server, "enqueue_agent") as enqueue:
             first = self._launch()
             replay = self._launch()
         self.assertEqual(first[0], 202, first[1])
         self.assertEqual(replay[0], 202, replay[1])
         self.assertEqual(replay[1]["job_id"], first[1]["job_id"])
-        self.assertEqual(replay[1]["hermes_session"], first[1]["hermes_session"])
-        self.assertEqual(first[1]["hermes_session"], claim["writer_session"])
+        self.assertEqual(replay[1]["harness_session"], first[1]["harness_session"])
+        self.assertEqual(first[1]["harness_session"], claim["writer_session"])
         self.assertEqual(enqueue.call_count, 2)
         self.assertEqual(len(list((self.home / "jobs").glob("*/job.json"))), 1)
 
@@ -5021,7 +5083,7 @@ class BuildStateTests(unittest.TestCase):
         conflict = self._complete("writer-complete", launch, {**receipt, "summary": "different"})
         self.assertEqual(first[0], 200, first[1])
         self.assertEqual(first[1]["stage"], "verifying")
-        self.assertEqual(first[1]["writer_session"], launch["hermes_session"])
+        self.assertEqual(first[1]["writer_session"], launch["harness_session"])
         self.assertIsNone(first[1]["lease"])
         self.assertTrue(self._read_doc()["writer_claim"]["consumed"])
         self.assertTrue(replay[1]["replayed"])
@@ -5073,7 +5135,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(premature[1]["code"], "claim_not_due")
         doc = self._read_doc()
         doc["stage"] = "review"
-        doc["writer_session"] = "gwslice-" + "d" * 32
+        doc["writer_session"] = str(uuid.UUID(hex="dddddddddddddddddddddddddddddddd"))
         change_id = server.build_change_id(self.repo, self.head)
         doc["checks"] = {
             "fast": {
@@ -5150,7 +5212,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False, "executed_provider": "anthropic", "executed_model": "sonnet", "fallback_disabled": True},
         ):
             review = self._post_build("review", reviewer="sonnet")
         self.assertEqual(review[0], 200, review[1])
@@ -5590,7 +5652,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False, "executed_provider": "anthropic", "executed_model": "sonnet", "fallback_disabled": True},
         ):
             self.assertTrue(self._post_build("review", reviewer="sonnet")[1]["ok"])
         self.assertEqual(self._state()[1]["stage"], "ready")
@@ -5638,7 +5700,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False, "executed_provider": "openai", "executed_model": "gpt-5.6-terra", "fallback_disabled": True},
         ):
             first = self._post_build("review")
         self.assertEqual(first[0], 200, first[1])
@@ -5652,7 +5714,7 @@ class BuildStateTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "build_review_round_result",
-            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False},
+            return_value={"verdict": "PASS", "summary": "clear", "compact": "clear", "no_verdict": False, "executed_provider": "xai", "executed_model": "grok-4.6", "fallback_disabled": True},
         ):
             second = self._post_build("review")
         self.assertEqual(second[0], 200, second[1])
@@ -5855,6 +5917,199 @@ class BuildStateTests(unittest.TestCase):
         for frm, to in server.BUILD_TRANSITIONS.values():
             stages.update((frm, to))
         self.assertEqual(set(schemas["BuildState"]["properties"]["stage"]["enum"]), stages)
+
+
+class RolloutProofTests(unittest.TestCase):
+    """Ticket-07 receipts extend a build's existing durable event ledger."""
+
+    BUILD = BuildStateTests.BUILD
+    BRANCH = BuildStateTests.BRANCH
+    setUp = BuildStateTests.setUp
+    _git = BuildStateTests._git
+    _create_body = BuildStateTests._create_body
+    _create = BuildStateTests._create
+    _post_build = BuildStateTests._post_build
+    _mechanical_route = BuildStateTests._mechanical_route
+    _mechanical_create = BuildStateTests._mechanical_create
+    _read_doc = BuildStateTests._read_doc
+    _write_doc = BuildStateTests._write_doc
+    _doc_path = BuildStateTests._doc_path
+
+    def _rollout_create(self):
+        result = self._mechanical_create(rollout={"ticket": "github_issue_52"})
+        self.assertEqual(result[0], 201, result[1])
+
+    def _source(self, build_id="canary-source", transition_id="transition-source"):
+        created = self._mechanical_create(build_id=build_id)
+        self.assertEqual(created[0], 201, created[1])
+        path = self._doc_path(build_id)
+        doc = json.loads(path.read_text())
+        change_id = server.build_change_id(self.repo, self.head)
+        server.build_record_event(doc, transition_id, "source-fingerprint", {
+            "event_id": transition_id, "head": self.head, "change_id": change_id,
+            "evidence_id": server.build_evidence_identity(doc, change_id),
+        }, 200)
+        self.assertIsNone(server.write_build(doc, build_id))
+        return build_id
+
+    def _proof(self, kind):
+        if kind == "catalog_parity":
+            return {"live_source": "fresh_post_publish_api_read", "normalized_catalog_sha": "a" * 64, "normalized_live_sha": "a" * 64}
+        if kind == "mechanical":
+            return {"named_disposable_branch": "canary/52", "fresh_clone": True, "empty_build_state": True, "correction": True, "acknowledgement": True, "merge_base": self.head, "remote_ref": "refs/heads/canary/52", "pushed_commit_count": 1, "force_push": False}
+        if kind == "checkpoint":
+            return {"decision_path": "build_iteration_checkpoint_due", "choices": ["continue", "reframe", "split", "park"], "live_advisory": True, "no_later_ceiling": True}
+        if kind == "lifecycle":
+            return {"pane_exact": True, "no_answer_preserves_preview": True, "cleanup_readback": True}
+        if kind == "sensitive":
+            return {"final_diff_sha": "pending", "evidence_id": "evidence-52", "reviews": []}
+        if kind == "visual":
+            artifact = {"served_commit_sha": self.head, "preview_url": "http://127.0.0.1:4173", "preview_port": 4173, "writer_session": str(uuid.UUID(hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), "round": 3, "evidence_id": "evidence-52"}
+            return {"artifacts": [artifact], "human_rounds": [{"writer_session": artifact["writer_session"], "preview_url": artifact["preview_url"]}, {"writer_session": artifact["writer_session"], "preview_url": artifact["preview_url"]}], "final_gate_return": True, "post_change_artifacts": True, "post_change_served_commit_sha": self.head}
+        raise AssertionError(kind)
+
+    def _receipt(self, kind, event_id, transition_id=None, **over):
+        source = over.pop("source_build_id", getattr(self, "source_build", None))
+        body = {"event_id": event_id, "kind": kind, "source_build_id": source, "canary_run_id": "canary-52", "transition_id": transition_id or "transition-source", "readback_id": f"readback-{kind}", "proof": self._proof(kind)}
+        body.update(over)
+        return self._post_build("rollout/receipt", **body)
+
+    def test_rollout_receipts_fail_closed_for_parity_replay_and_census(self):
+        self._rollout_create()
+        self.source_build = self._source()
+        mismatch = self._proof("catalog_parity"); mismatch["normalized_live_sha"] = "b" * 64
+        refused = self._receipt("catalog_parity", "parity-bad", proof=mismatch)
+        self.assertEqual(refused[0], 409, refused[1]); self.assertEqual(refused[1]["code"], "invalid_rollout_proof")
+        same_readback = self._receipt("catalog_parity", "parity-readback", transition_id="same", readback_id="same")
+        self.assertEqual(same_readback[0], 400, same_readback[1]); self.assertEqual(same_readback[1]["code"], "readback_not_separate")
+        accepted = self._receipt("catalog_parity", "parity-good")
+        self.assertEqual(accepted[0], 200, accepted[1])
+        replay = self._receipt("mechanical", "mechanical-replay", transition_id="transition-source")
+        self.assertEqual(replay[0], 409, replay[1]); self.assertEqual(replay[1]["code"], "duplicate_transition_receipt")
+        gaps = accepted[1]["rollout"]["gaps"]
+        self.assertIn("rollout receipt census lacks mechanical", gaps)
+        self.assertIn("rollout receipt census lacks sensitive", gaps)
+
+    def test_sensitive_receipt_projects_server_authored_identity_and_no_verdict_blocks(self):
+        self._rollout_create()
+        self.source_build = self._source()
+        self.assertEqual(self._receipt("catalog_parity", "parity-good")[0], 200)
+        self.source_build = self._source("canary-sensitive", "transition-sensitive")
+        change_id = server.build_change_id(self.repo, self.head)
+        doc = json.loads(self._doc_path(self.source_build).read_text())
+        doc["reviews"] = [
+            {"change_id": change_id, "reviewer": "terra", "role": "behavior", "verdict": "PASS", "no_verdict": False, "evidence_id": "none", "authority": {"author": "graphwing", "provider": "openai", "model": "gpt-5.6-terra", "role": "behavior"}},
+            {"change_id": change_id, "reviewer": "grok", "role": "security", "verdict": "PASS", "no_verdict": False, "evidence_id": "none", "authority": {"author": "graphwing", "provider": "xai", "model": "grok-4.6", "role": "security"}},
+        ]
+        self.assertIsNone(server.write_build(doc, self.source_build))
+        proof = {"final_diff_sha": change_id, "evidence_id": "forged", "reviews": [{"author": "forged"}]}
+        accepted = self._receipt("sensitive", "sensitive-good", transition_id="transition-sensitive", proof=proof)
+        self.assertEqual(accepted[0], 200, accepted[1])
+        reviews = accepted[1]["receipt"]["proof"]["reviews"]
+        self.assertEqual({row["author"] for row in reviews}, {"graphwing"})
+        doc = json.loads(self._doc_path(self.source_build).read_text())
+        doc["reviews"][1]["no_verdict"] = True; self.assertIsNone(server.write_build(doc, self.source_build))
+        blocked = self._receipt("sensitive", "sensitive-no-verdict", transition_id="transition-sensitive")
+        self.assertEqual(blocked[0], 409, blocked[1]); self.assertEqual(blocked[1]["code"], "invalid_rollout_proof")
+
+    def test_rollout_proof_validators_reject_visual_staleness_mechanical_force_push_and_checkpoint_bypass(self):
+        visual = self._proof("visual"); visual["post_change_artifacts"] = False
+        self.assertIn("fresh post-change", server.rollout_proof_gap("visual", visual))
+        visual = self._proof("visual"); visual["artifacts"][0]["served_commit_sha"] = "b" * 40
+        self.assertIn("served SHA is stale", server.rollout_proof_gap("visual", visual, self.head))
+        mechanical = self._proof("mechanical"); mechanical["force_push"] = True
+        self.assertIn("no force-push", server.rollout_proof_gap("mechanical", mechanical))
+        mechanical = self._proof("mechanical"); mechanical["pushed_commit_count"] = 2
+        self.assertIn("exactly one", server.rollout_proof_gap("mechanical", mechanical))
+        checkpoint = self._proof("checkpoint"); checkpoint["decision_path"] = "test_only_path"
+        self.assertIn("live decision path", server.rollout_proof_gap("checkpoint", checkpoint))
+
+    def test_review_attempt_open_terminal_mismatch_and_no_verdict_are_durable_without_retry(self):
+        self._mechanical_create()
+        doc = self._read_doc(); doc["stage"] = "review"; self._write_doc(doc)
+        calls = []
+        with mock.patch.object(server, "build_review_round_result", side_effect=lambda *a: calls.append(a) or {
+            "verdict": "PASS", "no_verdict": False, "ok": True, "summary": "wrong transport",
+            "executed_provider": "xai", "executed_model": "grok-4.6", "fallback_disabled": True,
+        }):
+            status, result = server.build_review_result(doc, "sonnet", {"scratch": str(self.repo)}, "behavior")
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["code"], "unexpected_execution")
+        self.assertEqual(len(calls), 1)
+        attempt = self._read_doc()["review_attempts"][-1]
+        self.assertEqual(attempt["status"], "terminal")
+        self.assertEqual(attempt["failure_class"], "unexpected_execution")
+        self.assertEqual(self._read_doc()["reviews"], [])
+
+    def test_failover_validates_identity_consumes_source_once_and_reconciles_missing_terminal(self):
+        self._mechanical_create()
+        doc = self._read_doc(); doc["stage"] = "review"
+        change_id = server.build_change_id(self.repo, self.head)
+        source = server.build_open_review_attempt(
+            doc, attempt_id="primary-failure", transition_id="primary-transition", role="behavior",
+            reviewer="sonnet", requested_provider="anthropic", requested_model="sonnet", head=self.head,
+            change_id=change_id, evidence_id=server.build_evidence_identity(doc, change_id), source_failure_id=None,
+        )
+        server.build_terminal_review_attempt(source, {"code": "unavailable_provider", "no_verdict": True, "error": "induced"})
+        self._write_doc(doc)
+        with mock.patch.object(server, "build_review_round_result", return_value={
+            "verdict": "PASS", "no_verdict": False, "ok": True, "summary": "pass",
+            "executed_provider": "anthropic", "executed_model": "opus", "fallback_disabled": True,
+        }):
+            status, accepted = server.build_review_result(doc, "sonnet", {"scratch": str(self.repo)}, "behavior",
+                                                           "anthropic", "opus", "failover-transition", "primary-failure")
+        self.assertEqual(status, 200, accepted); self.assertTrue(accepted["ok"])
+        source = server.build_find_review_attempt(self._read_doc(), "primary-failure")
+        self.assertEqual(source["consumed_by"], accepted["attempt_id"])
+        doc = self._read_doc(); doc["reviews"] = []; self._write_doc(doc)
+        denied = server.build_review_result(doc, "sonnet", {"scratch": str(self.repo)}, "behavior",
+                                             "anthropic", "opus", "repeat-transition", "primary-failure")
+        self.assertEqual(denied[0], 409); self.assertEqual(denied[1]["code"], "source_failure_consumed")
+        doc = self._read_doc()
+        abandoned = server.build_open_review_attempt(
+            doc, attempt_id="abandoned", transition_id="abandoned-transition", role="behavior",
+            reviewer="sonnet", requested_provider="anthropic", requested_model="sonnet", head=self.head,
+            change_id=change_id, evidence_id="none", source_failure_id=None,
+        )
+        abandoned["deadline"] = "2000-01-01T00:00:00Z"; self._write_doc(doc)
+        reconciled = self._post_build("review/reconcile")
+        self.assertEqual(reconciled[0], 200, reconciled[1])
+        abandoned = server.build_find_review_attempt(self._read_doc(), "abandoned")
+        self.assertEqual(abandoned["failure_class"], "timeout")
+
+    def test_published_pre_pr_graph_exposes_one_visible_rewst_failover_branch(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pre-pr-build.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["failover_review"]["type"], "action.graphwing.POST:/v1/build/review")
+        config = nodes["failover_review"]["config"]
+        self.assertIn("source_failure_id", config)
+        self.assertIn("failover_provider", config["provider"])
+        edges = graph["spec"]["edges"]
+        self.assertTrue(any(e["source"] == "switch_review_red" and e["target"] == "wait_failover_review" for e in edges))
+        self.assertTrue(any(e["source"] == "if_failover_review" and e["target"] == "join_review_passed" for e in edges))
+
+    def test_transport_provenance_accepts_only_normalized_native_receipt(self):
+        attempt = "1" * 32; path = server.job_dir(attempt) / "transport-provenance.json"; path.parent.mkdir(parents=True, exist_ok=True)
+        native = {"transport": "claude", "session_id": str(uuid.UUID(hex=attempt)), "provider": "anthropic", "model": "sonnet", "canonical_model": "claude-sonnet-5"}
+        path.write_text(json.dumps(native))
+        good, error = server.review_transport_provenance("claude", path, attempt, "anthropic", "sonnet")
+        self.assertIsNone(error); self.assertEqual(good["provider"], "anthropic")
+        native["canonical_model"] = "wrong"; path.write_text(json.dumps(native))
+        self.assertEqual(server.review_transport_provenance("claude", path, attempt, "anthropic", "sonnet")[1], "unrelated_transport_receipt")
+        self.assertEqual(server.review_transport_provenance("claude", path.parent / "other.json", attempt, "anthropic", "sonnet")[1], "missing_transport_provenance")
+
+    def test_nonzero_pass_shaped_transport_output_is_not_a_verdict(self):
+        class Failed:
+            stdout = b"VERDICT: PASS\n"
+            stderr = b"failed"
+            returncode = 7
+        with mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+             mock.patch.object(server.Path, "is_file", lambda self: True), \
+             mock.patch.object(server, "harness_job_env", return_value={}), \
+             mock.patch.object(server.subprocess, "run", return_value=Failed()):
+            result = server.review_result("sonnet", "ticket", Path("/tmp"), attempt_id="3" * 32)
+        self.assertEqual(result["code"], "transport_exit")
+        self.assertIsNone(result["verdict"])
 
 
 class CompletionSupervisorTests(unittest.TestCase):
@@ -6163,7 +6418,7 @@ class CompletionSupervisorTests(unittest.TestCase):
             "hermes_home": str(server.HOME),
         }]
         with mock.patch.object(server, "load_profiles", return_value=profile), mock.patch.object(
-            server, "HERMES_BIN", self.repo / "README"
+            server, "GROK_BIN", self.repo / "README"
         ), mock.patch.object(server, "enqueue_agent", side_effect=assert_bound):
             status, agent = server.agent_run(
                 json.dumps({"cwd": "scratch", "prompt": "one job", "supervised_source_run_id": runs[0]}).encode(),
@@ -7740,7 +7995,7 @@ class VisualEvidenceTests(unittest.TestCase):
             story="https://github.com/tfournet/graphwing/issues/52",
             ticket="ticket.md",
             route={
-                "class": "visual", "launcher": "hermes", "model": "grok-4.6",
+                "class": "visual", "launcher": "grok", "model": "grok-4.6",
                 "max_turns": 12, "run_budget_seconds": 900, "reviewer1": "sonnet",
             },
             verification=verification,
@@ -8319,7 +8574,7 @@ class VisualIterationTests(VisualEvidenceTests):
     def _iteration_ready(self, turns=0):
         self._visual_create()
         doc = self._read_doc()
-        doc["writer_session"] = "gwslice-" + "a" * 32
+        doc["writer_session"] = str(uuid.UUID(hex="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
         change_id = server.build_change_id(self.repo, self.head)
         doc["evidence_rounds"] = [{
             "round": 1,
@@ -8424,7 +8679,7 @@ class VisualIterationTests(VisualEvidenceTests):
         brief = self._post_build("brief")
         self.assertEqual(brief[0], 200, brief[1])
         self.assertTrue(brief[1]["resume"])
-        self.assertEqual(brief[1]["hermes_session"], session)
+        self.assertEqual(brief[1]["harness_session"], session)
         self.assertIn(notes, brief[1]["prompt"])
         self.assertEqual(claim[1]["receipt"]["strikes"], {"test": 0, "reviewer": 0, "retry": 0})
         self.assertTrue(claim[1]["receipt"]["strike_free"])
@@ -8826,6 +9081,8 @@ class PrLifecycleTests(VisualEvidenceTests):
         with mock.patch.object(server, "herdr_plan_deliver", return_value={"ok": True, "pane": "w1:p3"}) as deliver:
             parked = self._lifecycle("closed-ask", "closed")
         self.assertEqual(parked[0], 200, parked[1]); deliver.assert_called_once()
+        self.assertEqual(parked[1]["receipt"]["pane"], "w1:p3")
+        self.assertTrue(parked[1]["receipt"]["no_answer_preserves_preview"])
         wrong_pane = self._lifecycle("closed-wrong-pane", "closed", choice="stop", plan_pane="w1:p4")
         self.assertEqual(wrong_pane[0], 409, wrong_pane[1]); self.assertEqual(wrong_pane[1]["code"], "close_choice_not_pending")
         with mock.patch.object(server, "stack_stop", return_value={"ok": True}), \
