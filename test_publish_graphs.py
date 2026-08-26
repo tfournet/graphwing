@@ -177,6 +177,27 @@ class PublishGraphsTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             publish_graphs.require_catalog_parity(expected, altered, "graph")
 
+    def test_workflow_parity_ignores_only_server_generated_trigger_fields(self):
+        expected = {
+            "nodes": [
+                {"id": "start", "type": "trigger.manual", "config": {"alias": "start"}},
+                {"id": "work", "type": "action.noop", "config": {"alias": "work"}},
+            ],
+            "edges": [],
+        }
+        live = json.loads(json.dumps(expected))
+        live["nodes"][0]["config"].update({"triggerId": "server-id", "triggerUrl": "https://hooks.example/x"})
+        self.assertEqual(
+            publish_graphs.normalize_workflow_spec(expected),
+            publish_graphs.normalize_workflow_spec(live),
+        )
+        changed = json.loads(json.dumps(live))
+        changed["nodes"][1]["config"]["alias"] = "changed"
+        self.assertNotEqual(
+            publish_graphs.normalize_workflow_spec(expected),
+            publish_graphs.normalize_workflow_spec(changed),
+        )
+
     def test_deployed_catalog_is_authority_not_repository_loopback_default(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
