@@ -291,6 +291,21 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_cwd")
 
+    def test_agent_run_omitted_cwd_uses_server_default_repo_policy(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server, "JOBS_DIR", Path(td)), \
+             mock.patch.object(server, "load_repos", return_value={"other": str(self.scratch), "scratch": str(self.scratch)}), \
+             mock.patch.dict(os.environ, {"GRAPHWING_DEFAULT_REPO": "scratch"}), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/run", {}, True,
+                b'{"prompt":"x","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
+            )
+            job = server.read_job(payload["job_id"])
+        self.assertEqual(status, 202, payload)
+        self.assertEqual((job["repo"], job["cwd"]), ("scratch", str(self.scratch)))
+
     def test_agent_run_bad_webhook_url(self):
         status, payload, _ = server.dispatch(
             "POST",
@@ -2597,6 +2612,7 @@ while True:
             {"launcher", "provider", "model"},
         )
         self.assertIn("codeoff_workspace", props)
+        self.assertNotIn("default", props["cwd"])
         self.assertNotIn("oneOf", request_schema)
         self.assertNotIn("allOf", request_schema)
         self.assertFalse(request_schema["additionalProperties"])
@@ -8190,6 +8206,122 @@ class CodeOffTests(unittest.TestCase):
                     payload["error"],
                     "code-off jobs resolve prompt and cwd from the opaque reference",
                 )
+
+    def test_prepare_replays_only_an_exact_untouched_experiment(self):
+        first = self._prepare()
+        state_path = self.records / "experiment-0001" / "state.json"
+        state_before = state_path.read_bytes()
+        record_before = {
+            path.relative_to(self.records / "experiment-0001").as_posix(): path.read_bytes()
+            for path in (self.records / "experiment-0001").rglob("*") if path.is_file()
+        }
+        workspaces_before = {
+            slot: server.codeoff_tree_snapshot(server.codeoff_workspace_path("experiment-0001", slot), self.base_sha)["manifest_hash"]
+            for slot in ("author-1", "author-2")
+        }
+        worktree_list_before = self._git("worktree", "list", "--porcelain").stdout
+
+        status, replay = self._post("/v1/code-off/prepare", self._body())
+        self.assertEqual(status, 200, replay)
+        self.assertEqual(replay, first)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual({
+            path.relative_to(self.records / "experiment-0001").as_posix(): path.read_bytes()
+            for path in (self.records / "experiment-0001").rglob("*") if path.is_file()
+        }, record_before)
+        self.assertEqual({
+            slot: server.codeoff_tree_snapshot(server.codeoff_workspace_path("experiment-0001", slot), self.base_sha)["manifest_hash"]
+            for slot in ("author-1", "author-2")
+        }, workspaces_before)
+        self.assertEqual(self._git("worktree", "list", "--porcelain").stdout, worktree_list_before)
+
+        mismatches = {
+            "prompt": "different immutable task",
+            "seed": "11" * 32,
+            "category": "data",
+            "tags": ["security"],
+            "category_source": "different source",
+            "tests": ["fixture-fail"],
+            "toolchain": {"python": "different"},
+            "budgets": {"author_seconds": 61, "judge_seconds": 60, "test_seconds": 20, "max_turns": 4},
+            "commit_message": "different commit",
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                status, payload = self._post(
+                    "/v1/code-off/prepare", self._body(**{field: value})
+                )
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(payload["code"], "experiment_exists")
+        with mock.patch.object(
+            server, "load_repos",
+            return_value={"scratch": str(self.repo), "alias": str(self.repo)},
+        ):
+            status, payload = self._post(
+                "/v1/code-off/prepare", self._body(repo="alias")
+            )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
+
+        self._launch_done("experiment-0001", "author-1")
+        status, payload = self._post("/v1/code-off/prepare", self._body())
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
+
+    def test_prepare_replay_rejects_partial_state_or_changed_workspaces(self):
+        partials = {
+            "resume-status": {"status": "authors_running"},
+            "resume-reason": {"reason": "partial failure"},
+            "resume-aggregation": {"aggregation": {"decision": "winner"}},
+            "resume-judges": {"judges": {"judge-fable": {"receipt_hash": "x"}}},
+            "resume-candidate": {"candidates": {"author-1": {"artifact_hash": "x"}, "author-2": {}}},
+        }
+        for experiment_id, changes in partials.items():
+            with self.subTest(experiment_id=experiment_id):
+                self._prepare(experiment_id)
+                state_path = self.records / experiment_id / "state.json"
+                state = json.loads(state_path.read_text())
+                state.update(changes)
+                state_path.write_text(json.dumps(state))
+                status, payload = self._post("/v1/code-off/prepare", self._body(experiment_id))
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(payload["code"], "experiment_exists")
+
+        self._prepare("resume-event")
+        event_root = self.records / "resume-event"
+        event_state = json.loads((event_root / "state.json").read_text())
+        server._codeoff_commit_event(event_root, event_state, "diagnostic", {})
+        status, payload = self._post("/v1/code-off/prepare", self._body("resume-event"))
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
+
+        self._prepare("resume-workspaces")
+        first = server.codeoff_workspace_path("resume-workspaces", "author-1")
+        (first / "README.md").write_text("changed\n")
+        status, payload = self._post("/v1/code-off/prepare", self._body("resume-workspaces"))
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
+        (first / "README.md").write_text("base\n")
+        server._codeoff_remove_worktree(self.repo, server.codeoff_workspace_path("resume-workspaces", "author-2"))
+        status, payload = self._post("/v1/code-off/prepare", self._body("resume-workspaces"))
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
+
+    def test_prepare_replay_rejects_a_finalized_experiment(self):
+        stale = deepcopy(server.CODEOFF_MODEL_MANIFEST)
+        stale["as_of"] = "2000-01-01"
+        stale["max_age_days"] = 1
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", stale):
+            status, prepared = self._post(
+                "/v1/code-off/prepare", self._body("resume-finalized")
+            )
+            self.assertEqual(status, 200, prepared)
+            self.assertEqual(prepared["status"], "parked")
+            status, payload = self._post(
+                "/v1/code-off/prepare", self._body("resume-finalized")
+            )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_exists")
 
     def test_claude_codeoff_provenance_accepts_one_exact_first_party_model_usage(self):
         self._prepare("claude-provenance-good")

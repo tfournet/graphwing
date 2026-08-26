@@ -5336,6 +5336,36 @@ def _codeoff_launch_plan(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         }
     return out
 
+def _codeoff_prepared_result(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    selection = manifest["selection"]
+    return {
+        "ok": True, "experiment_id": manifest["experiment_id"], "status": "prepared",
+        "authors": selection["authors"], "random_judges": selection["random_judges"],
+        "seed_commitment": selection["seed_commitment"], "prompt_hash": manifest["prompt_hash"],
+        "rubric_hash": manifest["rubric_hash"], "manifest_file_hash": state["manifest_file_hash"],
+        "workspace_slots": ["author-1", "author-2"], "launches": _codeoff_launch_plan(manifest),
+    }
+
+def _codeoff_replay_prepared(record_root: Path, locked: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    root, manifest, state, err = _codeoff_load(locked["experiment_id"], active=True)
+    untouched = (
+        not err and state is not None and state.get("status") == "prepared"
+        and state.get("reason") is None and state.get("finalized") is False
+        and state.get("event_count") == 2 and state.get("aggregation") is None
+        and state.get("judges") == {} and state.get("candidates") == {"author-1": {}, "author-2": {}}
+        and state.get("agent_jobs") == {slot: [] for slot in locked["identities"]}
+    )
+    exact = manifest is not None and all(manifest.get(key) == value for key, value in locked.items())
+    workspaces_exact = untouched and exact and all(
+        codeoff_workspace_path(locked["experiment_id"], slot).is_dir()
+        and codeoff_tree_snapshot(codeoff_workspace_path(locked["experiment_id"], slot), locked["base_sha"])["manifest_hash"] == locked["base_snapshot_hash"]
+        for slot in ("author-1", "author-2")
+    )
+    if root != record_root or not workspaces_exact:
+        return 409, {"error": "experiment_id already exists; only an exact untouched prepare may resume", "code": "experiment_exists"}
+    assert manifest is not None and state is not None
+    return 200, _codeoff_prepared_result(manifest, state)
+
 def _codeoff_parse_interpolated(data: dict[str, Any]) -> dict[str, Any] | None:
     for key in ("tags", "tests", "toolchain", "budgets"):
         raw = data.get(key)
@@ -5449,9 +5479,27 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
     assert experiment_id is not None
     record_root = _codeoff_root(experiment_id)
     workspace_root = CODEOFF_WORKSPACES_DIR / experiment_id
+    locked = {
+        "protocol_version": CODEOFF_PROTOCOL_VERSION, "experiment_id": experiment_id,
+        "repo": name, "branch": branch, "base_sha": base_sha,
+        "base_tree": base_tree, "base_snapshot_hash": base_snapshot["manifest_hash"],
+        "classification": {"version": CODEOFF_CATEGORY_VERSION, "category": category, "tags": sorted(set(raw_tags))},
+        "original_classification": {"category": category, "tags": raw_tags}, "category_source": category_source.strip(),
+        "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps,
+        "approved_model_manifest": embedded, "approved_model_manifest_current": current,
+        "bounded_catalog_inventory": catalog_inventory, "approved_model_manifest_hash": embedded_hash,
+        "limitation": embedded.get("limitation"),
+        "task": task, "prompt_hash": hashlib.sha256(canonical_prompt).hexdigest(),
+        "rubric_hash": hashlib.sha256(codeoff_canonical_json(CODEOFF_RUBRIC)).hexdigest(),
+        "tests": names, "test_specs": specs, "toolchain": dict(sorted(toolchain.items())), "budgets": budgets,
+        "artifact_limits": {"max_files": CODEOFF_MAX_FILES, "max_file_bytes": CODEOFF_MAX_FILE_BYTES, "max_tree_bytes": CODEOFF_MAX_TREE_BYTES, "max_log_bytes": CODEOFF_MAX_LOG_BYTES},
+        "worktree_isolation": {"version": "opaque-worktree-v1", "slots": ["author-1", "author-2"], "caller_paths": False, "os_security_boundary": False},
+        "aggregation_policy_version": CODEOFF_AGGREGATION_VERSION, "rubric_version": CODEOFF_RUBRIC_VERSION,
+        "commit_message": commit_message.strip(),
+    }
     with CODEOFF_LOCK:
         if record_root.exists():
-            return 409, {"error": "experiment_id already exists; redraw/reopen is forbidden", "code": "experiment_exists"}
+            return _codeoff_replay_prepared(record_root, locked)
         if workspace_root.exists():
             return 409, {"error": "opaque workspace already exists", "code": "workspace_exists"}
         CODEOFFS_DIR.mkdir(parents=True, exist_ok=True)
@@ -5461,17 +5509,8 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             prompt_hash = _codeoff_artifact(record_build, canonical_prompt)
             rubric_hash = _codeoff_artifact(record_build, codeoff_canonical_json(CODEOFF_RUBRIC))
             manifest = {
-                "protocol_version": CODEOFF_PROTOCOL_VERSION, "experiment_id": experiment_id, "created_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "repo": name, "branch": branch, "base_sha": base_sha, "base_tree": base_tree, "base_snapshot_hash": base_snapshot["manifest_hash"],
-                "classification": {"version": CODEOFF_CATEGORY_VERSION, "category": category, "tags": sorted(set(raw_tags))}, "original_classification": {"category": category, "tags": raw_tags}, "category_source": category_source.strip(),
-                "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps, "approved_model_manifest": embedded, "bounded_catalog_inventory": catalog_inventory,
-                "approved_model_manifest_hash": embedded_hash,
-                "approved_model_manifest_current": current, "approved_model_manifest_checked_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "limitation": embedded.get("limitation"), "task": task, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash,
-                "tests": names, "test_specs": specs, "toolchain": dict(sorted(toolchain.items())), "budgets": budgets,
-                "artifact_limits": {"max_files": CODEOFF_MAX_FILES, "max_file_bytes": CODEOFF_MAX_FILE_BYTES, "max_tree_bytes": CODEOFF_MAX_TREE_BYTES, "max_log_bytes": CODEOFF_MAX_LOG_BYTES},
-                "worktree_isolation": {"version": "opaque-worktree-v1", "slots": ["author-1", "author-2"], "caller_paths": False, "os_security_boundary": False},
-                "aggregation_policy_version": CODEOFF_AGGREGATION_VERSION, "rubric_version": CODEOFF_RUBRIC_VERSION, "commit_message": commit_message.strip(),
+                **locked, "created_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "approved_model_manifest_checked_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
             manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
@@ -5499,7 +5538,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(record_build, ignore_errors=True)
             raise
-    return 200, {"ok": True, "experiment_id": experiment_id, "status": "prepared", "authors": draw["authors"], "random_judges": draw["random_judges"], "seed_commitment": draw["seed_commitment"], "prompt_hash": prompt_hash, "rubric_hash": rubric_hash, "manifest_file_hash": manifest_file_hash, "workspace_slots": ["author-1", "author-2"], "launches": _codeoff_launch_plan(manifest)}
+    return 200, _codeoff_prepared_result(manifest, state)
 
 def _codeoff_terminal_identity_matches(
     job: dict[str, Any], receipt: dict[str, Any], manifest_identity: dict[str, Any]
