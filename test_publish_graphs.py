@@ -31,6 +31,7 @@ class PublishGraphsTests(unittest.TestCase):
         with (
             mock.patch.object(publish_graphs, "load_graph", side_effect=fake_load),
             mock.patch.object(publish_graphs, "upsert_workflow", side_effect=fake_upsert),
+            mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}),
         ):
             published = publish_graphs.publish_selected(
                 "mcp", install, publish_graphs.resolve_stems("all"), "instance-1", "", ""
@@ -62,6 +63,7 @@ class PublishGraphsTests(unittest.TestCase):
                 "upsert_workflow",
                 return_value=("wf-listener", "ver-listener", "build-completion-supervisor"),
             ),
+            mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}),
         ):
             publish_graphs.publish_selected(
                 "mcp", install, ["build-completion-supervisor"], "instance-1", "", ""
@@ -97,7 +99,8 @@ class PublishGraphsTests(unittest.TestCase):
             seen[name] = tags
             return f"wf-{name}", f"ver-{name}", name
 
-        with mock.patch.object(publish_graphs, "upsert_workflow", side_effect=fake_upsert):
+        with mock.patch.object(publish_graphs, "upsert_workflow", side_effect=fake_upsert), \
+             mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}):
             publish_graphs.publish_selected(
                 "mcp", {}, ["pre-pr-build", "build-completion-supervisor"], "instance-1", "", ""
             )
@@ -123,6 +126,28 @@ class PublishGraphsTests(unittest.TestCase):
         self.assertIn(
             ("PATCH", "/workflows/wf-1/versions/v1", {"spec": {"nodes": []}, "tags": ["tag-a"]}), calls
         )
+
+    def test_normalized_live_readback_is_required_and_never_uses_submitted_bytes(self):
+        expected = {"nodes": [{"id": "a", "config": {"x": 1, "y": 2}}]}
+        reordered = {"nodes": [{"config": {"y": 2, "x": 1}, "id": "a"}]}
+        receipt = publish_graphs.require_catalog_parity(expected, reordered, "graph")
+        self.assertEqual(receipt["live_source"], "fresh_post_publish_api_read")
+        changed = {"nodes": [{"id": "a", "config": {"x": 99, "y": 2}}]}
+        with self.assertRaisesRegex(SystemExit, "mismatch; no parity receipt"):
+            publish_graphs.require_catalog_parity(expected, changed, "graph")
+        with self.assertRaisesRegex(SystemExit, "unreadable; no parity receipt"):
+            publish_graphs.require_catalog_parity(expected, None, "graph")
+
+    def test_parity_reads_real_api_envelopes_and_ignores_only_volatile_metadata(self):
+        expected = {"nodes": [{"id": "a", "config": {"x": 1}}]}
+        live = {"data": {"workflow": {"currentVersion": {"spec": {
+            "nodes": [{"id": "a", "config": {"x": 1}}], "updatedAt": "volatile",
+        }}}}}
+        self.assertEqual(publish_graphs.workflow_readback_spec(live)["nodes"], expected["nodes"])
+        self.assertEqual(publish_graphs.catalog_hash(expected), publish_graphs.catalog_hash(publish_graphs.workflow_readback_spec(live)))
+        altered = {"nodes": [{"id": "a", "config": {"x": 2}}], "updatedAt": "volatile"}
+        with self.assertRaises(SystemExit):
+            publish_graphs.require_catalog_parity(expected, altered, "graph")
 
 
 if __name__ == "__main__":

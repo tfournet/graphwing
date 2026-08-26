@@ -61,7 +61,7 @@ A ticket tagged **`decision`** (grill/prototype) is not a build. Graph **parks**
 Payload is the **ticket path**, not the whole spec. Same workflow JSON; next slice = next `input`. `implement-slice` `fileHead`s that path after checkout; `agentRun.prompt` is the ticket text.
 
 1. `gitCheckout` the story branch (create if needed).
-2. One **Hermes session per slice** (`agentRun`). Inner TDD is this session.
+2. One preassigned **direct-harness session per slice** (`agentRun`). Inner TDD is this session.
 3. Graph `testRun` (allowlisted recipe): this ticket’s tests **plus** the story suite. Visual still needs a named recipe (smoke / tiny happy path counts). E2E is **not** this gate.
 4. **Spec-review** (opposing vendor, plan mode) **gates commit**. Mechanical **S skips**. Nack = keep files, no sha, no Shortcut comment.
 5. Then `gitCommit` + `gitPush`. Writer **stages**; Graph commits. No sha until green (+ review unless S).
@@ -91,8 +91,8 @@ Stamp the highest class that applies. A TypeScript change to an auth boundary is
 
 | class | writer launcher / model | spec-review (plan mode) |
 |---|---|---|
-| `mechanical` | Hermes `agentRun` `grok-4.6` (`xai-oauth`) | Anthropic Sonnet |
-| `visual` | `claude -p` `claude-opus-5` (not Hermes) | **Terra** (`gpt-5.6-terra`, OpenAI) |
+| `mechanical` | Grok Build `agentRun` `grok-4.6` (direct xAI) | Anthropic Sonnet |
+| `visual` | `claude -p` `claude-opus-5` (direct Anthropic) | **Terra** (`gpt-5.6-terra`, OpenAI) |
 | `sensitive` | `claude -p` `claude-opus-5` | **Terra, then Grok** (both must ack) |
 
 **The reviewer's vendor is never the writer's, and never the planner's.** Two
@@ -115,7 +115,7 @@ review — that rules out Sonnet, Opus **and Fable**. Sol is excluded separately
 as the planning session, so OpenAI is represented by Terra: same vendor,
 different model, so the spec's author is never in the review chain.
 
-Reviewers running through Hermes are always launched with an explicit `-m`.
+All direct reviewers are launched with an explicit provider, `-m` model, and bound session.
 Without it every one of them silently takes the seat's default profile, and
 "Grok reviewed it" would only ever mean "whatever `config.yaml` said today".
 
@@ -137,7 +137,7 @@ Do not say "use Codex". That is a wire (`openai-codex`), not a policy.
 
 ## Retry (one session per slice)
 
-Resume the **same** Hermes session. Compact signal only (failing names + short tail). Keep files. Reviewer chain-of-thought never enters the writer session.
+Resume the **same** direct-harness session. Compact signal only (failing names + short tail). Keep files. Reviewer chain-of-thought never enters the writer session.
 
 | Event | Session | Then |
 |---|---|---|
@@ -167,7 +167,7 @@ Do not resume the last feature session to “fix e2e.”
 
 ## Tests fail (pre-PR)
 
-`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. Two compact resumes of the same Hermes session, then park (three suite-reds). Spec-review nack resumes once with compact review, then park if it nacks again.
+`graphwing-implement-slice` **keeps files** on red. No `gitRestore`. No commit. Two compact resumes of the same direct-harness session, then park (three suite-reds). Spec-review nack resumes once with compact review, then park if it nacks again.
 
 `graphwing-pr-drive` keeps files on red (no restore).
 
@@ -195,7 +195,7 @@ Future work lives in Obsidian `Riftwing/Notes/Graphwing human loop.md`. This lis
 ### Known
 
 3. Structure is human `/to-tickets`. Graph never cuts tickets.
-4. Spec-review nack resumes **once** (compact must-fix, same Hermes session), then parks. Wipe only on explicit discard.
+4. Spec-review nack resumes **once** (compact must-fix, same direct-harness session), then parks. Wipe only on explicit discard.
 5. Graph does not post Shortcut comments (ticket + sha, or `slices complete`).
 6. **`pr-drive` has no reviewer at all.** It writes, tests, commits and pushes
    with no spec-review node, so a PR fix gets less scrutiny than a slice. The
