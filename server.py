@@ -4010,6 +4010,8 @@ def native_job_env(job: dict[str, Any]) -> dict[str, str]:
             "PWD": cwd,
         }
     )
+    if job.get("codeoff_workspace"):
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -4031,6 +4033,8 @@ def spawn_claude(
     cwd = str(Path(job["cwd"]).resolve())
     env = {k: v for k, v in os.environ.items()}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "PWD": cwd})
+    if job.get("codeoff_workspace"):
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     cmd = [
         str(binary),
         "-p",
