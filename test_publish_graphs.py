@@ -144,6 +144,28 @@ class PublishGraphsTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "unreadable; no parity receipt"):
             publish_graphs.require_catalog_parity(expected, None, "graph")
 
+    def test_public_openapi_fetch_uses_release_verifier_headers(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"openapi":"3.1.0"}'
+
+        def urlopen(request, timeout):
+            self.assertEqual(request.full_url, "https://graphwing.example/openapi.json")
+            self.assertEqual(request.get_header("Accept"), "application/json")
+            self.assertEqual(request.get_header("User-agent"), "graphwing-release-verifier/1")
+            self.assertEqual(timeout, 30)
+            return Response()
+
+        with mock.patch.object(publish_graphs.urllib.request, "urlopen", side_effect=urlopen):
+            got = publish_graphs.fetch_public_openapi("https://graphwing.example/openapi.json")
+        self.assertEqual(got, {"openapi": "3.1.0"})
+
     def test_parity_reads_real_api_envelopes_and_ignores_only_volatile_metadata(self):
         expected = {"nodes": [{"id": "a", "config": {"x": 1}}]}
         live = {"data": {"workflow": {"currentVersion": {"spec": {
