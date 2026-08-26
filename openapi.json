@@ -1352,7 +1352,14 @@
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
           "log_ref": { "type": "string" },
-          "summary": { "type": ["string", "null"] }
+          "summary": { "type": ["string", "null"] },
+          "failure_class": {
+            "type": "string",
+            "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"],
+            "description": "Closed launcher outcome class. Only provider_availability may be failover eligible."
+          },
+          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"], "description": "Stable machine code within failure_class; none on success." },
+          "failover_eligible": { "type": "boolean", "description": "True only for structured or deterministic provider availability failures." }
         }
       },
       "AgentJob": {
@@ -1381,7 +1388,13 @@
         "type": "object",
         "properties": {
           "error": { "type": "string" },
-          "code": { "type": "string" }
+          "code": { "type": "string" },
+          "failure_class": {
+            "type": "string",
+            "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"]
+          },
+          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"] },
+          "failover_eligible": { "type": "boolean" }
         }
       }
     },
