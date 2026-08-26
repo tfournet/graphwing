@@ -4250,6 +4250,10 @@ def run_grok_acp(
                             raise ValueError("Grok assistant output exceeded limit")
                         chunks.append(text)
                 continue
+            if message.get("method") == "_x.ai/mcp/servers_updated":
+                if any(key in message for key in ("id", "result", "error")):
+                    raise ValueError("malformed Grok MCP server notification")
+                continue
             if type(message.get("id")) is not int or message["id"] != request_id:
                 raise ValueError("unexpected Grok ACP response")
             if ("result" in message) == ("error" in message):
