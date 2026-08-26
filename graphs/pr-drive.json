@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver: gitStatus → ghPrView → ghPrChecks. Green + reviews_ok is mergeable; red drives one fix slice; pending or blocking reviews stop at a unique Herdr noop. Doorbell is the authenticated webhook. Payload: repo, pr, test, prompt, commit_message.",
+  "description": "Hard-coded PR driver: remote-ready initial and after-fix paths converge on a final head-bound named test and persisted evidence gate before optional merge; red drives one bounded fix slice, while pending, blocking, and failure paths stop safely. Doorbell is the authenticated webhook. Payload: repo, pr, test, prompt, commit_message.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -120,7 +120,8 @@
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "review_decision", "expression": { "kind": "getField", "path": "TASKS.view.data.review_decision" } },
-            { "id": "m2", "output": "reviews_blocking", "expression": { "kind": "getField", "path": "TASKS.view.data.reviews_blocking" } }
+            { "id": "m2", "output": "reviews_blocking", "expression": { "kind": "getField", "path": "TASKS.view.data.reviews_blocking" } },
+            { "id": "m3", "output": "remote_state", "expression": { "kind": "getField", "path": "TASKS.view.data.remote_state" } }
           ]
         }
       },
@@ -139,9 +140,10 @@
             {
               "label": "need_review",
               "rules": [{ "path": "review_decision", "op": "equals", "value": "REVIEW_REQUIRED" }]
-            }
+            },
+            { "label": "remote_ready", "rules": [{ "path": "remote_state", "op": "equals", "value": "ready" }] }
           ],
-          "default": { "label": "mergeable" }
+          "default": { "label": "not_remote_ready" }
         }
       },
       {
@@ -290,6 +292,8 @@
           "number": "{{ CTX.INPUT.pr_number }}",
           "auto_merge": "{{ CTX.INPUT.auto_merge }}",
           "run_id": "{{ WORKFLOW.runId }}",
+          "test": "{{ CTX.INPUT.test }}",
+          "evidence_job_id": "{{ TASKS.final_wait.request.body.job_id }}",
           "merge_method": "squash"
         }
       },
@@ -325,13 +329,13 @@
         "position": { "x": 3400, "y": 240 },
         "config": { "stopOnFirst": true }
       },
-      {
-        "id": "join_mergeable",
-        "type": "logic.join.any",
-        "label": "Join mergeable",
-        "position": { "x": 2820, "y": 240 },
-        "config": { "stopOnFirst": true }
-      },
+      { "id": "join_final", "type": "logic.join.any", "label": "Join final evidence", "position": { "x": 2820, "y": 240 }, "config": { "stopOnFirst": true } },
+      { "id": "final_view", "type": "action.graphwing.GET:/v1/gh/pr/view", "label": "Fresh final PR head", "position": { "x": 3000, "y": 240 }, "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "repo": "{{ CTX.INPUT.repo }}", "number": "{{ CTX.INPUT.pr_number }}" } },
+      { "id": "final_checkout", "type": "action.graphwing.POST:/v1/git/checkout", "label": "Checkout final PR head", "position": { "x": 3180, "y": 240 }, "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "repo": "{{ CTX.INPUT.repo }}", "branch": "{{ TASKS.final_view.data.data.headRefName }}", "create": false } },
+      { "id": "final_wait", "type": "action.wait.webhook", "label": "Wait final named test", "position": { "x": 3360, "y": 240 }, "config": { "alias": "final_wait", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960 } },
+      { "id": "final_test", "type": "action.graphwing.POST:/v1/test/run", "label": "Final merge-evidence test", "position": { "x": 3360, "y": 400 }, "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "name": "{{ CTX.INPUT.test }}", "evidence_mode": "pr_merge", "repo": "{{ CTX.INPUT.repo }}", "pr": "{{ CTX.INPUT.pr_number }}", "run_id": "{{ WORKFLOW.runId }}", "expected_head": "{{ TASKS.final_view.data.data.headRefOid }}", "writer_job_id": "{{ CTX.receipt.job_id | default('') }}", "response_webhook_url": "{{ TASKS.final_wait.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.final_wait.pending.resumeToken }}" } },
+      { "id": "if_final_test", "type": "logic.filter", "label": "Final test passed?", "position": { "x": 3540, "y": 240 }, "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] } },
+      { "id": "join_final_fail", "type": "logic.join.any", "label": "Join final refusal", "position": { "x": 3540, "y": 520 }, "config": { "stopOnFirst": true } },
       {
         "id": "join_fix_test_fail",
         "type": "logic.join.any",
@@ -432,21 +436,21 @@
         "position": { "x": 3520, "y": 160 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.blocking", "op": "equals", "value": false }]
+          "rules": [{ "path": "data.blocking", "op": "equals", "value": false }, { "path": "data.all_green", "op": "equals", "value": true }]
         }
       },
       {
         "id": "done_after_fix",
         "type": "transforms.objectBuilder",
-        "label": "Done after one fix",
+        "label": "Done after final evidence",
         "position": { "x": 3740, "y": 80 },
         "config": {
           "alias": "done_after_fix",
           "version": 1,
           "mappings": [
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
-            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "checks_green_after_fix" } },
-            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "CTX.receipt.job_id" } }
+            { "id": "m2", "output": "reason", "expression": { "kind": "literal", "value": "final_test_green" } },
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.final_wait.request.body.job_id" } }
           ]
         }
       },
@@ -465,6 +469,8 @@
       { "id": "herdr_receipt", "type": "action.noop", "label": "Herdr: receipt not ok", "position": { "x": 2200, "y": 480 }, "config": {} },
       { "id": "herdr_commit", "type": "action.noop", "label": "Herdr: commit failed", "position": { "x": 3080, "y": 40 }, "config": {} },
       { "id": "herdr_push", "type": "action.noop", "label": "Herdr: push failed", "position": { "x": 3300, "y": 40 }, "config": {} },
+      { "id": "herdr_remote_not_ready", "type": "action.noop", "label": "Herdr: remote PR state not ready", "position": { "x": 1760, "y": 520 }, "config": {} },
+      { "id": "herdr_final_fail", "type": "action.noop", "label": "Herdr: final merge evidence refused", "position": { "x": 3740, "y": 520 }, "config": {} },
 
       { "id": "herdr_budget", "type": "action.noop", "label": "Herdr: still red (budget)", "position": { "x": 3740, "y": 240 }, "config": {} }
     ],
@@ -487,7 +493,8 @@
       { "id": "e5a", "source": "review_snap", "sourceHandle": "out", "target": "switch_review", "targetHandle": "in" },
       { "id": "e5b", "source": "switch_review", "sourceHandle": "case-0", "target": "herdr_changes_requested", "targetHandle": "in" },
       { "id": "e5c", "source": "switch_review", "sourceHandle": "case-1", "target": "herdr_review_required", "targetHandle": "in" },
-      { "id": "e5d", "source": "switch_review", "sourceHandle": "default", "target": "join_mergeable", "targetHandle": "in" },
+      { "id": "e5d", "source": "switch_review", "sourceHandle": "case-2", "target": "join_final", "targetHandle": "in" },
+      { "id": "e5e", "source": "switch_review", "sourceHandle": "default", "target": "herdr_remote_not_ready", "targetHandle": "in" },
       { "id": "e7", "source": "switch_checks", "sourceHandle": "case-2", "target": "join_fix_entry", "targetHandle": "in" },
       { "id": "e_jfe_out", "source": "join_fix_entry", "sourceHandle": "out", "target": "pr_checkout", "targetHandle": "in" },
       { "id": "e8", "source": "switch_checks", "sourceHandle": "default", "target": "herdr_pending", "targetHandle": "in" },
@@ -515,13 +522,25 @@
 
       { "id": "e19", "source": "checks2", "sourceHandle": "success", "target": "if_green2", "targetHandle": "in" },
       { "id": "e19f", "source": "checks2", "sourceHandle": "failure", "target": "herdr_checks2", "targetHandle": "in" },
-      { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "join_mergeable", "targetHandle": "in" },
-      { "id": "e_jm_out", "source": "join_mergeable", "sourceHandle": "out", "target": "merge_snap", "targetHandle": "in" },
+      { "id": "e20", "source": "if_green2", "sourceHandle": "pass", "target": "join_final", "targetHandle": "in" },
+      { "id": "e_final_view", "source": "join_final", "sourceHandle": "out", "target": "final_view", "targetHandle": "in" },
+      { "id": "e_final_checkout", "source": "final_view", "sourceHandle": "success", "target": "final_checkout", "targetHandle": "in" },
+      { "id": "e_final_wait", "source": "final_checkout", "sourceHandle": "success", "target": "final_wait", "targetHandle": "in" },
+      { "id": "e_final_pending", "source": "final_wait", "sourceHandle": "pending", "target": "final_test", "targetHandle": "in" },
+      { "id": "e_final_out", "source": "final_wait", "sourceHandle": "out", "target": "if_final_test", "targetHandle": "in" },
+      { "id": "e_final_pass", "source": "if_final_test", "sourceHandle": "pass", "target": "merge_snap", "targetHandle": "in" },
+      { "id": "e_final_view_fail", "source": "final_view", "sourceHandle": "failure", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_checkout_fail", "source": "final_checkout", "sourceHandle": "failure", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_action_fail", "source": "final_test", "sourceHandle": "failure", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_timeout", "source": "final_wait", "sourceHandle": "timeout", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_wait_fail", "source": "final_wait", "sourceHandle": "failure", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_red", "source": "if_final_test", "sourceHandle": "fail", "target": "join_final_fail", "targetHandle": "in" },
+      { "id": "e_final_refused", "source": "join_final_fail", "sourceHandle": "out", "target": "herdr_final_fail", "targetHandle": "in" },
       { "id": "e_ms_out", "source": "merge_snap", "sourceHandle": "out", "target": "switch_merge", "targetHandle": "in" },
       { "id": "e_sm_merge", "source": "switch_merge", "sourceHandle": "case-0", "target": "merge", "targetHandle": "in" },
       { "id": "e_sm_engineer", "source": "switch_merge", "sourceHandle": "default", "target": "join_done", "targetHandle": "in" },
       { "id": "e_merge_ok", "source": "merge", "sourceHandle": "success", "target": "join_done", "targetHandle": "in" },
-      { "id": "e_merge_fail", "source": "merge", "sourceHandle": "failure", "target": "join_done", "targetHandle": "in" },
+      { "id": "e_merge_fail", "source": "merge", "sourceHandle": "failure", "target": "join_final_fail", "targetHandle": "in" },
       { "id": "e_jd_out", "source": "join_done", "sourceHandle": "out", "target": "done_after_fix", "targetHandle": "in" },
       { "id": "e21", "source": "if_green2", "sourceHandle": "fail", "target": "continue", "targetHandle": "in" },
       { "id": "e_cont_ok", "source": "continue", "sourceHandle": "success", "target": "join_continue", "targetHandle": "in" },

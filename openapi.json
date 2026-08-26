@@ -606,7 +606,7 @@
       "post": {
         "operationId": "ghPrMerge",
         "tags": ["gh"],
-        "summary": "Merge a PR. Requires auto_merge and a run_id; re-checks green, mergeable, holds",
+        "summary": "Merge once with --match-head-commit after strict fresh PR/check state and persisted final named-test evidence",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhPrMergeRequest" } } }
@@ -614,6 +614,7 @@
         "responses": {
           "200": { "description": "merged", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
+          "502": { "$ref": "#/components/responses/Error" },
           "409": { "description": "refused", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } }
         }
       }
@@ -792,15 +793,17 @@
       "post": {
         "operationId": "testRun",
         "tags": ["test"],
-        "summary": "Run one tests.json recipe by name. No free-form argv. Long recipes return 202 + job_id.",
+        "summary": "Run one tests.json recipe by name. pr_merge evidence mode always persists immutable repo/PR/run/head/git provenance.",
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunRequest" } } }
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TestRunRequest" } } }
         },
         "responses": {
           "200": { "description": "sync result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunResult" } } } },
           "202": { "description": "queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunAccepted" } } } },
           "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
@@ -1100,6 +1103,7 @@
       "ScriptRunRequest": {
         "type": "object",
         "required": ["name"],
+        "additionalProperties": false,
         "properties": {
           "name": { "type": "string", "description": "scripts.json name only. No client argv." },
           "response_webhook_url": {
@@ -1110,9 +1114,11 @@
           "response_webhook_token": {
             "type": "string",
             "description": "From action.wait.webhook pending.resumeToken. Sent as X-Rewst-Token on the callback."
-          }
+          },
+          "resume_url": { "type": "string", "format": "uri", "description": "Legacy alias for response_webhook_url" }
         }
       },
+      "TestRunRequest": { "type": "object", "required": ["name"], "additionalProperties": false, "properties": { "name": { "type": "string", "description": "tests.json recipe name only" }, "evidence_mode": { "type": "string", "enum": ["pr_merge"] }, "repo": { "type": "string", "description": "Required only with pr_merge" }, "pr": { "type": "string", "description": "Required only with pr_merge" }, "run_id": { "type": "string", "description": "Required only with pr_merge" }, "expected_head": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$", "description": "Compared with a fresh server-side PR head" }, "writer_job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "Optional successful agent/session job for the after-fix route" }, "response_webhook_url": { "type": "string", "format": "uri" }, "response_webhook_token": { "type": "string" }, "resume_url": { "type": "string", "format": "uri", "description": "Legacy webhook alias" } } },
       "ScriptRunResult": {
         "type": "object",
         "properties": {
@@ -1314,12 +1320,17 @@
       },
       "GhPrMergeRequest": {
         "type": "object",
-        "required": ["repo", "number", "auto_merge", "run_id"],
+        "required": ["repo", "number", "auto_merge", "run_id", "test", "evidence_job_id"],
+        "additionalProperties": false,
         "properties": {
           "repo": { "type": "string" },
           "number": { "type": "string" },
           "auto_merge": { "type": "boolean", "description": "Off unless this run was started with auto-merge" },
           "run_id": { "type": "string", "description": "Merge is only reachable from inside a run" },
+          "test": { "type": "string", "description": "Must equal the persisted evidence job recipe" },
+          "evidence_job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "Persisted final pr_merge named-test job; receipts/booleans are not accepted" },
+          "codeoff_experiment_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,63}$", "description": "Optional issue-67 gate context; paired only and never substitutes for test evidence" },
+          "final_verification_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Requires codeoff_experiment_id" },
           "merge_method": { "type": "string", "enum": ["squash", "merge", "rebase"], "description": "Not named `method`: the connector reads that as the HTTP verb." }
         }
       },
@@ -1383,6 +1394,11 @@
           "data": {},
           "all_green": { "type": "boolean", "description": "ghPrChecks: no fail and no pending" },
           "any_red": { "type": "boolean", "description": "ghPrChecks: at least one fail/cancel" },
+          "checks_state": { "type": "string", "enum": ["green", "red", "pending", "no_checks", "unknown", "malformed", "inconsistent"] },
+          "no_checks": { "type": "boolean" },
+          "unknown": { "type": "array", "items": { "type": "string" } },
+          "remote_state": { "type": "string", "description": "ghPrView remote-only readiness; ready still lacks named-test evidence" },
+          "remote_ready": { "type": "boolean", "description": "Remote state only, never a merge-safety attestation" },
           "failing": { "type": "array", "items": { "type": "string" } },
           "pending": { "type": "array", "items": { "type": "string" } }
         }
