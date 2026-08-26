@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -312,7 +313,7 @@ class DispatchTests(unittest.TestCase):
             jobs = Path(td) / "jobs"
             codex = Path(td) / "codex"
             codex.write_text("fixture")
-            with mock.patch.object(server, "CODEX_BIN", codex), mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
                 with mock.patch.object(server, "JOBS_DIR", jobs):
                     with mock.patch.object(server, "enqueue_agent", lambda job: None):
                         status, payload, _ = server.dispatch(
@@ -339,6 +340,142 @@ class DispatchTests(unittest.TestCase):
             self.assertNotIn("response_webhook_token", gp)
             self.assertNotIn("resume_url", gp)
 
+    def test_agent_run_preflight_uses_request_time_launcher_resolver(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            current = root / "current-codex"
+            current.write_text("fixture")
+            body = json.dumps({
+                "prompt": "ping", "cwd": "scratch", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
+            }).encode()
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(current)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", wraps=server.resolve_launcher_binary_now) as resolve_now, \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/agent/run", {}, True, body
+                )
+        self.assertEqual(status, 202, payload)
+        resolve_now.assert_called_once_with("codex")
+
+    def test_run_agent_job_launches_the_binary_from_the_shared_current_resolver(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            current = root / "current-codex"
+            current.write_text("fixture")
+            job_id = "ab" * 16
+            job = {
+                "job_id": job_id,
+                "status": "queued",
+                "cwd": str(root),
+                "prompt": "ping",
+                "launcher": "codex",
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "max_turns": 2,
+                "run_budget_seconds": 30,
+                "session_identity": {
+                    "launcher": "codex", "provider": "openai",
+                    "model": "gpt-5.6-sol", "repo": "scratch",
+                    "branch": "main", "starting_head": "a" * 40,
+                    "native_session_id": None,
+                },
+                "response_webhook_url": None,
+                "response_webhook_token": None,
+                "resume_url": None,
+                "created_at": "2026-08-26T12:00:00Z",
+                "started_at": None,
+                "finished_at": None,
+                "receipt": None,
+                "log_ref": str(jobs / job_id / "stdout.log"),
+                "error": None,
+                "webhook": None,
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.job_dir(job_id).mkdir(parents=True)
+                server.job_dir(job_id).joinpath("prompt.txt").write_text("ping")
+                server.write_job(job)
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(current)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", wraps=server.resolve_launcher_binary_now) as resolve_now, \
+                 mock.patch.object(
+                     server, "spawn_writer",
+                     return_value=(None, {"error": "fixture stop", "code": "spawn_failed"}),
+                 ) as spawn, \
+                 mock.patch.object(server, "post_receipt", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server, "herdr_job_done", lambda job: None):
+                server.run_agent_job(job_id)
+        resolve_now.assert_called_once_with("codex")
+        spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.args[1], current)
+
+    def test_request_time_launcher_resolver_delegates_to_shared_current_resolver(self):
+        cases = {
+            "codex": ("GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex"),
+            "claude": ("GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude"),
+            "grok": ("GRAPHWING_GROK_BIN", Path.home() / ".local" / "bin" / "grok"),
+        }
+        for launcher, (env_var, fallback) in cases.items():
+            with self.subTest(launcher=launcher), \
+                 mock.patch.object(
+                     server, "resolve_executable", return_value=Path(f"/current/{launcher}")
+                 ) as shared:
+                self.assertEqual(
+                    server.resolve_launcher_binary_now(launcher),
+                    Path(f"/current/{launcher}"),
+                )
+                shared.assert_called_once_with(launcher, env_var, fallback)
+
+    def test_request_time_launcher_resolver_uses_env_then_current_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            configured = root / "configured-codex"
+            configured.write_text("configured")
+            current_path = root / "path-codex"
+            current_path.write_text("path")
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": ""}), \
+                 mock.patch.object(server.shutil, "which", return_value=str(current_path)):
+                self.assertEqual(server.resolve_launcher_binary_now("codex"), current_path)
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(configured)}), \
+                 mock.patch.object(server.shutil, "which", return_value="/provider/cli/must-not-run"):
+                self.assertEqual(server.resolve_launcher_binary_now("codex"), configured)
+
+    def test_native_reviews_use_request_time_launcher_resolution(self):
+        class FakeCompleted:
+            returncode = 0
+            stdout = b"VERDICT: PASS\n"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            codex = root / "current-codex"
+            codex.write_text("fixture")
+            captured = []
+
+            def fake_run(command, **kwargs):
+                captured.append(command)
+                output_index = command.index("--output-last-message") + 1
+                Path(command[output_index]).write_text(
+                    '{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}'
+                )
+                return FakeCompleted()
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+                 mock.patch.object(server.subprocess, "run", fake_run):
+                result = server.native_review_result(
+                    "codex", "openai", "gpt-5.6-sol", "ticket", root
+                )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(captured[0][0], str(codex))
+
     def test_codex_agent_run_records_git_bound_session_identity(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -350,7 +487,7 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "ping", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
             }).encode()
-            with mock.patch.object(server, "CODEX_BIN", codex), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -370,7 +507,7 @@ class DispatchTests(unittest.TestCase):
             jobs = root / "jobs"
             claude = root / "claude"
             claude.write_text("fixture")
-            with mock.patch.object(server, "CLAUDE_BIN", claude), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_CLAUDE_BIN": str(claude)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -418,7 +555,7 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "ping", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6",
             }).encode()
-            with mock.patch.object(server, "GROK_BIN", grok), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -470,7 +607,7 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "continue", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6", "resume_job_id": prior_job_id,
             }
-            with mock.patch.object(server, "GROK_BIN", grok), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -550,7 +687,7 @@ class DispatchTests(unittest.TestCase):
             (jobs / failed_job["job_id"]).mkdir(parents=True)
             (jobs / failed_job["job_id"] / "job.json").write_text(json.dumps(failed_job))
             base = {"prompt": "ping", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}
-            with mock.patch.object(server, "CODEX_BIN", codex), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -610,7 +747,7 @@ class DispatchTests(unittest.TestCase):
                 "provider": "anthropic", "model": "claude-opus-5",
                 "session_identity": identity, "resume_job_id": prior_job_id,
             }).encode()
-            with mock.patch.object(server, "CLAUDE_BIN", claude), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_CLAUDE_BIN": str(claude)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -656,7 +793,7 @@ class DispatchTests(unittest.TestCase):
                 "provider": "openai", "model": "gpt-5.6-sol",
                 "session_identity": identity, "resume_job_id": prior_job_id,
             }).encode()
-            with mock.patch.object(server, "CODEX_BIN", codex), \
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -883,17 +1020,17 @@ class DispatchTests(unittest.TestCase):
 
     def test_agent_run_missing_binary_codes_match_for_all_launchers(self):
         cases = (
-            ("codex", "openai", "gpt-5.6-sol", "CODEX_BIN"),
-            ("claude", "anthropic", "claude-opus-5", "CLAUDE_BIN"),
-            ("grok", "xai", "grok-4.6", "GROK_BIN"),
+            ("codex", "openai", "gpt-5.6-sol", "GRAPHWING_CODEX_BIN"),
+            ("claude", "anthropic", "claude-opus-5", "GRAPHWING_CLAUDE_BIN"),
+            ("grok", "xai", "grok-4.6", "GRAPHWING_GROK_BIN"),
         )
-        for launcher, provider, model, binary_name in cases:
+        for launcher, provider, model, env_var in cases:
             body = json.dumps({
                 "prompt": "x", "cwd": "scratch", "launcher": launcher,
                 "provider": provider, "model": model,
             }).encode()
             with self.subTest(launcher=launcher), \
-                 mock.patch.object(server, binary_name, Path(f"/nope/{launcher}")):
+                 mock.patch.dict(os.environ, {env_var: f"/nope/{launcher}"}):
                 status, payload, _ = server.dispatch(
                     "POST", "/v1/agent/run", {}, True, body,
                 )
@@ -909,11 +1046,11 @@ class DispatchTests(unittest.TestCase):
 
     def test_webhook_agent_run_missing_binary_posts_classified_receipt(self):
         cases = (
-            ("codex", "openai", "gpt-5.6-sol", "CODEX_BIN", "go_coding"),
-            ("claude", "anthropic", "claude-opus-5", "CLAUDE_BIN", "typescript_coding"),
-            ("grok", "xai", "grok-4.6", "GROK_BIN", "research_ops"),
+            ("codex", "openai", "gpt-5.6-sol", "GRAPHWING_CODEX_BIN", "go_coding"),
+            ("claude", "anthropic", "claude-opus-5", "GRAPHWING_CLAUDE_BIN", "typescript_coding"),
+            ("grok", "xai", "grok-4.6", "GRAPHWING_GROK_BIN", "research_ops"),
         )
-        for launcher, provider, model, bin_name, work_kind in cases:
+        for launcher, provider, model, env_var, work_kind in cases:
             with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as td:
                 jobs = Path(td) / "jobs"
                 primary_route = server.slice_route_lookup("mechanical", "M", work_kind=work_kind)
@@ -937,7 +1074,7 @@ class DispatchTests(unittest.TestCase):
                     return {"ok": True, "status": 200}
 
                 with mock.patch.object(server, "JOBS_DIR", jobs), \
-                     mock.patch.object(server, bin_name, Path(f"/nope/{launcher}")), \
+                     mock.patch.dict(os.environ, {env_var: f"/nope/{launcher}"}), \
                      mock.patch.object(server, "enqueue_agent", lambda job: server.run_agent_job(job["job_id"])), \
                      mock.patch.object(server, "spawn_writer", side_effect=AssertionError("no model process")), \
                      mock.patch.object(server, "run_grok_acp", side_effect=AssertionError("no model process")), \
@@ -981,11 +1118,11 @@ class DispatchTests(unittest.TestCase):
             codex = root / "codex"
             codex.write_text("fixture")
             job = {"job_id": job_id, "cwd": td, "model": "gpt-5.6-sol", "launcher": "codex", "session_identity": {"native_session_id": "codex-123"}}
-            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "CODEX_BIN", codex), mock.patch.object(server.subprocess, "Popen", FakePopen):
-                proc, err = server.spawn_codex(job)
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server.subprocess, "Popen", FakePopen):
+                proc, err = server.spawn_codex(job, codex)
                 resume_cmd = captured["cmd"]
                 initial_job = dict(job, session_identity={"native_session_id": None})
-                initial_proc, initial_err = server.spawn_codex(initial_job)
+                initial_proc, initial_err = server.spawn_codex(initial_job, codex)
                 initial_cmd = captured["cmd"]
         self.assertIsNone(err)
         self.assertIsNotNone(proc)
@@ -1028,12 +1165,11 @@ class DispatchTests(unittest.TestCase):
                 "session_identity": {"native_session_id": "claude-123"},
             }
             with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "CLAUDE_BIN", claude), \
                  mock.patch.object(server.subprocess, "Popen", FakePopen):
-                proc, err = server.spawn_claude(job)
+                proc, err = server.spawn_claude(job, claude)
                 resume_cmd = captured["cmd"]
                 initial_proc, initial_err = server.spawn_claude(
-                    dict(job, session_identity={"native_session_id": None})
+                    dict(job, session_identity={"native_session_id": None}), claude
                 )
                 initial_cmd = captured["cmd"]
         self.assertIsNone(err)
@@ -1101,6 +1237,12 @@ while True:
     elif method == "session/prompt":
         if cfg.get("sleep"): time.sleep(cfg["sleep"])
         sid = cfg.get("update_session_id", request["params"]["sessionId"])
+        if cfg.get("permission_request"):
+            send({"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":sid,"toolCall":{"toolCallId":"tool-1","title":"write fixture file","kind":"edit","status":"pending"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}})
+            response = sys.stdin.readline()
+            if response:
+                seen["permission_response"] = json.loads(response); save()
+            sys.exit(0)
         if cfg.get("malformed_update"):
             send({"jsonrpc":"2.0","method":"session/update","params":{}})
         if cfg.get("foreign_update"):
@@ -1155,13 +1297,40 @@ while True:
         }
         if api_key:
             env["XAI_API_KEY"] = "fixture-key"
+        env["GRAPHWING_GROK_BIN"] = str(fixture)
         with mock.patch.object(server, "JOBS_DIR", jobs), \
-             mock.patch.object(server, "GROK_BIN", fixture), \
              mock.patch.dict(os.environ, env, clear=False):
             if not api_key:
                 os.environ.pop("XAI_API_KEY", None)
             server.run_agent_job(job_id)
         return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
+
+    def _run_grok_review_fixture(self, cfg=None):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        jobs = root / "jobs"
+        fixture = self._write_grok_acp_fixture(root)
+        capture = root / "capture.json"
+        fixture_cfg = {
+            "chunks": [
+                '{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}'
+            ],
+            **(cfg or {}),
+        }
+        env = {
+            "ACP_TEST_FIXTURE": json.dumps(fixture_cfg),
+            "ACP_TEST_CAPTURE": str(capture),
+            "XAI_API_KEY": "fixture-key",
+        }
+        env["GRAPHWING_GROK_BIN"] = str(fixture)
+        with mock.patch.object(server, "JOBS_DIR", jobs), \
+             mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+             mock.patch.dict(os.environ, env, clear=False):
+            result = server.native_review_result(
+                "grok", "xai", "grok-4.6", "ticket", root
+            )
+        return result, json.loads(capture.read_text())
 
     def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
         saved, capture, jdir = self._run_grok_fixture()
@@ -1432,6 +1601,8 @@ while True:
     def test_run_agent_preserves_specific_spawn_error_in_saved_and_posted_receipt(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
+            codex = Path(td) / "codex"
+            codex.write_text("fixture")
             job_id = "ab" * 16
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
@@ -1449,6 +1620,7 @@ while True:
             (jdir / "job.json").write_text(json.dumps(job))
             specific = "missing codex binary: /fixture/codex"
             with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                  mock.patch.object(server, "spawn_writer", return_value=(None, {"error": specific, "code": "missing_binary"})), \
                  mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted:
                 server.run_agent_job(job_id)
@@ -1475,6 +1647,8 @@ while True:
             job = {"job_id": job_id, "status": "queued", "repo": "scratch", "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t", "started_at": None, "finished_at": None, "max_turns": 1, "run_budget_seconds": 30, "receipt": None, "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None, "response_webhook_url": None}
             (jdir / "job.json").write_text(json.dumps(job))
             (jdir / "prompt.txt").write_text("x")
+            codex = root / "codex"
+            codex.write_text("fixture")
             class FakeProc:
                 pid = 42
                 returncode = 0
@@ -1485,7 +1659,9 @@ while True:
                         + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
                     )
                     return 0
-            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)):
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)):
                 server.run_agent_job(job_id)
             saved = json.loads((jdir / "job.json").read_text())
         self.assertEqual(saved["status"], "completed")
@@ -1517,6 +1693,8 @@ while True:
             }
             (jdir / "job.json").write_text(json.dumps(job))
             (jdir / "prompt.txt").write_text("x")
+            claude = root / "claude"
+            claude.write_text("fixture")
 
             class FakeProc:
                 pid = 42
@@ -1531,6 +1709,7 @@ while True:
                     return 0
 
             with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CLAUDE_BIN": str(claude)}), \
                  mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)):
                 server.run_agent_job(job_id)
             saved = json.loads((jdir / "job.json").read_text())
@@ -1554,7 +1733,7 @@ while True:
                     "response_webhook_token": "tok_secret",
                 }
             ).encode()
-            with mock.patch.object(server, "CODEX_BIN", codex), mock.patch.object(server, "JOBS_DIR", jobs):
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), mock.patch.object(server, "JOBS_DIR", jobs):
                 with mock.patch.object(server, "enqueue_agent", lambda job: None):
                     status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
             self.assertEqual(status, 202, payload)
@@ -1919,6 +2098,168 @@ while True:
             self.assertEqual(captured["body"]["ticket"], "slices/demo/02-checkout.md")
             self.assertEqual(captured["body"]["kick_url"], "https://example.com/hook")
             self.assertEqual(captured["body"]["work_kind"], "typescript_coding")
+
+    def test_slice_continue_accepts_exact_rendered_happy_path_without_recovery_evidence(self):
+        captured = []
+
+        class FakeResp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=15):
+            captured.append(json.loads(req.data.decode()))
+            return FakeResp()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {"id": "01", "path": "slices/01.md", "blocked_by": [], "kind": "build", "status": "done"},
+                    {"id": "02", "path": "slices/02.md", "blocked_by": ["01"], "kind": "build", "status": "open"},
+                ],
+            )
+            rendered = {
+                "repo": "scratch", "index": rel, "branch": "feature/x",
+                "test": "graphwing-unit", "commit_message": "slice",
+                "iters_left": 2, "class": "mechanical", "work_kind": "go_coding",
+                "size": "M", "ac_count": 3, "seams": 1,
+                "recovery_version": "", "prior_primary_route": "",
+                "prior_primary_receipt": "", "prior_fallback_route": "",
+                "prior_fallback_receipt": "", "fresh_primary_receipt": "",
+                "kick_url": "https://example.com/hook", "kick_token": "",
+            }
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "urlopen", fake_urlopen):
+                # Normal-primary and recovered-primary continuations render the
+                # same recovery-free request body after a successful primary.
+                for origin in ("normal_primary", "recovered_primary"):
+                    with self.subTest(origin=origin):
+                        status, payload, _ = server.dispatch(
+                            "POST", "/v1/slice/continue", {}, True,
+                            json.dumps(rendered).encode(),
+                        )
+                        self.assertEqual(status, 200, payload)
+                        self.assertTrue(payload["kicked"], payload)
+        self.assertEqual(len(captured), 2)
+        recovery_fields = {
+            "recovery_version", "prior_primary_route", "prior_primary_receipt",
+            "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
+        }
+        for forwarded in captured:
+            self.assertTrue(recovery_fields.isdisjoint(forwarded), forwarded)
+
+    def test_slice_continue_forwards_only_complete_versioned_recovery_evidence(self):
+        captured = []
+
+        class FakeResp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=15):
+            captured.append(json.loads(req.data.decode()))
+            return FakeResp()
+
+        normal_fallback_evidence = {
+            "recovery_version": "provider-recovery-v1",
+            "prior_primary_route": {"route_version": "normal-v1"},
+            "prior_primary_receipt": {"job_id": "1" * 32, "status": "error"},
+            "prior_fallback_route": {"route_version": "availability-fallback-v1"},
+            "prior_fallback_receipt": {"job_id": "2" * 32, "status": "ok"},
+        }
+        retained_fallback_evidence = {
+            **normal_fallback_evidence,
+            "prior_primary_receipt": {"job_id": "3" * 32, "status": "error"},
+            "prior_fallback_receipt": {"job_id": "4" * 32, "status": "ok"},
+        }
+        evidence_with_fresh_primary = {
+            **retained_fallback_evidence,
+            "fresh_primary_receipt": {"job_id": "5" * 32, "status": "ok"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            rel = self._write_slice_index(
+                repo,
+                [
+                    {"id": "01", "path": "slices/01.md", "blocked_by": [], "kind": "build", "status": "done"},
+                    {"id": "02", "path": "slices/02.md", "blocked_by": ["01"], "kind": "build", "status": "open"},
+                ],
+            )
+            base = {
+                "repo": "scratch",
+                "index": rel,
+                "branch": "feature/x",
+                "test": "graphwing-unit",
+                "commit_message": "slice",
+                "work_kind": "go_coding",
+                "kick_url": "https://example.com/hook",
+            }
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "urlopen", fake_urlopen):
+                for label, evidence in (
+                    ("normal fallback", normal_fallback_evidence),
+                    ("direct recovery-retained fallback", retained_fallback_evidence),
+                    ("optional fresh primary", evidence_with_fresh_primary),
+                ):
+                    with self.subTest(label=label):
+                        status, payload, _ = server.dispatch(
+                            "POST", "/v1/slice/continue", {}, True,
+                            json.dumps({**base, **evidence}).encode(),
+                        )
+                        self.assertEqual(status, 200, payload)
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/continue", {}, True, json.dumps(base).encode()
+                )
+                self.assertEqual(status, 200, payload)
+                rejected = (
+                    ({**base, **evidence_with_fresh_primary, "recovery_version": None}, "missing version"),
+                    ({**base, **evidence_with_fresh_primary, "recovery_version": "provider-recovery-v999"}, "unknown version"),
+                    ({**base, **evidence_with_fresh_primary, "prior_fallback_receipt": None}, "incomplete core evidence"),
+                    ({**base, **evidence_with_fresh_primary, "fresh_primary_receipt": ["not", "an", "object"]}, "malformed fresh receipt"),
+                )
+                for candidate, label in rejected:
+                    with self.subTest(label=label):
+                        before = len(captured)
+                        status, payload, _ = server.dispatch(
+                            "POST", "/v1/slice/continue", {}, True,
+                            json.dumps(candidate).encode(),
+                        )
+                        self.assertEqual(status, 400, payload)
+                        self.assertEqual(payload["code"], "malformed_recovery_evidence")
+                        self.assertEqual(
+                            len(captured), before,
+                            "invalid recovery evidence must fail before the webhook",
+                        )
+                no_kick = {**base, **evidence_with_fresh_primary, "recovery_version": None}
+                no_kick.pop("kick_url")
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/continue", {}, True,
+                    json.dumps(no_kick).encode(),
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "malformed_recovery_evidence")
+        for position, evidence in enumerate(
+            (
+                normal_fallback_evidence,
+                retained_fallback_evidence,
+                evidence_with_fresh_primary,
+            )
+        ):
+            for key, value in evidence.items():
+                self.assertEqual(captured[position][key], value)
+        for key in evidence_with_fresh_primary:
+            self.assertNotIn(key, captured[3])
+        self.assertEqual(len(captured), 4)
 
     def test_slice_continue_rejects_http_kick_url(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3086,6 +3427,509 @@ while True:
             self.assertEqual(status, 400, payload)
             self.assertEqual(payload["code"], "primary_receipt_mismatch")
 
+    def _provider_recovery_fixture(
+        self,
+        jobs: Path,
+        failure_code: str = "missing_binary",
+        *,
+        primary_job_id: str = "1" * 32,
+        primary_starting_head: str | None = None,
+        primary_created_at: str = "2026-08-26T12:00:00Z",
+        primary_finished_at: str = "2026-08-26T12:00:30Z",
+        fallback_status: str = "completed",
+        fallback_job_id: str = "2" * 32,
+        fallback_starting_head: str | None = None,
+        fallback_created_at: str = "2026-08-26T12:00:30Z",
+        fallback_finished_at: str = "2026-08-26T12:01:00Z",
+        fresh_primary: bool = False,
+        fresh_created_at: str = "2026-08-26T12:02:00Z",
+    ) -> dict:
+        primary_route = server.slice_route_lookup(
+            "mechanical", "M", work_kind="go_coding"
+        )
+        fallback_route = server.build_slice_route(
+            "mechanical",
+            "M",
+            None,
+            None,
+            "go_coding",
+            server.AVAILABILITY_FALLBACK_WRITER_ROUTES["go_coding"],
+            server.FALLBACK_ROUTE_VERSION,
+            f"availability_fallback:{failure_code}",
+            "openai",
+        )
+        selected = {
+            key: fallback_route[key]
+            for key in ("route_version", "launcher", "provider", "model", "effort", "reason")
+        }
+        fallback_route.update(
+            {
+                "role": "availability_fallback",
+                "primary_route_version": "normal-v1",
+                "primary_reason": "work_kind=go_coding",
+                "fallback_reason": f"availability_fallback:{failure_code}",
+                "fallback_code": failure_code,
+                "selected_alternate_route": selected,
+            }
+        )
+
+        initial_head = "a" * 40
+
+        def identity(route, native_session_id, starting_head=initial_head):
+            return {
+                "launcher": route["launcher"],
+                "provider": route["provider"],
+                "model": route["model"],
+                "repo": "scratch",
+                "branch": "main",
+                "starting_head": starting_head,
+                "native_session_id": native_session_id,
+            }
+
+        primary_identity = identity(
+            primary_route, None, primary_starting_head or initial_head
+        )
+        fallback_identity = identity(
+            fallback_route,
+            f"fallback-session-{fallback_job_id[:8]}",
+            fallback_starting_head or initial_head,
+        )
+        primary_receipt = {
+            "status": "error",
+            "job_id": primary_job_id,
+            "role": "primary",
+            "session_identity": primary_identity,
+            "failure_class": "provider_availability",
+            "failure_code": failure_code,
+            "failover_eligible": True,
+            "diagnostic": server.compact_diagnostic(failure_code),
+        }
+        fallback_receipt = {
+            "status": "ok",
+            "job_id": fallback_job_id,
+            "role": "availability_fallback",
+            "session_identity": fallback_identity,
+            "failure_class": "none",
+            "failure_code": "none",
+            "failover_eligible": False,
+            "diagnostic": server.compact_diagnostic("none"),
+        }
+
+        def write(job):
+            path = jobs / job["job_id"] / "job.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(job, indent=2) + "\n")
+
+        write(
+            {
+                "job_id": primary_receipt["job_id"],
+                "status": "failed",
+                "created_at": primary_created_at,
+                "finished_at": primary_finished_at,
+                "launcher": primary_route["launcher"],
+                "provider": primary_route["provider"],
+                "model": primary_route["model"],
+                "session_identity": primary_identity,
+                "receipt": {key: value for key, value in primary_receipt.items() if key != "role"},
+            }
+        )
+        write(
+            {
+                "job_id": fallback_receipt["job_id"],
+                "status": fallback_status,
+                "created_at": fallback_created_at,
+                "finished_at": fallback_finished_at if fallback_status == "completed" else None,
+                "launcher": fallback_route["launcher"],
+                "provider": fallback_route["provider"],
+                "model": fallback_route["model"],
+                "session_identity": fallback_identity,
+                "receipt": {key: value for key, value in fallback_receipt.items() if key != "role"},
+            }
+        )
+        body = {
+            "class": "mechanical",
+            "size": "M",
+            "work_kind": "go_coding",
+            "primary_route": primary_route,
+            "primary_receipt": primary_receipt,
+            "fallback_route": fallback_route,
+            "fallback_receipt": fallback_receipt,
+        }
+        if fresh_primary:
+            fresh_identity = identity(primary_route, "fresh-primary-session")
+            fresh_receipt = {
+                "status": "ok",
+                "job_id": "3" * 32,
+                "role": "primary",
+                "session_identity": fresh_identity,
+                "failure_class": "none",
+                "failure_code": "none",
+                "failover_eligible": False,
+                "diagnostic": server.compact_diagnostic("none"),
+            }
+            write(
+                {
+                    "job_id": fresh_receipt["job_id"],
+                    "status": "completed",
+                    "created_at": fresh_created_at,
+                    "finished_at": "2026-08-26T12:02:30Z",
+                    "launcher": primary_route["launcher"],
+                    "provider": primary_route["provider"],
+                    "model": primary_route["model"],
+                    "session_identity": fresh_identity,
+                    "receipt": {key: value for key, value in fresh_receipt.items() if key != "role"},
+                }
+            )
+            body["fresh_primary_receipt"] = fresh_receipt
+        return body
+
+    def test_provider_recovery_remains_valid_after_fallback_slice_head_progression(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            first = self._provider_recovery_fixture(jobs, "provider_network")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, retained, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True,
+                    json.dumps(first).encode(),
+                )
+            self.assertEqual(status, 200, retained)
+            self.assertEqual(
+                (retained["decision"], retained["role"]),
+                ("fallback_retained", "availability_fallback"),
+            )
+
+            # The retained fallback runs the next slice after the H0 commit, so
+            # its new durable job starts at H1.  The following boundary carries
+            # the original primary failure and this latest fallback success.
+            h0, h1 = "a" * 40, "b" * 40
+            following = self._provider_recovery_fixture(
+                jobs,
+                "provider_network",
+                fallback_job_id="4" * 32,
+                fallback_starting_head=h1,
+                fallback_created_at="2026-08-26T12:02:00Z",
+                fallback_finished_at="2026-08-26T12:02:30Z",
+            )
+            self.assertEqual(following["primary_receipt"]["session_identity"]["starting_head"], h0)
+            self.assertEqual(following["fallback_receipt"]["session_identity"]["starting_head"], h1)
+            self.assertTrue((jobs / ("2" * 32) / "job.json").is_file())
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, retained, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True,
+                    json.dumps(following).encode(),
+                )
+            self.assertEqual(status, 200, retained)
+            self.assertEqual(
+                (retained["decision"], retained["role"]),
+                ("fallback_retained", "availability_fallback"),
+            )
+            self.assertEqual(retained["evidence"]["primary"]["job_id"], "1" * 32)
+            self.assertEqual(retained["evidence"]["fallback"]["job_id"], "4" * 32)
+
+    def test_provider_recovery_repo_and_branch_mismatches_fail_closed(self):
+        for field, value in (("repo", "other"), ("branch", "other")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(jobs, "provider_network")
+                fallback_identity = {
+                    **body["fallback_receipt"]["session_identity"],
+                    field: value,
+                }
+                body["fallback_receipt"]["session_identity"] = fallback_identity
+                stored_path = jobs / body["fallback_receipt"]["job_id"] / "job.json"
+                stored = json.loads(stored_path.read_text())
+                stored["session_identity"] = fallback_identity
+                stored["receipt"]["session_identity"] = fallback_identity
+                stored_path.write_text(json.dumps(stored) + "\n")
+
+                # The fallback receipt still matches its own durable job.  It
+                # must nevertheless be rejected against the primary evidence.
+                self.assertEqual(stored["session_identity"], fallback_identity)
+                self.assertEqual(stored["receipt"]["session_identity"], fallback_identity)
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
+                    status, payload = server.derive_slice_recovery_route(body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "recovery_evidence_mismatch")
+
+    def test_provider_recovery_rejects_own_job_head_mismatch_and_out_of_order_fallback(self):
+        cases = ("own_job_head_mismatch", "out_of_order")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(
+                    jobs,
+                    "provider_network",
+                    fallback_created_at=(
+                        "2026-08-26T11:59:00Z"
+                        if case == "out_of_order"
+                        else "2026-08-26T12:00:30Z"
+                    ),
+                    fallback_finished_at=(
+                        "2026-08-26T12:00:00Z"
+                        if case == "out_of_order"
+                        else "2026-08-26T12:01:00Z"
+                    ),
+                )
+                if case == "own_job_head_mismatch":
+                    body["fallback_receipt"]["session_identity"] = {
+                        **body["fallback_receipt"]["session_identity"],
+                        "starting_head": "b" * 40,
+                    }
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
+                    status, payload = server.derive_slice_recovery_route(body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    payload["code"],
+                    (
+                        "recovery_evidence_mismatch"
+                        if case == "own_job_head_mismatch"
+                        else "stale_recovery_evidence"
+                    ),
+                    payload,
+                )
+
+    def test_provider_recovery_re_resolves_missing_binary_at_later_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            body = self._provider_recovery_fixture(jobs)
+            configured = root / "bin" / "codex"
+            configured.parent.mkdir()
+            configured.write_text("#!/bin/sh\nexit 99\n")
+            configured.chmod(0o755)
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(configured)}), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True, json.dumps(body).encode()
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["recovery_version"], "provider-recovery-v1")
+            self.assertEqual((payload["decision"], payload["role"]), ("primary_recovered", "primary"))
+            self.assertEqual(payload["selected_route"], body["primary_route"])
+            evidence = payload["evidence"]
+            self.assertEqual(evidence["recovery_version"], "provider-recovery-v1")
+            self.assertEqual(evidence["basis"], "configured_binary_available")
+            self.assertEqual(
+                (evidence["primary"]["provider"], evidence["fallback"]["provider"]),
+                ("openai", "anthropic"),
+            )
+            dumped = json.dumps(evidence)
+            self.assertNotIn(str(root), dumped)
+            for unsafe in ("callback", "token", "stdout", "stderr", "provider_output"):
+                self.assertNotIn(unsafe, dumped.lower())
+
+            configured.unlink()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(configured)}), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, retained, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True, json.dumps(body).encode()
+                )
+            self.assertEqual(status, 200, retained)
+            self.assertEqual((retained["decision"], retained["role"]), ("fallback_retained", "availability_fallback"))
+            self.assertEqual(retained["evidence"]["basis"], "configured_binary_unavailable")
+
+    def test_provider_recovery_remote_failure_needs_later_fresh_primary_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            body = self._provider_recovery_fixture(jobs, "provider_rate_limit")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, retained, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True, json.dumps(body).encode()
+                )
+            self.assertEqual(status, 200, retained)
+            self.assertEqual((retained["decision"], retained["role"]), ("fallback_retained", "availability_fallback"))
+            self.assertEqual(retained["selected_route"], body["fallback_route"])
+            self.assertEqual(retained["evidence"]["basis"], "fresh_primary_success_required")
+
+            recovered = self._provider_recovery_fixture(
+                jobs, "provider_rate_limit", fresh_primary=True
+            )
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True, json.dumps(recovered).encode()
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual((payload["decision"], payload["role"]), ("primary_recovered", "primary"))
+            self.assertEqual(payload["evidence"]["basis"], "fresh_primary_success")
+            self.assertEqual(payload["evidence"]["fresh_primary"]["job_id"], "3" * 32)
+
+    def test_recovered_primary_refailure_drops_consumed_fresh_success_before_next_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            initial = self._provider_recovery_fixture(
+                jobs, "provider_network", fresh_primary=True
+            )
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(
+                     server,
+                     "resolve_launcher_binary_now",
+                     side_effect=AssertionError("remote recovery cannot inspect binaries"),
+                 ):
+                status, recovered = server.derive_slice_recovery_route(initial)
+            self.assertEqual(status, 200, recovered)
+            self.assertEqual(
+                (recovered["decision"], recovered["role"]),
+                ("primary_recovered", "primary"),
+            )
+
+            # The recovered primary is the current writer. It fails, then its
+            # newly derived fallback succeeds at the same slice head.
+            continuation = self._provider_recovery_fixture(
+                jobs,
+                "provider_network",
+                primary_job_id="4" * 32,
+                primary_starting_head="b" * 40,
+                primary_created_at="2026-08-26T12:03:00Z",
+                primary_finished_at="2026-08-26T12:03:30Z",
+                fallback_job_id="5" * 32,
+                fallback_starting_head="b" * 40,
+                fallback_created_at="2026-08-26T12:03:30Z",
+                fallback_finished_at="2026-08-26T12:04:00Z",
+            )
+
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                stale_status, stale = server.derive_slice_recovery_route({
+                    **continuation,
+                    "fresh_primary_receipt": initial["fresh_primary_receipt"],
+                })
+            self.assertEqual(stale_status, 400, stale)
+            self.assertEqual(stale["code"], "stale_recovery_evidence")
+
+            graph = json.loads(
+                (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+            )
+            nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+            for walk_id in ("walk", "walk_e2e"):
+                with self.subTest(walk_id=walk_id):
+                    config = nodes[walk_id]["config"]
+                    self.assertEqual(config["fresh_primary_receipt"], "{{ '' }}")
+                    with mock.patch.object(server, "JOBS_DIR", jobs):
+                        next_status, retained = server.derive_slice_recovery_route(
+                            continuation
+                        )
+                    self.assertEqual(next_status, 200, retained)
+                    self.assertEqual(
+                        (retained["decision"], retained["role"]),
+                        ("fallback_retained", "availability_fallback"),
+                    )
+                    self.assertEqual(
+                        retained["evidence"]["basis"],
+                        "fresh_primary_success_required",
+                    )
+
+    def test_fallback_handler_and_recovery_share_dict_policy_without_code_collapse(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            body = self._provider_recovery_fixture(jobs)
+            fallback_request = {
+                key: body[key]
+                for key in (
+                    "class", "size", "work_kind", "primary_route",
+                    "primary_receipt",
+                )
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                helper_status, helper_payload = server.derive_slice_fallback_route(
+                    fallback_request
+                )
+                handler_status, handler_payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/fallback", {}, True,
+                    json.dumps(fallback_request).encode(),
+                )
+            self.assertEqual(
+                (handler_status, handler_payload),
+                (helper_status, helper_payload),
+            )
+
+            malformed = self._provider_recovery_fixture(jobs)
+            malformed["primary_receipt"]["failover_eligible"] = "true"
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "slice_route_fallback", wraps=server.slice_route_fallback) as http_handler, \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True,
+                    json.dumps(malformed).encode(),
+                )
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(payload["code"], "bad_failover_eligible")
+            http_handler.assert_not_called()
+
+    def test_recovery_handler_is_a_thin_wrapper_over_dict_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            body = self._provider_recovery_fixture(jobs, "provider_rate_limit")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                direct = server.derive_slice_recovery_route(body)
+                handled_status, handled_payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/recovery", {}, True,
+                    json.dumps(body).encode(),
+                )
+            self.assertEqual((handled_status, handled_payload), direct)
+
+    def test_provider_recovery_evidence_fails_closed(self):
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/slice/route/recovery", {}, True,
+            b'{"work_kind":"go_coding"}',
+        )
+        self.assertEqual((status, payload["code"]), (400, "missing_recovery_evidence"))
+
+        cases = (
+            ("malformed", "malformed_recovery_evidence"),
+            ("mismatched", "recovery_evidence_mismatch"),
+            ("durable_mismatch", "recovery_evidence_mismatch"),
+            ("nonterminal", "nonterminal_recovery_evidence"),
+            ("stale", "stale_recovery_evidence"),
+        )
+        for case, expected_code in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(
+                    jobs,
+                    "provider_network" if case == "stale" else "missing_binary",
+                    fallback_status="running" if case == "nonterminal" else "completed",
+                    fresh_primary=case == "stale",
+                    fresh_created_at="2026-08-26T11:59:00Z",
+                )
+                if case == "malformed":
+                    body["fallback_receipt"] = {**body["fallback_receipt"], "job_id": "../bad"}
+                elif case == "mismatched":
+                    body["fallback_route"] = {**body["fallback_route"], "provider": "xai"}
+                elif case == "durable_mismatch":
+                    stored_path = jobs / ("2" * 32) / "job.json"
+                    stored = json.loads(stored_path.read_text())
+                    stored["receipt"]["failure_code"] = "provider_network"
+                    stored_path.write_text(json.dumps(stored) + "\n")
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                     mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/slice/route/recovery", {}, True, json.dumps(body).encode()
+                    )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], expected_code, payload)
+
     def test_route_never_returns_a_profile_named_reviewer(self):
         banned = {"terra", "sol", "sonnet", "opus", "fable"}
         for work_kind in ("go_coding", "typescript_coding", "research_ops"):
@@ -3293,8 +4137,9 @@ while True:
             else:
                 self.assertEqual(config["session_identity"], f"{{{{ CTX.{receipt}.session_identity }}}}")
                 self.assertEqual(config["resume_job_id"], f"{{{{ CTX.{receipt}.resume_job_id }}}}")
-            self.assertIn("TASKS.fallback_route.data.provider", config["provider"])
-            self.assertIn("TASKS.route.data.provider", config["provider"])
+            self.assertIn(f"CTX.{receipt}.session_identity.provider", config["provider"])
+            if node_id != "agent3":
+                self.assertIn("CTX.fallback_receipt.session_identity.provider", config["provider"])
         for receipt in ("record", "record2"):
             outputs = {m["output"] for m in nodes[receipt]["config"]["mappings"]}
             self.assertIn("session_identity", outputs)
@@ -3319,7 +4164,10 @@ while True:
             return False
 
         self.assertEqual([n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")], ["fallback_route"])
-        self.assertEqual([n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/agent/run") and n["config"].get("launcher") == "{{ TASKS.fallback_route.data.launcher }}"], ["agent_fallback"])
+        self.assertEqual(
+            [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/agent/run") and "TASKS.fallback_route.data.launcher" in n["config"].get("launcher", "")],
+            ["agent_fallback"],
+        )
         self.assertTrue(nodes["fallback_route"]["type"].endswith("/v1/slice/route/fallback"))
         gate = nodes["if_initial_fallback_eligible"]
         self.assertEqual(gate["type"], "logic.filter")
@@ -3331,7 +4179,9 @@ while True:
         self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"if_receipt_ok"})
         self.assertEqual([(e["source"], e.get("sourceHandle")) for e in edges if e["target"] == "fallback_route"], [("if_initial_fallback_eligible", "pass")])
 
-        self.assertIn(("fallback_route", "success", "wait_fallback"), edge_triples)
+        self.assertIn(("fallback_route", "success", "join_fallback_start"), edge_triples)
+        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), edge_triples)
+        self.assertIn(("fallback_route_choice", "out", "wait_fallback"), edge_triples)
         self.assertIn(("wait_fallback", "pending", "agent_fallback"), edge_triples)
         self.assertIn(("wait_fallback", "out", "record_fallback"), edge_triples)
         self.assertIn(("record_fallback", "out", "if_fallback_receipt_ok"), edge_triples)
@@ -3344,20 +4194,292 @@ while True:
         cfg = nodes["agent_fallback"]["config"]
         self.assertNotIn("session_identity", cfg)
         self.assertNotIn("resume_job_id", cfg)
+        for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
+            self.assertEqual(
+                cfg[field],
+                f"{{{{ TASKS.fallback_route.data.{field} | default(TASKS.recovery_route.data.selected_route.{field}) }}}}",
+            )
+
+    def test_implement_slice_fallback_templates_resolve_the_actual_later_route(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+
+        def task_paths(template):
+            return re.findall(r"TASKS\.[A-Za-z0-9_.]+", template)
+
+        def resolve(template, values):
+            paths = task_paths(template)
+            for path in paths:
+                if path in values:
+                    return values[path]
+            raise AssertionError(f"no fake value for {template}")
+
+        for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
+            template = nodes["agent_fallback"]["config"][field]
+            fallback_path = f"TASKS.fallback_route.data.{field}"
+            recovery_path = f"TASKS.recovery_route.data.selected_route.{field}"
+            self.assertEqual(task_paths(template), [fallback_path, recovery_path])
+            self.assertEqual(
+                resolve(template, {fallback_path: f"fallback-{field}", recovery_path: f"recovery-{field}"}),
+                f"fallback-{field}",
+            )
+            self.assertEqual(
+                resolve(template, {recovery_path: f"recovery-{field}"}),
+                f"recovery-{field}",
+            )
+
+        for node_id, slot in (
+            ("review1", "reviewer1"), ("review1b", "reviewer1"),
+            ("review2", "reviewer2"), ("review2b", "reviewer2"),
+        ):
+            for field in ("launcher", "provider", "model"):
+                template = nodes[node_id]["config"][field]
+                fallback_path = f"TASKS.fallback_route.data.{slot}_{field}"
+                recovery_path = f"TASKS.recovery_route.data.selected_route.{slot}_{field}"
+                normal_path = f"TASKS.route.data.{slot}_{field}"
+                self.assertEqual(
+                    task_paths(template), [fallback_path, recovery_path, normal_path]
+                )
+                self.assertEqual(
+                    resolve(
+                        template,
+                        {
+                            fallback_path: f"fallback-{field}",
+                            recovery_path: f"recovery-{field}",
+                            normal_path: f"normal-{field}",
+                        },
+                    ),
+                    f"fallback-{field}",
+                )
+
+        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            for field in ("max_turns", "run_budget_seconds"):
+                template = nodes[node_id]["config"][field]
+                self.assertEqual(
+                    task_paths(template),
+                    [
+                        f"TASKS.fallback_route.data.{field}",
+                        f"TASKS.recovery_route.data.selected_route.{field}",
+                        f"TASKS.route.data.{field}",
+                    ],
+                )
+
+        choice = nodes["fallback_route_choice"]
+        self.assertEqual(choice["type"], "transforms.codeExpression")
+        self.assertEqual(choice["config"]["alias"], "fallback_route_choice")
+        choice_code = choice["config"]["code"]["code"]
+        self.assertEqual(
+            task_paths(choice_code),
+            ["TASKS.fallback_route.data", "TASKS.recovery_route.data.selected_route"],
+        )
+        fallback_route = {"launcher": "claude", "provider": "anthropic", "effort": "default"}
+        recovery_route = {"launcher": "codex", "provider": "openai", "effort": "high"}
+        self.assertEqual(
+            resolve(
+                choice_code,
+                {
+                    "TASKS.fallback_route.data": fallback_route,
+                    "TASKS.recovery_route.data.selected_route": recovery_route,
+                },
+            ),
+            fallback_route,
+        )
+        self.assertEqual(
+            resolve(
+                choice_code,
+                {"TASKS.recovery_route.data.selected_route": recovery_route},
+            ),
+            recovery_route,
+        )
+
+    def test_implement_slice_recovery_is_only_a_later_initial_boundary(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        recovery_nodes = [
+            n["id"] for n in graph["spec"]["nodes"]
+            if n["type"].endswith("/v1/slice/route/recovery")
+        ]
+        self.assertEqual(recovery_nodes, ["recovery_route"])
+        self.assertEqual(nodes["recovery_marker"]["type"], "transforms.objectBuilder")
+        marker = {
+            m["output"]: m["expression"]
+            for m in nodes["recovery_marker"]["config"]["mappings"]
+        }
+        self.assertEqual(
+            marker,
+            {"recovery_version": {"kind": "getField", "path": "CTX.INPUT.recovery_version"}},
+        )
+        self.assertEqual(
+            nodes["switch_recovery"]["config"]["cases"][0]["rules"],
+            [{
+                "path": "CTX.recovery_marker.recovery_version",
+                "op": "equals",
+                "value": "provider-recovery-v1",
+            }],
+        )
+        self.assertIn(("ticket_head", "success", "recovery_marker"), triples)
+        self.assertIn(("switch_recovery", "case-0", "recovery_route"), triples)
+        self.assertIn(("switch_recovery", "default", "join_primary_start"), triples)
+        self.assertIn(("recovery_route", "success", "switch_recovery_route"), triples)
+        self.assertIn(("switch_recovery_route", "case-0", "join_fallback_start"), triples)
+        self.assertIn(("switch_recovery_route", "default", "join_primary_start"), triples)
+        self.assertIn(("join_primary_start", "out", "wait"), triples)
+        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
+        self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
+        self.assertIn(("recovery_route", "failure", "recovery_route_fail"), triples)
+        self.assertFalse(any(e["source"] == "recovery_route_fail" for e in edges))
+        terminal_mappings = nodes["recovery_route_fail"]["config"]["mappings"]
+        self.assertEqual([m["id"] for m in terminal_mappings], [f"m{i}" for i in range(1, 6)])
+        self.assertEqual(
+            {m["output"] for m in terminal_mappings},
+            {"diagnostic_version", "status", "workflow", "stage", "summary"},
+        )
+        dumped_terminal = json.dumps(terminal_mappings).lower()
+        for unsafe in ("getfield", "tasks.", "data.error", "callback", "token", "stdout", "stderr", "trace"):
+            self.assertNotIn(unsafe, dumped_terminal)
+
+        recovery_config = nodes["recovery_route"]["config"]
+        for field in (
+            "primary_route", "primary_receipt", "fallback_route", "fallback_receipt",
+            "fresh_primary_receipt",
+        ):
+            self.assertIn(field, recovery_config)
+            if field != "primary_route":
+                self.assertIn("CTX.INPUT.", recovery_config[field])
+
+        route_decisions = {
+            node_id for node_id, node in nodes.items()
+            if "/v1/slice/route" in node["type"]
+        }
+        downstream_starts = {
+            "fallback_route", "wait_fallback", "agent_fallback", "record_fallback",
+            "if_fallback_receipt_ok", "wait2", "agent2", "record2", "if_receipt_ok2",
+            "wait3", "agent3", "if_receipt_ok3", "wait_rn1", "agent_rn1",
+            "if_receipt_ok_rn1", "wait_rn2", "agent_rn2", "if_receipt_ok_rn2",
+            "wait_rev1", "review1", "if_review1", "wait_r1b", "review1b",
+            "if_review1b", "wait_rev2", "review2", "if_review2", "wait_r2b",
+            "review2b", "if_review2b",
+        }
+        for start in downstream_starts:
+            seen, pending = set(), [start]
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(e["target"] for e in edges if e["source"] == current)
+            self.assertNotIn("recovery_route", seen - {start}, start)
+            self.assertTrue((seen - {start}).isdisjoint(route_decisions), (start, seen & route_decisions))
+
+        writer_nodes = {
+            node_id for node_id, node in nodes.items()
+            if node["type"].endswith("/v1/agent/run")
+        }
+        self.assertEqual(
+            writer_nodes,
+            {"agent", "agent_fallback", "agent2", "agent3", "agent_rn1", "agent_rn2"},
+        )
+        self.assertEqual(
+            [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
+            ["fallback_route"],
+        )
+
+    def test_implement_slice_active_resumes_are_pinned_to_successful_receipt(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        first_identity = {
+            field: f"{{{{ CTX.fallback_receipt.session_identity.{field} | default(CTX.receipt.session_identity.{field}) }}}}"
+            for field in ("launcher", "provider", "model")
+        }
+        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+            config = nodes[node_id]["config"]
+            for field, expected in first_identity.items():
+                self.assertEqual(config[field], expected, (node_id, field))
+                self.assertNotIn("TASKS.recovery", config[field])
+                self.assertNotIn("TASKS.fallback_route", config[field])
+                self.assertNotIn("TASKS.route", config[field])
+            self.assertEqual(
+                config["session_identity"],
+                "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}",
+            )
         for field in ("launcher", "provider", "model"):
-            self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{field} }}}}")
+            self.assertEqual(
+                nodes["agent3"]["config"][field],
+                f"{{{{ CTX.receipt2.session_identity.{field} }}}}",
+            )
+        self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ CTX.receipt2.session_identity }}")
+
+        for node_id, slot in (
+            ("review1", "reviewer1"), ("review1b", "reviewer1"),
+            ("review2", "reviewer2"), ("review2b", "reviewer2"),
+        ):
+            for field in ("launcher", "provider", "model"):
+                value = nodes[node_id]["config"][field]
+                self.assertIn(f"TASKS.recovery_route.data.selected_route.{slot}_{field}", value)
+                self.assertIn(f"TASKS.fallback_route.data.{slot}_{field}", value)
+                self.assertIn(f"TASKS.route.data.{slot}_{field}", value)
+
+        for node_id, ordinary in (("agent", "route"), ("agent_fallback", "fallback_route")):
+            for field in ("launcher", "provider", "model"):
+                value = nodes[node_id]["config"][field]
+                self.assertIn(f"TASKS.recovery_route.data.selected_route.{field}", value)
+                self.assertIn(f"TASKS.{ordinary}.data.{field}", value)
+            self.assertNotIn("session_identity", nodes[node_id]["config"])
+            self.assertNotIn("resume_job_id", nodes[node_id]["config"])
+
+        for walk_id in ("walk", "walk_e2e"):
+            config = nodes[walk_id]["config"]
+            successful_fallback = "CTX.fallback_receipt.status == 'ok'"
+            self.assertEqual(
+                config["recovery_version"],
+                f"{{{{ 'provider-recovery-v1' if {successful_fallback} else '' }}}}",
+            )
+            self.assertEqual(
+                config["prior_primary_route"],
+                f"{{{{ TASKS.route.data if {successful_fallback} else '' }}}}",
+            )
+            self.assertEqual(
+                config["prior_primary_receipt"],
+                f"{{{{ (CTX.receipt | default(CTX.INPUT.prior_primary_receipt)) if {successful_fallback} else '' }}}}",
+            )
+            self.assertEqual(
+                config["prior_fallback_route"],
+                f"{{{{ (TASKS.fallback_route.data | default(TASKS.recovery_route.data.selected_route)) if {successful_fallback} else '' }}}}",
+            )
+            self.assertEqual(
+                config["prior_fallback_receipt"],
+                f"{{{{ CTX.fallback_receipt if {successful_fallback} else '' }}}}",
+            )
+            self.assertEqual(
+                config["fresh_primary_receipt"],
+                "{{ '' }}",
+            )
 
     def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+            cfg = nodes[node_id]["config"]
+            for field in ("launcher", "provider", "model"):
+                self.assertEqual(cfg[field], f"{{{{ CTX.fallback_receipt.session_identity.{field} | default(CTX.receipt.session_identity.{field}) }}}}")
+        for field in ("launcher", "provider", "model"):
+            self.assertEqual(nodes["agent3"]["config"][field], f"{{{{ CTX.receipt2.session_identity.{field} }}}}")
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
-            for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-                self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{field} | default(TASKS.route.data.{field}) }}}}")
+            for field in ("max_turns", "run_budget_seconds"):
+                self.assertIn(f"TASKS.recovery_route.data.selected_route.{field}", cfg[field])
+                self.assertIn(f"TASKS.fallback_route.data.{field}", cfg[field])
+                self.assertIn(f"TASKS.route.data.{field}", cfg[field])
         for node_id, slot in (("review1", "reviewer1"), ("review1b", "reviewer1"), ("review2", "reviewer2"), ("review2b", "reviewer2")):
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
-                self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{slot}_{field} | default(TASKS.route.data.{slot}_{field}) }}}}")
+                self.assertIn(f"TASKS.recovery_route.data.selected_route.{slot}_{field}", cfg[field])
+                self.assertIn(f"TASKS.fallback_route.data.{slot}_{field}", cfg[field])
+                self.assertIn(f"TASKS.route.data.{slot}_{field}", cfg[field])
         for node_id in ("agent2", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
             self.assertEqual(cfg["session_identity"], "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}")
@@ -3497,7 +4619,7 @@ while True:
                 stack.extend(e["target"] for e in edges if e["source"] == current)
             self.assertTrue(writer_ids.isdisjoint(seen), (start, writer_ids & seen))
         done = {m["output"]: m["expression"] for m in nodes["done"]["config"]["mappings"]}
-        for field, path in (("primary_receipt", "CTX.receipt"), ("fallback_receipt", "CTX.fallback_receipt"), ("primary_route", "TASKS.route.data"), ("fallback_route", "TASKS.fallback_route.data")):
+        for field, path in (("primary_receipt", "CTX.receipt"), ("fallback_receipt", "CTX.fallback_receipt"), ("primary_route", "TASKS.route.data"), ("fallback_route", "CTX.fallback_route_choice")):
             self.assertEqual(done[field], {"kind": "getField", "path": path})
         self.assertEqual(done["primary_diagnostic"], {"kind": "getField", "path": "CTX.receipt.diagnostic"})
         self.assertEqual(done["fallback_diagnostic"], {"kind": "getField", "path": "CTX.fallback_receipt.diagnostic"})
@@ -3666,7 +4788,26 @@ while True:
             m["output"]: m["expression"] for m in implement_nodes["record2"]["config"]["mappings"]
         }
         self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "TASKS.route.data"})
-        self.assertEqual(retry_mappings["fallback_route"], {"kind": "getField", "path": "TASKS.fallback_route.data"})
+        self.assertEqual(
+            retry_mappings["fallback_route"],
+            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+        )
+        fallback_mappings = {
+            m["output"]: m["expression"]
+            for m in implement_nodes["record_fallback"]["config"]["mappings"]
+        }
+        self.assertEqual(
+            fallback_mappings["route"],
+            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+        )
+        done_mappings = {
+            m["output"]: m["expression"]
+            for m in implement_nodes["done"]["config"]["mappings"]
+        }
+        self.assertEqual(
+            done_mappings["fallback_route"],
+            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+        )
 
         drive = json.loads((root / "pr-drive.json").read_text())
         drive_nodes = {n["id"]: n for n in drive["spec"]["nodes"]}
@@ -3739,26 +4880,62 @@ while True:
                 return FakeProc((json.dumps(event) + "\n").encode())
             return FakeProc(b"VERDICT: PASS\n")
 
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
-             mock.patch.object(server.Path, "is_file", lambda self: True), \
-             mock.patch.object(server.subprocess, "run", fake_run):
-            codex = server.native_review_result(
-                "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
-            )
-            claude = server.native_review_result(
-                "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td)
-            )
-        self.assertEqual((codex["verdict"], claude["verdict"]), ("PASS", "PASS"))
+        with tempfile.TemporaryDirectory() as td:
+            codex_bin = Path(td) / "codex"
+            claude_bin = Path(td) / "claude"
+            codex_bin.write_text("fixture")
+            claude_bin.write_text("fixture")
+            with mock.patch.dict(os.environ, {
+                     "GRAPHWING_CODEX_BIN": str(codex_bin),
+                     "GRAPHWING_CLAUDE_BIN": str(claude_bin),
+                 }), \
+                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+                 mock.patch.object(server.subprocess, "run", fake_run):
+                codex = server.native_review_result(
+                    "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+                )
+                claude = server.native_review_result(
+                    "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td)
+                )
+        grok, grok_capture = self._run_grok_review_fixture()
+        self.assertEqual(
+            (codex["verdict"], claude["verdict"], grok["verdict"]),
+            ("PASS", "PASS", "PASS"),
+        )
         codex_cmd, codex_kwargs = commands[0]
         self.assertEqual(codex_cmd[codex_cmd.index("--sandbox") + 1], "read-only")
+        self.assertNotIn("workspace-write", codex_cmd)
         self.assertIn("model_reasoning_effort=high", codex_cmd)
         self.assertEqual(codex_cmd[codex_cmd.index("--model") + 1], "gpt-5.6-sol")
         self.assertIn("input", codex_kwargs)
         claude_cmd, _ = commands[1]
         self.assertEqual(claude_cmd[claude_cmd.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude_cmd)
         self.assertEqual(claude_cmd[claude_cmd.index("--model") + 1], "claude-sonnet-5")
         self.assertEqual(claude_cmd[claude_cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
+        self.assertEqual(
+            grok_capture["argv"],
+            ["agent", "--model", "grok-4.6", "stdio"],
+        )
+        initialize = next(
+            request for request in grok_capture["requests"]
+            if request["method"] == "initialize"
+        )
+        self.assertEqual(initialize["params"]["clientCapabilities"], {
+            "fs": {"readTextFile": False, "writeTextFile": False},
+            "terminal": False,
+        })
+
+    def test_grok_review_permission_request_is_denied_and_fails_closed(self):
+        result, capture = self._run_grok_review_fixture({"permission_request": True})
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["no_verdict"], result)
+        self.assertEqual(result["summary"], "Grok review requested tool permission")
+        self.assertEqual(capture["permission_response"], {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "result": {"outcome": {"outcome": "cancelled"}},
+        })
 
     def test_direct_review_failures_never_pass(self):
         class FakeProc:
@@ -3783,11 +4960,13 @@ while True:
             (OSError("spawn failed"), "review_failed"),
         )
         with tempfile.TemporaryDirectory() as td:
+            codex = Path(td) / "codex"
+            codex.write_text("fixture")
             for outcome, code in cases:
                 effect = outcome if isinstance(outcome, BaseException) else None
                 with self.subTest(outcome=type(outcome).__name__, code=code), \
+                     mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                      mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
-                     mock.patch.object(server.Path, "is_file", lambda self: True), \
                      mock.patch.object(
                          server.subprocess, "run",
                          side_effect=effect,
@@ -3799,20 +4978,26 @@ while True:
                 self.assertFalse(result["ok"], result)
                 if code:
                     self.assertEqual(result["code"], code)
-        with mock.patch.object(server.Path, "is_file", lambda self: False):
-            missing = server.native_review_result(
-                "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
-            )
+            with mock.patch.dict(
+                os.environ, {"GRAPHWING_CODEX_BIN": str(Path(td) / "missing-codex")}
+            ):
+                missing = server.native_review_result(
+                    "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+                )
         self.assertFalse(missing["ok"])
         self.assertEqual(missing["code"], "not_implemented")
 
     def test_grok_review_reuses_the_direct_acp_launcher(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
+            grok = Path(td) / "grok"
+            grok.write_text("fixture")
             job_id = "ab" * 16
             (jobs / job_id).mkdir(parents=True)
 
-            def fake_acp(job):
+            def fake_acp(job, binary, *, mode):
+                self.assertEqual(binary, grok)
+                self.assertEqual(mode, "review")
                 self.assertEqual(job["response_webhook_url"], "https://example.invalid/resume")
                 path = jobs / job["job_id"]
                 path.joinpath("last-message.txt").write_text(json.dumps({
@@ -3822,8 +5007,7 @@ while True:
                 return 0, False, "grok-review-session", None
 
             with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "GROK_BIN", Path(td) / "grok"), \
-                 mock.patch.object(server.Path, "is_file", lambda self: True), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
                  mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
                  mock.patch.object(server, "run_grok_acp", fake_acp):
                 server.write_job({
@@ -4588,7 +5772,8 @@ while True:
         self.assertEqual(edges["e7j"]["target"], "route")
         self.assertEqual(edges["e7k"]["target"], "ticket_head")
         self.assertEqual(edges["e7b"]["source"], "ticket_head")
-        self.assertEqual(edges["e7b"]["target"], "wait")
+        self.assertEqual(edges["e7b"]["target"], "recovery_marker")
+        self.assertEqual(edges["e_primary_start"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
         self.assertEqual(edges["e12"]["target"], "join_walk")
@@ -4599,10 +5784,11 @@ while True:
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
-        self.assertEqual(agent["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
+        self.assertIn("TASKS.recovery_route.data.selected_route.launcher", agent["config"]["launcher"])
+        self.assertIn("TASKS.route.data.launcher", agent["config"]["launcher"])
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
-        self.assertIn("TASKS.fallback_route.data.launcher", agent2["config"]["launcher"])
-        self.assertIn("TASKS.route.data.launcher", agent2["config"]["launcher"])
+        self.assertIn("CTX.fallback_receipt.session_identity.launcher", agent2["config"]["launcher"])
+        self.assertIn("CTX.receipt.session_identity.launcher", agent2["config"]["launcher"])
         self.assertEqual(edges["e7j"]["target"], "route")
         self.assertEqual(edges["e_commit_first"]["target"], "join_switch_rev")
         self.assertEqual(edges["e_join_switch_rev"]["target"], "map_switch_rev")
@@ -4712,6 +5898,63 @@ while True:
         )
         fallback_request = spec["components"]["schemas"]["SliceRouteFallbackRequest"]
         self.assertEqual(set(fallback_request["required"]), {"work_kind", "primary_route", "primary_receipt"})
+
+    def test_provider_recovery_contract_is_declared_in_openapi(self):
+        spec = json.loads(server.openapi_bytes())
+        operation = spec["paths"]["/v1/slice/route/recovery"]["post"]
+        self.assertEqual(operation["operationId"], "sliceRouteRecovery")
+        self.assertEqual(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SliceRouteRecoveryRequest",
+        )
+        self.assertEqual(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SliceRouteRecovery",
+        )
+        request = spec["components"]["schemas"]["SliceRouteRecoveryRequest"]
+        self.assertEqual(
+            set(request["required"]),
+            {
+                "work_kind", "primary_route", "primary_receipt", "fallback_route",
+                "fallback_receipt",
+            },
+        )
+        self.assertIn("fresh_primary_receipt", request["properties"])
+        response = spec["components"]["schemas"]["SliceRouteRecovery"]
+        self.assertEqual(
+            response["properties"]["recovery_version"]["enum"],
+            ["provider-recovery-v1"],
+        )
+        self.assertEqual(
+            set(response["properties"]["decision"]["enum"]),
+            {"primary_recovered", "fallback_retained"},
+        )
+        evidence = spec["components"]["schemas"]["ProviderRecoveryEvidence"]
+        self.assertFalse(evidence["additionalProperties"])
+        self.assertEqual(
+            set(evidence["required"]),
+            {"recovery_version", "basis", "failure_code", "primary", "fallback"},
+        )
+        self.assertEqual(
+            set(evidence["properties"]["failure_code"]["enum"]),
+            set(server.PROVIDER_AVAILABILITY_CODES),
+        )
+        identity = spec["components"]["schemas"]["RecoveryRouteIdentity"]
+        self.assertFalse(identity["additionalProperties"])
+        self.assertEqual(
+            set(identity["required"]),
+            {"job_id", "route_version", "launcher", "provider", "model"},
+        )
+        continued = spec["components"]["schemas"]["SliceContinueRequest"]["properties"]
+        for field in (
+            "recovery_version", "prior_primary_route", "prior_primary_receipt",
+            "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
+        ):
+            self.assertIn(field, continued)
+        self.assertEqual(
+            set(spec["components"]["schemas"]["SliceRoute"]["properties"]["route_version"]["enum"]),
+            {"normal-v1", "availability-fallback-v1"},
+        )
 
     def test_parse_review_verdict(self):
         self.assertEqual(server.parse_review_verdict("noise\nVERDICT: PASS\n")[0], "PASS")

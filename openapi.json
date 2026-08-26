@@ -473,6 +473,22 @@
         }
       }
     },
+    "/v1/slice/route/recovery": {
+      "post": {
+        "operationId": "sliceRouteRecovery",
+        "tags": ["slice"],
+        "summary": "At a later explicit invocation boundary, recheck a prior one-hop fallback using durable terminal job evidence. Local missing binaries are re-resolved; remote recovery requires a later successful primary receipt.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRouteRecoveryRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "bounded recovery decision", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRouteRecovery" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/slice/e2e": {
       "post": {
         "operationId": "sliceE2e",
@@ -493,7 +509,7 @@
       "post": {
         "operationId": "reviewRun",
         "tags": ["review"],
-        "summary": "Opposing-vendor review of git diff HEAD through an explicit direct Codex, Claude, or Grok launcher. Does not commit.",
+        "summary": "Read-only opposing-vendor review of git diff HEAD through an explicit direct Codex, Claude, or Grok launcher. Does not edit, commit, or push.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunRequest" } } }
@@ -1154,6 +1170,12 @@
           "size": { "type": "string", "enum": ["S", "M", "L"] },
           "ac_count": { "type": ["integer", "string"] },
           "seams": { "type": ["integer", "string"] },
+          "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"], "description": "Explicit later-invocation recovery marker. Omit it and every recovery evidence field for an ordinary continuation; otherwise the exact version and all four prior route/receipt objects are required." },
+          "prior_primary_route": { "$ref": "#/components/schemas/SliceRoute" },
+          "prior_primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
+          "prior_fallback_route": { "$ref": "#/components/schemas/SliceRoute" },
+          "prior_fallback_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
+          "fresh_primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
           "kick_url": { "type": "string", "format": "uri", "description": "https Rewst webhook to start the next slice. Omitted: return frontier only." },
           "kick_token": { "type": "string" }
         }
@@ -1190,6 +1212,25 @@
           "primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" }
         }
       },
+      "SliceRouteRecoveryRequest": {
+        "type": "object",
+        "required": ["work_kind", "primary_route", "primary_receipt", "fallback_route", "fallback_receipt"],
+        "properties": {
+          "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
+          "size": { "type": "string", "enum": ["S", "M", "L"] },
+          "ac_count": { "type": "integer" },
+          "seams": { "type": "integer" },
+          "primary_route": { "$ref": "#/components/schemas/SliceRoute" },
+          "primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
+          "fallback_route": { "$ref": "#/components/schemas/SliceRoute" },
+          "fallback_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
+          "fresh_primary_receipt": { "$ref": "#/components/schemas/AgentReceipt", "description": "For remote provider failures only: a distinct successful normal-primary job created no earlier than the prior fallback finished." }
+        }
+      },
+      "RecoveryRouteIdentity": { "type": "object", "required": ["job_id", "route_version", "launcher", "provider", "model"], "additionalProperties": false, "properties": { "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "route_version": { "type": "string", "enum": ["normal-v1", "availability-fallback-v1"] }, "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] }, "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] }, "model": { "type": "string" } } },
+      "ProviderRecoveryEvidence": { "type": "object", "required": ["recovery_version", "basis", "failure_code", "primary", "fallback"], "additionalProperties": false, "description": "Compact route/job identities only. No paths, callbacks, secrets, raw provider output, or traces.", "properties": { "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"] }, "basis": { "type": "string", "enum": ["configured_binary_available", "configured_binary_unavailable", "fresh_primary_success_required", "fresh_primary_success"] }, "failure_code": { "type": "string", "enum": ["missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx"] }, "primary": { "$ref": "#/components/schemas/RecoveryRouteIdentity" }, "fallback": { "$ref": "#/components/schemas/RecoveryRouteIdentity" }, "fresh_primary": { "$ref": "#/components/schemas/RecoveryRouteIdentity" } } },
+      "SliceRouteRecovery": { "type": "object", "required": ["ok", "recovery_version", "decision", "role", "selected_route", "evidence"], "additionalProperties": false, "properties": { "ok": { "type": "boolean" }, "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"] }, "decision": { "type": "string", "enum": ["primary_recovered", "fallback_retained"] }, "role": { "type": "string", "enum": ["primary", "availability_fallback"] }, "selected_route": { "$ref": "#/components/schemas/SliceRoute" }, "evidence": { "$ref": "#/components/schemas/ProviderRecoveryEvidence" } } },
       "SliceRoute": {
         "type": "object",
         "properties": {

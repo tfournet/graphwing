@@ -74,14 +74,38 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst trigger. Th
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
 Completed writer callbacks carry a `diagnostic-v1` object with a stable code, evidence
-kind, and canned summary; pre-callback action/wait failures use canned stage receipts.
+kind, and canned summary; pre-callback action/wait failures use compact diagnostic stage
+receipts.
 Every failover-eligible writer outcome remains
 `provider_availability`, including a missing writer binary and structured provider
 authentication or network evidence. `local_infrastructure` describes stack, port,
 health, command, and configuration checks only; a missing non-writer executable is
 `local_binary_missing`, not provider availability. The closed launcher failure taxonomy
-and one-hop fallback gate are unchanged. Receipts never copy callback data, paths,
-provider output, or traces.
+and one-hop fallback gate are unchanged. Only compact diagnostics and provider-recovery
+evidence are claimed sanitized: they never copy callback data, paths, provider output,
+or traces. Other `AgentReceipt` fields retain their documented artifact values and are
+not covered by that claim.
+
+Provider recovery is a new invocation decision, never an active-session decision.
+After a successful one-hop fallback, a later manual/webhook payload may set
+`recovery_version: provider-recovery-v1` and supply the prior primary/fallback routes
+and receipts. The recovery endpoint re-reads both terminal job files. Missing,
+malformed, mismatched, nonterminal, or out-of-order evidence stops the run. A prior
+successful fallback is the only recovery state both continuation paths carry forward;
+a normal or recovered-primary run omits the marker.
+`missing_binary` is rechecked with the same request-time resolver used by `agentRun`
+preflight and worker launch; an explicit `GRAPHWING_<LAUNCHER>_BIN` remains
+authoritative. Authentication, quota, rate, network, overload, and 5xx
+failures stay on fallback unless the payload also supplies a distinct, later successful
+normal-primary job receipt. The check never invokes a launcher or provider. Corrections
+and review-nack resumes remain pinned to the successful session receipt selected at the
+start of that invocation.
+
+Lane 66 did not run or publish a live Rewst canary. Catalog fixtures assert the
+`CTX.<objectBuilder alias>.<field>` recovery-switch path and fallback precedence, using
+the alias convention recorded in issue-52 git history, but they do not prove how a live
+tenant version will evaluate those expressions. Publish/canary verification remains a
+separate runtime step.
 
 ## Drive a PR to green
 
@@ -131,7 +155,7 @@ without a `run_id`, so a hand-rolled curl cannot merge anything.
 
 | Slug | When |
 |---|---|
-| `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`; success includes stack/port diagnostics and action failures terminate with sanitized stage receipts. |
+| `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`; success includes stack/port diagnostics and action failures terminate with compact diagnostic stage receipts. |
 | `graphwing-pr-status` | Read-only PR checks. Unauthenticated webhook. |
 | `graphwing-pr-drive` | One fix slice when CI is red. Authenticated webhook / doorbell OIDC. |
 
