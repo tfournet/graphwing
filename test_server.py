@@ -6329,6 +6329,7 @@ while True:
 
     def test_rollout_docs_name_proof_levels_commands_and_safety_limits(self):
         root = Path(__file__).resolve().parent
+        readme_source = (root / "README.md").read_text()
         operator_source = (root / "docs" / "HUMAN-LOOP.md").read_text()
         operator = operator_source.lower()
         for label in ("fixture proof", "catalog/import proof", "published proof", "live canary proof"):
@@ -6360,16 +6361,89 @@ while True:
         self.assertEqual(loader.loadTestsFromNames(documented).countTestCases(), len(focused))
         self.assertFalse(loader.errors, loader.errors)
 
-        catalog = (root / "graphs" / "README.md").read_text().lower()
-        using = (root / "docs" / "USING.md").read_text().lower()
-        self.assertNotIn("`kick_url` starts the next", catalog)
-        for statement in (
-            "known broken and unusable", ".github/workflows/pr-drive-doorbell.yml",
-            "still sends `pr`", "not rollout proof", "`pr-status` webhook is known non-operational",
-        ):
-            self.assertIn(statement, catalog)
-        self.assertIn("generic catalog wiring", using)
-        self.assertIn("cannot continue", using)
+        topology_caption = (
+            "*Topology-only: webhook starts are known-disabled; use the documented "
+            "manual/form/API starts for `implement-slice` and `pr-drive`; `pr-status` "
+            "has no working start.*"
+        )
+        self.assertIn(
+            '<img src="docs/images/architecture.svg" '
+            'alt="Your computer runs Graphwing. Rewst in the cloud calls it. '
+            'You start work and merge." width="100%">\n</p>\n\n' + topology_caption,
+            readme_source,
+        )
+        self.assertIn(
+            "| `graphwing-pr-status` | `pr` | Source-parity input only; currently "
+            "non-operational through webhook or manual/form/API because `pr` does not "
+            "reach `CTX.INPUT` until that field is renamed/fixed. |",
+            readme_source,
+        )
+
+        catalog_source = (root / "graphs" / "README.md").read_text()
+        self.assertNotIn("`kick_url` starts the next", catalog_source)
+        self.assertIn(
+            "Use a manual/form or `/workflows/{slug}/run` start with "
+            '`{ "input": {...} }` only for `implement-slice` and `pr-drive`. '
+            "`pr-status` has no working start: its sole trigger input is named `pr`, "
+            "and that field does not reach `CTX.INPUT` through webhook or "
+            "manual/form/API until it is renamed/fixed.",
+            catalog_source,
+        )
+        self.assertIn(
+            "`.github/workflows/pr-drive-doorbell.yml` has two independent defects: "
+            "the current webhook-to-`CTX.INPUT` mapping is broken, and it sends `pr` "
+            "while `pr-drive` consumes `pr_number`.",
+            catalog_source,
+        )
+        doorbell_source = (root / ".github" / "workflows" / "pr-drive-doorbell.yml").read_text()
+        doorbell_body = next(line for line in doorbell_source.splitlines() if "printf -v body" in line)
+        self.assertIn('"pr":"', doorbell_body)
+        self.assertNotIn('"pr_number":"', doorbell_body)
+
+        pr_drive = json.loads((root / "graphs" / "pr-drive.json").read_text())
+        nodes = {node["id"]: node for node in pr_drive["spec"]["nodes"]}
+        self.assertEqual(nodes["view"]["config"]["number"], "{{ CTX.INPUT.pr_number }}")
+        self.assertIn(
+            "| `graphwing-pr-status` | `pr` | source-parity input only; currently "
+            "non-operational through webhook or manual/form/API because `pr` does not "
+            "reach `CTX.INPUT` until that field is renamed/fixed; intended "
+            "classification is remote-only and performs no named-test job or git write |",
+            catalog_source,
+        )
+
+        using_source = (root / "docs" / "USING.md").read_text()
+        self.assertIn("generic catalog wiring", using_source)
+        self.assertIn("cannot continue", using_source)
+        self.assertIn(
+            "| `graphwing-pr-status` | No working start today: its source-parity `pr` "
+            "input does not reach `CTX.INPUT` through webhook or manual/form/API until "
+            "that field is renamed/fixed. |",
+            using_source,
+        )
+
+        pr_status_path = root / "graphs" / "pr-status.json"
+        pr_status_raw = pr_status_path.read_bytes()
+        pr_status = json.loads(pr_status_raw)
+        old_description = (
+            "Read-only remote PR status. Never creates named-test evidence or writes git; "
+            "remote_ready still requires final named-test evidence before merge. Payload: pr."
+        )
+        expected_description = (
+            "Read-only remote PR status is currently non-operational: its sole trigger input "
+            "pr does not reach CTX.INPUT through webhook or manual/form/API until that field "
+            "is renamed/fixed. Never creates named-test evidence or writes git; remote_ready "
+            "still requires final named-test evidence before merge. Payload: pr."
+        )
+        self.assertEqual(pr_status["description"], expected_description)
+        self.assertNotEqual(pr_status["description"], old_description)
+        compact = pr_status_raw.rstrip(b"\r\n")
+        spec_marker = b'"spec":'
+        spec_bytes = compact[compact.index(spec_marker) + len(spec_marker):-1]
+        self.assertEqual(json.loads(spec_bytes), pr_status["spec"])
+        self.assertEqual(
+            hashlib.sha256(spec_bytes).hexdigest(),
+            "206462e492ec75f4dc32d9e1caaed508c91dcc8d5cbdcd92a60d1474874dd509",
+        )
 
     def test_pr_status_graph_is_read_only_and_unauthenticated(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "pr-status.json"
