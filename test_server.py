@@ -4374,10 +4374,11 @@ while True:
                 (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
             )
             nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
-            for walk_id in ("walk", "walk_e2e"):
+            for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
                 with self.subTest(walk_id=walk_id):
                     config = nodes[walk_id]["config"]
-                    self.assertEqual(config["fresh_primary_receipt"], "{{ '' }}")
+                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.fresh_primary_receipt }}}}")
+                    self.assertIn("'fresh_primary_receipt': ''", nodes[alias]["config"]["code"]["code"])
                     with mock.patch.object(server, "JOBS_DIR", jobs):
                         next_status, retained = server.derive_slice_recovery_route(
                             continuation
@@ -4626,6 +4627,78 @@ while True:
         labels = [c["label"] for c in nodes["switch_checks"]["config"]["cases"]]
         self.assertLess(labels.index("blocked_by_findings"), labels.index("green"))
 
+    def test_implement_slice_rewst_templates_are_path_valid_and_jinja_lite_safe(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        predecessors = {node_id: set() for node_id in nodes}
+        for edge in graph["edges"]:
+            predecessors[edge["target"]].add(edge["source"])
+
+        roots = {node_id for node_id, incoming in predecessors.items() if not incoming}
+        all_nodes = set(nodes)
+        dominators = {
+            node_id: ({node_id} if node_id in roots else set(all_nodes))
+            for node_id in nodes
+        }
+        while True:
+            updated = {}
+            for node_id, incoming in predecessors.items():
+                common = set.intersection(*(dominators[pred] for pred in incoming)) if incoming else set()
+                updated[node_id] = {node_id} | common
+            if updated == dominators:
+                break
+            dominators = updated
+
+        task_reference = re.compile(r"TASKS\.([A-Za-z0-9_]+)")
+        path_errors = []
+        jinja_lite_errors = []
+        forbidden_jinja_lite = re.compile(r"(?:\{%-?|==|!=|\bif\b|\belse\b|\band\b|\bor\b)")
+        for node_id, node in nodes.items():
+            dumped = json.dumps(node.get("config", {}))
+            for alias in sorted(set(task_reference.findall(dumped))):
+                if alias not in dominators[node_id]:
+                    path_errors.append(f"{node_id} references non-dominating TASKS.{alias}")
+            if node["type"].startswith("action."):
+                def scan(value, path):
+                    if isinstance(value, str):
+                        if "{%" in value:
+                            jinja_lite_errors.append(f"{node_id}.{path}")
+                        for expression in re.findall(r"{{(.*?)}}", value, re.DOTALL):
+                            if forbidden_jinja_lite.search(expression):
+                                jinja_lite_errors.append(f"{node_id}.{path}")
+                    elif isinstance(value, dict):
+                        for key, child in value.items():
+                            scan(child, f"{path}.{key}" if path else key)
+                    elif isinstance(value, list):
+                        for index, child in enumerate(value):
+                            scan(child, f"{path}[{index}]")
+                scan(node.get("config", {}), "config")
+
+        self.assertEqual(path_errors, [])
+        self.assertEqual(jinja_lite_errors, [])
+
+        indegree = {node_id: 0 for node_id in nodes}
+        outgoing = {node_id: [] for node_id in nodes}
+        for edge in graph["edges"]:
+            indegree[edge["target"]] += 1
+            outgoing[edge["source"]].append(edge["target"])
+        self.assertTrue(all(
+            indegree[node_id] < 2 or nodes[node_id]["type"].startswith("logic.join.")
+            for node_id in nodes
+        ))
+        pending = [node_id for node_id, degree in indegree.items() if degree == 0]
+        visited = []
+        while pending:
+            node_id = pending.pop()
+            visited.append(node_id)
+            for target in outgoing[node_id]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    pending.append(target)
+        self.assertEqual(set(visited), set(nodes), "implement-slice graph must remain acyclic")
+
     def test_async_gates_wait_for_the_result_not_the_ack(self):
         # testRun and reviewRun return a queue receipt ({"ok": true,
         # "status": "queued"}). The graph used to feed that straight into a
@@ -4672,7 +4745,7 @@ while True:
         self.assertEqual(nodes["join_receipt_fail"]["type"], "logic.join.any")
         self.assertTrue(any(e["source"] == "join_receipt_fail" and e["target"] == "receipt_fail" for e in edges))
         self.assertEqual(nodes["join_writer_success"]["type"], "logic.join.any")
-        self.assertTrue(any(e["source"] == "join_writer_success" and e["target"] == "wait_test" for e in edges))
+        self.assertTrue(any(e["source"] == "join_writer_success" and e["target"] == "active_route" for e in edges))
 
     def test_native_retry_writers_use_recorded_receipts_only(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -4703,152 +4776,62 @@ while True:
 
     def test_implement_slice_initial_availability_fallback_topology(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
-        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in graph["spec"]["edges"]}
+        self.assertIn(("if_initial_fallback_eligible", "pass", "fallback_route"), triples)
+        self.assertIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), triples)
+        self.assertIn(("if_initial_fallback_eligible", "fail", "join_receipt_fail"), triples)
         edges = graph["spec"]["edges"]
-        edge_triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
-        def reaches(start, target):
-            seen = set()
-            stack = [start]
-            while stack:
-                cur = stack.pop()
-                if cur == target:
-                    return True
-                if cur in seen:
-                    continue
-                seen.add(cur)
-                stack.extend(e["target"] for e in edges if e["source"] == cur)
-            return False
-
-        self.assertEqual([n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")], ["fallback_route"])
-        self.assertEqual(
-            [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/agent/run") and "TASKS.fallback_route.data.launcher" in n["config"].get("launcher", "")],
-            ["agent_fallback"],
-        )
-        self.assertTrue(nodes["fallback_route"]["type"].endswith("/v1/slice/route/fallback"))
-        gate = nodes["if_initial_fallback_eligible"]
-        self.assertEqual(gate["type"], "logic.filter")
-        rules = [{"path": "status", "op": "equals", "value": "error"}, {"path": "role", "op": "equals", "value": "primary"}, {"path": "failure_class", "op": "equals", "value": "provider_availability"}, {"path": "failover_eligible", "op": "equals", "value": True}]
-        self.assertEqual(gate["config"], {"group": "AND", "rules": rules})
-        self.assertIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), edge_triples)
-        self.assertIn(("if_initial_fallback_eligible", "pass", "fallback_route"), edge_triples)
-        self.assertIn(("if_initial_fallback_eligible", "fail", "join_receipt_fail"), edge_triples)
-        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"if_receipt_ok"})
         self.assertEqual([(e["source"], e.get("sourceHandle")) for e in edges if e["target"] == "fallback_route"], [("if_initial_fallback_eligible", "pass")])
-
-        self.assertIn(("fallback_route", "success", "join_fallback_start"), edge_triples)
-        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), edge_triples)
-        self.assertIn(("fallback_route_choice", "out", "wait_fallback"), edge_triples)
-        self.assertIn(("wait_fallback", "pending", "agent_fallback"), edge_triples)
-        self.assertIn(("wait_fallback", "out", "record_fallback"), edge_triples)
-        self.assertIn(("record_fallback", "out", "if_fallback_receipt_ok"), edge_triples)
-        self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), edge_triples)
-
+        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"if_receipt_ok"})
+        def reaches(start, target):
+            seen, pending = set(), [start]
+            while pending:
+                current = pending.pop()
+                if current == target:
+                    return True
+                if current not in seen:
+                    seen.add(current)
+                    pending.extend(e["target"] for e in edges if e["source"] == current)
+            return False
         for source in ("if_receipt_ok2", "if_receipt_ok3", "if_receipt_ok_rn1", "if_receipt_ok_rn2", "if_review1", "if_review1b", "if_review2", "if_review2b", "if_test_ok", "if_test_ok2", "if_test_rn1", "if_test_rn2"):
             self.assertFalse(reaches(source, "fallback_route"), source)
             self.assertFalse(reaches(source, "agent_fallback"), source)
-
-        cfg = nodes["agent_fallback"]["config"]
-        self.assertNotIn("session_identity", cfg)
-        self.assertNotIn("resume_job_id", cfg)
+        self.assertEqual(nodes["if_initial_fallback_eligible"]["config"], {
+            "group": "AND",
+            "rules": [
+                {"path": "status", "op": "equals", "value": "error"},
+                {"path": "role", "op": "equals", "value": "primary"},
+                {"path": "failure_class", "op": "equals", "value": "provider_availability"},
+                {"path": "failover_eligible", "op": "equals", "value": True},
+            ],
+        })
+        self.assertIn(("fallback_route", "success", "normal_fallback_candidate"), triples)
+        self.assertIn(("normal_fallback_candidate", "out", "join_fallback_start"), triples)
+        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
+        self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
+        self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), triples)
+        self.assertNotIn("session_identity", nodes["agent_fallback"]["config"])
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-            self.assertEqual(
-                cfg[field],
-                f"{{{{ TASKS.fallback_route.data.{field} | default(TASKS.recovery_route.data.selected_route.{field}) }}}}",
-            )
+            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
 
     def test_implement_slice_fallback_templates_resolve_the_actual_later_route(self):
-        graph = json.loads(
-            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(
+            nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
+            "TASKS.fallback_route.data",
         )
-        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
-
-        def task_paths(template):
-            return re.findall(r"TASKS\.[A-Za-z0-9_.]+", template)
-
-        def resolve(template, values):
-            paths = task_paths(template)
-            for path in paths:
-                if path in values:
-                    return values[path]
-            raise AssertionError(f"no fake value for {template}")
-
-        for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-            template = nodes["agent_fallback"]["config"][field]
-            fallback_path = f"TASKS.fallback_route.data.{field}"
-            recovery_path = f"TASKS.recovery_route.data.selected_route.{field}"
-            self.assertEqual(task_paths(template), [fallback_path, recovery_path])
-            self.assertEqual(
-                resolve(template, {fallback_path: f"fallback-{field}", recovery_path: f"recovery-{field}"}),
-                f"fallback-{field}",
-            )
-            self.assertEqual(
-                resolve(template, {recovery_path: f"recovery-{field}"}),
-                f"recovery-{field}",
-            )
-
-        for node_id, slot in (
-            ("review1", "reviewer1"), ("review1b", "reviewer1"),
-            ("review2", "reviewer2"), ("review2b", "reviewer2"),
-        ):
-            for field in ("launcher", "provider", "model"):
-                template = nodes[node_id]["config"][field]
-                fallback_path = f"TASKS.fallback_route.data.{slot}_{field}"
-                recovery_path = f"TASKS.recovery_route.data.selected_route.{slot}_{field}"
-                normal_path = f"TASKS.route.data.{slot}_{field}"
-                self.assertEqual(
-                    task_paths(template), [fallback_path, recovery_path, normal_path]
-                )
-                self.assertEqual(
-                    resolve(
-                        template,
-                        {
-                            fallback_path: f"fallback-{field}",
-                            recovery_path: f"recovery-{field}",
-                            normal_path: f"normal-{field}",
-                        },
-                    ),
-                    f"fallback-{field}",
-                )
-
-        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
-            for field in ("max_turns", "run_budget_seconds"):
-                template = nodes[node_id]["config"][field]
-                self.assertEqual(
-                    task_paths(template),
-                    [
-                        f"TASKS.fallback_route.data.{field}",
-                        f"TASKS.recovery_route.data.selected_route.{field}",
-                        f"TASKS.route.data.{field}",
-                    ],
-                )
-
+        self.assertEqual(nodes["selected_route"]["config"]["code"]["code"], "{{ CTX.recovery_selection.route | default(CTX.normal_primary_candidate.route) | tojson }}")
+        self.assertEqual(nodes["active_route"]["config"]["code"]["code"], "{{ CTX.fallback_receipt.route | default(CTX.receipt.route) | tojson }}")
         choice = nodes["fallback_route_choice"]
         self.assertEqual(choice["type"], "transforms.codeExpression")
-        self.assertEqual(choice["config"]["alias"], "fallback_route_choice")
-        choice_code = choice["config"]["code"]["code"]
         self.assertEqual(
-            task_paths(choice_code),
-            ["TASKS.fallback_route.data", "TASKS.recovery_route.data.selected_route"],
+            choice["config"]["code"]["code"],
+            "{{ CTX.normal_fallback_candidate.route | default(CTX.recovery_selection.route) | tojson }}",
         )
-        fallback_route = {"launcher": "claude", "provider": "anthropic", "effort": "default"}
-        recovery_route = {"launcher": "codex", "provider": "openai", "effort": "high"}
-        self.assertEqual(
-            resolve(
-                choice_code,
-                {
-                    "TASKS.fallback_route.data": fallback_route,
-                    "TASKS.recovery_route.data.selected_route": recovery_route,
-                },
-            ),
-            fallback_route,
-        )
-        self.assertEqual(
-            resolve(
-                choice_code,
-                {"TASKS.recovery_route.data.selected_route": recovery_route},
-            ),
-            recovery_route,
-        )
+        for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
+            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
 
     def test_implement_slice_recovery_is_only_a_later_initial_boundary(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -4880,10 +4863,21 @@ while True:
         self.assertIn(("ticket_head", "success", "recovery_marker"), triples)
         self.assertIn(("switch_recovery", "case-0", "recovery_route"), triples)
         self.assertIn(("switch_recovery", "default", "join_primary_start"), triples)
-        self.assertIn(("recovery_route", "success", "switch_recovery_route"), triples)
+        self.assertIn(("recovery_route", "success", "recovery_selection"), triples)
+        self.assertIn(("recovery_selection", "out", "switch_recovery_route"), triples)
+        self.assertEqual(nodes["switch_recovery_route"]["config"]["cases"][0]["rules"], [{
+            "path": "CTX.recovery_selection.role", "op": "equals", "value": "availability_fallback",
+        }])
+        recovery_outputs = {m["output"]: m["expression"]["path"] for m in nodes["recovery_selection"]["config"]["mappings"]}
+        self.assertEqual(recovery_outputs, {
+            "route": "TASKS.recovery_route.data.selected_route",
+            "evidence": "TASKS.recovery_route.data.evidence",
+            "role": "TASKS.recovery_route.data.role",
+        })
         self.assertIn(("switch_recovery_route", "case-0", "join_fallback_start"), triples)
         self.assertIn(("switch_recovery_route", "default", "join_primary_start"), triples)
-        self.assertIn(("join_primary_start", "out", "wait"), triples)
+        self.assertIn(("join_primary_start", "out", "selected_route"), triples)
+        self.assertIn(("selected_route", "out", "wait"), triples)
         self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
         self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
         self.assertIn(("recovery_route", "failure", "recovery_route_fail"), triples)
@@ -4975,45 +4969,26 @@ while True:
         ):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                self.assertIn(f"TASKS.recovery_route.data.selected_route.{slot}_{field}", value)
-                self.assertIn(f"TASKS.fallback_route.data.{slot}_{field}", value)
-                self.assertIn(f"TASKS.route.data.{slot}_{field}", value)
+                self.assertEqual(value, f"{{{{ CTX.active_route.{slot}_{field} }}}}")
+                self.assertNotIn("TASKS.", value)
 
         for node_id, ordinary in (("agent", "route"), ("agent_fallback", "fallback_route")):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                self.assertIn(f"TASKS.recovery_route.data.selected_route.{field}", value)
-                self.assertIn(f"TASKS.{ordinary}.data.{field}", value)
+                expected = "CTX.selected_route" if node_id == "agent" else "CTX.fallback_route_choice"
+                self.assertEqual(value, f"{{{{ {expected}.{field} }}}}")
             self.assertNotIn("session_identity", nodes[node_id]["config"])
             self.assertNotIn("resume_job_id", nodes[node_id]["config"])
 
-        for walk_id in ("walk", "walk_e2e"):
+        for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
             config = nodes[walk_id]["config"]
-            successful_fallback = "CTX.fallback_receipt.status == 'ok'"
-            self.assertEqual(
-                config["recovery_version"],
-                f"{{{{ 'provider-recovery-v1' if {successful_fallback} else '' }}}}",
-            )
-            self.assertEqual(
-                config["prior_primary_route"],
-                f"{{{{ TASKS.route.data if {successful_fallback} else '' }}}}",
-            )
-            self.assertEqual(
-                config["prior_primary_receipt"],
-                f"{{{{ (CTX.receipt | default(CTX.INPUT.prior_primary_receipt)) if {successful_fallback} else '' }}}}",
-            )
-            self.assertEqual(
-                config["prior_fallback_route"],
-                f"{{{{ (TASKS.fallback_route.data | default(TASKS.recovery_route.data.selected_route)) if {successful_fallback} else '' }}}}",
-            )
-            self.assertEqual(
-                config["prior_fallback_receipt"],
-                f"{{{{ CTX.fallback_receipt if {successful_fallback} else '' }}}}",
-            )
-            self.assertEqual(
-                config["fresh_primary_receipt"],
-                "{{ '' }}",
-            )
+            for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt", "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
+                self.assertEqual(config[field], f"{{{{ CTX.{alias}.{field} }}}}")
+            code = nodes[alias]["config"]["code"]["code"]
+            self.assertIn("{% if fallback.status | default('') == 'ok' %}", code)
+            self.assertIn("'recovery_version': 'provider-recovery-v1'", code)
+            self.assertIn("{% else %}{{ {'recovery_version': ''", code)
+            self.assertIn("'fresh_primary_receipt': ''", code)
 
     def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -5027,15 +5002,12 @@ while True:
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
             for field in ("max_turns", "run_budget_seconds"):
-                self.assertIn(f"TASKS.recovery_route.data.selected_route.{field}", cfg[field])
-                self.assertIn(f"TASKS.fallback_route.data.{field}", cfg[field])
-                self.assertIn(f"TASKS.route.data.{field}", cfg[field])
+                expected = f"{{{{ CTX.receipt2.route.{field} }}}}" if node_id == "agent3" else f"{{{{ CTX.active_route.{field} }}}}"
+                self.assertEqual(cfg[field], expected)
         for node_id, slot in (("review1", "reviewer1"), ("review1b", "reviewer1"), ("review2", "reviewer2"), ("review2b", "reviewer2")):
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
-                self.assertIn(f"TASKS.recovery_route.data.selected_route.{slot}_{field}", cfg[field])
-                self.assertIn(f"TASKS.fallback_route.data.{slot}_{field}", cfg[field])
-                self.assertIn(f"TASKS.route.data.{slot}_{field}", cfg[field])
+                self.assertEqual(cfg[field], f"{{{{ CTX.active_route.{slot}_{field} }}}}")
         for node_id in ("agent2", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
             self.assertEqual(cfg["session_identity"], "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}")
@@ -5175,7 +5147,7 @@ while True:
                 stack.extend(e["target"] for e in edges if e["source"] == current)
             self.assertTrue(writer_ids.isdisjoint(seen), (start, writer_ids & seen))
         done = {m["output"]: m["expression"] for m in nodes["done"]["config"]["mappings"]}
-        for field, path in (("primary_receipt", "CTX.receipt"), ("fallback_receipt", "CTX.fallback_receipt"), ("primary_route", "TASKS.route.data"), ("fallback_route", "CTX.fallback_route_choice")):
+        for field, path in (("primary_receipt", "CTX.receipt"), ("fallback_receipt", "CTX.fallback_receipt"), ("primary_route", "CTX.receipt.route"), ("fallback_route", "CTX.fallback_receipt.route")):
             self.assertEqual(done[field], {"kind": "getField", "path": path})
         self.assertEqual(done["primary_diagnostic"], {"kind": "getField", "path": "CTX.receipt.diagnostic"})
         self.assertEqual(done["fallback_diagnostic"], {"kind": "getField", "path": "CTX.fallback_receipt.diagnostic"})
@@ -5314,12 +5286,12 @@ while True:
             slot = "reviewer1" if suffix.startswith("1") else "reviewer2"
             config = node["config"]
             self.assertNotIn("reviewer", config)
-            self.assertIn(f"TASKS.fallback_route.data.{slot}_launcher", config["launcher"])
-            self.assertIn(f"TASKS.route.data.{slot}_launcher", config["launcher"])
-            self.assertIn(f"TASKS.fallback_route.data.{slot}_provider", config["provider"])
-            self.assertIn(f"TASKS.route.data.{slot}_provider", config["provider"])
-            self.assertIn(f"TASKS.fallback_route.data.{slot}_model", config["model"])
-            self.assertIn(f"TASKS.route.data.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
         second = nodes["switch_rev2"]["config"]
         self.assertEqual(second["cases"][0]["rules"], [
             {"path": "data.reviewer2_launcher", "op": "equals", "value": "none"}
@@ -5339,11 +5311,11 @@ while True:
         implement = json.loads((root / "implement-slice.json").read_text())
         implement_nodes = {n["id"]: n for n in implement["spec"]["nodes"]}
         mappings = {m["output"]: m["expression"] for m in implement_nodes["record"]["config"]["mappings"]}
-        self.assertEqual(mappings["route"], {"kind": "getField", "path": "TASKS.route.data"})
+        self.assertEqual(mappings["route"], {"kind": "getField", "path": "CTX.selected_route"})
         retry_mappings = {
             m["output"]: m["expression"] for m in implement_nodes["record2"]["config"]["mappings"]
         }
-        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "TASKS.route.data"})
+        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "CTX.active_route"})
         self.assertEqual(
             retry_mappings["fallback_route"],
             {"kind": "getField", "path": "CTX.fallback_route_choice"},
@@ -5362,7 +5334,7 @@ while True:
         }
         self.assertEqual(
             done_mappings["fallback_route"],
-            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+            {"kind": "getField", "path": "CTX.fallback_receipt.route"},
         )
 
         drive = json.loads((root / "pr-drive.json").read_text())
@@ -6488,18 +6460,18 @@ while True:
         self.assertEqual(edges["e_r1b_nack"]["target"], "join_wait_human")
         self.assertEqual(edges["e_r2b_nack"]["target"], "join_wait_human")
         rn1 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent_rn1")
-        self.assertIn("TASKS.review1.data.compact", rn1["config"]["prompt"])
+        self.assertIn("TASKS.wait_rev1.request.body.compact", rn1["config"]["prompt"])
         self.assertEqual(edges["e_rn1_tbad"]["target"], "join_wait_human")
         self.assertEqual(edges["e_rn2_tbad"]["target"], "join_wait_human")
         self.assertNotIn("switch_retry", {node["id"] for node in graph["spec"]["nodes"]})
-        self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
+        self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e_recovery_input")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
         self.assertIn("CTX.fallback_receipt.session_identity", agent2["config"]["session_identity"])
         self.assertIn("CTX.receipt.session_identity", agent2["config"]["session_identity"])
         self.assertIn("CTX.fallback_receipt.resume_job_id", agent2["config"]["resume_job_id"])
         self.assertIn("CTX.receipt.resume_job_id", agent2["config"]["resume_job_id"])
-        self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
+        self.assertIn("TASKS.wait_test.request.body.summary", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
         self.assertNotIn("CTX.INPUT.prompt", agent2["config"]["prompt"])
@@ -6533,22 +6505,24 @@ while True:
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
         self.assertEqual(edges["e7"]["target"], "frontier")
         self.assertEqual(edges["e7j"]["target"], "route")
-        self.assertEqual(edges["e7k"]["target"], "ticket_head")
+        self.assertEqual(edges["e7k"]["target"], "normal_primary_candidate")
+        self.assertEqual(edges["e_normal_primary_candidate"]["target"], "ticket_head")
         self.assertEqual(edges["e7b"]["source"], "ticket_head")
         self.assertEqual(edges["e7b"]["target"], "recovery_marker")
-        self.assertEqual(edges["e_primary_start"]["target"], "wait")
+        self.assertEqual(edges["e_primary_start"]["target"], "selected_route")
+        self.assertEqual(edges["e_selected_route"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
         self.assertEqual(edges["e12"]["target"], "join_walk")
-        self.assertEqual(edges["e_join_walk"]["target"], "walk")
+        self.assertEqual(edges["e_join_walk"]["target"], "walk_recovery_input")
+        self.assertEqual(edges["e_walk_recovery_input"]["target"], "walk")
         self.assertEqual(edges["e7h"]["target"], "join_e2e")
         self.assertEqual(edges["e12d"]["target"], "join_e2e")
         self.assertEqual(edges["e_join_e2e"]["target"], "e2e")
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
-        self.assertIn("TASKS.recovery_route.data.selected_route.launcher", agent["config"]["launcher"])
-        self.assertIn("TASKS.route.data.launcher", agent["config"]["launcher"])
+        self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.launcher }}")
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
         self.assertIn("CTX.fallback_receipt.session_identity.launcher", agent2["config"]["launcher"])
         self.assertIn("CTX.receipt.session_identity.launcher", agent2["config"]["launcher"])
@@ -8517,13 +8491,13 @@ class CodeOffTests(unittest.TestCase):
                 visit(node)
         self.assertNotIn("retry", json.dumps(graph).lower())
 
-    def test_publish_catalog_includes_codeoff_and_existing_implement_slice_is_unchanged(self):
+    def test_publish_catalog_includes_codeoff_and_validated_implement_slice(self):
         source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()
         self.assertIn('"code-off"', source)
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "8e4445cb6570ed9ad3cfd8a16017375c19954c89db5e71f9c5727ae0878378f7")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "044c2381a9f9c400d0a682ee5fe3efdee19b39e53e597ce705389eff89d20a11")
 
 
 class InstallTests(unittest.TestCase):
