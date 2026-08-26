@@ -14,7 +14,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -277,72 +276,24 @@ def install_claude_plugin(non_interactive: bool, opt_in: bool | None) -> None:
 
 
 def install_omarchy_plugin(non_interactive: bool, opt_in: bool | None) -> None:
-    """Copy the bar watcher into ~/.config/omarchy/plugins and enable it.
-
-    Omarchy refuses plugin ids in the omarchy.* namespace and refuses
-    symlinks, so this is a real copy, refreshed on each install.
-    """
-    src = REPO / "plugins" / OMARCHY_PLUGIN_ID
-    dest = Path.home() / ".config/omarchy/plugins" / OMARCHY_PLUGIN_ID
-    omarchy = shutil.which("omarchy")
+    """Run ~/work/graphwing.watch/install.py when that checkout exists."""
+    src = Path.home() / "work" / OMARCHY_PLUGIN_ID
+    installer = src / "install.py"
     if opt_in is None:
-        if not src.is_dir():
+        if not installer.is_file():
             return
-        if omarchy is None and not (Path.home() / ".config/omarchy").is_dir():
+        if shutil.which("omarchy") is None and not (Path.home() / ".config/omarchy").is_dir():
             return
-        opt_in = True if non_interactive else yes("Install the Omarchy bar watcher?", True, False)
+        opt_in = False if non_interactive else yes("Install the Omarchy bar watcher?", True, False)
     if not opt_in:
         print(f"skipped {OMARCHY_PLUGIN_ID}")
         return
-    if not src.is_dir():
+    if not installer.is_file():
         print(f"missing plugin source {src}")
         return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    print(f"copied {OMARCHY_PLUGIN_ID} -> {dest}")
-    if omarchy is None:
-        print(f"enable later with: omarchy plugin enable {OMARCHY_PLUGIN_ID} --section right --before omarchy.agents")
-        return
-    check = subprocess.run(
-        [omarchy, "plugin", "validate", str(dest)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if check.returncode != 0:
-        print("omarchy plugin validate failed")
-        print((check.stderr or check.stdout).strip()[:400])
-        return
-    subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], check=False, capture_output=True, text=True)
-    discovered = False
-    for _ in range(40):
-        listing = subprocess.run(
-            [omarchy, "plugin", "list", "--json"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if listing.returncode == 0 and OMARCHY_PLUGIN_ID in (listing.stdout or ""):
-            discovered = True
-            break
-        time.sleep(0.05)
-    if not discovered:
-        print(f"plugin copied; enable later with: omarchy plugin enable {OMARCHY_PLUGIN_ID}")
-        return
-    enable = subprocess.run(
-        [omarchy, "plugin", "enable", OMARCHY_PLUGIN_ID, "--section", "right", "--before", "omarchy.agents"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if enable.returncode != 0:
-        print("plugin copied; enable later with:")
-        print(f"  omarchy plugin enable {OMARCHY_PLUGIN_ID} --section right --before omarchy.agents")
-        print((enable.stderr or enable.stdout).strip()[:400])
-        return
-    print(f"enabled {OMARCHY_PLUGIN_ID} on the right bar")
+    done = subprocess.run([sys.executable, str(installer)], check=False)
+    if done.returncode != 0:
+        print(f"{OMARCHY_PLUGIN_ID} install failed")
 
 
 def systemd_user(*args: str) -> subprocess.CompletedProcess[str]:

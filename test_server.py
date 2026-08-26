@@ -2620,33 +2620,6 @@ while True:
             self.assertNotIn("token", json.dumps(done))
             self.assertNotIn("nope", json.dumps(payload))
 
-    def test_watch_helper_no_key(self):
-        helper = Path(__file__).resolve().parent / "plugins" / "graphwing.watch" / "status.py"
-        with tempfile.TemporaryDirectory() as td:
-            proc = subprocess.run(
-                [sys.executable, str(helper), td, "8645"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["code"], "no_key")
-
-    def test_watch_helper_focus_requires_label(self):
-        helper = Path(__file__).resolve().parent / "plugins" / "graphwing.watch" / "status.py"
-        proc = subprocess.run(
-            [sys.executable, str(helper), ".", "8645", "focus"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["code"], "missing_tab")
-
     def test_watch_empty_jobs(self):
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(server, "JOBS_DIR", Path(td)), mock.patch.object(
