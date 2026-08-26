@@ -40,7 +40,7 @@ Rewst walks its step list:
 1. Short calls return immediately. `gitStatus`, `testRun`, `fileHead` of the ticket file.
 2. `agentRun` is slow. Graphwing starts one native Codex, Claude, or Grok job and returns 202. Rewst waits on a callback URL. When the job ends, Graphwing POSTs `{ status, summary, sha, … }` and Rewst continues.
 3. If tests fail, files stay on disk. Graphwing does not `git restore`. After a few failed retries it stops and waits for you.
-4. If the ticket is done, Graphwing commits and pushes. The workflow then POSTs *itself* with the next ticket. That is a new run. Rewst will not let one run loop forever.
+4. If the ticket is done, Graphwing commits and pushes. The catalog has a fresh-run `kick_url` edge, but the current webhook-to-`CTX.INPUT` mapping is broken; start the next bounded slice manually or through the API.
 
 The agent sees only that ticket file. It does not see the grill chat or the rest of the epic.
 
@@ -54,13 +54,13 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 
 | Workflow | You pass | It does |
 |---|---|---|
-| `graphwing-implement-slice` | repo, branch, ticket path, test | One ticket: code, test, review, commit. Then start the next ticket. |
-| `graphwing-verify-stack` | stack, ports | Check that a local stack is up. |
-| `graphwing-pr-status` | PR number | Read GitHub checks. No writes. |
-| `graphwing-pr-drive` | repo, PR, test | One fix attempt when CI is red. |
-| `graphwing-code-off` | repo, exact base SHA, 32-byte seed, locked category, task, named tests/toolchain/budgets | Freeze two isolated candidates, obtain three blind structured judgments, promote only a test-green exact winner, then gate commit/push. No redraw, fallback, loop, or merge. |
+| `graphwing-implement-slice` | `repo`, `branch`, `index`, `ticket`, `commit_message`, `test`, `iters_left`, `class`, `work_kind`, `size`, `ac_count`, `seams`, `kick_url`, `kick_token`, `e2e`, `recovery_version`, `prior_primary_route`, `prior_primary_receipt`, `prior_fallback_route`, `prior_fallback_receipt`, `fresh_primary_receipt` | One ticket: route, write, named test, opposing review, complete, commit, push. `diagnostic-v1` receipts are bounded; `provider-recovery-v1` is a later-invocation evidence check, never an active-session switch. |
+| `graphwing-verify-stack` | `stack`, `ports` | Check stack then ports and retain compact diagnostics. |
+| `graphwing-pr-status` | `pr` | Classify fresh remote PR/check state. No named test or writes; `remote_ready` is not merge-safe. |
+| `graphwing-pr-drive` | `repo`, `pr_number`, `attempt`, `max_attempts`, `auto_merge`, `kick_url`, `kick_token`, `test`, `class`, `size`, `work_kind`, `prompt`, `commit_message` | On red, make one bounded fix. Every remote-ready path runs one final persisted, head-bound named test before optional merge. |
+| `graphwing-code-off` | `experiment_id`, `repo`, `base_sha`, `seed`, `category`, `tags`, `category_source`, `prompt`, `tests`, `toolchain`, `budgets`, `commit_message` | Deterministic bounded DAG with two frozen candidates and three blind judgments; only an exact test-green winner can reach commit/push. No redraw, fallback, cycle, or merge. |
 
-How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules for the human: [docs/HUMAN-LOOP.md](docs/HUMAN-LOOP.md).
+The exact catalog input sets are in [graphs/README.md](graphs/README.md). How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules and proof levels: [docs/HUMAN-LOOP.md](docs/HUMAN-LOOP.md).
 
 ## What lives where
 
@@ -89,9 +89,9 @@ GRAPHWING_HOME=. python3 test_server.py
 
 Git write endpoints only work on those short names. No `--force`. No `git add -A` unless you pass paths. Tests and scripts are allowlisted names in `tests.json` / `scripts.json`.
 
-Code-off state is a hash-chained, content-addressed record under `$GRAPHWING_HOME/codeoffs`; audit exposes the seed commitment but never the seed or blind map. Candidate/final tests use the
-same disposable Git-worktree recipe, and only a verified hash is safely applied. Fixed Fable is
-historical/unproven, so production parks before any launcher until a reviewed manifest update.
+Code-off state is a hash-chained, content-addressed record under `$GRAPHWING_HOME/codeoffs`; audit exposes the seed commitment but never the seed or blind map. Candidate/final tests use the same disposable Git-worktree recipe, and only a verified hash is safely applied. Production currently parks before launch because Fable and Terra are unproven/non-runnable. Git worktrees are not OS isolation.
+
+PR merge safety requires the persisted final named-test job plus a fresh open/non-draft, stable-head, merge-ready PR and a nonempty terminal-green GitHub check set. `pr-status`, earlier tests, and code-off receipts cannot waive that gate. This catalog has no visual-proof workflow. Local fixtures or catalog parsing do not establish Rewst import parity, publication, live readiness, or a canary.
 
 Publish workflows after you have `$GRAPHWING_HOME/rewst-install.json` and a Rewst MCP token:
 

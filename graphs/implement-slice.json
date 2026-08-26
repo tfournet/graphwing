@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. Completed primary/fallback callbacks retain diagnostic-v1 evidence; pre-callback failures use compact diagnostic stage receipts, routing remains one-hop, and provider recovery is checked only at a later invocation boundary. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, class, work_kind, iters_left, optional kick_url.",
+  "description": "Walks one bounded slice using the declared trigger inputs documented in the catalog. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. Completed primary/fallback callbacks retain diagnostic-v1 evidence; pre-callback failures use compact diagnostic stage receipts, routing remains one-hop, and provider recovery is checked only at a later invocation boundary. On red, files stay. Chained webhook continuation via kick_url is known-disabled because current webhook runs do not create CTX.INPUT.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
