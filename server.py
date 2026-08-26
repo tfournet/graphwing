@@ -3870,14 +3870,18 @@ def spawn_harness(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, 
     model = str(job.get("model") or "")
     if not model:
         return None, {"error": "missing configured model", "code": "unavailable_provider"}
+    resume_session = job.get("claim_kind") in ("correction", "design")
     if launcher == "claude":
         cmd = [str(CLAUDE_BIN), "-p", "--output-format", "json", "--permission-mode", "acceptEdits",
-               "--max-turns", str(job["max_turns"]), "--add-dir", cwd, "--model", model,
-               "--session-id", str(session), prompt]
+               "--max-turns", str(job["max_turns"]), "--add-dir", cwd, "--model", model]
+        cmd.extend(["--resume", str(session)] if resume_session else ["--session-id", str(session)])
+        cmd.append(prompt)
     elif launcher == "grok":
         cmd = [str(GROK_BIN), "--prompt-file", str(prompt_path), "--output-format", "json",
                "--permission-mode", "acceptEdits", "--no-subagents", "--max-turns", str(job["max_turns"]),
-               "--model", model, "--session-id", str(session), "--cwd", cwd]
+               "--model", model]
+        cmd.extend(["--resume", str(session)] if resume_session else ["--session-id", str(session)])
+        cmd.extend(["--cwd", cwd])
     else:
         if isinstance(session, str) and HARNESS_SESSION_RE.fullmatch(session):
             cmd = [str(CODEX_BIN), "exec", "resume", "--json", "--model", model, session, prompt]
