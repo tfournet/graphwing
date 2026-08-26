@@ -152,7 +152,7 @@ class PublishGraphsTests(unittest.TestCase):
             {"build_id": {"type": "string"}, "event_id": {"type": "string"}},
         )
 
-    def test_upsert_applies_version_config_before_publish(self):
+    def test_upsert_applies_config_before_publish_and_output_schema_after(self):
         calls = []
 
         def fake_api(_mcp, method, path, body=None, timeout=120):
@@ -186,7 +186,7 @@ class PublishGraphsTests(unittest.TestCase):
         self.assertIn(config_call, calls)
         self.assertIn(schema_call, calls)
         self.assertLess(calls.index(config_call), calls.index(publish_call))
-        self.assertLess(calls.index(schema_call), calls.index(publish_call))
+        self.assertGreater(calls.index(schema_call), calls.index(publish_call))
 
     def test_config_parity_reads_fresh_endpoint_and_projects_server_defaults(self):
         expected = {"outputs": [{"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"}]}

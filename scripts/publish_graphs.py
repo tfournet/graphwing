@@ -487,10 +487,10 @@ def upsert_workflow(
         if warnings:
             print("warnings", json.dumps(warnings)[:800])
         apply_workflow_config(mcp, wid, vid, config or {}, slug)
-        apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
         st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
         if st not in (200, 201, 202):
             raise SystemExit(f"publish failed {st} {json.dumps(pub)[:500]}")
+        apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
         print("published", slug, wid, vid)
         return wid, vid, slug
     print(f"create {slug}")
@@ -517,9 +517,9 @@ def upsert_workflow(
     if warnings:
         print("warnings", json.dumps(warnings)[:800])
     apply_workflow_config(mcp, wid, vid, config or {}, slug)
-    apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
     st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
     must(st, pub, label="publish workflow")
+    apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
     print("published", slug, wid, vid)
     return wid, vid, created.get("slug") or slug
 
