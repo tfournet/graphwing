@@ -59,6 +59,41 @@ def catalog_hash(value) -> str:
     return hashlib.sha256(canonical_catalog_bytes(value)).hexdigest()
 
 
+def deployed_openapi_spec() -> dict:
+    """Read the installed catalog copy; repository loopback defaults are not authority."""
+    path = HOME / "openapi.json"
+    try:
+        spec = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"deployed OpenAPI unreadable at {path}: {exc}") from exc
+    if not isinstance(spec, dict):
+        raise SystemExit(f"deployed OpenAPI unreadable at {path}")
+    return spec
+
+
+def fetch_public_openapi(url: str) -> dict:
+    """Fetch the exact sourceUrl before a Rewst mutation, without caching it."""
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        spec = json.loads(raw)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise SystemExit(f"public OpenAPI unreadable at {url}: {exc}") from exc
+    if not isinstance(spec, dict):
+        raise SystemExit(f"public OpenAPI unreadable at {url}")
+    return spec
+
+
+def require_deployed_public_parity(deployed: dict, public: dict) -> dict:
+    """Require semantic parity while retaining server destination as a semantic key."""
+    if not isinstance(deployed, dict) or not isinstance(public, dict):
+        raise SystemExit("deployed/public OpenAPI unreadable; no Rewst mutation")
+    deployed_sha, public_sha = catalog_hash(deployed), catalog_hash(public)
+    if deployed_sha != public_sha:
+        raise SystemExit(f"deployed/public OpenAPI mismatch; no Rewst mutation ({deployed_sha} != {public_sha})")
+    return {"deployed_catalog_sha": deployed_sha, "fresh_public_source_sha": public_sha}
+
+
 def require_catalog_parity(expected, live, label: str) -> dict:
     """Fail closed on unreadable or normalized catalog/readback mismatch."""
     if not isinstance(live, (dict, list)):

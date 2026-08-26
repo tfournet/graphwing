@@ -49,7 +49,9 @@ def verify_integration_parity(mcp: str, integration: str, catalog_spec: dict) ->
     status, live = pg.api(mcp, "GET", f"/custom-integrations/{integration}")
     if status != 200:
         raise SystemExit(f"integration live readback HTTP {status}; no parity receipt")
-    return pg.require_catalog_parity(catalog_spec, integration_readback_spec(live), "custom integration")
+    readback = integration_readback_spec(live)
+    pg.require_catalog_parity(catalog_spec, readback, "custom integration")
+    return {"fresh_rewst_readback_sha": pg.catalog_hash(readback)}
 
 
 def main() -> None:
@@ -64,6 +66,12 @@ def main() -> None:
     print("integration", integration)
     print("sourceUrl  ", spec_url)
 
+    # This is deliberately before PUT/publish: sourceUrl must already serve
+    # the installed catalog, including its non-loopback server destination.
+    deployed_spec = pg.deployed_openapi_spec()
+    public_spec = pg.fetch_public_openapi(spec_url)
+    source_parity = pg.require_deployed_public_parity(deployed_spec, public_spec)
+
     status, body = pg.api(mcp, "PUT", f"/custom-integrations/{integration}", {"sourceUrl": spec_url})
     pg.must(status, body, ok=(200, 201), label="reimport spec")
     ops = body.get("spec", {}).get("paths") or {}
@@ -75,8 +83,8 @@ def main() -> None:
     # The live side is a fresh GET after publish, never the sourceUrl payload
     # or the response to PUT/POST.  Failure deliberately leaves no success
     # receipt for the controller to count.
-    catalog_spec = json.loads((pg.ROOT / "openapi.json").read_text())
-    parity = verify_integration_parity(mcp, integration, catalog_spec)
+    readback_parity = verify_integration_parity(mcp, integration, deployed_spec)
+    parity = {**source_parity, **readback_parity}
 
     version = published.get("version") or published.get("versionNumber")
     version_id = published.get("versionId") or published.get("id")

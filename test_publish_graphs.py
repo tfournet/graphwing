@@ -13,6 +13,12 @@ publish_graphs = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(publish_graphs)
 
+REIMPORT_PATH = Path(__file__).resolve().parent / "scripts" / "reimport_integration.py"
+REIMPORT_SPEC = importlib.util.spec_from_file_location("reimport_integration", REIMPORT_PATH)
+reimport_integration = importlib.util.module_from_spec(REIMPORT_SPEC)
+assert REIMPORT_SPEC.loader is not None
+REIMPORT_SPEC.loader.exec_module(reimport_integration)
+
 
 class PublishGraphsTests(unittest.TestCase):
     def test_all_publishes_source_before_listener_and_substitutes_source_id(self):
@@ -148,6 +154,68 @@ class PublishGraphsTests(unittest.TestCase):
         altered = {"nodes": [{"id": "a", "config": {"x": 2}}], "updatedAt": "volatile"}
         with self.assertRaises(SystemExit):
             publish_graphs.require_catalog_parity(expected, altered, "graph")
+
+    def test_deployed_catalog_is_authority_not_repository_loopback_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            deployed = {"openapi": "3.0.0", "servers": [{"url": "https://graphwing.tfour.net"}], "paths": {"/x": {}}}
+            (home / "openapi.json").write_text(json.dumps(deployed))
+            with mock.patch.object(publish_graphs, "HOME", home):
+                self.assertEqual(publish_graphs.deployed_openapi_spec(), deployed)
+            loopback_repo_default = {**deployed, "servers": [{"url": "http://127.0.0.1:8645"}]}
+            self.assertNotEqual(publish_graphs.catalog_hash(deployed), publish_graphs.catalog_hash(loopback_repo_default))
+
+    def test_deployed_public_mismatch_stops_before_any_rewst_mutation(self):
+        deployed = {"servers": [{"url": "https://graphwing.tfour.net"}], "paths": {"/x": {}}}
+        public = {"servers": [{"url": "https://wrong.example"}], "paths": {"/x": {}}}
+        with mock.patch.object(reimport_integration.pg, "load_install", return_value={"custom_integration_id": "ci-1"}), \
+             mock.patch.object(reimport_integration.pg, "tenant_id", return_value="tenant"), \
+             mock.patch.object(reimport_integration.pg, "public_openapi_url", return_value="https://graphwing.tfour.net/openapi.json"), \
+             mock.patch.object(reimport_integration.pg, "rewst_mcp", return_value="mcp"), \
+             mock.patch.object(reimport_integration.pg, "deployed_openapi_spec", return_value=deployed), \
+             mock.patch.object(reimport_integration.pg, "fetch_public_openapi", return_value=public), \
+             mock.patch.object(reimport_integration.pg, "api") as api:
+            with self.assertRaisesRegex(SystemExit, "no Rewst mutation"):
+                reimport_integration.main()
+        api.assert_not_called()
+
+    def test_matching_public_but_mismatched_rewst_readback_fails(self):
+        deployed = {"servers": [{"url": "https://graphwing.tfour.net"}], "paths": {"/x": {}}}
+        calls = []
+        def api(_mcp, method, path, body=None):
+            calls.append((method, path))
+            if method == "GET":
+                return 200, {"spec": {"servers": [{"url": "https://graphwing.tfour.net"}], "paths": {"/wrong": {}}}}
+            return 200, {"version": 1}
+        with mock.patch.object(reimport_integration.pg, "load_install", return_value={"custom_integration_id": "ci-1"}), \
+             mock.patch.object(reimport_integration.pg, "tenant_id", return_value="tenant"), \
+             mock.patch.object(reimport_integration.pg, "public_openapi_url", return_value="https://graphwing.tfour.net/openapi.json"), \
+             mock.patch.object(reimport_integration.pg, "rewst_mcp", return_value="mcp"), \
+             mock.patch.object(reimport_integration.pg, "deployed_openapi_spec", return_value=deployed), \
+             mock.patch.object(reimport_integration.pg, "fetch_public_openapi", return_value=deployed), \
+             mock.patch.object(reimport_integration.pg, "api", side_effect=api):
+            with self.assertRaisesRegex(SystemExit, "mismatch; no parity receipt"):
+                reimport_integration.main()
+        self.assertEqual(calls, [("PUT", "/custom-integrations/ci-1"), ("POST", "/custom-integrations/ci-1/publish"), ("GET", "/custom-integrations/ci-1")])
+
+    def test_deployed_public_and_fresh_rewst_readback_match(self):
+        deployed = {"servers": [{"url": "https://graphwing.tfour.net"}], "paths": {"/x": {}}}
+        saved = {}
+        def api(_mcp, method, path, body=None):
+            if method == "GET": return 200, {"spec": deployed}
+            if method == "PUT": return 200, {"spec": deployed}
+            return 200, {"version": 2, "versionId": "v2"}
+        install = {"custom_integration_id": "ci-1"}
+        with mock.patch.object(reimport_integration.pg, "load_install", return_value=install), \
+             mock.patch.object(reimport_integration.pg, "tenant_id", return_value="tenant"), \
+             mock.patch.object(reimport_integration.pg, "public_openapi_url", return_value="https://graphwing.tfour.net/openapi.json"), \
+             mock.patch.object(reimport_integration.pg, "rewst_mcp", return_value="mcp"), \
+             mock.patch.object(reimport_integration.pg, "deployed_openapi_spec", return_value=deployed), \
+             mock.patch.object(reimport_integration.pg, "fetch_public_openapi", return_value=deployed), \
+             mock.patch.object(reimport_integration.pg, "api", side_effect=api), \
+             mock.patch.object(reimport_integration.pg, "save_install", side_effect=lambda value: saved.update(value)):
+            reimport_integration.main()
+        self.assertEqual(saved["custom_integration_version_id"], "v2")
 
 
 if __name__ == "__main__":
