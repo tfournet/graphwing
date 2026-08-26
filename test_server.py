@@ -4953,6 +4953,10 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(brief[0], 200, brief[1])
         self.assertTrue(brief[1]["resume"])
         self.assertEqual(brief[1]["harness_session"], doc["writer_session"])
+        brief_payload = brief[1]
+        assert isinstance(brief_payload, dict)
+        self.assertIn("Graphwing runs them", brief_payload["prompt"])
+        self.assertIn("do not search for or run", brief_payload["prompt"])
         self.assertEqual(self._read_doc()["budget"]["jobs_used"], before + 1)
 
     def test_finalize_requires_current_clean_gates_and_commits_pushes_once(self):
