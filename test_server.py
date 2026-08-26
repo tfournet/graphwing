@@ -5859,7 +5859,7 @@ class BuildStateTests(unittest.TestCase):
         doc["reviews"] = [{"compact": "SECRET PRIOR REVIEW REASONING"}]
         behavior = server.build_review_prompt(doc, server.BUILD_REVIEW_BEHAVIOR_ROLE)
         security = server.build_review_prompt(doc, server.BUILD_REVIEW_SECURITY_ROLE)
-        for lens in ("PROMISED BEHAVIOR", "SCOPE", "RED EVIDENCE", "PRODUCTION PATH", "INTEGRATION SEAM", "HONEST FAILURE"):
+        for lens in ("PROMISED BEHAVIOR", "SCOPE", "RED EVIDENCE", "EXECUTION PATH", "INTEGRATION SEAM", "HONEST FAILURE"):
             self.assertIn(lens, behavior)
         for lens in ("TENANT SCOPE", "PERMISSIONS", "FORGED INPUT", "LEAKAGE", "IDEMPOTENCY", "DATA LOSS"):
             self.assertIn(lens, security)
@@ -5977,6 +5977,15 @@ class BuildStateTests(unittest.TestCase):
             if edge["source"] == "switch_step" and edge["sourceHandle"] == f"case-{evidence_index}"
         )
         self.assertEqual(edge["target"], "visual_evidence_required")
+
+    def test_behavior_review_respects_canary_scope_and_post_review_integration_order(self):
+        lines = server.build_behavior_review_prompt(
+            {"verification": {"integration": ["sensitive-integration"]}}
+        )
+        prompt = "\n".join(lines)
+        self.assertIn("self-contained", prompt)
+        self.assertIn("Clean integration runs after review", prompt)
+        self.assertIn("Do not require the post-review receipt yet", prompt)
 
     # -- catalog ------------------------------------------------------------
 
