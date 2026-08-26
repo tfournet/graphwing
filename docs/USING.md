@@ -73,6 +73,16 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst trigger. Th
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
+Completed writer callbacks carry a `diagnostic-v1` object with a stable code, evidence
+kind, and canned summary; pre-callback action/wait failures use canned stage receipts.
+Every failover-eligible writer outcome remains
+`provider_availability`, including a missing writer binary and structured provider
+authentication or network evidence. `local_infrastructure` describes stack, port,
+health, command, and configuration checks only; a missing non-writer executable is
+`local_binary_missing`, not provider availability. The closed launcher failure taxonomy
+and one-hop fallback gate are unchanged. Receipts never copy callback data, paths,
+provider output, or traces.
+
 ## Drive a PR to green
 
 ```bash
@@ -104,12 +114,13 @@ The writer's prompt is not yours to write. A `findings` node reads the reviewers
 `engineering-findings-json`, dedupes by fingerprint (two reviewers raising one defect
 is one fix), orders by severity, and hands over the remedies without the argument.
 
-Two node-output traps worth knowing before editing this graph. A node result is exposed
-as `TASKS.<node>.data.<field>`, so an endpoint that nests its payload under `data` makes
-every path a double `.data.data` that silently reads null. And a large output is replaced
-by an artifact stub: `TASKS.checks.all_green` is unreadable because that node returns
-~21KB, which is why the findings endpoint runs `gh pr checks` itself and returns
-`all_green` flat.
+Two node-output traps worth knowing before editing this graph. `action.graphwing` results
+are exposed as `TASKS.<node>.data.<field>`, while a `transforms.objectBuilder` publishes
+its configured alias at `CTX.<alias>`. An endpoint that nests its action payload under
+`data` therefore needs double `.data.data`. A large action output can instead become an
+artifact stub: `TASKS.checks.data.all_green` is unreadable because that node returns
+~21KB, which is why the findings endpoint runs `gh pr checks` itself and returns a small
+flat result.
 
 `auto_merge` is per-run and defaults false. When true and the PR is green, mergeable,
 and carries no `hold:*` label, the run merges with `--squash --delete-branch`. The
@@ -120,7 +131,7 @@ without a `run_id`, so a hand-rolled curl cannot merge anything.
 
 | Slug | When |
 |---|---|
-| `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`. |
+| `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`; success includes stack/port diagnostics and action failures terminate with sanitized stage receipts. |
 | `graphwing-pr-status` | Read-only PR checks. Unauthenticated webhook. |
 | `graphwing-pr-drive` | One fix slice when CI is red. Authenticated webhook / doorbell OIDC. |
 

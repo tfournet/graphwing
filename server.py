@@ -103,6 +103,50 @@ PROVIDER_AVAILABILITY_CODES = frozenset(
     FAILURE_CLASS_CODES["provider_availability"]
     | {"provider_http_5xx", *(code for code, _ in PROVIDER_FAILURE_GROUPS)}
 )
+DIAGNOSTIC_VERSION = "diagnostic-v1"
+DIAGNOSTIC_METADATA = {
+    **{
+        code: ("workflow_failure", "execution", "closed_failure_code", "bounded workflow operation failed")
+        for code in FAILURE_CLASS_BY_CODE if code != "success"
+    },
+    **{
+        code: ("provider_availability", "provider", "structured_provider_error", "provider temporarily unavailable")
+        for code in PROVIDER_AVAILABILITY_CODES
+    },
+    "none": ("none", "none", "success", "ok"),
+    "missing_binary": ("provider_availability", "binary", "deterministic_binary_check", "writer binary unavailable"),
+    "provider_authentication": ("provider_availability", "auth", "structured_provider_error", "provider authentication rejected"),
+    "provider_network": ("provider_availability", "network", "structured_provider_error", "provider network unavailable"),
+    "not_configured": ("local_infrastructure", "config", "deterministic_config_check", "local configuration unavailable"),
+    "bad_health_config": ("local_infrastructure", "config", "deterministic_config_check", "local health probe misconfigured"),
+    "health_unreachable": ("local_infrastructure", "network", "bounded_loopback_probe", "local health endpoint unreachable"),
+    "health_bad_status": ("local_infrastructure", "health", "bounded_loopback_probe", "local health endpoint returned a bad status"),
+    "stack_unhealthy": ("local_infrastructure", "stack", "compose_snapshot", "local stack is unhealthy"),
+    "port_not_listening": ("local_infrastructure", "port", "bounded_port_probe", "local port is not listening"),
+    "local_binary_missing": ("local_infrastructure", "binary", "deterministic_binary_check", "local command binary unavailable"),
+    "cmd_failed": ("local_infrastructure", "command", "bounded_command", "local command failed"),
+    "timeout": ("local_infrastructure", "command", "bounded_command", "local command timed out"),
+    "missing_port": ("workflow_failure", "request", "validated_input", "port input is required"),
+    "bad_port": ("workflow_failure", "request", "validated_input", "port input is invalid"),
+    "unknown_port": ("workflow_failure", "request", "validated_input", "port is not allowlisted"),
+    "unknown_stack": ("workflow_failure", "request", "validated_input", "stack is not configured"),
+}
+
+
+def compact_diagnostic(code: str) -> dict[str, str]:
+    """Canned evidence only: never echo error prose, output, URLs, or paths."""
+    safe_code = code if code in DIAGNOSTIC_METADATA else "unknown_failure"
+    category, component, evidence, summary = DIAGNOSTIC_METADATA[safe_code]
+    return {
+        "diagnostic_version": DIAGNOSTIC_VERSION,
+        "category": category,
+        "component": component,
+        "code": safe_code,
+        "evidence": evidence,
+        "summary": summary,
+    }
+
+
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
@@ -723,7 +767,7 @@ def run_cmd(args: list[str], cwd: Path | None = None, timeout: int = CMD_TIMEOUT
             env=merged,
         )
     except FileNotFoundError:
-        return {"ok": False, "error": f"missing binary: {args[0]}", "code": "missing_binary", "status": 501}
+        return {"ok": False, "error": f"missing binary: {args[0]}", "code": "local_binary_missing", "status": 501}
     except subprocess.TimeoutExpired as exc:
         raw_out = exc.stdout or b""
         raw_err = exc.stderr or b""
@@ -2231,14 +2275,24 @@ def probe_loopback(url: str) -> dict[str, Any]:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in ("http", "https") or host not in ("127.0.0.1", "localhost"):
-        return {"ok": False, "url": url, "error": "health url must be loopback http(s)"}
+        return {
+            "ok": False, "url": url, "error": "health url must be loopback http(s)",
+            "diagnostic": compact_diagnostic("bad_health_config"),
+        }
     try:
         req = Request(url, method="GET")
         with urlopen(req, timeout=2) as resp:
             code = getattr(resp, "status", 200)
-            return {"ok": 200 <= code < 500, "url": url, "status": code}
+            ok = 200 <= code < 500
+            return {
+                "ok": ok, "url": url, "status": code,
+                "diagnostic": compact_diagnostic("none" if ok else "health_bad_status"),
+            }
     except Exception as exc:
-        return {"ok": False, "url": url, "error": str(exc)[:160]}
+        return {
+            "ok": False, "url": url, "error": str(exc)[:160],
+            "diagnostic": compact_diagnostic("health_unreachable"),
+        }
 
 
 def parse_compose_ps(raw: str) -> list[dict[str, Any]]:
@@ -2274,12 +2328,18 @@ def parse_compose_ps(raw: str) -> list[dict[str, Any]]:
 def stack_status(name: str | None) -> dict[str, Any]:
     stacks, _ports = load_stacks()
     if not stacks:
-        return {"ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501}
+        return {
+            "ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501,
+            "diagnostic": compact_diagnostic("not_configured"),
+        }
     key = (name or "").strip()
     if not key:
         key = "riftwing" if "riftwing" in stacks else next(iter(stacks))
     if key not in stacks:
-        return {"ok": False, "error": f"unknown stack '{key}'", "code": "unknown_stack", "allowed": sorted(stacks), "status": 400}
+        return {
+            "ok": False, "error": f"unknown stack '{key}'", "code": "unknown_stack",
+            "allowed": sorted(stacks), "status": 400, "diagnostic": compact_diagnostic("unknown_stack"),
+        }
     spec = stacks[key]
     cwd: Path = spec["cwd"]
     compose = spec["compose_file"]
@@ -2292,6 +2352,11 @@ def stack_status(name: str | None) -> dict[str, Any]:
     health = [{"name": h["name"], **probe_loopback(h["url"])} for h in spec["health"]]
     health_ok = all(h.get("ok") for h in health) if health else bool(containers)
     running = [c for c in containers if str(c.get("state") or "").lower() in ("running", "up")]
+    code = "none" if bool(running) and health_ok else str(r.get("code") or "stack_unhealthy")
+    if r.get("ok") and not health_ok and health:
+        diagnostic = next((h["diagnostic"] for h in health if not h.get("ok")), compact_diagnostic(code))
+    else:
+        diagnostic = compact_diagnostic(code)
     return {
         "ok": True,
         "stack": key,
@@ -2301,29 +2366,39 @@ def stack_status(name: str | None) -> dict[str, Any]:
         "health": health,
         "compose_ok": bool(r.get("ok")),
         "compose_error": None if r.get("ok") else (r.get("error") or "compose ps failed"),
+        "diagnostic": diagnostic,
     }
 
 
-def port_listening(port: int) -> bool:
+def port_probe(port: int) -> dict[str, Any]:
     r = run_cmd(["ss", "-ltnH", f"sport = :{port}"], timeout=5)
-    if not r.get("ok"):
-        return False
-    return bool((r.get("stdout") or "").strip())
+    listening = bool(r.get("ok") and (r.get("stdout") or "").strip())
+    code = "none" if listening else str(r.get("code") or "port_not_listening")
+    return {"port": port, "listening": listening, "diagnostic": compact_diagnostic(code)}
 
 
 def port_check(raw: str | None) -> dict[str, Any]:
     _stacks, allowed = load_stacks()
     if not allowed:
-        return {"ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501}
+        return {
+            "ok": False, "error": "stacks.json is not configured", "code": "not_configured", "status": 501,
+            "diagnostic": compact_diagnostic("not_configured"),
+        }
     if not raw or not raw.strip():
-        return {"ok": False, "error": "port or ports is required", "code": "missing_port", "status": 400}
+        return {
+            "ok": False, "error": "port or ports is required", "code": "missing_port", "status": 400,
+            "diagnostic": compact_diagnostic("missing_port"),
+        }
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     ports: list[int] = []
     for p in parts:
         try:
             n = int(p)
         except ValueError:
-            return {"ok": False, "error": f"port must be an integer: {p}", "code": "bad_port", "status": 400}
+            return {
+                "ok": False, "error": f"port must be an integer: {p}", "code": "bad_port", "status": 400,
+                "diagnostic": compact_diagnostic("bad_port"),
+            }
         if n not in allowed:
             return {
                 "ok": False,
@@ -2331,10 +2406,12 @@ def port_check(raw: str | None) -> dict[str, Any]:
                 "code": "unknown_port",
                 "allowed": sorted(allowed),
                 "status": 400,
+                "diagnostic": compact_diagnostic("unknown_port"),
             }
         ports.append(n)
-    results = [{"port": n, "listening": port_listening(n)} for n in ports]
-    return {"ok": True, "ports": results}
+    results = [port_probe(n) for n in ports]
+    diagnostic = next((r["diagnostic"] for r in results if not r["listening"]), compact_diagnostic("none"))
+    return {"ok": True, "ports": results, "diagnostic": diagnostic}
 
 
 def herdr_agents() -> dict[str, Any]:
@@ -3155,6 +3232,7 @@ def classify_agent_failure(evidence_code: str, structured_output: str = "") -> d
         "failure_class": failure_class,
         "failure_code": failure_code,
         "failover_eligible": failure_class == "provider_availability",
+        "diagnostic": compact_diagnostic(failure_code),
     }
 
 
@@ -3784,7 +3862,7 @@ def named_cmd_run(
     async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT
     if not async_run:
         result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=timeout)
-        if result.get("code") == "missing_binary":
+        if result.get("code") == "local_binary_missing":
             return 501, {"error": result.get("error"), "code": "not_implemented"}
         if result.get("code") == "timeout":
             return 504, {
@@ -3915,9 +3993,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, budget_err
     binary = globals()[native_spec["binary"]]
     if not binary.is_file() and not webhook_url:
-        code = "missing_binary" if launcher == "grok" else "provider_unavailable"
         classified = classify_agent_failure("missing_binary")
-        return 501, {"error": f"{launcher} binary missing: {binary}", "code": code, **classified}
+        return 501, {"error": f"{launcher} binary missing: {binary}", "code": "missing_binary", **classified}
     branch, head, git_err = current_branch_head(resolved)
     if git_err:
         return 400, git_err

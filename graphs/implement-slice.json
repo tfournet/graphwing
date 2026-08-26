@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-implement-slice",
   "name": "graphwing-implement-slice",
-  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, class, work_kind, iters_left, optional kick_url.",
+  "description": "Walks a slice index serially. gitStatus → gitCheckout → sliceFrontier → fileHead ticket → agentRun → testRun → sliceComplete → gitCommit/gitPush. Completed primary/fallback callbacks retain diagnostic-v1 evidence; pre-callback failures use sanitized stage receipts and routing remains one-hop. On green, sliceContinue POSTs kick_url with the next ticket if the frontier is a build. On red, files stay. Payload: repo, branch, index, optional ticket, commit_message, test, class, work_kind, iters_left, optional kick_url.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -251,8 +251,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
-          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}",
+          "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}",
           "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
           "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
           "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
@@ -348,8 +348,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
-          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}",
+          "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}",
           "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
           "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
           "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
@@ -488,7 +488,8 @@
             { "id": "m10", "output": "failure_class", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failure_class" } },
             { "id": "m11", "output": "failure_code", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failure_code" } },
             { "id": "m12", "output": "failover_eligible", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failover_eligible" } },
-            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "primary" } }
+            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "primary" } },
+            { "id": "m14", "output": "diagnostic", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.diagnostic" } }
           ]
         }
       },
@@ -524,7 +525,7 @@
         "type": "action.graphwing.POST:/v1/slice/route/fallback",
         "label": "sliceRoute availability fallback",
         "position": { "x": 1080, "y": -40 },
-        "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 15, "class": "{{ CTX.INPUT.class }}", "work_kind": "{{ CTX.INPUT.work_kind }}", "size": "{{ CTX.INPUT.size }}", "ac_count": "{{ CTX.INPUT.ac_count }}", "seams": "{{ CTX.INPUT.seams }}", "primary_route": "{{ TASKS.route.data }}", "primary_receipt": "{{ TASKS.record }}" }
+        "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 15, "class": "{{ CTX.INPUT.class }}", "work_kind": "{{ CTX.INPUT.work_kind }}", "size": "{{ CTX.INPUT.size }}", "ac_count": "{{ CTX.INPUT.ac_count }}", "seams": "{{ CTX.INPUT.seams }}", "primary_route": "{{ TASKS.route.data }}", "primary_receipt": "{{ CTX.receipt }}" }
       },
       {
         "id": "wait_fallback",
@@ -558,7 +559,8 @@
             { "id": "m10", "output": "failure_class", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failure_class" } },
             { "id": "m11", "output": "failure_code", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failure_code" } },
             { "id": "m12", "output": "failover_eligible", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failover_eligible" } },
-            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "availability_fallback" } }
+            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "availability_fallback" } },
+            { "id": "m14", "output": "diagnostic", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.diagnostic" } }
           ] }
       },
       {
@@ -575,20 +577,11 @@
         "position": { "x": 1540, "y": 80 },
         "config": { "stopOnFirst": true }
       },
-      {
-        "id": "join_fallback_fail",
-        "type": "logic.join.any",
-        "label": "Join fallback failures",
-        "position": { "x": 1480, "y": -160 },
-        "config": { "stopOnFirst": true }
-      },
-      {
-        "id": "fallback_fail",
-        "type": "transforms.objectBuilder",
-        "label": "Fallback failed",
-        "position": { "x": 1540, "y": -160 },
-        "config": { "alias": "fallback_fail", "version": 1, "mappings": [{ "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "fallback_failed" } }, { "id": "m2", "output": "primary_receipt", "expression": { "kind": "getField", "path": "TASKS.record" } }, { "id": "m3", "output": "fallback_receipt", "expression": { "kind": "getField", "path": "TASKS.record_fallback" } }, { "id": "m4", "output": "primary_route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }, { "id": "m5", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }, { "id": "m6", "output": "fallback_route_error", "expression": { "kind": "getField", "path": "TASKS.fallback_route" } }, { "id": "m7", "output": "fallback_action_error", "expression": { "kind": "getField", "path": "TASKS.agent_fallback" } }, { "id": "m8", "output": "raw_wait_receipt", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body" } }] }
-      },
+      { "id": "fallback_route_fail", "type": "transforms.objectBuilder", "label": "Fallback route diagnostic", "position": { "x": 1480, "y": -160 }, "config": { "alias": "fallback_route_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "fallback_route" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "summary", "expression": { "kind": "literal", "value": "fallback route failed" } }] } },
+      { "id": "fallback_wait_timeout", "type": "transforms.objectBuilder", "label": "Fallback wait timeout diagnostic", "position": { "x": 1540, "y": -160 }, "config": { "alias": "fallback_wait_timeout_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "timeout" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "fallback_wait_timeout" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "summary", "expression": { "kind": "literal", "value": "fallback writer receipt timed out" } }] } },
+      { "id": "fallback_wait_fail", "type": "transforms.objectBuilder", "label": "Fallback wait failure diagnostic", "position": { "x": 1600, "y": -160 }, "config": { "alias": "fallback_wait_failure_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "fallback_wait_failure" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "summary", "expression": { "kind": "literal", "value": "fallback writer wait failed" } }] } },
+      { "id": "fallback_action_fail", "type": "transforms.objectBuilder", "label": "Fallback action diagnostic", "position": { "x": 1660, "y": -160 }, "config": { "alias": "fallback_action_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "fallback_action" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "fallback_diagnostic", "expression": { "kind": "getField", "path": "TASKS.agent_fallback.data.diagnostic" } }, { "id": "m7", "output": "summary", "expression": { "kind": "literal", "value": "fallback writer action failed" } }] } },
+      { "id": "fallback_receipt_fail", "type": "transforms.objectBuilder", "label": "Fallback receipt diagnostic", "position": { "x": 1720, "y": -160 }, "config": { "alias": "fallback_receipt_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "fallback_receipt" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "fallback_diagnostic", "expression": { "kind": "getField", "path": "CTX.fallback_receipt.diagnostic" } }, { "id": "m7", "output": "summary", "expression": { "kind": "literal", "value": "fallback writer receipt not ok" } }] } },
       {
         "id": "test",
         "type": "action.graphwing.POST:/v1/test/run",
@@ -636,8 +629,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
-          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}",
+          "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}",
           "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
           "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
           "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
@@ -666,7 +659,8 @@
             { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } },
             { "id": "m8", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } },
             { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } },
-            { "id": "m10", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }
+            { "id": "m10", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } },
+            { "id": "m11", "output": "diagnostic", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.diagnostic" } }
           ]
         }
       },
@@ -741,8 +735,8 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record2.session_identity }}",
-          "resume_job_id": "{{ TASKS.record2.resume_job_id }}",
+          "session_identity": "{{ CTX.receipt2.session_identity }}",
+          "resume_job_id": "{{ CTX.receipt2.resume_job_id }}",
           "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
           "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
           "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
@@ -907,6 +901,13 @@
         "config": { "stopOnFirst": true }
       },
       {
+        "id": "join_correction_action_fail",
+        "type": "logic.join.any",
+        "label": "Join correction writer action failures",
+        "position": { "x": 1780, "y": -40 },
+        "config": { "stopOnFirst": true }
+      },
+      {
         "id": "join_test_http_fail",
         "type": "logic.join.any",
         "label": "Join test_http_fail",
@@ -1038,16 +1039,28 @@
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
             { "id": "m2", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
             { "id": "m3", "output": "branch", "expression": { "kind": "getField", "path": "CTX.INPUT.branch" } },
-            { "id": "m4", "output": "primary_receipt", "expression": { "kind": "getField", "path": "TASKS.record" } },
-            { "id": "m5", "output": "fallback_receipt", "expression": { "kind": "getField", "path": "TASKS.record_fallback" } },
+            { "id": "m4", "output": "primary_receipt", "expression": { "kind": "getField", "path": "CTX.receipt" } },
+            { "id": "m5", "output": "fallback_receipt", "expression": { "kind": "getField", "path": "CTX.fallback_receipt" } },
             { "id": "m6", "output": "primary_route", "expression": { "kind": "getField", "path": "TASKS.route.data" } },
-            { "id": "m7", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }
+            { "id": "m7", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } },
+            { "id": "m8", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } },
+            { "id": "m9", "output": "fallback_diagnostic", "expression": { "kind": "getField", "path": "CTX.fallback_receipt.diagnostic" } }
           ]
         }
       },
-      { "id": "timeout", "type": "action.noop", "label": "Wait timeout", "position": { "x": 840, "y": -40 }, "config": {} },
-      { "id": "fail", "type": "action.noop", "label": "Wait failure", "position": { "x": 840, "y": -160 }, "config": {} },
-      { "id": "receipt_fail", "type": "action.noop", "label": "Writer receipt not ok", "position": { "x": 980, "y": -160 }, "config": {} },
+      {
+        "id": "primary_action_fail", "type": "transforms.objectBuilder", "label": "Primary action diagnostic", "position": { "x": 760, "y": -40 },
+        "config": { "alias": "primary_action_diagnostic", "version": 1, "mappings": [
+          { "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } },
+          { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } },
+          { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } },
+          { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "primary_writer_action" } },
+          { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "primary writer action failed" } }
+        ] }
+      },
+      { "id": "timeout", "type": "transforms.objectBuilder", "label": "Wait timeout diagnostic", "position": { "x": 840, "y": -40 }, "config": { "alias": "primary_wait_timeout", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "timeout" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "primary_writer_wait" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "primary writer receipt timed out" } }] } },
+      { "id": "fail", "type": "transforms.objectBuilder", "label": "Wait failure diagnostic", "position": { "x": 840, "y": -160 }, "config": { "alias": "primary_wait_failure", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "primary_writer_wait" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "primary writer wait failed" } }] } },
+      { "id": "receipt_fail", "type": "transforms.objectBuilder", "label": "Writer receipt diagnostic", "position": { "x": 980, "y": -160 }, "config": { "alias": "writer_receipt_diagnostic", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "writer_receipt" } }, { "id": "m5", "output": "primary_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt.diagnostic" } }, { "id": "m6", "output": "fallback_diagnostic", "expression": { "kind": "getField", "path": "CTX.fallback_receipt.diagnostic" } }, { "id": "m7", "output": "retry_diagnostic", "expression": { "kind": "getField", "path": "CTX.receipt2.diagnostic" } }, { "id": "m8", "output": "summary", "expression": { "kind": "literal", "value": "writer receipt not ok" } }] } },
       { "id": "checkout_fail", "type": "action.noop", "label": "Herdr: checkout failed", "position": { "x": 420, "y": -160 }, "config": {} },
       { "id": "ticket_fail", "type": "action.noop", "label": "Herdr: ticket fileHead failed", "position": { "x": 490, "y": -160 }, "config": {} },
       { "id": "frontier_fail", "type": "action.noop", "label": "Herdr: sliceFrontier failed", "position": { "x": 455, "y": -160 }, "config": {} },
@@ -1087,8 +1100,9 @@
       { "id": "e2e_fail", "type": "action.noop", "label": "Herdr: sliceE2e HTTP failed", "position": { "x": 1720, "y": -40 }, "config": {} },
       { "id": "test_http_fail", "type": "action.noop", "label": "Herdr: testRun HTTP failed", "position": { "x": 1120, "y": 320 }, "config": {} },
 
-      { "id": "wait2_timeout", "type": "action.noop", "label": "Herdr: retry wait timeout", "position": { "x": 1840, "y": 200 }, "config": {} },
-      { "id": "wait2_fail", "type": "action.noop", "label": "Herdr: retry wait failure", "position": { "x": 1840, "y": 80 }, "config": {} },
+      { "id": "correction_action_fail", "type": "transforms.objectBuilder", "label": "Correction writer action diagnostic", "position": { "x": 1840, "y": -40 }, "config": { "alias": "correction_writer_action_failure", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "correction_writer_action" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "correction writer action failed" } }] } },
+      { "id": "wait2_timeout", "type": "transforms.objectBuilder", "label": "Correction writer wait timeout diagnostic", "position": { "x": 1840, "y": 200 }, "config": { "alias": "correction_writer_wait_timeout", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "timeout" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "correction_writer_wait" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "correction writer receipt timed out" } }] } },
+      { "id": "wait2_fail", "type": "transforms.objectBuilder", "label": "Correction writer wait failure diagnostic", "position": { "x": 1840, "y": 80 }, "config": { "alias": "correction_writer_wait_failure", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "implement-slice" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "correction_writer_wait" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "correction writer wait failed" } }] } },
       { "id": "test2_http_fail", "type": "action.noop", "label": "Herdr: retry testRun HTTP failed", "position": { "x": 2280, "y": 200 }, "config": {} },
       { "id": "herdr_waiting", "type": "action.noop", "label": "Herdr: waiting for human; files kept", "position": { "x": 1840, "y": 680 }, "config": {} },
       { "id": "nack_timeout", "type": "action.noop", "label": "Herdr: human timeout", "position": { "x": 1840, "y": 800 }, "config": {} }
@@ -1103,6 +1117,7 @@
       { "id": "e4", "source": "wait", "sourceHandle": "out", "target": "record", "targetHandle": "in" },
       { "id": "e5", "source": "wait", "sourceHandle": "timeout", "target": "timeout", "targetHandle": "in" },
       { "id": "e6", "source": "wait", "sourceHandle": "failure", "target": "fail", "targetHandle": "in" },
+      { "id": "e_agent_diagnostic", "source": "agent", "sourceHandle": "failure", "target": "primary_action_fail", "targetHandle": "in" },
       { "id": "e7", "source": "checkout", "sourceHandle": "success", "target": "frontier", "targetHandle": "in" },
       { "id": "e7f", "source": "frontier", "sourceHandle": "success", "target": "switch_kind", "targetHandle": "in" },
       { "id": "e7g", "source": "frontier", "sourceHandle": "failure", "target": "frontier_fail", "targetHandle": "in" },
@@ -1135,12 +1150,12 @@
       { "id": "e14b", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" },
       { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "if_initial_fallback_eligible", "targetHandle": "in" },
       { "id": "e_fb_gate_ok", "source": "if_initial_fallback_eligible", "sourceHandle": "pass", "target": "fallback_route", "targetHandle": "in" }, { "id": "e_fb_gate_bad", "source": "if_initial_fallback_eligible", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
-      { "id": "e_fb_route_ok", "source": "fallback_route", "sourceHandle": "success", "target": "wait_fallback", "targetHandle": "in" }, { "id": "e_fb_route_fail", "source": "fallback_route", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" },
+      { "id": "e_fb_route_ok", "source": "fallback_route", "sourceHandle": "success", "target": "wait_fallback", "targetHandle": "in" }, { "id": "e_fb_route_fail", "source": "fallback_route", "sourceHandle": "failure", "target": "fallback_route_fail", "targetHandle": "in" },
       { "id": "e_fb_wait_pending", "source": "wait_fallback", "sourceHandle": "pending", "target": "agent_fallback", "targetHandle": "in" }, { "id": "e_fb_wait_out", "source": "wait_fallback", "sourceHandle": "out", "target": "record_fallback", "targetHandle": "in" },
-      { "id": "e_fb_wait_timeout", "source": "wait_fallback", "sourceHandle": "timeout", "target": "join_fallback_fail", "targetHandle": "in" }, { "id": "e_fb_wait_fail", "source": "wait_fallback", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" },
-      { "id": "e_fb_agent_fail", "source": "agent_fallback", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" }, { "id": "e_fb_record", "source": "record_fallback", "sourceHandle": "out", "target": "if_fallback_receipt_ok", "targetHandle": "in" },
-      { "id": "e_fb_receipt_ok", "source": "if_fallback_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" }, { "id": "e_fb_receipt_bad", "source": "if_fallback_receipt_ok", "sourceHandle": "fail", "target": "join_fallback_fail", "targetHandle": "in" },
-      { "id": "e_join_fallback_fail", "source": "join_fallback_fail", "sourceHandle": "out", "target": "fallback_fail", "targetHandle": "in" }, { "id": "e_writer_success", "source": "join_writer_success", "sourceHandle": "out", "target": "wait_test", "targetHandle": "in" },
+      { "id": "e_fb_wait_timeout", "source": "wait_fallback", "sourceHandle": "timeout", "target": "fallback_wait_timeout", "targetHandle": "in" }, { "id": "e_fb_wait_fail", "source": "wait_fallback", "sourceHandle": "failure", "target": "fallback_wait_fail", "targetHandle": "in" },
+      { "id": "e_fb_agent_fail", "source": "agent_fallback", "sourceHandle": "failure", "target": "fallback_action_fail", "targetHandle": "in" }, { "id": "e_fb_record", "source": "record_fallback", "sourceHandle": "out", "target": "if_fallback_receipt_ok", "targetHandle": "in" },
+      { "id": "e_fb_receipt_ok", "source": "if_fallback_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" }, { "id": "e_fb_receipt_bad", "source": "if_fallback_receipt_ok", "sourceHandle": "fail", "target": "fallback_receipt_fail", "targetHandle": "in" },
+      { "id": "e_writer_success", "source": "join_writer_success", "sourceHandle": "out", "target": "wait_test", "targetHandle": "in" },
       { "id": "e15", "source": "wait_test", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
@@ -1156,6 +1171,7 @@
       { "id": "e_rn1_receipt_bad", "source": "if_receipt_ok_rn1", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn1_to", "source": "wait_rn1", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn1_fail", "source": "wait_rn1", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
+      { "id": "e_agent_rn1_fail", "source": "agent_rn1", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e_rn1_th", "source": "test_rn1", "sourceHandle": "success", "target": "if_test_rn1", "targetHandle": "in" },
       { "id": "e_rn1_tf", "source": "test_rn1", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn1_tok", "source": "if_test_rn1", "sourceHandle": "pass", "target": "wait_r1b", "targetHandle": "in" },
@@ -1176,6 +1192,7 @@
       { "id": "e_rn2_receipt_bad", "source": "if_receipt_ok_rn2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn2_to", "source": "wait_rn2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn2_fail", "source": "wait_rn2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
+      { "id": "e_agent_rn2_fail", "source": "agent_rn2", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e_rn2_th", "source": "test_rn2", "sourceHandle": "success", "target": "if_test_rn2", "targetHandle": "in" },
       { "id": "e_rn2_tf", "source": "test_rn2", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn2_tok", "source": "if_test_rn2", "sourceHandle": "pass", "target": "wait_r2b", "targetHandle": "in" },
@@ -1189,6 +1206,7 @@
       { "id": "e24", "source": "wait2", "sourceHandle": "out", "target": "record2", "targetHandle": "in" },
       { "id": "e25", "source": "wait2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e26", "source": "wait2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
+      { "id": "e_agent2_fail", "source": "agent2", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e27", "source": "record2", "sourceHandle": "out", "target": "if_receipt_ok2", "targetHandle": "in" },
       { "id": "e27a", "source": "if_receipt_ok2", "sourceHandle": "pass", "target": "test2", "targetHandle": "in" },
       { "id": "e27b", "source": "if_receipt_ok2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
@@ -1205,6 +1223,7 @@
       { "id": "e31c_bad", "source": "if_receipt_ok3", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e31d", "source": "wait3", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e31e", "source": "wait3", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
+      { "id": "e_agent3_fail", "source": "agent3", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e31f", "source": "test3", "sourceHandle": "success", "target": "if_test_ok3", "targetHandle": "in" },
       { "id": "e31g", "source": "test3", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e31h", "source": "if_test_ok3", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
@@ -1217,6 +1236,7 @@
       { "id": "e_join_review_fail", "source": "join_review_fail", "sourceHandle": "out", "target": "review_fail", "targetHandle": "in" },
       { "id": "e_join_wait2_timeout", "source": "join_wait2_timeout", "sourceHandle": "out", "target": "wait2_timeout", "targetHandle": "in" },
       { "id": "e_join_wait2_fail", "source": "join_wait2_fail", "sourceHandle": "out", "target": "wait2_fail", "targetHandle": "in" },
+      { "id": "e_join_correction_action_fail", "source": "join_correction_action_fail", "sourceHandle": "out", "target": "correction_action_fail", "targetHandle": "in" },
       { "id": "e_join_test_http_fail", "source": "join_test_http_fail", "sourceHandle": "out", "target": "test_http_fail", "targetHandle": "in" },
       { "id": "e_join_switch_rev", "source": "join_switch_rev", "sourceHandle": "out", "target": "map_switch_rev", "targetHandle": "in" },
       { "id": "e_map_switch_rev", "source": "map_switch_rev", "sourceHandle": "out", "target": "switch_rev", "targetHandle": "in" },
