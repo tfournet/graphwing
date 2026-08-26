@@ -1419,11 +1419,16 @@
           "agents": { "type": "array", "items": { "type": "object" } }
         }
       },
+      "OrdinaryIdentityTuple": {"oneOf":[{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"}}}]},
+      "CodeOffIdentityTuple": {"oneOf":[{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-terra"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-fable-5"}}}]},
+      "OrdinaryAgentRequestIdentity": {"allOf":[{"$ref":"#/components/schemas/OrdinaryIdentityTuple"},{"properties":{"session_identity":{"allOf":[{"$ref":"#/components/schemas/SessionIdentity"},{"$ref":"#/components/schemas/OrdinaryIdentityTuple"}]}}}]},
+      "CodeOffAgentRequestIdentity": {"allOf":[{"$ref":"#/components/schemas/CodeOffIdentityTuple"},{"properties":{"session_identity":{"allOf":[{"$ref":"#/components/schemas/SessionIdentity"},{"$ref":"#/components/schemas/CodeOffIdentityTuple"}]}}}]},
       "AgentRunRequest": {
         "type": "object",
         "required": ["launcher", "provider", "model"],
         "additionalProperties": false,
         "oneOf": [{"required":["prompt"],"not":{"required":["codeoff_workspace"]}},{"required":["codeoff_workspace"],"not":{"anyOf":[{"required":["prompt"]},{"required":["cwd"]}]}}],
+        "allOf": [{"if":{"required":["prompt"]},"then":{"$ref":"#/components/schemas/OrdinaryAgentRequestIdentity"}},{"if":{"required":["codeoff_workspace"]},"then":{"$ref":"#/components/schemas/CodeOffAgentRequestIdentity"}}],
         "properties": {
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
           "launcher": { "type": "string", "enum": ["claude", "codex", "grok"] },
@@ -1472,17 +1477,20 @@
       },
       "SessionIdentity": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"],
+        "allOf": [{"$ref":"#/components/schemas/CodeOffIdentityTuple"}],
         "properties": {
           "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
-          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "grok-4.6"] },
           "repo": { "type": "string" },
           "branch": { "type": "string" },
           "starting_head": { "type": "string" },
           "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id, Claude result.session_id, or Grok ACP session/new result.sessionId. Required non-null for success and resume." }
         }
       },
+      "CodeOffExecutionIdentity": {"type":"object","additionalProperties":false,"required":["version","source","launcher","provider","model","native_session_id"],"properties":{"version":{"type":"string","enum":["code-off-execution-identity-v1"]},"source":{"type":"string","enum":["claude-result-v1","codex-rollout-v1","grok-acp-v1"]},"launcher":{"type":"string","enum":["codex","claude","grok"]},"provider":{"type":"string","enum":["openai","anthropic","xai"]},"model":{"type":"string","enum":["gpt-5.6-sol","claude-opus-5","claude-sonnet-5","grok-4.6","gpt-5.6-terra","claude-fable-5"],"description":"Exact requested model retained after launcher-native execution provenance checks; Codex and Claude prove the executed model."},"native_session_id":{"type":"string","minLength":1}},"oneOf":[{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"},"source":{"const":"codex-rollout-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"},"source":{"const":"claude-result-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"},"source":{"const":"claude-result-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"},"source":{"const":"grok-acp-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-terra"},"source":{"const":"codex-rollout-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-fable-5"},"source":{"const":"claude-result-v1"}}}]},
       "AgentReceipt": {
         "type": "object",
         "properties": {
@@ -1490,6 +1498,7 @@
           "job_id": { "type": "string" },
           "role": { "type": "string", "enum": ["primary", "availability_fallback"] },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
+          "execution_identity": { "$ref": "#/components/schemas/CodeOffExecutionIdentity" },
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
           "log_ref": { "type": "string" },
