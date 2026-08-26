@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -1821,8 +1825,10 @@ while True:
         request_schema = spec["components"]["schemas"]["AgentRunRequest"]
         self.assertEqual(
             set(request_schema["required"]),
-            {"prompt", "launcher", "provider", "model"},
+            {"launcher", "provider", "model"},
         )
+        self.assertIn("codeoff_workspace", props)
+        self.assertEqual(len(request_schema["oneOf"]), 2)
         self.assertFalse(request_schema["additionalProperties"])
         for schema_name in ("AgentRunAccepted", "AgentJob", "AgentReceipt"):
             identity = spec["components"]["schemas"][schema_name]["properties"]["session_identity"]
@@ -5971,6 +5977,1211 @@ while True:
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_launcher")
+
+
+class CodeOffTests(unittest.TestCase):
+    """Issue 67 is a bounded protocol; no fixture may launch a model or use network."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        root = Path(self.td.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "codeoff@test")
+        self._git("config", "user.name", "code-off-test")
+        (self.repo / "README.md").write_text("base\n")
+        (self.repo / "delete-me.txt").write_text("delete\n")
+        (self.repo / "rename-me.txt").write_text("rename\n")
+        self._git("add", ".")
+        self._git("commit", "-m", "base")
+        self.base_sha = self._git("rev-parse", "HEAD").stdout.strip()
+        self.records = root / "codeoffs"
+        self.workspaces = root / "codeoff-workspaces"
+        self.jobs = root / "jobs"
+        self.tests_path = root / "tests.json"
+        self.tests_path.write_text(json.dumps({"tests": [
+            {"name": "fixture-pass", "argv": [sys.executable, "-c", "import subprocess; from pathlib import Path; assert subprocess.check_output(['git','rev-parse','--is-inside-work-tree'], text=True).strip() == 'true'; assert Path('README.md').is_file()"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
+            {"name": "fixture-fail", "argv": [sys.executable, "-c", "raise SystemExit(7)"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
+            {"name": "fixture-git-fail", "argv": [sys.executable, "-c", "import subprocess; assert subprocess.check_output(['git','rev-parse','--is-inside-work-tree'], text=True).strip() == 'true'; raise SystemExit(7)"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
+            {"name": "fixture-import", "argv": [sys.executable, "-c", "import candidate_module; assert candidate_module.VALUE == 1"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
+            {"name": "fixture-mutates", "argv": [sys.executable, "-c", "from pathlib import Path; Path('recipe-output.tmp').write_text('mutation\\n')"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
+        ]}) + "\n")
+        self.production_manifest = deepcopy(server.CODEOFF_MODEL_MANIFEST)
+        proven = deepcopy(server.CODEOFF_MODEL_MANIFEST)
+        proven["as_of"] = "2026-08-26"
+        proven["max_age_days"] = 36500
+        for identity in proven["models"].values():
+            identity["runnable"] = True
+            identity["proven"] = True
+            identity["reason"] = "fixture-approved"
+        patches = (
+            mock.patch.object(server, "CODEOFFS_DIR", self.records),
+            mock.patch.object(server, "CODEOFF_WORKSPACES_DIR", self.workspaces),
+            mock.patch.object(server, "JOBS_DIR", self.jobs),
+            mock.patch.object(server, "TESTS_PATH", self.tests_path),
+            mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", proven),
+            mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
+            mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args], check=True,
+            capture_output=True, text=True,
+        )
+
+    def _body(self, experiment_id="experiment-0001", seed=None, **overrides):
+        body = {
+            "experiment_id": experiment_id,
+            "repo": "scratch",
+            "base_sha": self.base_sha,
+            "seed": seed or ("00" * 32),
+            "category": "backend",
+            "tags": ["testing", "api", "testing"],
+            "category_source": "issue-67-fixture",
+            "prompt": "Implement the fixture without network.\n",
+            "tests": ["fixture-pass"],
+            "toolchain": {"python": sys.version.split()[0], "git": "fixture"},
+            "budgets": {"author_seconds": 60, "judge_seconds": 60, "test_seconds": 20, "max_turns": 4},
+            "commit_message": "feat: promote code-off winner",
+        }
+        body.update(overrides)
+        return body
+
+    def _post(self, path, body, authed=True):
+        return server.dispatch("POST", path, {}, authed, json.dumps(body).encode())[:2]
+
+    def _prepare(self, experiment_id="experiment-0001", **overrides):
+        status, payload = self._post("/v1/code-off/prepare", self._body(experiment_id, **overrides))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "prepared", payload)
+        return payload
+
+    def _launch_done(self, experiment_id, slot):
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        identity = manifest["identities"][slot]
+        body = self._agent_body(experiment_id, slot)
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, payload = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, payload)
+        enqueue.assert_called_once()
+        job = server.read_job(payload["job_id"])
+        self.assertIsNotNone(job)
+        identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
+        job.update({
+            "status": "completed", "started_at": "2026-08-26T12:00:00Z",
+            "finished_at": "2026-08-26T12:00:01Z", "session_identity": identity,
+            "receipt": {"status": "ok", "job_id": job["job_id"], "session_identity": identity, "summary": "fixture"},
+        })
+        server.write_job(job)
+        return job["job_id"]
+
+    def _agent_body(self, experiment_id, slot):
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        identity = manifest["identities"][slot]
+        return {
+            "codeoff_workspace": {"experiment_id": experiment_id, "slot": slot},
+            "launcher": identity["launcher"], "provider": identity["provider"],
+            "model": identity["exact_model"],
+            "max_turns": manifest["budgets"]["max_turns"],
+            "run_budget_seconds": (
+                manifest["budgets"]["author_seconds"] if slot.startswith("author-")
+                else manifest["budgets"]["judge_seconds"]
+            ),
+        }
+
+    def _freeze_and_test(self, experiment_id, slot):
+        job_id = self._launch_done(experiment_id, slot)
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": experiment_id, "slot": slot, "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        status, tested = self._post("/v1/code-off/candidate", {
+            "experiment_id": experiment_id, "slot": slot, "action": "test",
+        })
+        self.assertEqual(status, 200, tested)
+        return frozen, tested
+
+    def _ready_to_finalize(self, experiment_id="experiment-0001"):
+        self._prepare(experiment_id)
+        winner = server.codeoff_workspace_path(experiment_id, "author-1")
+        (winner / "README.md").write_text("winner\n")
+        for slot in ("author-1", "author-2"):
+            frozen, tested = self._freeze_and_test(experiment_id, slot)
+            self.assertTrue(tested["tests_pass"], (frozen, tested))
+        status, blind = self._post("/v1/code-off/blind", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, blind)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1")
+        status, aggregate = self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, aggregate)
+        self.assertTrue(aggregate["promotion_eligible"], aggregate)
+        return aggregate
+
+    def _assert_no_staging(self, experiment_id):
+        workspace = self.workspaces / experiment_id
+        if workspace.exists():
+            self.assertFalse([path for path in workspace.iterdir() if path.name.startswith(".")], list(workspace.iterdir()))
+        self.assertFalse([path for path in self.repo.parent.iterdir() if ".codeoff-" in path.name])
+        listed = self._git("worktree", "list", "--porcelain").stdout
+        self.assertNotIn(".verify-", listed)
+        self.assertNotIn(".codeoff-", listed)
+
+    def _target_snapshot(self):
+        return server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"]
+
+    def _ready_for_judges(self, experiment_id="experiment-0001"):
+        self._prepare(experiment_id)
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot)
+        status, blind = self._post("/v1/code-off/blind", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, blind)
+        return blind
+
+    @staticmethod
+    def _scores(total_bias=0):
+        return {"correctness": 30 + total_bias, "tests": 15, "quality": 15, "scope": 8, "maintainability": 8}
+
+    def _judge_done(self, experiment_id, judge_slot, prefer_author, score_a=0, score_b=0):
+        job_id = self._launch_done(experiment_id, judge_slot)
+        private = json.loads((self.records / experiment_id / "private" / "blinding.json").read_text())
+        labels = private["judges"][judge_slot]["labels"]
+        preferred = next(label for label, slot in labels.items() if slot == prefer_author)
+        result = {
+            "rubric_version": "code-off-rubric-v1",
+            "judge_snapshot_hash": private["judges"][judge_slot]["judge_snapshot_hash"],
+            "candidates": {
+                label: {"scores": self._scores(score_a if slot == "author-1" else score_b), "pass": True, "rationale": f"bounded {label}"}
+                for label, slot in labels.items()
+            },
+            "preference": preferred,
+            "rationale": "bounded comparison",
+        }
+        workspace = server.codeoff_workspace_path(experiment_id, judge_slot)
+        (workspace / "judge-result.json").write_text(json.dumps(result) + "\n")
+        status, receipt = self._post("/v1/code-off/judge", {
+            "experiment_id": experiment_id, "slot": judge_slot, "job_id": job_id,
+        })
+        self.assertEqual(status, 200, receipt)
+        return receipt
+
+    def test_fixed_seed_selection_is_versioned_canonical_and_without_replacement(self):
+        draw = server.codeoff_draw("00" * 32)
+        self.assertEqual(server.CODEOFF_AUTHOR_POOL, ["grok", "sol", "terra", "sonnet", "opus"])
+        self.assertEqual(draw["authors"], ["sol", "sonnet"])
+        self.assertEqual(draw["random_judges"], ["opus", "grok"])
+        self.assertEqual(len(set(draw["authors"] + draw["random_judges"])), 4)
+        self.assertTrue(set(draw["authors"]).isdisjoint(draw["random_judges"]))
+        self.assertEqual(draw, server.codeoff_draw("00" * 32))
+        self.assertEqual(draw["algorithm_version"], "code-off-draw-v1")
+        self.assertEqual(draw["policy_version"], "code-off-policy-v1")
+        self.assertEqual(server.CODEOFF_CATEGORIES, {"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
+        self.assertEqual(server.CODEOFF_TAGS, {"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
+
+    def test_prepare_locks_category_tags_source_seed_and_exact_snapshots(self):
+        payload = self._prepare()
+        manifest = json.loads((self.records / "experiment-0001" / "manifest.json").read_text())
+        self.assertEqual(manifest["classification"]["version"], "code-category-v1")
+        self.assertEqual(manifest["classification"]["category"], "backend")
+        self.assertEqual(manifest["classification"]["tags"], ["api", "testing"])
+        self.assertEqual(manifest["original_classification"]["tags"], ["testing", "api", "testing"])
+        self.assertEqual(manifest["category_source"], "issue-67-fixture")
+        self.assertEqual(manifest["selection"]["seed"], "00" * 32)
+        self.assertEqual(manifest["selection"]["ordered_pool"], server.CODEOFF_AUTHOR_POOL)
+        self.assertRegex(manifest["selection"]["seed_commitment"], r"^[0-9a-f]{64}$")
+        for slot, identity in manifest["identities"].items():
+            self.assertEqual(identity["manifest_version"], server.CODEOFF_MODEL_MANIFEST["version"], slot)
+            self.assertTrue(identity["manifest_current"], slot)
+            self.assertIn(identity["exact_model"], {"gpt-5.6-sol", "gpt-5.6-terra", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "grok-4.6"})
+        self.assertEqual(payload["prompt_hash"], manifest["prompt_hash"])
+        self.assertNotIn("prompt", payload)
+
+    def test_public_audit_is_a_non_reconstructing_commitment_projection(self):
+        self._ready_to_finalize("audit-projection-1")
+        root = self.records / "audit-projection-1"
+        manifest = json.loads((root / "manifest.json").read_text())
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": ["audit-projection-1"]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        projection = audit["selection"]
+        self.assertNotIn("seed", projection)
+        self.assertEqual(projection["seed_commitment"], manifest["selection"]["seed_commitment"])
+        self.assertEqual(projection["authors"], manifest["selection"]["authors"])
+        self.assertEqual(projection["random_judges"], manifest["selection"]["random_judges"])
+        self.assertEqual(audit["aggregation"]["winner"], "author-1")
+        self.assertNotIn("preferences", audit["aggregation"])
+        self.assertTrue(all(set(receipt) == {"receipt_hash"} for receipt in audit["judges"].values()))
+        self.assertGreaterEqual(audit["event_count"], 16)
+        self.assertRegex(audit["prompt_hash"], r"^[0-9a-f]{64}$")
+        rendered = json.dumps(audit, sort_keys=True)
+        self.assertNotIn(manifest["selection"]["seed"], rendered)
+        self.assertNotIn('"labels"', rendered)
+        self.assertFalse(any(item["labels"] == projection for item in private["judges"].values()))
+        with self.assertRaises((KeyError, TypeError, ValueError)):
+            server.codeoff_draw(projection["seed"])
+
+    def test_graph_shaped_json_strings_are_bounded_parsed_and_strict(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
+        prepare = next(node for node in graph["spec"]["nodes"] if node["id"] == "prepare")["config"]
+        native = self._body("graph-values-0001")
+        shaped = {
+            key: json.dumps(native[key], separators=(",", ":")) if key in {"tags", "tests", "toolchain", "budgets"} else native[key]
+            for key in native
+        }
+        for key in native:
+            self.assertEqual(prepare[key], f"{{{{ CTX.INPUT.{key} }}}}")
+        status, payload = self._post("/v1/code-off/prepare", shaped)
+        self.assertEqual(status, 200, payload)
+        manifest = json.loads((self.records / "graph-values-0001" / "manifest.json").read_text())
+        self.assertEqual(manifest["classification"]["tags"], ["api", "testing"])
+        self.assertEqual(manifest["tests"], native["tests"])
+        self.assertEqual(manifest["toolchain"], native["toolchain"])
+        self.assertEqual(manifest["budgets"], native["budgets"])
+        agent_body = self._agent_body("graph-values-0001", "author-1")
+        agent_body.update({key: str(agent_body[key]) for key in ("max_turns", "run_budget_seconds")})
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, receipt = self._post("/v1/agent/run", agent_body)
+        self.assertEqual(status, 202, receipt)
+        enqueue.assert_called_once()
+        bad = (
+            ("tags", '"api"'), ("tests", "{}"), ("toolchain", "[]"),
+            ("budgets", '{"author_seconds":60}'), ("tags", "[" + '"api",' * 600 + '"api"]'),
+        )
+        for index, (field, value) in enumerate(bad):
+            body = self._body(f"graph-bad-{index:04d}")
+            body[field] = value
+            status, receipt = self._post("/v1/code-off/prepare", body)
+            self.assertEqual(status, 400, (field, receipt))
+            self.assertIn(receipt["code"], {f"bad_{field}", "bad_json_value"})
+
+    def test_categories_and_opaque_inputs_fail_closed(self):
+        cases = (
+            ({"category": "frontend"}, "bad_category"),
+            ({"tags": ["api", "unknown"]}, "bad_tags"),
+            ({"category_source": ""}, "bad_category_source"),
+            ({"seed": "00" * 31}, "bad_seed"),
+            ({"experiment_id": "../escape"}, "bad_experiment_id"),
+            ({"workspace_path": "/tmp/escape"}, "unexpected_fields"),
+        )
+        for i, (change, code) in enumerate(cases):
+            with self.subTest(code=code):
+                body = self._body(f"bad-input-{i:04d}")
+                body.update(change)
+                status, payload = self._post("/v1/code-off/prepare", body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], code)
+
+    def test_prepare_snapshot_failure_is_transactional_and_same_id_retries(self):
+        real_snapshot = server.codeoff_tree_snapshot
+
+        def fail_after_artifacts(path, base_sha=None):
+            if Path(path).name == "author-1":
+                raise OSError("fixture snapshot interruption")
+            return real_snapshot(path, base_sha)
+
+        with mock.patch.object(server, "codeoff_tree_snapshot", side_effect=fail_after_artifacts):
+            status, payload = self._post("/v1/code-off/prepare", self._body("prepare-retry-01"))
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["code"], "codeoff_runtime_failure")
+        self.assertTrue(payload["retryable"])
+        self.assertFalse((self.records / "prepare-retry-01").exists())
+        self.assertFalse((self.workspaces / "prepare-retry-01").exists())
+        self.assertNotIn("prepare-retry-01", self._git("worktree", "list", "--porcelain").stdout)
+        self._prepare("prepare-retry-01")
+
+    def test_event_and_state_write_interruptions_recover_for_retry(self):
+        for index, target in enumerate(("_codeoff_event", "_codeoff_write_state")):
+            experiment_id = f"write-retry-{index:04d}"
+            with self.subTest(target=target):
+                self._prepare(experiment_id)
+                job_id = self._launch_done(experiment_id, "author-1")
+                with mock.patch.object(server, target, side_effect=OSError("fixture interrupted write")):
+                    status, payload = self._post("/v1/code-off/candidate", {
+                        "experiment_id": experiment_id, "slot": "author-1", "action": "freeze", "job_id": job_id,
+                    })
+                self.assertEqual(status, 500, payload)
+                self.assertEqual(payload["code"], "codeoff_runtime_failure")
+                self.assertTrue(payload["retryable"])
+                audit_status, audit, _ = server.dispatch(
+                    "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+                )
+                self.assertEqual(audit_status, 200, audit)
+                self.assertFalse(audit["candidates"]["author-1"])
+                retry_status, retry = self._post("/v1/code-off/candidate", {
+                    "experiment_id": experiment_id, "slot": "author-1", "action": "freeze", "job_id": job_id,
+                })
+                self.assertEqual(retry_status, 200, retry)
+
+    def test_blind_state_interruption_cleans_uncommitted_judge_workspaces_for_retry(self):
+        self._prepare()
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        with mock.patch.object(server, "_codeoff_write_state", side_effect=OSError("fixture blind state interruption")):
+            status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (500, "codeoff_runtime_failure"))
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "blinded")
+
+    def test_candidate_infrastructure_interruption_is_retryable_not_terminal(self):
+        self._prepare()
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        with mock.patch.object(server, "_codeoff_verify_artifact", side_effect=OSError("fixture staging outage")):
+            status, payload = self._post("/v1/code-off/candidate", {
+                "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+            })
+        self.assertEqual((status, payload["code"], payload["retryable"]), (500, "codeoff_runtime_failure", True))
+        self.assertFalse(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
+        self.assertEqual(self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+        })[0], 200)
+
+    def test_duplicate_blind_after_judge_launch_preserves_frozen_workspaces(self):
+        self._ready_for_judges()
+        self._launch_done("experiment-0001", "judge-fable")
+        marker = server.codeoff_workspace_path("experiment-0001", "judge-fable") / "live-marker"
+        marker.write_text("must survive duplicate blind\n")
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "already_blinded")
+        self.assertTrue(marker.exists())
+
+    def test_current_unproven_fable_and_selected_terra_park_without_redraw_or_launch(self):
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", self.production_manifest), \
+             mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("launcher lookup forbidden")), \
+             mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("launch forbidden")):
+            status, first = self._post("/v1/code-off/prepare", self._body("park-fable-0001", seed="00" * 32))
+            status2, terra = self._post("/v1/code-off/prepare", self._body("park-terra-0001", seed=(4).to_bytes(32, "big").hex()))
+        self.assertEqual((status, status2), (200, 200))
+        self.assertEqual(first["status"], "parked")
+        self.assertIn("fable", " ".join(first["reasons"]))
+        self.assertEqual(first["authors"], ["sol", "sonnet"])
+        self.assertEqual(terra["authors"], ["terra", "sol"])
+        self.assertIn("terra", " ".join(terra["reasons"]))
+        self.assertFalse((self.workspaces / "park-fable-0001").exists())
+        self.assertTrue(json.loads((self.records / "park-fable-0001" / "state.json").read_text())["finalized"])
+
+    def test_stale_manifest_parks_before_worktree_or_launch(self):
+        stale = deepcopy(server.CODEOFF_MODEL_MANIFEST)
+        stale.update({"as_of": "2020-01-01", "max_age_days": 1})
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", stale), \
+             mock.patch.object(server, "run_git", wraps=server.run_git) as git:
+            status, payload = self._post("/v1/code-off/prepare", self._body("stale-manifest-1"))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "parked")
+        self.assertIn("approved_model_manifest_stale", payload["reasons"])
+        self.assertFalse(any("worktree" in call.args[1] for call in git.call_args_list))
+
+    def test_prepare_creates_two_isolated_git_worktrees_and_agent_run_resolves_only_opaque_ref(self):
+        self._prepare()
+        one = server.codeoff_workspace_path("experiment-0001", "author-1")
+        two = server.codeoff_workspace_path("experiment-0001", "author-2")
+        self.assertNotEqual(one, two)
+        self.assertTrue((one / ".git").exists())
+        self.assertTrue((two / ".git").exists())
+        job_id = self._launch_done("experiment-0001", "author-1")
+        job = server.read_job(job_id)
+        self.assertEqual(job["codeoff_workspace"], {"experiment_id": "experiment-0001", "slot": "author-1"})
+        self.assertEqual((self.jobs / job_id / "prompt.txt").read_bytes(), (self.records / "experiment-0001" / "artifacts" / job["prompt_hash"]).read_bytes())
+        status, payload = self._post("/v1/agent/run", {
+            "prompt": "escape", "cwd": str(one), "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_cwd")
+        status, payload = self._post("/v1/agent/run", {
+            "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1", "path": str(one)},
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "bad_codeoff_workspace")
+        status, payload = self._post("/v1/agent/run", {
+            "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-2"},
+            "launcher": "claude", "provider": "anthropic", "model": "moving-latest-alias",
+            "max_turns": 4, "run_budget_seconds": 60,
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "codeoff_identity_mismatch")
+
+    def test_ordinary_agent_run_never_acquires_the_codeoff_lock(self):
+        class ForbiddenLock:
+            def __enter__(self):
+                raise AssertionError("ordinary agent_run acquired CODEOFF_LOCK")
+
+            def __exit__(self, *_args):
+                return False
+
+        body = {
+            "prompt": "bounded ordinary fixture", "cwd": "scratch", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol", "max_turns": 1, "run_budget_seconds": 30,
+        }
+        with mock.patch.object(server, "CODEOFF_LOCK", ForbiddenLock()), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, payload = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, payload)
+        enqueue.assert_called_once()
+
+    def test_duplicate_budget_resume_and_terminal_receipt_mismatches_fail_closed(self):
+        self._prepare()
+        wrong_budget = self._agent_body("experiment-0001", "author-2")
+        wrong_budget["max_turns"] += 1
+        status, payload = self._post("/v1/agent/run", wrong_budget)
+        self.assertEqual((status, payload["code"]), (400, "codeoff_budget_mismatch"))
+
+        job_id = self._launch_done("experiment-0001", "author-1")
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, payload = self._post("/v1/agent/run", self._agent_body("experiment-0001", "author-1"))
+        self.assertEqual((status, payload["code"]), (409, "slot_already_launched"))
+
+        resume_id = "f" * 32
+        resume_body = self._agent_body("experiment-0001", "author-2")
+        branch, head, err = server.current_branch_head(server.codeoff_workspace_path("experiment-0001", "author-2"))
+        self.assertIsNone(err)
+        resume_identity = {
+            "launcher": resume_body["launcher"], "provider": resume_body["provider"], "model": resume_body["model"],
+            "repo": "codeoff:experiment-0001:author-2", "branch": branch, "starting_head": head,
+            "native_session_id": "fixture-resume",
+        }
+        server.write_job({
+            "job_id": resume_id, "status": "completed", "launcher": resume_body["launcher"],
+            "session_identity": resume_identity,
+            "receipt": {"status": "ok", "job_id": resume_id, "session_identity": resume_identity},
+        })
+        resume_body.update({"resume_job_id": resume_id, "session_identity": resume_identity})
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)):
+            status, payload = self._post("/v1/agent/run", resume_body)
+        self.assertEqual((status, payload["code"]), (400, "codeoff_resume_mismatch"))
+
+        job = server.read_job(job_id)
+        job["receipt"]["job_id"] = "0" * 32
+        server.write_job(job)
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual((status, payload["code"]), (422, "agent_receipt_mismatch"))
+        self.assertTrue(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_nonterminal_agent_receipt_remains_retryable(self):
+        self._prepare()
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", self._agent_body("experiment-0001", "author-1"))
+        self.assertEqual(status, 202, launched)
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": launched["job_id"],
+        })
+        self.assertEqual((status, payload["code"]), (409, "agent_not_terminal"))
+        self.assertFalse(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
+
+    def test_freeze_preserves_complete_tree_fidelity_and_detects_mutation(self):
+        self._prepare()
+        work = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (work / "README.md").write_bytes(b"changed\x00binary\xff")
+        (work / "untracked.bin").write_bytes(bytes(range(256)))
+        (work / "executable.sh").write_text("#!/bin/sh\nexit 0\n")
+        (work / "executable.sh").chmod(0o755)
+        (work / "delete-me.txt").unlink()
+        subprocess.run(["git", "-C", str(work), "mv", "rename-me.txt", "renamed.txt"], check=True)
+        (work / "link").symlink_to("renamed.txt")
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        raw = (self.records / "experiment-0001" / "artifacts" / frozen["tree_manifest_hash"]).read_bytes()
+        tree = json.loads(raw)
+        entries = {entry["path"]: entry for entry in tree["entries"]}
+        self.assertEqual(entries["README.md"]["sha256"], hashlib.sha256(b"changed\x00binary\xff").hexdigest())
+        self.assertEqual(entries["untracked.bin"]["size"], 256)
+        self.assertEqual(entries["executable.sh"]["mode"], "0755")
+        self.assertEqual(entries["link"]["type"], "symlink")
+        self.assertEqual(entries["link"]["target"], "renamed.txt")
+        self.assertNotIn("delete-me.txt", entries)
+        self.assertTrue(any(c["status"].startswith("R") for c in tree["changes"]))
+        self.assertTrue(any(c["status"] == "D" and c["path"] == "delete-me.txt" for c in tree["changes"]))
+        (work / "renamed.txt").write_text("mutated after freeze\n")
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+        })
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(payload["code"], "candidate_mutated")
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_extraction_rejects_absolute_and_escaping_symlink_targets(self):
+        def symlink_tar(name, target):
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode="w") as archive:
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = target
+                archive.addfile(info)
+            return raw.getvalue()
+
+        for index, (name, target) in enumerate((("absolute", "/etc/passwd"), ("nested/escape", "../../outside"))):
+            with self.subTest(target=target):
+                destination = Path(self.td.name) / f"unsafe-{index}"
+                with self.assertRaisesRegex(RuntimeError, "unsafe candidate artifact"):
+                    server._codeoff_extract(symlink_tar(name, target), destination)
+                self.assertFalse((destination / name).exists())
+        destination = Path(self.td.name) / "safe-relative"
+        server._codeoff_extract(symlink_tar("nested/link", "../inside"), destination)
+        self.assertTrue((destination / "nested" / "link").is_symlink())
+
+    def test_freeze_parks_absolute_and_escaping_symlinks_before_artifact_creation(self):
+        for index, target in enumerate(("/etc/passwd", "../../outside")):
+            experiment_id = f"unsafe-link-{index:04d}"
+            with self.subTest(target=target):
+                self._prepare(experiment_id)
+                work = server.codeoff_workspace_path(experiment_id, "author-1")
+                (work / "nested").mkdir()
+                (work / "nested" / "escape").symlink_to(target)
+                job_id = self._launch_done(experiment_id, "author-1")
+                status, payload = self._post("/v1/code-off/candidate", {
+                    "experiment_id": experiment_id, "slot": "author-1", "action": "freeze", "job_id": job_id,
+                })
+                self.assertEqual((status, payload["code"]), (422, "candidate_unsafe_symlink"))
+                state = json.loads((self.records / experiment_id / "state.json").read_text())
+                self.assertTrue(state["finalized"])
+                self.assertFalse(state["candidates"]["author-1"])
+                self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": experiment_id})[0], 200)
+
+    def test_freeze_parks_unencodable_symlink_metadata(self):
+        self._prepare()
+        work = server.codeoff_workspace_path("experiment-0001", "author-1")
+        os.symlink(b"\xff", os.fsencode(work / "opaque-link"))
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual((status, payload["code"]), (422, "candidate_freeze_failed"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_parallel_candidate_tests_do_not_serialize_on_global_lock(self):
+        self._prepare()
+        for slot in ("author-1", "author-2"):
+            job_id = self._launch_done("experiment-0001", slot)
+            status, payload = self._post("/v1/code-off/candidate", {
+                "experiment_id": "experiment-0001", "slot": slot, "action": "freeze", "job_id": job_id,
+            })
+            self.assertEqual(status, 200, payload)
+        barrier = threading.Barrier(2)
+        original = server._codeoff_run_tests
+        results, failures = {}, []
+
+        def concurrent_tests(*args, **kwargs):
+            barrier.wait(timeout=0.75)
+            return original(*args, **kwargs)
+
+        def worker(slot):
+            try:
+                results[slot] = self._post("/v1/code-off/candidate", {
+                    "experiment_id": "experiment-0001", "slot": slot, "action": "test",
+                })
+            except BaseException as exc:  # capture thread evidence for the main assertion
+                failures.append(exc)
+
+        with mock.patch.object(server, "_codeoff_run_tests", side_effect=concurrent_tests):
+            threads = [threading.Thread(target=worker, args=(slot,)) for slot in ("author-1", "author-2")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertFalse(failures, failures)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual({slot: result[0] for slot, result in results.items()}, {"author-1": 200, "author-2": 200})
+        state = json.loads((self.records / "experiment-0001" / "state.json").read_text())
+        self.assertEqual(state["status"], "candidates_tested")
+        self.assertTrue(all(state["candidates"][slot]["tests"]["pass"] for slot in results))
+
+    def test_allowlisted_python_recipe_cannot_create_bytecode_mutation(self):
+        self._prepare(tests=["fixture-import"])
+        work = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (work / "candidate_module.py").write_text("VALUE = 1\n")
+        frozen, tested = self._freeze_and_test("experiment-0001", "author-1")
+        self.assertTrue(tested["tests_pass"], frozen)
+        self.assertFalse((work / "__pycache__").exists())
+
+    def test_recipe_tree_mutation_parks_and_allows_cleanup(self):
+        self._prepare(tests=["fixture-mutates"])
+        job_id = self._launch_done("experiment-0001", "author-1")
+        self.assertEqual(self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })[0], 200)
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+        })
+        self.assertEqual((status, payload["code"]), (422, "candidate_test_mutated"))
+        self.assertTrue(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_corrupt_content_addressed_candidate_artifact_parks_and_cleans(self):
+        self._prepare()
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        (self.records / "experiment-0001" / "artifacts" / frozen["artifact_hash"]).write_bytes(b"corrupt")
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+        })
+        self.assertEqual((status, payload["code"]), (422, "candidate_artifact_invalid"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_corrupt_content_addressed_tree_manifest_parks_and_cleans(self):
+        self._prepare()
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        (self.records / "experiment-0001" / "artifacts" / frozen["tree_manifest_hash"]).write_bytes(b"corrupt")
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+        })
+        self.assertEqual((status, payload["code"]), (422, "candidate_artifact_invalid"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_candidate_extraction_integrity_failure_parks_and_cleans(self):
+        self._prepare()
+        job_id = self._launch_done("experiment-0001", "author-1")
+        self.assertEqual(self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })[0], 200)
+        with mock.patch.object(server, "_codeoff_extract", side_effect=server.CodeOffArtifactError("unsafe candidate artifact")):
+            status, payload = self._post("/v1/code-off/candidate", {
+                "experiment_id": "experiment-0001", "slot": "author-1", "action": "test",
+            })
+        self.assertEqual((status, payload["code"]), (422, "candidate_artifact_invalid"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_blind_gate_candidate_mutation_parks_and_cleans(self):
+        self._prepare()
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        (server.codeoff_workspace_path("experiment-0001", "author-1") / "README.md").write_text("late mutation\n")
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (422, "candidate_mutated"))
+        self.assertTrue(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_blind_gate_late_artifact_corruption_parks_and_cleans(self):
+        self._prepare()
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        state = json.loads((self.records / "experiment-0001" / "state.json").read_text())
+        digest = state["candidates"]["author-1"]["tree_manifest_hash"]
+        (self.records / "experiment-0001" / "artifacts" / digest).write_bytes(b"late corruption")
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (422, "candidate_artifact_invalid"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_ignored_candidate_secret_parks_before_commit_eligibility(self):
+        self._prepare()
+        work = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (work / ".gitignore").write_text("secret.env\n")
+        (work / "secret.env").write_text("TOKEN=private\n")
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual((status, payload["code"]), (422, "candidate_ignored_paths"))
+        state = json.loads((self.records / "experiment-0001" / "state.json").read_text())
+        self.assertTrue(state["finalized"])
+        self.assertIsNone(state.get("final_verification"))
+        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+
+    def test_clean_blind_bundles_ignore_generic_words_and_use_independent_maps(self):
+        self._prepare(seed=(1).to_bytes(32, "big").hex())
+        first = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (first / "ordinary-docs.txt").write_text("This branch uses an OpenAI SDK; worktree and session are ordinary engineering words.\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["leakage_findings"], 0)
+        private = json.loads((self.records / "experiment-0001" / "private" / "blinding.json").read_text())
+        orders = [tuple(item["labels"].values()) for item in private["judges"].values()]
+        self.assertGreater(len(set(orders)), 1)
+        for judge in payload["bundles"]:
+            self.assertRegex(judge["bundle_hash"], r"^[0-9a-f]{64}$")
+            self.assertNotIn("artifact", judge)
+
+    def test_baseline_model_names_are_not_candidate_introduced_leakage(self):
+        baseline = self.repo / "server_like.py"
+        padding = "# server-like baseline padding\n" * 10000
+        baseline.write_text('EXACT_MODEL = "gpt-5.6-sol"\n' + padding + "VALUE = 1\n")
+        self._git("add", "server_like.py")
+        self._git("commit", "-m", "server-like baseline")
+        self.base_sha = self._git("rev-parse", "HEAD").stdout.strip()
+        self._prepare()
+        first = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (first / "server_like.py").write_text('EXACT_MODEL = "gpt-5.6-sol"\n' + padding + "VALUE = 2\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["leakage_findings"], 0)
+
+    def test_judge_prompt_contains_locked_task_and_category_without_identity_metadata(self):
+        task = "Repair the deterministic cache invalidation path.\n"
+        self._prepare(prompt=task, category="backend", tags=["bug_fix", "testing"])
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})[0], 200)
+        resolved, err = server._resolve_codeoff_agent({"experiment_id": "experiment-0001", "slot": "judge-fable"})
+        self.assertIsNone(err)
+        prompt = resolved["prompt"].decode()
+        self.assertIn(task.strip(), prompt)
+        self.assertIn("backend", prompt)
+        self.assertIn("bug_fix", prompt)
+        for secret in ("author-1", "author-2", "logical_model", "exact_model", "gpt-5.6-sol", "claude-fable-5"):
+            self.assertNotIn(secret, prompt)
+
+    def test_targeted_identity_leakage_parks_before_any_judge_can_launch(self):
+        self._prepare()
+        first = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (first / "self-id.txt").write_text("I am the OpenAI Codex author using exact_model gpt-5.6-sol.\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test("experiment-0001", slot)
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 422, payload)
+        self.assertEqual(payload["code"], "candidate_identity_leakage")
+        self.assertGreater(payload["leakage_findings"], 0)
+        self.assertNotIn("openai", json.dumps(payload).lower())
+        state = json.loads((self.records / "experiment-0001" / "state.json").read_text())
+        self.assertTrue(state["finalized"])
+        self.assertEqual(state["reason"], "candidate_identity_leakage")
+        for slot in ("judge-fable", "judge-1", "judge-2"):
+            self.assertFalse(server.codeoff_workspace_path("experiment-0001", slot).exists())
+            resolved, err = server._resolve_codeoff_agent({"experiment_id": "experiment-0001", "slot": slot})
+            self.assertIsNone(resolved)
+            self.assertEqual(err["code"], "experiment_finalized")
+
+    def test_strict_judge_parser_rejects_prose_ranges_types_keys_and_snapshot(self):
+        good = {
+            "rubric_version": "code-off-rubric-v1", "judge_snapshot_hash": "a" * 64,
+            "candidates": {
+                "candidate-1": {"scores": self._scores(), "pass": True, "rationale": "one"},
+                "candidate-2": {"scores": self._scores(), "pass": False, "rationale": "two"},
+            },
+            "preference": "abstain", "rationale": "close",
+        }
+        parsed, err = server.parse_codeoff_judge_result(good, "a" * 64)
+        self.assertIsNone(err)
+        self.assertEqual(parsed["candidates"]["candidate-1"]["total"], 76)
+        bad = [
+            "candidate one seems better",
+            {**good, "extra": 1},
+            {**good, "judge_snapshot_hash": "b" * 64},
+            {**good, "candidates": {**good["candidates"], "candidate-1": {**good["candidates"]["candidate-1"], "scores": {**self._scores(), "correctness": 41}}}},
+            {**good, "candidates": {**good["candidates"], "candidate-1": {**good["candidates"]["candidate-1"], "pass": 1}}},
+        ]
+        for item in bad:
+            with self.subTest(item=item):
+                parsed, err = server.parse_codeoff_judge_result(item, "a" * 64)
+                self.assertIsNone(parsed)
+                self.assertIsNotNone(err)
+
+    def test_aggregation_vote_score_tie_missing_and_test_conflict(self):
+        mapping = {
+            judge: {"candidate-1": "author-1", "candidate-2": "author-2"}
+            for judge in ("judge-fable", "judge-1", "judge-2")
+        }
+
+        def receipt(pref, a, b):
+            return {"preference": pref, "candidates": {
+                "candidate-1": {"total": a}, "candidate-2": {"total": b},
+            }}
+
+        votes = {
+            "judge-fable": receipt("candidate-1", 10, 90),
+            "judge-1": receipt("candidate-1", 10, 90),
+            "judge-2": receipt("candidate-2", 10, 90),
+        }
+        out, err = server.aggregate_codeoff_results(mapping, votes, {"author-1": True, "author-2": True})
+        self.assertIsNone(err)
+        self.assertEqual((out["winner"], out["basis"]), ("author-1", "preference-majority"))
+        scores = {
+            "judge-fable": receipt("candidate-1", 20, 80),
+            "judge-1": receipt("candidate-2", 20, 80),
+            "judge-2": receipt("abstain", 20, 80),
+        }
+        out, err = server.aggregate_codeoff_results(mapping, scores, {"author-1": True, "author-2": True})
+        self.assertEqual((out["winner"], out["basis"]), ("author-2", "summed-scores"))
+        tied = {judge: receipt("abstain", 50, 50) for judge in mapping}
+        out, err = server.aggregate_codeoff_results(mapping, tied, {"author-1": True, "author-2": True})
+        self.assertEqual(out["decision"], "parked")
+        self.assertEqual(out["reason"], "exact_score_tie")
+        out, err = server.aggregate_codeoff_results(mapping, dict(list(votes.items())[:2]), {"author-1": True, "author-2": True})
+        self.assertIsNone(out)
+        self.assertEqual(err["code"], "missing_judges")
+        out, err = server.aggregate_codeoff_results(mapping, votes, {"author-1": False, "author-2": True})
+        self.assertEqual(out["winner"], "author-1")
+        self.assertFalse(out["promotion_eligible"])
+        self.assertEqual(out["tests"], {"author-1": False, "author-2": True})
+
+    def test_git_dependent_recipe_has_identical_candidate_and_final_failure_semantics(self):
+        self._prepare(tests=["fixture-git-fail"])
+        job_id = self._launch_done("experiment-0001", "author-1")
+        status, frozen = self._post("/v1/code-off/candidate", {
+            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
+        })
+        self.assertEqual(status, 200, frozen)
+        root, manifest, state, err = server._codeoff_load("experiment-0001", active=True)
+        self.assertIsNone(err)
+        outcomes = [
+            server._codeoff_verify_artifact(root, manifest, self.repo, state["candidates"]["author-1"], phase)
+            for phase in ("candidate", "final")
+        ]
+        self.assertEqual([result["tests"]["pass"] for result in outcomes], [False, False])
+        self.assertTrue(all(result["git_faithful"] for result in outcomes))
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_rejects_mutated_winner_without_touching_target(self):
+        self._ready_to_finalize()
+        before = self._target_snapshot()
+        winner = server.codeoff_workspace_path("experiment-0001", "author-1")
+        (winner / "README.md").write_text("mutated after aggregation\n")
+        status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (409, "winner_mutated"))
+        self.assertEqual(self._target_snapshot(), before)
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_rejects_mutated_base_without_changing_it_further(self):
+        self._ready_to_finalize()
+        (self.repo / "README.md").write_text("operator mutation\n")
+        before = self._target_snapshot()
+        status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (409, "promotion_base_mutated"))
+        self.assertEqual(self._target_snapshot(), before)
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_rejects_staged_base_index_without_touching_target(self):
+        self._ready_to_finalize()
+        (self.repo / "README.md").write_text("staged operator mutation\n")
+        self._git("add", "README.md")
+        self._git("restore", "--worktree", "--source=HEAD", "README.md")
+        before = self._git("status", "--porcelain=v1").stdout
+        self.assertTrue(before)
+        status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (409, "promotion_base_mismatch"))
+        self.assertEqual(self._git("status", "--porcelain=v1").stdout, before)
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_test_failure_leaves_target_pristine_and_cleans_staging(self):
+        self._ready_to_finalize()
+        before = self._target_snapshot()
+        original = server.run_cmd
+
+        def fail_final_recipe(args, *pargs, **kwargs):
+            if args and args[0] == sys.executable:
+                return {"ok": False, "returncode": 7, "stdout": "", "stderr": "final fixture failure", "truncated": False}
+            return original(args, *pargs, **kwargs)
+
+        with mock.patch.object(server, "run_cmd", side_effect=fail_final_recipe):
+            status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "parked")
+        self.assertFalse(payload["tests_pass"])
+        self.assertEqual(self._target_snapshot(), before)
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_apply_failure_rolls_target_back_and_cleans_staging(self):
+        self._ready_to_finalize()
+        before = self._target_snapshot()
+
+        def partial_apply(_staging, target, _base_sha):
+            (target / "README.md").write_text("partial broken apply\n")
+            raise OSError("fixture apply interruption")
+
+        with mock.patch.object(server, "_codeoff_apply_verified", side_effect=partial_apply):
+            status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (500, "promotion_apply_failed"))
+        self.assertEqual(self._target_snapshot(), before)
+        self._assert_no_staging("experiment-0001")
+
+    def test_finalize_receipt_persistence_failure_restores_base_and_retries(self):
+        self._ready_to_finalize()
+        before = self._target_snapshot()
+        with mock.patch.object(server, "_codeoff_write_state", side_effect=OSError("fixture final state interruption")):
+            status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual((status, payload["code"]), (500, "codeoff_runtime_failure"))
+        self.assertEqual(self._target_snapshot(), before)
+        self._assert_no_staging("experiment-0001")
+        status, payload = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["commit_eligible"])
+
+    def test_manifest_event_state_and_final_record_tampering_fail_closed(self):
+        for index, filename in enumerate(("manifest.json", "event", "state.json")):
+            experiment_id = f"tamper-record-{index:02d}"
+            with self.subTest(filename=filename):
+                self._prepare(experiment_id)
+                root = self.records / experiment_id
+                path = root / filename
+                if filename == "manifest.json":
+                    value = json.loads(path.read_text())
+                    value["category_source"] = "tampered"
+                    path.write_text(json.dumps(value) + "\n")
+                    expected = "manifest_tampered"
+                elif filename == "event":
+                    state = json.loads((root / "state.json").read_text())
+                    path = root / "events" / f"{state['event_count']:08d}-{state['event_head']}.json"
+                    value = json.loads(path.read_text())
+                    value["kind"] = "tampered"
+                    path.write_text(json.dumps(value) + "\n")
+                    expected = "event_chain_tampered"
+                else:
+                    path.write_text("{not-json\n")
+                    expected = "record_unreadable"
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], expected)
+
+    def test_deleted_final_record_fails_closed_and_audit_is_read_only(self):
+        self._ready_to_finalize()
+        status, final = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, final)
+        final_path = self.records / "experiment-0001" / "final.json"
+        final_path.unlink()
+        status, payload, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": ["experiment-0001"]}, True, b"",
+        )
+        self.assertEqual((status, payload["code"]), (400, "final_tampered"))
+        self.assertFalse(final_path.exists())
+
+    def test_codeoff_git_gate_rejects_repo_message_unavailable_and_wrong_tree(self):
+        self._ready_to_finalize()
+        status, final = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, final)
+        gate = {"codeoff_experiment_id": "experiment-0001", "final_verification_hash": final["receipt_hash"], "message": "feat: promote code-off winner"}
+        self.assertEqual(server._codeoff_git_gate(gate, "different", self.repo, "commit")["code"], "codeoff_repo_mismatch")
+        self.assertEqual(server._codeoff_git_gate({**gate, "message": "wrong"}, "scratch", self.repo, "commit")["code"], "codeoff_commit_mismatch")
+        with mock.patch.object(server, "codeoff_tree_snapshot", side_effect=RuntimeError("fixture unreadable tree")):
+            self.assertEqual(server._codeoff_git_gate(gate, "scratch", self.repo, "commit")["code"], "codeoff_tree_unavailable")
+        (self.repo / "README.md").write_text("wrong promoted tree\n")
+        self.assertEqual(server._codeoff_git_gate(gate, "scratch", self.repo, "commit")["code"], "codeoff_tree_mismatch")
+
+    def test_full_receipts_aggregate_promote_finalize_audit_hash_chain_and_cleanup(self):
+        aggregate = self._ready_to_finalize()
+        self.assertEqual(aggregate["winner"], "author-1")
+        self.assertTrue(aggregate["promotion_eligible"])
+        status, final = self._post("/v1/code-off/finalize", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, final)
+        self.assertTrue(final["commit_eligible"])
+        self.assertTrue(final["push_eligible"])
+        state = json.loads((self.records / "experiment-0001" / "state.json").read_text())
+        winner = state["candidates"]["author-1"]
+        promoted = server.codeoff_tree_snapshot(self.repo)
+        self.assertEqual(promoted["manifest_hash"], winner["tree_manifest_hash"])
+        events = server._codeoff_events(self.records / "experiment-0001", state)
+        previous = "0" * 64
+        for number, event in enumerate(events, 1):
+            self.assertEqual(event["sequence"], number)
+            self.assertEqual(event["previous_hash"], previous)
+            unhashed = {k: v for k, v in event.items() if k != "hash"}
+            self.assertEqual(event["hash"], hashlib.sha256(server.codeoff_canonical_json(unhashed)).hexdigest())
+            previous = event["hash"]
+        status, audit, _ = server.dispatch("GET", "/v1/code-off/audit", {"experiment_id": ["experiment-0001"]}, True, b"")
+        self.assertEqual(status, 200, audit)
+        rendered = json.dumps(audit)
+        self.assertNotIn("Implement the fixture", rendered)
+        self.assertNotIn(str(self.repo), rendered)
+        self.assertNotIn("blinding", rendered.lower())
+        self.assertEqual(audit["event_head"], previous)
+        gate = {"codeoff_experiment_id": "experiment-0001", "final_verification_hash": final["receipt_hash"], "message": "feat: promote code-off winner"}
+        self.assertIsNone(server._codeoff_git_gate(gate, "scratch", self.repo, "commit"))
+        rejected = server._codeoff_git_gate({**gate, "final_verification_hash": "0" * 64}, "scratch", self.repo, "commit")
+        self.assertEqual(rejected["code"], "codeoff_gate_rejected")
+        rejected = server._codeoff_git_gate(gate, "scratch", self.repo, "push")
+        self.assertEqual(rejected["code"], "codeoff_head_mismatch")
+        commit_status, committed = self._post("/v1/git/commit", {**gate, "repo": "scratch", "add": "."})
+        self.assertEqual(commit_status, 200, committed)
+        self.assertIsNone(server._codeoff_git_gate(gate, "scratch", self.repo, "push"))
+        correct_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("rm", "--cached", "README.md")
+        self._git("commit", "--amend", "--no-edit")
+        rejected = server._codeoff_git_gate(gate, "scratch", self.repo, "push")
+        self.assertEqual(rejected["code"], "codeoff_push_mismatch")
+        self._git("reset", "--hard", correct_head)
+        self._git("commit", "--allow-empty", "-m", "unexpected extra commit")
+        rejected = server._codeoff_git_gate(gate, "scratch", self.repo, "push")
+        self.assertEqual(rejected["code"], "codeoff_push_mismatch")
+        final_path = self.records / "experiment-0001" / "final.json"
+        final_bytes = final_path.read_bytes()
+        final_path.write_text("{not-json\n")
+        status, payload, _ = server.dispatch("GET", "/v1/code-off/audit", {"experiment_id": ["experiment-0001"]}, True, b"")
+        self.assertEqual((status, payload["code"]), (400, "final_tampered"))
+        final_path.write_bytes(final_bytes)
+        status, payload = self._post("/v1/code-off/blind", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "experiment_finalized")
+        status, cleaned = self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 200, cleaned)
+        self.assertFalse((self.workspaces / "experiment-0001").exists())
+        self.assertTrue((self.records / "experiment-0001" / "final.json").is_file())
+
+    def test_cleanup_refuses_before_finalization_and_auth_is_required(self):
+        self._prepare()
+        status, payload = self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "not_finalized")
+        status, payload = self._post("/v1/code-off/audit", {"experiment_id": "experiment-0001"}, authed=False)
+        self.assertEqual(status, 401)
+
+    def test_codeoff_openapi_is_strict_authenticated_and_agent_workspace_has_no_path(self):
+        spec = json.loads(server.openapi_bytes())
+        expected = {
+            "/v1/code-off/prepare": "codeOffPrepare",
+            "/v1/code-off/candidate": "codeOffCandidate",
+            "/v1/code-off/blind": "codeOffBlind",
+            "/v1/code-off/judge": "codeOffJudge",
+            "/v1/code-off/aggregate": "codeOffAggregate",
+            "/v1/code-off/finalize": "codeOffFinalize",
+            "/v1/code-off/audit": "codeOffAudit",
+            "/v1/code-off/cleanup": "codeOffCleanup",
+        }
+        for path, operation_id in expected.items():
+            method = "get" if path.endswith("audit") else "post"
+            self.assertEqual(spec["paths"][path][method]["operationId"], operation_id)
+        for name in ("CodeOffPrepareRequest", "CodeOffCandidateRequest", "CodeOffJudgeRequest", "CodeOffExperimentRequest", "CodeOffWorkspaceRef", "CodeOffJudgeResult", "CodeOffPrepareResult", "CodeOffCompact"):
+            self.assertFalse(spec["components"]["schemas"][name]["additionalProperties"], name)
+        workspace = spec["components"]["schemas"]["CodeOffWorkspaceRef"]
+        self.assertEqual(set(workspace["required"]), {"experiment_id", "slot"})
+        self.assertNotIn("path", workspace["properties"])
+        prepare = spec["components"]["schemas"]["CodeOffPrepareRequest"]["properties"]
+        for field, native_type in (("tags", "array"), ("tests", "array"), ("toolchain", "object"), ("budgets", "object")):
+            variants = prepare[field]["oneOf"]
+            self.assertEqual({item.get("type") for item in variants}, {native_type, "string"}, field)
+            string_variant = next(item for item in variants if item.get("type") == "string")
+            self.assertLessEqual(string_variant["maxLength"], 8192)
+        selection = spec["components"]["schemas"]["CodeOffPublicSelection"]
+        self.assertFalse(selection["additionalProperties"])
+        self.assertNotIn("seed", selection["properties"])
+        self.assertIn("seed_commitment", selection["required"])
+        agent = spec["components"]["schemas"]["AgentRunRequest"]["properties"]
+        self.assertIn("codeoff_workspace", agent)
+        for field in ("max_turns", "run_budget_seconds"):
+            self.assertEqual({item["type"] for item in agent[field]["oneOf"]}, {"integer", "string"})
+
+    def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
+        self.assertEqual(graph["slug"], "graphwing-code-off")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        for wait, agent in (("wait_author_1", "author_1"), ("wait_author_2", "author_2"), ("wait_judge_fable", "judge_fable"), ("wait_judge_1", "judge_1"), ("wait_judge_2", "judge_2")):
+            self.assertEqual(nodes[wait]["type"], "action.wait.webhook")
+            self.assertIn((wait, "pending", agent), triples)
+            self.assertIn(wait, nodes[agent]["config"]["response_webhook_url"])
+        self.assertEqual(nodes["join_candidates"]["type"], "logic.join.all")
+        self.assertEqual(nodes["join_judges"]["type"], "logic.join.all")
+        self.assertTrue(nodes["join_candidates"]["config"]["waitForAll"])
+        self.assertTrue(nodes["join_judges"]["config"]["waitForAll"])
+        self.assertEqual({e["source"] for e in edges if e["target"] == "join_candidates"}, {"test_1", "test_2"})
+        self.assertEqual({e["source"] for e in edges if e["target"] == "join_judges"}, {"receipt_fable", "receipt_1", "receipt_2"})
+        self.assertIn(("eligible", "pass", "finalize"), triples)
+        self.assertIn(("final_verified", "pass", "commit"), triples)
+        self.assertTrue(any(e["source"] == "commit" and e["target"] == "push" for e in edges))
+        self.assertFalse(any("merge" in node["type"].lower() for node in nodes.values()))
+        openapi = json.loads(server.openapi_bytes())
+        openapi_paths = openapi["paths"]
+        graphwing_actions = {node_id: node for node_id, node in nodes.items() if node["type"].startswith("action.graphwing.")}
+
+        def accepts(value, schema, where):
+            if "$ref" in schema:
+                schema = openapi["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
+            if "oneOf" in schema:
+                failures = []
+                for variant in schema["oneOf"]:
+                    try:
+                        accepts(value, variant, where)
+                        return
+                    except AssertionError as exc:
+                        failures.append(str(exc))
+                self.fail(f"{where} matches no schema variant: {failures}")
+            expected = schema.get("type")
+            if isinstance(expected, list):
+                self.assertIn(type(value).__name__.replace("NoneType", "null"), expected, where)
+            elif expected == "object":
+                self.assertIsInstance(value, dict, where)
+                properties = schema.get("properties", {})
+                self.assertTrue(set(schema.get("required", ())) <= set(value), where)
+                if schema.get("additionalProperties") is False:
+                    self.assertTrue(set(value) <= set(properties), where)
+                for key, item in value.items():
+                    if key in properties:
+                        accepts(item, properties[key], f"{where}.{key}")
+            elif expected == "array":
+                self.assertIsInstance(value, list, where)
+            elif expected == "string":
+                self.assertIsInstance(value, str, where)
+                if "{{" not in value and "enum" in schema:
+                    self.assertIn(value, schema["enum"], where)
+            elif expected == "integer":
+                self.assertIs(type(value), int, where)
+            elif expected == "boolean":
+                self.assertIs(type(value), bool, where)
+
+        for node_id, node in graphwing_actions.items():
+            action, endpoint = node["type"].removeprefix("action.graphwing.").split(":", 1)
+            self.assertIn(endpoint, openapi_paths, node_id)
+            self.assertIn((node_id, "failure", "join_terminal"), triples, node_id)
+            request_schema = openapi_paths[endpoint][action.lower()]["requestBody"]["content"]["application/json"]["schema"]
+            accepts({key: value for key, value in node["config"].items() if key not in {"integrationInstanceId", "timeout"}}, request_schema, node_id)
+        self.assertEqual(
+            {node_id for node_id, node in graphwing_actions.items() if node["type"] in {"action.graphwing.POST:/v1/git/commit", "action.graphwing.POST:/v1/git/push"}},
+            {"commit", "push"},
+        )
+        self.assertEqual(nodes["eligible"]["config"]["rules"][0]["path"], "data.promotion_eligible")
+        self.assertEqual(nodes["final_verified"]["config"]["rules"][0]["path"], "data.commit_eligible")
+        self.assertEqual(nodes["commit"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
+        self.assertEqual(nodes["push"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
+        for suffix in ("1", "2"):
+            self.assertEqual(nodes[f"freeze_{suffix}"]["config"]["job_id"], f"{{{{ TASKS.wait_author_{suffix}.request.body.job_id }}}}")
+        for node_id, wait_id in (("receipt_fable", "wait_judge_fable"), ("receipt_1", "wait_judge_1"), ("receipt_2", "wait_judge_2")):
+            self.assertEqual(nodes[node_id]["config"]["job_id"], f"{{{{ TASKS.{wait_id}.request.body.job_id }}}}")
+        # No cycles, and every action failure is terminal rather than a redraw/retry.
+        outgoing = {}
+        for edge in edges:
+            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        color = {node: 0 for node in nodes}
+        def visit(node):
+            color[node] = 1
+            for target in outgoing.get(node, []):
+                self.assertNotEqual(color[target], 1, f"cycle through {target}")
+                if color[target] == 0:
+                    visit(target)
+            color[node] = 2
+        for node in nodes:
+            if color[node] == 0:
+                visit(node)
+        self.assertNotIn("retry", json.dumps(graph).lower())
+
+    def test_publish_catalog_includes_codeoff_and_existing_implement_slice_is_unchanged(self):
+        source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()
+        self.assertIn('"code-off"', source)
+        self.assertIn('install["code_off"]', source)
+        implement = (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_bytes()
+        self.assertEqual(hashlib.sha256(implement).hexdigest(), "7e9cfe14e4e2f9530a4c2173e8c774a1509a6b6bdb1d9b14acc0e028d2a0aa4c")
 
 
 class InstallTests(unittest.TestCase):
