@@ -59,6 +59,24 @@ def catalog_hash(value) -> str:
     return hashlib.sha256(canonical_catalog_bytes(value)).hexdigest()
 
 
+def normalize_workflow_spec(value):
+    """Remove only Rewst-owned fields generated for trigger nodes on publish."""
+    normalized = normalize_catalog(value)
+    if not isinstance(normalized, dict):
+        return normalized
+    nodes = normalized.get("nodes")
+    if not isinstance(nodes, list):
+        return normalized
+    for node in nodes:
+        if not isinstance(node, dict) or not str(node.get("type") or "").startswith("trigger."):
+            continue
+        config = node.get("config")
+        if isinstance(config, dict):
+            config.pop("triggerId", None)
+            config.pop("triggerUrl", None)
+    return normalized
+
+
 def deployed_openapi_spec() -> dict:
     """Read the installed catalog copy; repository loopback defaults are not authority."""
     path = HOME / "openapi.json"
@@ -131,7 +149,11 @@ def verify_workflow_parity(mcp: str, workflow_id: str, expected_spec: dict, slug
     status, body = api(mcp, "GET", f"/workflows/{workflow_id}?include=spec")
     if status != 200:
         raise SystemExit(f"{slug} live readback HTTP {status}; no parity receipt")
-    return require_catalog_parity(expected_spec, workflow_readback_spec(body), slug)
+    return require_catalog_parity(
+        normalize_workflow_spec(expected_spec),
+        normalize_workflow_spec(workflow_readback_spec(body)),
+        slug,
+    )
 
 
 def load_install() -> dict:
