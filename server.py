@@ -9046,12 +9046,14 @@ def build_behavior_review_prompt(doc: dict[str, Any]) -> list[str]:
         )
     lines.extend(
         [
-            "4. PRODUCTION PATH: do the tests exercise the code that actually runs, or a copy,",
-            "   a mock, or a helper the production path never calls? Does anything the change",
-            "   promises to keep survive a restart, or does it only live in memory?",
+            "4. EXECUTION PATH: do the tests exercise the real code path the ticket promises,",
+            "   rather than a copy or mock? If the ticket explicitly scopes a self-contained",
+            "   canary, do not demand unrelated production wiring. Judge restart behavior only",
+            "   when the ticket promises persisted state.",
             "5. INTEGRATION SEAM: the plan declares this seam as "
             + (", ".join(integration) if integration else "none"),
-            "   Is the seam covered by something that runs it for real?",
+            "   Clean integration runs after review. Does this candidate provide an executable",
+            "   real seam for that phase? Do not require the post-review receipt yet.",
             "6. HONEST FAILURE: when a step fails, times out, or returns nothing, does the",
             "   change say so, or does it report success anyway? Name any path where a",
             "   failure reads as a pass.",
