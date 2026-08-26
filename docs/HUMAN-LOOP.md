@@ -52,7 +52,7 @@ A timeout without a verdict, exhausted retry budget, repeated red suite, or repe
 ## Operational boundaries
 
 - `diagnostic-v1` is a compact receipt contract, not a trace dump. `provider-recovery-v1` may reconsider a prior fallback only at a later invocation boundary from persisted evidence; active corrections remain pinned.
-- Production code-off parks before launch while Fable and Terra remain unproven. Git worktrees are not OS isolation.
+- Code-off is eligible only while its at-most-30-day embedded approval is current and every exact immutable slot identity is proven; Fable and Terra are code-off-only, not ordinary launcher choices. Expiry or provenance mismatch parks rather than discovering, aliasing, substituting, falling back, or redrawing. Git worktrees are not OS isolation.
 - PR status is remote-only. Merge requires the persisted final named-test job bound to repo/PR/run/head and clean start/end, then fresh open, non-draft, stable-head, merge-ready state with a nonempty terminal-green GitHub check set.
 - There is no visual proof scope in this catalog. Preserve issue-52 visual exclusions; a named recipe is not screenshot/browser evidence.
 - Local green tests do not claim Rewst import parity, publication, live readiness, or a canary.
@@ -91,7 +91,7 @@ git diff --check
 
 **Published proof** — only an authorized run of `python3 scripts/reimport_integration.py` followed by `python3 scripts/publish_graphs.py --only all --no-run`, plus fresh provider workflow/version/spec readback, can establish it. Saved IDs alone are insufficient.
 
-**Live canary proof** — requires a deployed source-matching API/OpenAPI, published/read-back graph, and an actual bounded nonvisual run trace. Active units alone are not proof. Code-off cannot be a launch canary while prepare parks, and no visual canary is in scope.
+**Live canary proof** — requires a deployed source-matching API/OpenAPI, published/read-back graph, and an actual bounded nonvisual run trace. Active units alone are not proof. The code-off policy's bounded catalog inventory and canary evidence was obtained 2026-08-26, but is not continuous discovery or proof that this change ran/published a live Rewst code-off; expiration parks new runs pending policy review. No visual canary is in scope.
 
 ## Do not
 

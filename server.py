@@ -98,17 +98,34 @@ CODEOFF_AUTHOR_POOL = ["grok", "sol", "terra", "sonnet", "opus"]
 CODEOFF_CATEGORIES = frozenset({"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
 CODEOFF_TAGS = frozenset({"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
 CODEOFF_MODEL_MANIFEST: dict[str, Any] = {
-    "version": "approved-model-manifest-v1",
+    "version": "approved-model-manifest-v2",
     "as_of": "2026-08-26",
     "max_age_days": 30,
-    "limitation": "Embedded approvals require a code change when stale; no moving aliases, fallback, or substitution. Same-user worktrees are not an OS security boundary.",
+    "policy_creation_evidence": {
+        "inventory": "Bounded native-launcher catalog inventory obtained 2026-08-26 recorded each exact provider/model identity below.",
+        "canary": "Bounded native-launcher canary evidence obtained 2026-08-26 proved each exact identity below runnable at policy creation.",
+    },
+    "policy_semantics": {
+        "latest": "Approved latest at policy creation, never a moving alias.",
+        "expiration": "Expiry forces review and parks new runs pending a policy update.",
+        "discovery": "No dynamic provider discovery or OpenCode dependency.",
+    },
+    "approval_scope": "Exact immutable code-off identities only; ordinary launcher eligibility is unchanged.",
+    "limitation": "Latest means approved latest at policy creation. Expiry forces review and parks new runs; there is no dynamic provider discovery or OpenCode dependency, fallback, substitution, alias resolution, or redraw. Same-user worktrees are not an OS security boundary.",
     "models": {
-        "grok": {"exact_model": "grok-4.6", "provider": "xai", "launcher": "grok", "runnable": True, "proven": True, "reason": "approved"},
-        "sol": {"exact_model": "gpt-5.6-sol", "provider": "openai", "launcher": "codex", "runnable": True, "proven": True, "reason": "approved"},
-        "terra": {"exact_model": "gpt-5.6-terra", "provider": "openai", "launcher": "codex", "runnable": False, "proven": False, "reason": "historical identity is not currently runnable or proven"},
-        "sonnet": {"exact_model": "claude-sonnet-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "approved"},
-        "opus": {"exact_model": "claude-opus-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "approved"},
-        "fable": {"exact_model": "claude-fable-5", "provider": "anthropic", "launcher": "claude", "runnable": False, "proven": False, "reason": "historical fixed judge is not currently runnable or proven"},
+        "grok": {"exact_model": "grok-4.6", "provider": "xai", "launcher": "grok", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+        "sol": {"exact_model": "gpt-5.6-sol", "provider": "openai", "launcher": "codex", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+        "terra": {"exact_model": "gpt-5.6-terra", "provider": "openai", "launcher": "codex", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+        "sonnet": {"exact_model": "claude-sonnet-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+        "opus": {"exact_model": "claude-opus-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+        "fable": {"exact_model": "claude-fable-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "Exact native identity passed the bounded 2026-08-26 inventory and canary."},
+    },
+}
+CODEOFF_CATALOG_INVENTORY: dict[str, Any] = {
+    "version": "bounded-model-catalog-v1",
+    "models": {
+        "grok": "grok-4.6", "sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra",
+        "sonnet": "claude-sonnet-5", "opus": "claude-opus-5", "fable": "claude-fable-5",
     },
 }
 CODEOFF_RUBRIC = {
@@ -122,6 +139,9 @@ CODEOFF_MAX_FILE_BYTES = 32 * 1024 * 1024
 CODEOFF_MAX_TREE_BYTES = 100 * 1024 * 1024
 CODEOFF_MAX_LOG_BYTES = 256 * 1024
 CODEOFF_MAX_RATIONALE = 1200
+CODEOFF_PROVENANCE_MAX_FILES = 65536
+CODEOFF_PROVENANCE_MAX_BYTES = 8 * 1024 * 1024
+CODEOFF_PROVENANCE_MAX_EVENTS = 10000
 CODEOFF_LOCK = threading.RLock()
 class CodeOffArtifactError(RuntimeError): pass
 FAILURE_CLASS_CODES = {
@@ -3883,7 +3903,7 @@ def run_grok_acp(
     command = [str(binary), "agent"]
     if mode == "writer":
         command.append("--always-approve")
-    command.extend(["--model", "grok-4.6", "stdio"])
+    command.extend(["--model", str(job["model"]), "stdio"])
     try:
         proc = subprocess.Popen(
             command,
@@ -4168,6 +4188,146 @@ def read_bounded_output(path: Path) -> str:
     return data.decode("utf-8", "replace")
 
 
+def _codeoff_jsonl(path: Path) -> list[dict[str, Any]] | None:
+    """Read a complete, bounded native JSONL record; partial proof is no proof."""
+    try:
+        if not path.is_file() or path.stat().st_size > CODEOFF_PROVENANCE_MAX_BYTES:
+            return None
+        events: list[dict[str, Any]] = []
+        total = 0
+        with path.open("rb") as stream:
+            for raw in stream:
+                total += len(raw)
+                if total > CODEOFF_PROVENANCE_MAX_BYTES or len(events) >= CODEOFF_PROVENANCE_MAX_EVENTS:
+                    return None
+                try:
+                    event = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return None
+                if not isinstance(event, dict):
+                    return None
+                events.append(event)
+        return events
+    except OSError:
+        return None
+
+
+def _codeoff_provenance_source(launcher: Any) -> str | None:
+    return {
+        "claude": "claude-result-v1",
+        "codex": "codex-rollout-v1",
+        "grok": "grok-acp-v1",
+    }.get(launcher)
+
+
+def _codeoff_identity_values(raw: Any, model_key: str = "model") -> tuple[str, str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    values = (raw.get("launcher"), raw.get("provider"), raw.get(model_key))
+    return values if all(isinstance(value, str) and value for value in values) else None  # type: ignore[return-value]
+
+
+def _codeoff_compact_execution_identity(job: dict[str, Any]) -> dict[str, str] | None:
+    session = job.get("session_identity")
+    source = _codeoff_provenance_source(job.get("launcher"))
+    if (
+        not isinstance(session, dict) or source is None
+        or _codeoff_identity_values(session) != _codeoff_identity_values(job)
+    ):
+        return None
+    values = {key: session.get(key) for key in ("launcher", "provider", "model", "native_session_id")}
+    if not all(isinstance(value, str) and value for value in values.values()):
+        return None
+    return {"version": "code-off-execution-identity-v1", "source": source, **values}  # type: ignore[arg-type]
+
+
+def _codeoff_claude_provenance(job: dict[str, Any]) -> bool:
+    events = _codeoff_jsonl(job_dir(job["job_id"]) / "stdout.log")
+    results = [event for event in events or [] if event.get("type") == "result"]
+    if len(results) != 1:
+        return False
+    result = results[0]
+    session = job.get("session_identity") or {}
+    usage = result.get("modelUsage")
+    model = job.get("model")
+    if not (
+        result.get("subtype") == "success" and result.get("is_error") is False
+        and result.get("session_id") == session.get("native_session_id")
+        and session.get("model") == model
+        and isinstance(usage, dict) and set(usage) == {model}
+    ):
+        return False
+    detail = usage.get(model)
+    return isinstance(detail, dict) and detail.get("canonicalModel") == model and detail.get("provider") == "firstParty"
+
+
+def _codeoff_codex_rollout(job: dict[str, Any]) -> Path | None:
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    sessions = home / "sessions"
+    native_id = str((job.get("session_identity") or {}).get("native_session_id") or "")
+    matches: list[Path] = []
+    scanned = 0
+    try:
+        if not sessions.is_dir() or sessions.is_symlink():
+            return None
+        def traversal_error(error: OSError) -> None:
+            raise error
+
+        for root, dirs, files in os.walk(sessions, onerror=traversal_error, followlinks=False):
+            scanned += len(dirs) + len(files)
+            if scanned > CODEOFF_PROVENANCE_MAX_FILES:
+                return None
+            for name in files:
+                if name.endswith(".jsonl") and Path(name).stem.endswith(native_id):
+                    matches.append(Path(root) / name)
+                    if len(matches) > 1:
+                        return None
+    except OSError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _codeoff_codex_provenance(job: dict[str, Any]) -> bool:
+    rollout = _codeoff_codex_rollout(job)
+    events = _codeoff_jsonl(rollout) if rollout else None
+    if events is None:
+        return False
+    metas = [event.get("payload") for event in events if event.get("type") == "session_meta"]
+    turns = [event.get("payload") for event in events if event.get("type") == "turn_context"]
+    session = job.get("session_identity") or {}
+    if len(metas) != 1 or not turns or not isinstance(metas[0], dict):
+        return False
+    meta = metas[0]
+    git = meta.get("git")
+    cwd, model = str(Path(job["cwd"]).resolve()), job.get("model")
+    if not (
+        meta.get("id") == session.get("native_session_id")
+        and meta.get("originator") == "codex_exec" and meta.get("source") == "exec"
+        and meta.get("model_provider") in ("openai", "openai-api")
+        and meta.get("cwd") == cwd
+        and isinstance(git, dict) and git.get("commit_hash") == session.get("starting_head")
+    ):
+        return False
+    return all(isinstance(turn, dict) and turn.get("cwd") == cwd and turn.get("model") == model for turn in turns)
+
+
+def _codeoff_execution_identity(
+    job: dict[str, Any], adapter_evidence: Any
+) -> dict[str, str] | None:
+    """Return only the compact receipt after launcher-native proof succeeds."""
+    launcher = job.get("launcher")
+    if _codeoff_provenance_source(launcher) is None or adapter_evidence is not None:
+        return None
+    compact = _codeoff_compact_execution_identity(job)
+    if compact is None:
+        return None
+    if launcher == "claude" and not _codeoff_claude_provenance(job):
+        return None
+    if launcher == "codex" and not _codeoff_codex_provenance(job):
+        return None
+    return compact
+
+
 def run_agent_job(job_id: str) -> None:
     job = read_job(job_id)
     if not job:
@@ -4237,12 +4397,25 @@ def run_agent_job(job_id: str) -> None:
     if failure_summary:
         receipt["status"] = "error"
         receipt["summary"] = failure_summary
+    execution_identity = None
+    if receipt["status"] == "ok" and job.get("codeoff_workspace"):
+        execution_identity = _codeoff_execution_identity(job, adapter_evidence)
+        if execution_identity is None:
+            receipt["status"] = "error"
+            receipt["summary"] = "code-off execution provenance was absent, ambiguous, or mismatched"
+            receipt.update(classify_agent_failure("session_provenance_invalid"))
+        else:
+            receipt["execution_identity"] = execution_identity
     job = read_job(job_id) or job
     if isinstance(receipt.get("session_identity"), dict):
         job["session_identity"] = dict(receipt["session_identity"])
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
     job["receipt"] = receipt
+    if execution_identity is not None:
+        job["execution_identity"] = execution_identity
+    else:
+        job.pop("execution_identity", None)
     job["status"] = "completed" if receipt["status"] == "ok" else "failed"
     if timed_out:
         job["error"] = "agent run budget exceeded"
@@ -4995,10 +5168,19 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
         if spec is None or Path(spec["cwd"]).resolve() != Path(repo).resolve():
             return 400, {"error": f"test '{test_name}' is not allowlisted for repo", "code": "unknown_test", "allowed": sorted(catalog)}
         specs.append({"name": test_name, "argv": list(spec["argv"]), "timeout_seconds": int(spec["timeout_seconds"])})
-    draw = codeoff_draw(seed)
     embedded = json.loads(json.dumps(CODEOFF_MODEL_MANIFEST))
+    catalog_inventory = json.loads(json.dumps(CODEOFF_CATALOG_INVENTORY))
     manifest_checked_at = datetime.now(timezone.utc)
+    embedded_hash = hashlib.sha256(codeoff_canonical_json(embedded)).hexdigest()
     current = _codeoff_manifest_current(embedded, manifest_checked_at)
+    catalog_models = catalog_inventory.get("models")
+    valid_catalog = catalog_inventory.get("version") == "bounded-model-catalog-v1" and isinstance(catalog_models, dict) and set(catalog_models) == set(embedded.get("models", {})) and all(isinstance(model, str) and model for model in catalog_models.values())
+    catalog_reasons = ["bounded_catalog_inventory_invalid"] if not valid_catalog else [
+        f"catalog_identity_newer:{logical}:{exact_model}"
+        for logical, exact_model in catalog_models.items()
+        if embedded["models"][logical].get("exact_model") != exact_model
+    ]
+    draw = codeoff_draw(seed)
     slot_logical = {"author-1": draw["authors"][0], "author-2": draw["authors"][1], "judge-fable": "fable", "judge-1": draw["random_judges"][0], "judge-2": draw["random_judges"][1]}
     identities: dict[str, dict[str, Any]] = {}
     for slot, logical in slot_logical.items():
@@ -5033,7 +5215,8 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
                 "protocol_version": CODEOFF_PROTOCOL_VERSION, "experiment_id": experiment_id, "created_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "repo": name, "branch": branch, "base_sha": base_sha, "base_tree": base_tree, "base_snapshot_hash": base_snapshot["manifest_hash"],
                 "classification": {"version": CODEOFF_CATEGORY_VERSION, "category": category, "tags": sorted(set(raw_tags))}, "original_classification": {"category": category, "tags": raw_tags}, "category_source": category_source.strip(),
-                "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps, "approved_model_manifest": embedded,
+                "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps, "approved_model_manifest": embedded, "bounded_catalog_inventory": catalog_inventory,
+                "approved_model_manifest_hash": embedded_hash,
                 "approved_model_manifest_current": current, "approved_model_manifest_checked_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "limitation": embedded.get("limitation"), "task": task, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash,
                 "tests": names, "test_specs": specs, "toolchain": dict(sorted(toolchain.items())), "budgets": budgets,
@@ -5045,7 +5228,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
             state = {"status": "preparing", "reason": None, "finalized": False, "manifest_file_hash": manifest_file_hash, "event_count": 0, "event_head": "0" * 64, "agent_jobs": {slot: [] for slot in slot_logical}, "candidates": {"author-1": {}, "author-2": {}}, "judges": {}, "aggregation": None}
             _codeoff_commit_event(record_build, state, "prepared_manifest", {"manifest_file_hash": manifest_file_hash, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash})
-            reasons = ([] if current else ["approved_model_manifest_stale"]) + [f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}" for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]]
+            reasons = ([] if current else ["approved_model_manifest_stale"]) + catalog_reasons + [f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}" for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]]
             if reasons:
                 _codeoff_finalize_record(record_build, manifest, state, "parked", ";".join(reasons))
                 record_build.replace(record_root)
@@ -5069,6 +5252,26 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             raise
     return 200, {"ok": True, "experiment_id": experiment_id, "status": "prepared", "authors": draw["authors"], "random_judges": draw["random_judges"], "seed_commitment": draw["seed_commitment"], "prompt_hash": prompt_hash, "rubric_hash": rubric_hash, "manifest_file_hash": manifest_file_hash, "workspace_slots": ["author-1", "author-2"], "launches": _codeoff_launch_plan(manifest)}
 
+def _codeoff_terminal_identity_matches(
+    job: dict[str, Any], receipt: dict[str, Any], manifest_identity: dict[str, Any]
+) -> bool:
+    expected = _codeoff_identity_values(manifest_identity, "exact_model")
+    execution = _codeoff_compact_execution_identity(job)
+    source = _codeoff_provenance_source(manifest_identity.get("launcher"))
+    surfaces = (
+        job, job.get("session_identity"), receipt.get("session_identity"),
+        job.get("execution_identity"), receipt.get("execution_identity"),
+    )
+    return bool(
+        expected is not None and source is not None and execution is not None
+        and all(_codeoff_identity_values(surface) == expected for surface in surfaces)
+        and receipt.get("session_identity") == job.get("session_identity")
+        and execution.get("source") == source
+        and job.get("execution_identity") == execution
+        and receipt.get("execution_identity") == execution
+    )
+
+
 def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str, Any], slot: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id) or job_id not in state.get("agent_jobs", {}).get(slot, []):
         return None, {"error": "job is not pinned to this experiment slot", "code": "job_mismatch"}
@@ -5076,7 +5279,7 @@ def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str
     if isinstance(job, dict) and job.get("status") in ("queued", "running"): return None, {"error": "slot agent has not reached a terminal receipt", "code": "agent_not_terminal"}
     identity = manifest["identities"][slot]
     receipt = job.get("receipt") if isinstance(job, dict) else None
-    if not (isinstance(job, dict) and job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and receipt.get("session_identity") == job.get("session_identity") and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot} and (job.get("launcher"), job.get("provider"), job.get("model")) == (identity["launcher"], identity["provider"], identity["exact_model"])):
+    if not (isinstance(job, dict) and job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and _codeoff_terminal_identity_matches(job, receipt, identity) and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot}):
         return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
     return job, None
 
@@ -5161,7 +5364,7 @@ def codeoff_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
                 return _codeoff_park_candidate(data.get("experiment_id"), slot, str(exc) if str(exc).startswith("candidate_") else "candidate_freeze_failed")
             except RuntimeError:
                 return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_freeze_failed")
-            receipt = {"version": "code-off-freeze-receipt-v1", "slot": slot, "job_id": job["job_id"], "identity": manifest["identities"][slot], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash, "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "bytes": snapshot["bytes"]}
+            receipt = {"version": "code-off-freeze-receipt-v1", "slot": slot, "job_id": job["job_id"], "identity": manifest["identities"][slot], "execution_identity": job["execution_identity"], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash, "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "bytes": snapshot["bytes"]}
             receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
             candidate.update({**receipt, "freeze_receipt_hash": receipt_hash, "tests": None})
             state["status"] = "candidates_running"
@@ -5377,7 +5580,7 @@ def codeoff_judge(body: bytes) -> tuple[int, dict[str, Any]]:
             _codeoff_finalize_record(root, manifest, state, "parked", f"{parse_err['code']}:{slot}")
             return 422, parse_err
         assert parsed and job
-        receipt = {"version": "code-off-judge-receipt-v1", "slot": slot, "identity": manifest["identities"][slot], "job_id": job["job_id"], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), **parsed}
+        receipt = {"version": "code-off-judge-receipt-v1", "slot": slot, "identity": manifest["identities"][slot], "execution_identity": job["execution_identity"], "job_id": job["job_id"], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), **parsed}
         receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
         state["judges"][slot] = {**parsed, "receipt_hash": receipt_hash}
         state["status"] = "judging"
