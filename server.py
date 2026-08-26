@@ -4822,7 +4822,7 @@ def named_cmd_run(
     if evidence_err:
         return int(evidence_err.pop("status", 400)), evidence_err
     timeout = int(spec["timeout_seconds"])
-    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT or evidence is not None
+    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT or evidence is not None or webhook_url is not None
     if not async_run:
         result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=timeout)
         if result.get("code") == "local_binary_missing":

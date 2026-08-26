@@ -719,7 +719,7 @@
       "post": {
         "operationId": "scriptRun",
         "tags": ["script"],
-        "summary": "Run one scripts.json entry by name. No free-form argv. async or timeout_seconds>25 returns 202 + job_id and POSTs an artifact receipt to response_webhook_url.",
+        "summary": "Run one scripts.json entry by name. No free-form argv. async, timeout_seconds>25, or a response webhook returns 202 + job_id and POSTs an artifact receipt.",
         "requestBody": {
           "required": true,
           "content": {
@@ -795,7 +795,7 @@
       "post": {
         "operationId": "testRun",
         "tags": ["test"],
-        "summary": "Run one tests.json recipe by name. pr_merge evidence mode always persists immutable repo/PR/run/head/git provenance.",
+        "summary": "Run one tests.json recipe by name. A response webhook forces async execution. pr_merge evidence mode always persists immutable repo/PR/run/head/git provenance.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TestRunRequest" } } }
@@ -814,7 +814,7 @@
       "post": {
         "operationId": "rrRun",
         "tags": ["rr"],
-        "summary": "Optional plugin: run one rr.json recipe if present. 501 not_configured otherwise. No free-form rr run.",
+        "summary": "Optional plugin: run one rr.json recipe if present. A response webhook forces async execution. 501 not_configured otherwise.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScriptRunRequest" } } }
