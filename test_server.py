@@ -6639,6 +6639,46 @@ while True:
             self.assertEqual(payload["name"], "graphwing-selftest")
             self.assertRegex(payload["job_id"], r"^[0-9a-f]{32}$")
 
+    def test_webhook_forces_sync_named_commands_async_and_delivers_receipts(self):
+        for kind, returncode, expected_status in (
+            ("script", 0, "ok"),
+            ("test", 1, "error"),
+            ("rr", 0, "ok"),
+        ):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                jobs = root / "jobs"
+                spec = {
+                    "sync": {
+                        "name": "sync",
+                        "argv": [sys.executable, "-c", f"raise SystemExit({returncode})"],
+                        "cwd": root,
+                        "timeout_seconds": 5,
+                        "async": False,
+                    }
+                }
+                body = json.dumps({
+                    "name": "sync",
+                    "response_webhook_url": "https://example.invalid/resume",
+                    "response_webhook_token": "token",
+                }).encode()
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted, \
+                     mock.patch.object(server, "enqueue_script") as enqueued:
+                    status, payload = server.named_cmd_run(
+                        kind, spec, body, f"{kind}.json", f"unknown_{kind}", {}
+                    )
+                    self.assertEqual(status, 202, payload)
+                    enqueued.assert_called_once()
+                    queued = enqueued.call_args.args[0]
+                    self.assertEqual(queued["job_id"], payload["job_id"])
+                    server.run_script_job(queued["job_id"])
+                    saved = server.read_job(payload["job_id"])
+                self.assertEqual(saved["receipt"]["status"], expected_status)
+                posted.assert_called_once_with(
+                    "https://example.invalid/resume", saved["receipt"], token="token"
+                )
+
     def test_script_argv_forbidden(self):
         status, payload, _ = server.dispatch(
             "POST",

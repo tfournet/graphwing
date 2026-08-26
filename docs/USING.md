@@ -149,6 +149,7 @@ flat result.
 
 `auto_merge` is per-run and defaults false. Initial-green and after-fix routes both checkout the freshly read PR head and run one final named test. The earlier after-fix test remains advisory.
 Only the final async job carries persisted `pr-merge-evidence-v1` repo/recipe/PR/run/head and clean start/end provenance; after-fix pins the successful writer/session job while initial-green has no writer reference.
+For named scripts, tests, and RR recipes, supplying `response_webhook_url` forces async execution even when the catalog recipe defaults to sync, so a Graph wait always receives a terminal callback.
 Merge accepts that final persisted job ID only when its repo/recipe/PR/run/head and clean start/end provenance match. It then freshly requires an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
 Code-off receipts remain independent issue-67 commit/push gates and cannot waive this final test. `graphwing-pr-status` reports remote readiness only; `remote_ready` means `named_test_required`, not merge-safe.
 
