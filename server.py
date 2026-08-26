@@ -8080,8 +8080,8 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         str(head.get("text") or ""),
         "",
         "VERIFICATION",
-        "These named recipes decide whether this change is done. Each one runs to a",
-        "real verdict; a queued job or a skipped command does not count as a pass.",
+        "These named recipes decide whether this change is done. Graphwing runs them",
+        "after you return; do not search for or run the named recipes yourself.",
     ]
     for phase in BUILD_CHECK_PHASES:
         names = [n for n in (verification.get(phase) or []) if isinstance(n, str)]
@@ -8092,7 +8092,7 @@ def build_brief(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
             "the run that failed in your summary."
         )
     lines.append(
-        "Stage the files you changed. Do not commit, do not push, do not open a PR: "
+        "Stage the files you changed and return after staging. Do not commit, do not push, do not open a PR: "
         "finalization is a separate step and runs only after the review is clean."
     )
     if finding:
