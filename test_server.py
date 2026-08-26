@@ -7642,8 +7642,8 @@ class CompletionSupervisorTests(unittest.TestCase):
         self.assertEqual(set(config["statuses"]), set(server.SUPERVISOR_TERMINAL_STATUSES))
         self.assertEqual(config["executionModes"], ["live"])
         self.assertEqual(config["contextMode"], "output")
-        self.assertEqual(config["sourceWorkflowTags"], [server.SUPERVISOR_TAG])
-        self.assertEqual(config["sourceWorkflowIds"], ["$GRAPHWING_SOURCE_WORKFLOW_ID"])
+        self.assertEqual(config["tags"], [server.SUPERVISOR_TAG])
+        self.assertEqual(config["workflowIds"], ["$GRAPHWING_SOURCE_WORKFLOW_ID"])
         self.assertTrue(config["excludeSelf"])
         node_types = [node["type"].lower() for node in graph["spec"]["nodes"]]
         # The server owns durable watch settlement; the listener never holds an
