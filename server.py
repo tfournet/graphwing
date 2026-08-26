@@ -3875,7 +3875,7 @@ def spawn_harness(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, 
                "--max-turns", str(job["max_turns"]), "--add-dir", cwd, "--model", model,
                "--session-id", str(session), prompt]
     elif launcher == "grok":
-        cmd = [str(GROK_BIN), "-p", "--prompt-file", str(prompt_path), "--output-format", "json",
+        cmd = [str(GROK_BIN), "--prompt-file", str(prompt_path), "--output-format", "json",
                "--permission-mode", "acceptEdits", "--no-subagents", "--max-turns", str(job["max_turns"]),
                "--model", model, "--session-id", str(session), "--cwd", cwd]
     else:
