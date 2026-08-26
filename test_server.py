@@ -1869,6 +1869,7 @@ class DispatchTests(unittest.TestCase):
 
             def __init__(self, cmd, **kwargs):
                 captured["cmd"] = list(cmd)
+                captured["env"] = kwargs["env"]
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1883,6 +1884,7 @@ class DispatchTests(unittest.TestCase):
                 "job_id": job_id, "cwd": td, "model": "claude-opus-5",
                 "launcher": "claude", "max_turns": 12,
                 "session_identity": {"native_session_id": "claude-123"},
+                "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
             }
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server.subprocess, "Popen", FakePopen):
@@ -1901,6 +1903,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(initial_err)
         self.assertIsNotNone(initial_proc)
         self.assertNotIn("--resume", initial_cmd)
+        self.assertEqual(captured["env"]["PYTHONDONTWRITEBYTECODE"], "1")
 
     def _write_grok_acp_fixture(self, root: Path) -> Path:
         fixture = root / "grok-fixture"
@@ -2320,13 +2323,19 @@ while True:
         self.assertNotIn("session/load", [r["method"] for r in capture["requests"]])
 
     def test_native_job_env_overrides_terminal_cwd(self):
-        with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
+        with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim", "PYTHONDONTWRITEBYTECODE": "inherited"}):
             env = server.native_job_env(
                 {"job_id": "ab" * 16, "cwd": "/home/tim/work/gw-real-slice"}
             )
+            codeoff_env = server.native_job_env({
+                "job_id": "cd" * 16, "cwd": "/home/tim/work/gw-codeoff",
+                "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
+            })
         self.assertEqual(env["TERMINAL_CWD"], "/home/tim/work/gw-real-slice")
         self.assertEqual(env["PWD"], "/home/tim/work/gw-real-slice")
         self.assertNotEqual(env.get("TERMINAL_CWD"), "/home/tim/rewst/riftwing")
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "inherited")
+        self.assertEqual(codeoff_env["PYTHONDONTWRITEBYTECODE"], "1")
 
     def test_run_agent_preserves_specific_spawn_error_in_saved_and_posted_receipt(self):
         with tempfile.TemporaryDirectory() as td:
