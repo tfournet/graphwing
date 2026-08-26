@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-verify-stack",
   "name": "graphwing-verify-stack",
-  "description": "Hard-coded: stackStatus then portCheck. Success retains diagnostic-v1 evidence; action failures end with sanitized stage receipts. Payload: stack, ports.",
+  "description": "Hard-coded: stackStatus then one scalar port parameter. Success retains diagnostic-v1 evidence; action failures end with sanitized stage receipts. Payload: stack, port.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -25,8 +25,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 15,
-          "port": "{{ CTX.INPUT.ports }}",
-          "ports": "{{ CTX.INPUT.ports }}"
+          "port": "{{ CTX.INPUT.port }}"
         }
       },
       {

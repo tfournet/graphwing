@@ -67,6 +67,17 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
     raw = os.environ.get(env_var, "").strip()
     if raw:
         return Path(raw)
+    mise = shutil.which("mise")
+    if mise:
+        try:
+            selected = subprocess.run(
+                [mise, "which", name], check=False, capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            selected = None
+        candidate = Path(selected.stdout.strip()) if selected and selected.returncode == 0 else None
+        if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     found = shutil.which(name)
     if found:
         return Path(found)
@@ -76,6 +87,7 @@ def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
 CODEX_BIN = resolve_executable("codex", "GRAPHWING_CODEX_BIN", Path.home() / ".local" / "bin" / "codex")
 CLAUDE_BIN = resolve_executable("claude", "GRAPHWING_CLAUDE_BIN", Path.home() / ".local" / "bin" / "claude")
 GROK_BIN = resolve_executable("grok", "GRAPHWING_GROK_BIN", Path.home() / ".local" / "bin" / "grok")
+GH_BIN = resolve_executable("gh", "GRAPHWING_GH_BIN", Path.home() / ".local" / "bin" / "gh")
 RR_BIN = resolve_executable("rr", "GRAPHWING_RR_BIN", Path.home() / "go" / "bin" / "rr")
 AGENT_MAX_TURNS = 30
 AGENT_RUN_BUDGET = 300
@@ -2587,7 +2599,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
 
 
 def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
-    r = run_cmd(["gh", *args], cwd=path)
+    r = run_cmd([str(GH_BIN), *args], cwd=path)
     verdict_exit = args[:2] == ["pr", "checks"] and r.get("returncode") in (1, 8)
     if not r.get("ok") and not verdict_exit:
         return r
@@ -2601,7 +2613,7 @@ def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
 def gh_text(path: Path, args: list[str]) -> dict[str, Any]:
     """Run gh where the output is prose. `gh pr merge` prints a sentence, and
     routing that through gh_json reported a successful merge as a failure."""
-    return run_cmd(["gh", *args], cwd=path)
+    return run_cmd([str(GH_BIN), *args], cwd=path)
 
 
 PR_VIEW_FIELDS = "number,title,state,url,headRefName,headRefOid,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus,labels"
