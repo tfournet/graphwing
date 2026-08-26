@@ -80,6 +80,25 @@ NATIVE_LAUNCHERS = {
     "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
     "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
+FAILURE_CLASS_CODES = {
+    "none": {"success"},
+    "provider_availability": {"missing_binary"},
+    "timeout_budget": {"run_budget_exceeded", "reported_timeout"},
+    "model_execution": {"process_exit", "spawn_failed", "model_stopped", "model_reported_error"},
+    "malformed_contract": {"invalid_receipt", "adapter_contract_invalid", "missing_prompt"},
+    "session_provenance": {"session_identity_missing", "session_identity_mismatch", "session_provenance_invalid"},
+    "repository_state": {"repository_mismatch", "branch_mismatch", "head_mismatch"},
+    "cancelled": {"cancelled"},
+    "unknown": {"unknown_failure"},
+}
+FAILURE_CLASS_BY_CODE = {code: failure_class for failure_class, codes in FAILURE_CLASS_CODES.items() for code in codes}
+PROVIDER_FAILURE_GROUPS = (
+    ("provider_authentication", {"authentication_error", "authentication_failed", "invalid_api_key", "unauthorized"}),
+    ("provider_quota", {"quota_exceeded", "insufficient_quota"}),
+    ("provider_rate_limit", {"rate_limit_error", "rate_limit_exceeded", "rate_limited"}),
+    ("provider_network", {"network_error", "connection_error", "dns_error", "tls_error"}),
+    ("provider_overloaded", {"overloaded", "overloaded_error", "service_unavailable"}),
+)
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
@@ -2948,21 +2967,95 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
     return None
 
 
-def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, returncode: int, timed_out: bool) -> dict[str, Any]:
+def structured_provider_failure(text: str) -> str | None:
+    """Return an allowlisted provider code from adapter-owned JSON, never prose."""
+    for line in (text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        roots: list[dict[str, Any]] = []
+        error = event.get("error")
+        if isinstance(error, dict):
+            roots.append(error)
+        if event.get("is_error") is True or event.get("type") in ("error", "request_error"):
+            roots.append(event)
+        for root in roots:
+            pending = [root]
+            while pending:
+                item = pending.pop()
+                for key in ("error", "data"):
+                    nested = item.get(key)
+                    if isinstance(nested, dict):
+                        pending.append(nested)
+                for key in ("code", "type", "error_code", "error_type"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        token = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+                        for failure_code, tokens in PROVIDER_FAILURE_GROUPS:
+                            if token in tokens:
+                                return failure_code
+                for key in ("status", "status_code", "http_status"):
+                    value = item.get(key)
+                    try:
+                        status = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if status == 429:
+                        return "provider_rate_limit"
+                    if 500 <= status <= 599:
+                        return "provider_http_5xx"
+    return None
+
+
+def classify_agent_failure(evidence_code: str, structured_output: str = "") -> dict[str, Any]:
+    failure_class = FAILURE_CLASS_BY_CODE.get(evidence_code)
+    provider_code = None
+    if failure_class in (None, "model_execution", "unknown"):
+        provider_code = structured_provider_failure(structured_output)
+    if provider_code:
+        failure_class, failure_code = "provider_availability", provider_code
+    elif failure_class:
+        failure_code = "none" if evidence_code == "success" else evidence_code
+    else:
+        failure_class, failure_code = "unknown", "unknown_failure"
+    return {
+        "failure_class": failure_class,
+        "failure_code": failure_code,
+        "failover_eligible": failure_class == "provider_availability",
+    }
+
+
+def normalize_receipt(
+    job: dict[str, Any],
+    parsed: dict[str, Any] | None,
+    returncode: int,
+    timed_out: bool,
+    evidence_code: str | None = None,
+    structured_output: str = "",
+) -> dict[str, Any]:
     failure: str | None = None
     if timed_out:
-        status, failure = "timeout", "agent run budget exceeded"
+        status, failure, evidence = "timeout", "agent run budget exceeded", "run_budget_exceeded"
     elif returncode != 0:
-        status, failure = "error", f"{job.get('launcher') or 'agent'} exited {returncode}"
+        status, failure, evidence = "error", f"{job.get('launcher') or 'agent'} exited {returncode}", "process_exit"
     elif parsed is None:
-        status, failure = "error", "missing or invalid final receipt"
+        status, failure, evidence = "error", "missing or invalid final receipt", "invalid_receipt"
     else:
         status = str(parsed.get("status") or "error")
+        evidence = "success" if status == "ok" else (
+            "reported_timeout" if status == "timeout" else "model_reported_error"
+        )
     identity = job.get("session_identity")
     if status == "ok" and job.get("launcher") in NATIVE_LAUNCHERS and (
         not isinstance(identity, dict) or not identity.get("native_session_id")
     ):
-        status, failure = "error", f"missing structured {job.get('launcher')} session identity"
+        status, failure, evidence = (
+            "error", f"missing structured {job.get('launcher')} session identity",
+            "session_identity_missing",
+        )
     rec = {
         "status": status,
         "job_id": job["job_id"],
@@ -2982,6 +3075,7 @@ def normalize_receipt(job: dict[str, Any], parsed: dict[str, Any] | None, return
             rec["pr_url"] = str(pr_url)[:500]
         if failure is None and summary not in (None, ""):
             rec["summary"] = str(summary)[:500]
+    rec.update(classify_agent_failure(evidence_code or evidence, structured_output))
     return rec
 
 
@@ -3127,6 +3221,7 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
             cwd=cwd, env=env, start_new_session=True, bufsize=0,
         )
     except OSError as exc:
+        job["_adapter_failure_code"] = "spawn_failed"
         return 1, False, None, f"spawn failed: {exc}"
     job["pid"] = proc.pid
     write_job(job)
@@ -3204,6 +3299,7 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
                     or not isinstance(update.get("sessionUpdate"), str)
                     or update_params.get("sessionId") != session_id
                 ):
+                    job["_adapter_failure_code"] = "session_identity_mismatch"
                     raise ValueError("malformed or changed Grok session update")
                 if update.get("sessionUpdate") == "agent_message_chunk":
                     content = update.get("content")
@@ -3221,6 +3317,7 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
             if ("result" in message) == ("error" in message):
                 raise ValueError(f"invalid Grok ACP {method} response")
             if "error" in message:
+                job["_adapter_failure_code"] = "unknown_failure"
                 raise RuntimeError(f"Grok ACP {method} error")
             result = message["result"]
             if not isinstance(result, dict):
@@ -3258,21 +3355,25 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
                 method_id = "xai.api_key" if os.environ.get("XAI_API_KEY") else "cached_token"
                 selected = method_by_id.get(method_id)
                 if selected is None or selected.get("type", "agent") != "agent":
+                    job["_adapter_failure_code"] = "adapter_contract_invalid"
                     raise RuntimeError("unsupported Grok ACP authentication")
                 request(stdout_f, "authenticate", {"methodId": method_id, "_meta": {"headless": True}})
             if session_id:
                 capabilities = initialized.get("agentCapabilities")
                 if not isinstance(capabilities, dict) or capabilities.get("loadSession") is not True:
+                    job["_adapter_failure_code"] = "session_provenance_invalid"
                     raise RuntimeError("Grok ACP does not support session/load")
                 loaded = request(stdout_f, "session/load", {
                     "sessionId": session_id, "cwd": cwd, "mcpServers": [],
                 })
                 if loaded.get("sessionId") not in (None, session_id):
+                    job["_adapter_failure_code"] = "session_identity_mismatch"
                     raise ValueError("Grok session identity changed during load")
             else:
                 created = request(stdout_f, "session/new", {"cwd": cwd, "mcpServers": []})
                 candidate = created.get("sessionId")
                 if not isinstance(candidate, str) or not NATIVE_SESSION_RE.fullmatch(candidate.strip()):
+                    job["_adapter_failure_code"] = "session_identity_missing"
                     raise ValueError("missing structured Grok session identity")
                 session_id = candidate.strip()
             prompted = request(stdout_f, "session/prompt", {
@@ -3280,6 +3381,10 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
                 "prompt": [{"type": "text", "text": path.joinpath("prompt.txt").read_text()}],
             }, collect=True)
             if prompted.get("stopReason") != "end_turn":
+                job["_adapter_failure_code"] = (
+                    "cancelled" if prompted.get("stopReason") in ("cancelled", "canceled")
+                    else "model_stopped"
+                )
                 raise RuntimeError("Grok ACP prompt did not end_turn")
             final_message = "".join(chunks)
             path.joinpath("last-message.txt").write_text(final_message)
@@ -3293,11 +3398,19 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
                 and isinstance(parsed["summary"], str)
                 and bool(parsed["summary"].strip())
             ):
+                job["_adapter_failure_code"] = "invalid_receipt"
                 raise ValueError("missing or invalid final receipt")
             returncode = 0
     except TimeoutError as exc:
         timed_out, error = True, str(exc)
-    except (BrokenPipeError, OSError, RuntimeError, ValueError) as exc:
+    except ValueError as exc:
+        job.setdefault("_adapter_failure_code", "adapter_contract_invalid")
+        error = str(exc)
+        code = proc.poll()
+        if code not in (None, 0):
+            returncode = code
+    except (BrokenPipeError, OSError, RuntimeError) as exc:
+        job.setdefault("_adapter_failure_code", "process_exit")
         error = str(exc)
         code = proc.poll()
         if code not in (None, 0):
@@ -3384,7 +3497,10 @@ def run_agent_job(job_id: str) -> None:
         job["status"] = "failed"
         job["finished_at"] = utcnow()
         job["error"] = err.get("error")
-        job["receipt"] = normalize_receipt(job, {"status": "error", "summary": err.get("error")}, 1, False)
+        job["receipt"] = normalize_receipt(
+            job, {"status": "error", "summary": err.get("error")}, 1, False,
+            evidence_code=str(err.get("code") or "unknown_failure"),
+        )
         job["receipt"]["summary"] = err.get("error")
         hook = deliver_webhook(job, job["receipt"])
         if hook is not None:
@@ -3409,15 +3525,27 @@ def run_agent_job(job_id: str) -> None:
     final_message = read_bounded_output(job_dir(job_id) / "last-message.txt")
     parsed = parse_receipt_text(final_message) or parse_receipt_text(stdout)
     session_id = session_id or parse_native_session_id(stdout, str(job.get("launcher") or ""))
-    session_error = record_native_session(job, session_id)
-    if protocol_error and not timed_out:
-        session_error = protocol_error
-    receipt = normalize_receipt(job, parsed, returncode, timed_out)
-    if session_error:
+    session_error: str | None = None
+    session_evidence: str | None = None
+    if returncode == 0 and not timed_out:
+        expected_session = (job.get("session_identity") or {}).get("native_session_id")
+        session_error = record_native_session(job, session_id)
+        if session_error:
+            session_evidence = (
+                "session_identity_mismatch" if expected_session and session_id
+                else "session_identity_missing"
+            )
+    adapter_evidence = job.pop("_adapter_failure_code", None)
+    failure_summary = protocol_error if protocol_error and not timed_out else session_error
+    receipt = normalize_receipt(
+        job, parsed, returncode, timed_out,
+        evidence_code=session_evidence or adapter_evidence, structured_output=stdout,
+    )
+    if failure_summary:
         receipt["status"] = "error"
-        receipt["summary"] = session_error
+        receipt["summary"] = failure_summary
     job = read_job(job_id) or job
-    if session_id and not session_error and isinstance(job.get("session_identity"), dict):
+    if session_id and not failure_summary and isinstance(job.get("session_identity"), dict):
         job["session_identity"]["native_session_id"] = session_id
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
@@ -3653,7 +3781,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     binary = {"claude": CLAUDE_BIN, "codex": CODEX_BIN, "grok": GROK_BIN}[launcher]
     if not binary.is_file():
         code = "missing_binary" if launcher == "grok" else "provider_unavailable"
-        return 501, {"error": f"{launcher} binary missing: {binary}", "code": code}
+        classified = classify_agent_failure("missing_binary")
+        return 501, {"error": f"{launcher} binary missing: {binary}", "code": code, **classified}
     branch, head, git_err = current_branch_head(resolved)
     if git_err:
         return 400, git_err

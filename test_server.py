@@ -745,6 +745,55 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("changed", server.record_native_session(job, "claude-456"))
         self.assertEqual(job["session_identity"]["native_session_id"], "claude-123")
 
+    def test_launcher_failure_contract_is_closed_and_failover_is_narrow(self):
+        expected = {
+            "none": {"success"}, "provider_availability": {"missing_binary"},
+            "timeout_budget": {"run_budget_exceeded", "reported_timeout"},
+            "model_execution": {"process_exit", "spawn_failed", "model_stopped", "model_reported_error"},
+            "malformed_contract": {"invalid_receipt", "adapter_contract_invalid", "missing_prompt"},
+            "session_provenance": {"session_identity_missing", "session_identity_mismatch", "session_provenance_invalid"},
+            "repository_state": {"repository_mismatch", "branch_mismatch", "head_mismatch"},
+            "cancelled": {"cancelled"}, "unknown": {"unknown_failure"},
+        }
+        self.assertEqual(server.FAILURE_CLASS_CODES, expected)
+        for failure_class, codes in expected.items():
+            for evidence in codes:
+                got = server.classify_agent_failure(evidence)
+                self.assertEqual((got["failure_class"], got["failure_code"], got["failover_eligible"]),
+                                 (failure_class, "none" if evidence == "success" else evidence,
+                                  failure_class == "provider_availability"))
+
+    def test_structured_provider_failures_and_receipts_are_closed(self):
+        fixtures = (
+            ("codex", {"type": "error", "error": {"code": "rate_limit_exceeded"}}, "provider_rate_limit"),
+            ("codex-quota", {"type": "error", "error": {"code": "quota_exceeded"}}, "provider_quota"),
+            ("claude", {"type": "result", "is_error": True, "error": {"type": "authentication_error"}}, "provider_authentication"),
+            ("claude-network", {"type": "error", "error": {"type": "network_error"}}, "provider_network"),
+            ("grok", {"jsonrpc": "2.0", "error": {"data": {"status": 503}}}, "provider_http_5xx"),
+            ("grok-overload", {"jsonrpc": "2.0", "error": {"data": {"code": "overloaded_error"}}}, "provider_overloaded"),
+        )
+        for launcher, event, code in fixtures:
+            with self.subTest(launcher=launcher):
+                got = server.classify_agent_failure("process_exit", json.dumps(event))
+                self.assertEqual((got["failure_class"], got["failure_code"], got["failover_eligible"]),
+                                 ("provider_availability", code, True))
+        structured = json.dumps({"type": "error", "error": {"status_code": 503}})
+        for evidence, expected in (("run_budget_exceeded", "timeout_budget"), ("session_identity_mismatch", "session_provenance")):
+            got = server.classify_agent_failure(evidence, structured)
+            self.assertEqual((got["failure_class"], got["failover_eligible"]), (expected, False))
+        prose = server.classify_agent_failure("process_exit", "authentication quota network overload")
+        self.assertEqual((prose["failure_class"], prose["failover_eligible"]), ("model_execution", False))
+        job = {"job_id": "ab" * 16, "launcher": "codex", "log_ref": "/tmp/log", "session_identity": {"native_session_id": "native-123"}}
+        receipts = (
+            (server.normalize_receipt(job, {"status": "ok", "summary": "done"}, 0, False), "none", "none"),
+            (server.normalize_receipt(job, None, 0, False), "malformed_contract", "invalid_receipt"),
+            (server.normalize_receipt(job, {"status": "error", "summary": "specific"}, 0, False), "model_execution", "model_reported_error"),
+            (server.normalize_receipt(job, {"status": "timeout", "summary": "budget"}, 0, False), "timeout_budget", "reported_timeout"),
+        )
+        for receipt, failure_class, failure_code in receipts:
+            self.assertEqual((receipt["failure_class"], receipt["failure_code"]), (failure_class, failure_code))
+        self.assertEqual(receipts[-2][0]["summary"], "specific")
+
     def test_agent_run_missing_binary(self):
         with mock.patch.object(server, "CODEX_BIN", Path("/nope/codex")):
             status, payload, _ = server.dispatch(
@@ -753,6 +802,9 @@ class DispatchTests(unittest.TestCase):
             )
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "provider_unavailable")
+        self.assertEqual(payload["failure_class"], "provider_availability")
+        self.assertEqual(payload["failure_code"], "missing_binary")
+        self.assertTrue(payload["failover_eligible"])
 
     def test_grok_agent_run_missing_binary_is_typed(self):
         with mock.patch.object(server, "GROK_BIN", Path("/nope/grok")):
@@ -762,6 +814,9 @@ class DispatchTests(unittest.TestCase):
             )
         self.assertEqual(status, 501)
         self.assertEqual(payload["code"], "missing_binary")
+        self.assertEqual(payload["failure_class"], "provider_availability")
+        self.assertEqual(payload["failure_code"], "missing_binary")
+        self.assertTrue(payload["failover_eligible"])
 
     def test_wrap_prompt_locks_cwd(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
@@ -886,7 +941,9 @@ while True:
     if cfg.get("missing_result_method") == method:
         send({"jsonrpc":"2.0","id":response_id(request)}); continue
     if cfg.get("error_method") == method:
-        send({"jsonrpc":"2.0","id":response_id(request),"error":{"code":-32000,"message":"fixture error"}})
+        error = {"code":cfg.get("error_code", -32000),"message":"fixture error"}
+        if "error_status" in cfg: error["data"] = {"status":cfg["error_status"]}
+        send({"jsonrpc":"2.0","id":response_id(request),"error":error})
         if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
         continue
     if method == "initialize":
@@ -996,6 +1053,9 @@ while True:
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["session_identity"]["native_session_id"], "grok-123")
         self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["failure_class"], "none")
+        self.assertEqual(saved["receipt"]["failure_code"], "none")
+        self.assertFalse(saved["receipt"]["failover_eligible"])
         self.assertEqual((jdir / "last-message.txt").read_text(), '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}')
 
     def test_grok_acp_initializer_disables_unsupported_client_methods(self):
@@ -1134,6 +1194,23 @@ while True:
                 }:
                     self.assertIsNone(saved["session_identity"]["native_session_id"])
 
+    def test_grok_failure_receipts_cover_non_failover_classes(self):
+        fixtures = {
+            "malformed_contract": ({"chunks": ["prose only"]}, "invalid_receipt"),
+            "session_provenance": ({"load_result": {"sessionId": "grok-other"}}, "session_identity_mismatch"),
+            "cancelled": ({"stop_reason": "cancelled"}, "cancelled"),
+            "model_execution": ({"exit_method": "session/prompt"}, "process_exit"),
+            "unknown": ({"error_method": "session/prompt"}, "unknown_failure"),
+        }
+        for expected, (fixture, code) in fixtures.items():
+            with self.subTest(expected=expected):
+                saved, _, _ = self._run_grok_fixture(
+                    fixture, resume=expected == "session_provenance"
+                )
+                receipt = saved["receipt"]
+                self.assertEqual((receipt["failure_class"], receipt["failure_code"]), (expected, code))
+                self.assertFalse(receipt["failover_eligible"])
+
     def test_grok_acp_rejects_nonzero_exit_after_valid_prompt_result(self):
         saved, _, _ = self._run_grok_fixture({"exit_after_method": "session/prompt", "exit_code": 7})
         self.assertEqual(saved["status"], "failed")
@@ -1149,6 +1226,15 @@ while True:
         self.assertEqual(saved["status"], "failed")
         self.assertEqual(saved["returncode"], 7)
         self.assertEqual(saved["receipt"]["summary"], "Grok ACP session/prompt error")
+
+    def test_grok_structured_provider_error_is_failover_eligible(self):
+        saved, _, _ = self._run_grok_fixture({
+            "error_method": "session/prompt",
+            "error_code": "rate_limit_exceeded",
+        })
+        self.assertEqual(saved["receipt"]["failure_class"], "provider_availability")
+        self.assertEqual(saved["receipt"]["failure_code"], "provider_rate_limit")
+        self.assertTrue(saved["receipt"]["failover_eligible"])
 
     def test_grok_acp_bounds_stderr_log(self):
         saved, _, jdir = self._run_grok_fixture({"stderr_bytes": server.FILE_MAX_BYTES * 2})
@@ -1192,6 +1278,8 @@ while True:
     def test_grok_resume_requires_load_capability(self):
         saved, capture, _ = self._run_grok_fixture({"load_session": False}, resume=True)
         self.assertEqual(saved["status"], "failed")
+        self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]),
+                         ("session_provenance", "session_provenance_invalid"))
         self.assertNotIn("session/load", [r["method"] for r in capture["requests"]])
 
     def test_native_job_env_overrides_terminal_cwd(self):
@@ -1230,6 +1318,13 @@ while True:
             self.assertEqual(saved["receipt"]["summary"], specific)
             posted.assert_called_once()
             self.assertEqual(posted.call_args.args[1]["summary"], specific)
+            self.assertEqual(posted.call_args.args[1], saved["receipt"])
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                public = server.public_job(server.read_job(job_id))
+            self.assertEqual(public["receipt"], saved["receipt"])
+            self.assertEqual(saved["receipt"]["failure_class"], "provider_availability")
+            self.assertEqual(saved["receipt"]["failure_code"], "missing_binary")
+            self.assertTrue(saved["receipt"]["failover_eligible"])
 
     def test_codex_job_completes_only_with_matching_session_and_receipt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1415,6 +1510,18 @@ while True:
         for schema_name in ("AgentRunAccepted", "AgentJob", "AgentReceipt"):
             identity = spec["components"]["schemas"][schema_name]["properties"]["session_identity"]
             self.assertEqual(identity["$ref"], "#/components/schemas/SessionIdentity")
+        receipt = spec["components"]["schemas"]["AgentReceipt"]["properties"]
+        self.assertEqual(
+            set(receipt["failure_class"]["enum"]),
+            {"none", "provider_availability", "timeout_budget", "model_execution",
+             "malformed_contract", "session_provenance", "repository_state",
+             "cancelled", "unknown"},
+        )
+        for field in ("failure_class", "failure_code", "failover_eligible"):
+            self.assertIn(field, receipt)
+            self.assertIn(field, spec["components"]["schemas"]["Error"]["properties"])
+        expected_codes = (set(server.FAILURE_CLASS_BY_CODE) - {"success"}) | {"none", "provider_http_5xx"} | {code for code, _ in server.PROVIDER_FAILURE_GROUPS}
+        self.assertEqual(set(receipt["failure_code"]["enum"]), expected_codes)
         self.assertNotIn("profile", props)
         self.assertNotIn("/v1/agent/profiles", spec["paths"])
         self.assertEqual(set(props["provider"]["enum"]), {"openai", "anthropic", "xai"})
