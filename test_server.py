@@ -465,6 +465,48 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(env["PWD"], "/home/tim/work/gw-real-slice")
         self.assertNotEqual(env.get("TERMINAL_CWD"), "/home/tim/rewst/riftwing")
 
+    def test_correction_turn_resumes_claude_and_grok_sessions(self):
+        captured = []
+
+        class Popen:
+            pid = 9
+
+            def __init__(self, cmd, **kwargs):
+                captured.append(list(cmd))
+
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            job_id = "cd" * 16
+            session = str(uuid.UUID(hex=job_id))
+            (jobs / job_id).mkdir(parents=True)
+            (jobs / job_id / "prompt.txt").write_text("fix the failed check")
+            binary = Path(td) / "harness"
+            binary.write_text("#!/bin/sh\n")
+            for launcher in ("claude", "grok"):
+                job = {
+                    "job_id": job_id,
+                    "cwd": td,
+                    "max_turns": 2,
+                    "run_budget_seconds": 30,
+                    "harness_session": session,
+                    "launcher": launcher,
+                    "model": "sonnet" if launcher == "claude" else "grok-4.6",
+                    "claim_kind": "correction",
+                }
+                patches = {"CLAUDE_BIN": binary, "GROK_BIN": binary}
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "CLAUDE_BIN", patches["CLAUDE_BIN"]), \
+                     mock.patch.object(server, "GROK_BIN", patches["GROK_BIN"]), \
+                     mock.patch.object(server.subprocess, "Popen", Popen):
+                    proc, error = server.spawn_harness(job)
+                self.assertIsNone(error)
+                self.assertIsNotNone(proc)
+        self.assertEqual(len(captured), 2)
+        for cmd in captured:
+            self.assertIn("--resume", cmd)
+            self.assertEqual(cmd[cmd.index("--resume") + 1], session)
+            self.assertNotIn("--session-id", cmd)
+
     def test_run_agent_completes_receipt(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
