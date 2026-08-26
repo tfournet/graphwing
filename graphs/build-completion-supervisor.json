@@ -47,7 +47,7 @@
             "id": "{{ TRIGGER.workflowCompleted.sourceWorkflow.id }}",
             "slug": "{{ TRIGGER.workflowCompleted.sourceWorkflow.slug }}",
             "name": "{{ TRIGGER.workflowCompleted.sourceWorkflow.name }}",
-            "tags": "{{ TASKS.completion_payload.source_workflow.tags | tojson }}"
+            "tags": "{{ CTX.completion_payload.source_workflow.tags | tojson }}"
           },
           "source_run": {
             "id": "{{ TRIGGER.workflowCompleted.sourceRun.id }}",
