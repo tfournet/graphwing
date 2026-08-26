@@ -1,5 +1,7 @@
 # Ticket 07 sensitive review canary
 
+This is a self-contained disposable canary of tenant-boundary logic and its executable test. Production authorization wiring and production callers are explicitly out of scope.
+
 Create `tenant_access.py` with:
 
 ```python
