@@ -899,7 +899,7 @@ class DispatchTests(unittest.TestCase):
         text = json.dumps({
             "type": "result", "subtype": "success", "is_error": False,
             "session_id": "claude-123",
-            "result": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+            "result": 'Test execution was unavailable.\n\n{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
         })
         self.assertEqual(server.parse_native_session_id(text, "claude"), "claude-123")
         self.assertEqual(server.parse_receipt_text(text)["summary"], "done")
