@@ -578,7 +578,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60,
           "build_id": "{{ CTX.INPUT.build_id }}", "reviewer": "{{ TASKS.next.data.review_reviewer }}",
           "provider": "{{ CTX.INPUT.failover_provider }}", "model": "{{ CTX.INPUT.failover_model }}",
-          "transition_id": "{{ CTX.WORKFLOW.runId }}:failover:{{ TASKS.wait_review.request.body.attempt_id }}",
+          "transition_id": "{{ WORKFLOW.runId }}:failover:{{ TASKS.wait_review.request.body.attempt_id }}",
           "source_failure_id": "{{ TASKS.wait_review.request.body.attempt_id }}",
           "response_webhook_url": "{{ TASKS.wait_failover_review.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_failover_review.pending.resumeToken }}"
@@ -1016,11 +1016,11 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "source_run_id": "{{ CTX.WORKFLOW.runId }}",
+          "source_run_id": "{{ WORKFLOW.runId }}",
           "build_id": "{{ CTX.INPUT.build_id }}",
           "event_id": "{{ CTX.INPUT.event_id }}",
-          "workflow_id": "{{ CTX.WORKFLOW.id }}",
-          "workflow_version": "{{ CTX.WORKFLOW.version }}",
+          "workflow_id": "{{ WORKFLOW.id }}",
+          "workflow_version": "{{ WORKFLOW.version }}",
           "expected_stage": "{{ CTX.INPUT.expected_stage }}",
           "deadline": "{{ CTX.INPUT.deadline }}",
           "plan_pane": "{{ CTX.INPUT.plan_pane }}",
@@ -1053,11 +1053,11 @@
           ]
         }
       },
-      {"id": "bind_writer_initial", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged initial writer job", "position": {"x": 1120, "y": 340}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.agent.data.job_id }}"}},
-      {"id": "bind_writer_fix", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged correction writer job", "position": {"x": 840, "y": 660}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.agent_fix.data.job_id }}"}},
-      {"id": "bind_fast", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged fast-check job", "position": {"x": 700, "y": 400}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.checks_fast.data.job_id }}"}},
-      {"id": "bind_review", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged behavior-review job", "position": {"x": 700, "y": 820}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.review.data.job_id }}"}},
-      {"id": "bind_integration", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged integration-check job", "position": {"x": 700, "y": 1120}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ CTX.WORKFLOW.runId }}", "job_id": "{{ TASKS.checks_int.data.job_id }}"}},
+      {"id": "bind_writer_initial", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged initial writer job", "position": {"x": 1120, "y": 340}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ WORKFLOW.runId }}", "job_id": "{{ TASKS.agent.data.job_id }}"}},
+      {"id": "bind_writer_fix", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged correction writer job", "position": {"x": 840, "y": 660}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ WORKFLOW.runId }}", "job_id": "{{ TASKS.agent_fix.data.job_id }}"}},
+      {"id": "bind_fast", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged fast-check job", "position": {"x": 700, "y": 400}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ WORKFLOW.runId }}", "job_id": "{{ TASKS.checks_fast.data.job_id }}"}},
+      {"id": "bind_review", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged behavior-review job", "position": {"x": 700, "y": 820}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ WORKFLOW.runId }}", "job_id": "{{ TASKS.review.data.job_id }}"}},
+      {"id": "bind_integration", "type": "action.graphwing.POST:/v1/supervisor/bind", "label": "Bind acknowledged integration-check job", "position": {"x": 700, "y": 1120}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 30, "source_run_id": "{{ WORKFLOW.runId }}", "job_id": "{{ TASKS.checks_int.data.job_id }}"}},
       {"id": "join_bind_failed", "type": "logic.join.any", "label": "Any supervisor binding failure", "position": {"x": 980, "y": 1320}, "config": {"stopOnFirst": true}},
       {"id": "bind_failed", "type": "action.noop", "label": "Park: local job was not bound to source run", "position": {"x": 1160, "y": 1320}, "config": {"status": "parked", "reason": "job_binding_failed", "files_intact": true}},
       { "id": "visual_evidence_required", "type": "action.noop", "label": "Sensitive visible build requires the separate visual-evidence path before review", "position": { "x": 560, "y": 1380 }, "config": {} }
