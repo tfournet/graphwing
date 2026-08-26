@@ -30,7 +30,7 @@ class PublishGraphsTests(unittest.TestCase):
             loaded.append((stem, source_workflow_id))
             return {"name": stem, "slug": stem, "description": stem, "spec": {"source": source_workflow_id}}
 
-        def fake_upsert(_mcp, name, _slug, _description, _spec, _tags, *, config=None):
+        def fake_upsert(_mcp, name, _slug, _description, _spec, _tags, *, config=None, output_schema=None):
             published_order.append(name)
             return f"wf-{name}", f"ver-{name}", name
 
@@ -101,13 +101,14 @@ class PublishGraphsTests(unittest.TestCase):
     def test_publish_passes_source_and_listener_top_level_tags(self):
         seen = {}
 
-        def fake_upsert(_mcp, name, _slug, _description, _spec, tags, *, config=None):
+        def fake_upsert(_mcp, name, _slug, _description, _spec, tags, *, config=None, output_schema=None):
             seen[name] = tags
             return f"wf-{name}", f"ver-{name}", name
 
         with mock.patch.object(publish_graphs, "upsert_workflow", side_effect=fake_upsert), \
              mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}), \
-             mock.patch.object(publish_graphs, "verify_workflow_config_parity", return_value={"readback": True}):
+             mock.patch.object(publish_graphs, "verify_workflow_config_parity", return_value={"readback": True}), \
+             mock.patch.object(publish_graphs, "verify_workflow_output_schema_parity", return_value={"readback": True}):
             publish_graphs.publish_selected(
                 "mcp", {}, ["pre-pr-build", "build-completion-supervisor"], "instance-1", "", ""
             )
@@ -145,6 +146,11 @@ class PublishGraphsTests(unittest.TestCase):
                 {"name": "event_id", "type": "string", "binding": "CTX.INPUT.event_id"},
             ],
         )
+        self.assertEqual(graph["outputSchema"]["required"], ["build_id", "event_id"])
+        self.assertEqual(
+            graph["outputSchema"]["properties"],
+            {"build_id": {"type": "string"}, "event_id": {"type": "string"}},
+        )
 
     def test_upsert_applies_version_config_before_publish(self):
         calls = []
@@ -158,14 +164,29 @@ class PublishGraphsTests(unittest.TestCase):
             return 200, {}
 
         config = {"outputs": [{"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"}]}
+        output_schema = {"type": "object", "properties": {"build_id": {"type": "string"}}}
         with mock.patch.object(publish_graphs, "api", side_effect=fake_api):
             publish_graphs.upsert_workflow(
-                "mcp", "source", "source", "desc", {"nodes": []}, [], config=config
+                "mcp",
+                "source",
+                "source",
+                "desc",
+                {"nodes": []},
+                [],
+                config=config,
+                output_schema=output_schema,
             )
         config_call = ("PATCH", "/workflows/wf-1/versions/v1/config", config)
+        schema_call = (
+            "PUT",
+            "/workflows/wf-1/versions/v1/output-schema",
+            {"outputSchema": output_schema},
+        )
         publish_call = ("POST", "/workflows/wf-1/versions/v1/publish", {})
         self.assertIn(config_call, calls)
+        self.assertIn(schema_call, calls)
         self.assertLess(calls.index(config_call), calls.index(publish_call))
+        self.assertLess(calls.index(schema_call), calls.index(publish_call))
 
     def test_config_parity_reads_fresh_endpoint_and_projects_server_defaults(self):
         expected = {"outputs": [{"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"}]}
@@ -177,6 +198,21 @@ class PublishGraphsTests(unittest.TestCase):
         with mock.patch.object(publish_graphs, "api", return_value=(200, {"config": {}})):
             with self.assertRaisesRegex(SystemExit, "config live catalog mismatch"):
                 publish_graphs.verify_workflow_config_parity("mcp", "wf-1", "v1", expected, "source")
+
+    def test_output_schema_parity_uses_fresh_published_version(self):
+        expected = {"type": "object", "properties": {"build_id": {"type": "string"}}}
+        body = {"currentVersion": {"outputSchema": expected}}
+        with mock.patch.object(publish_graphs, "api", return_value=(200, body)) as api:
+            receipt = publish_graphs.verify_workflow_output_schema_parity("mcp", "wf-1", expected, "source")
+        api.assert_called_once_with("mcp", "GET", "/workflows/wf-1?include=spec")
+        self.assertEqual(receipt["normalized_catalog_sha"], receipt["normalized_live_sha"])
+        with mock.patch.object(
+            publish_graphs,
+            "api",
+            return_value=(200, {"currentVersion": {"outputSchema": {"type": "object", "properties": {}}}}),
+        ):
+            with self.assertRaisesRegex(SystemExit, "output schema live catalog mismatch"):
+                publish_graphs.verify_workflow_output_schema_parity("mcp", "wf-1", expected, "source")
 
     def test_normalized_live_readback_is_required_and_never_uses_submitted_bytes(self):
         expected = {"nodes": [{"id": "a", "config": {"x": 1, "y": 2}}]}

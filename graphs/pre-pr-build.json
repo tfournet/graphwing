@@ -10,6 +10,15 @@
     ],
     "tags": { "info": ["graphwing-supervised"] }
   },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["build_id", "event_id"],
+    "properties": {
+      "build_id": { "type": "string" },
+      "event_id": { "type": "string" }
+    }
+  },
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
