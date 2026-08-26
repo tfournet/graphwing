@@ -186,6 +186,30 @@ def apply_workflow_config(mcp: str, workflow_id: str, version_id: str, config: d
         raise SystemExit(f"config {slug} HTTP {status}: {json.dumps(body)[:800]}")
 
 
+def apply_workflow_output_schema(
+    mcp: str, workflow_id: str, version_id: str, output_schema: dict, slug: str
+) -> None:
+    if not output_schema:
+        return
+    status, body = api(
+        mcp,
+        "PUT",
+        f"/workflows/{workflow_id}/versions/{version_id}/output-schema",
+        {"outputSchema": output_schema},
+    )
+    if status not in (200, 201):
+        raise SystemExit(f"output schema {slug} HTTP {status}: {json.dumps(body)[:800]}")
+
+
+def verify_workflow_output_schema_parity(mcp: str, workflow_id: str, expected: dict, slug: str) -> dict:
+    status, body = api(mcp, "GET", f"/workflows/{workflow_id}?include=spec")
+    if status != 200:
+        raise SystemExit(f"{slug} output schema readback HTTP {status}; no parity receipt")
+    current = body.get("currentVersion") if isinstance(body, dict) else None
+    live = current.get("outputSchema") if isinstance(current, dict) else None
+    return require_catalog_parity(expected, live, f"{slug} output schema")
+
+
 def load_install() -> dict:
     path = HOME / "rewst-install.json"
     if not path.is_file():
@@ -376,8 +400,16 @@ def publish_selected(
             source_workflow_id=source_workflow_id,
         )
         config = g.get("config") if isinstance(g.get("config"), dict) else {}
+        output_schema = g.get("outputSchema") if isinstance(g.get("outputSchema"), dict) else {}
         wid, vid, slug = upsert_workflow(
-            mcp, g["name"], g["slug"], g["description"], g["spec"], g.get("tags") or [], config=config
+            mcp,
+            g["name"],
+            g["slug"],
+            g["description"],
+            g["spec"],
+            g.get("tags") or [],
+            config=config,
+            output_schema=output_schema,
         )
         # Publishing is not proof that the server kept the graph we sent.
         # Read it again only after publication and stop before persisting any
@@ -385,6 +417,8 @@ def publish_selected(
         parity = verify_workflow_parity(mcp, wid, g["spec"], slug)
         if config:
             parity["config"] = verify_workflow_config_parity(mcp, wid, vid, config, slug)
+        if output_schema:
+            parity["output_schema"] = verify_workflow_output_schema_parity(mcp, wid, output_schema, slug)
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug, "parity": parity}
         if stem == "pre-pr-build":
             source_workflow_id = wid
@@ -417,6 +451,7 @@ def upsert_workflow(
     tags: list[str],
     *,
     config: dict | None = None,
+    output_schema: dict | None = None,
 ):
     st, by_slug = api(mcp, "GET", f"/workflows/{slug}")
     existing = by_slug if st == 200 and by_slug.get("id") else None
@@ -452,6 +487,7 @@ def upsert_workflow(
         if warnings:
             print("warnings", json.dumps(warnings)[:800])
         apply_workflow_config(mcp, wid, vid, config or {}, slug)
+        apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
         st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
         if st not in (200, 201, 202):
             raise SystemExit(f"publish failed {st} {json.dumps(pub)[:500]}")
@@ -481,6 +517,7 @@ def upsert_workflow(
     if warnings:
         print("warnings", json.dumps(warnings)[:800])
     apply_workflow_config(mcp, wid, vid, config or {}, slug)
+    apply_workflow_output_schema(mcp, wid, vid, output_schema or {}, slug)
     st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
     must(st, pub, label="publish workflow")
     print("published", slug, wid, vid)
