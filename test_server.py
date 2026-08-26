@@ -5615,7 +5615,21 @@ class BuildStateTests(unittest.TestCase):
         edge_targets = {
             (edge["source"], edge["sourceHandle"]): edge["target"] for edge in edges
         }
-        self.assertEqual(edge_targets[("join_start", "out")], "register")
+        self.assertEqual(edge_targets[("join_start", "out")], "completion_build_id")
+        self.assertEqual(edge_targets[("completion_build_id", "out")], "completion_event_id")
+        self.assertEqual(edge_targets[("completion_event_id", "out")], "register")
+        for node_id, alias in (("completion_build_id", "build_id"), ("completion_event_id", "event_id")):
+            node = nodes[node_id]
+            self.assertEqual(node["type"], "transforms.codeExpression")
+            self.assertEqual(node["config"]["alias"], alias)
+            self.assertEqual(node["config"]["outputSchema"], {"type": "string"})
+        self.assertEqual(
+            graph["config"]["outputs"],
+            [
+                {"name": "build_id", "type": "string", "binding": "CTX.build_id"},
+                {"name": "event_id", "type": "string", "binding": "CTX.event_id"},
+            ],
+        )
         self.assertEqual(edge_targets[("register", "success")], "next")
         self.assertEqual(edge_targets[("register", "failure")], "registration_refused")
         register = nodes["register"]

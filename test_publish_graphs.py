@@ -142,8 +142,8 @@ class PublishGraphsTests(unittest.TestCase):
         self.assertEqual(
             config["outputs"],
             [
-                {"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"},
-                {"name": "event_id", "type": "string", "binding": "CTX.INPUT.event_id"},
+                {"name": "build_id", "type": "string", "binding": "CTX.build_id"},
+                {"name": "event_id", "type": "string", "binding": "CTX.event_id"},
             ],
         )
         self.assertEqual(graph["outputSchema"]["required"], ["build_id", "event_id"])
@@ -212,7 +212,14 @@ class PublishGraphsTests(unittest.TestCase):
 
     def test_output_schema_parity_uses_fresh_published_version(self):
         expected = {"type": "object", "properties": {"build_id": {"type": "string"}}}
-        body = {"currentVersion": {"outputSchema": expected}}
+        live = {
+            "type": "object",
+            "properties": {
+                "build_id": {"type": "string"},
+                "server_inferred_terminal": {"type": "object", "properties": {}},
+            },
+        }
+        body = {"currentVersion": {"outputSchema": live}}
         with mock.patch.object(publish_graphs, "api", return_value=(200, body)) as api:
             receipt = publish_graphs.verify_workflow_output_schema_parity("mcp", "wf-1", expected, "source")
         api.assert_called_once_with("mcp", "GET", "/workflows/wf-1?include=spec")
