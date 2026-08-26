@@ -5200,6 +5200,11 @@ class BuildStateTests(unittest.TestCase):
         self.assertTrue((self.repo / "partial.txt").is_file())
         self.assertIsNone(completed[1]["lease"])
         self.assertEqual(self._next()[1]["step"], "fix")
+        writer_result = self._read_doc()["writer_result"]
+        finding = server.build_step_finding(
+            self._read_doc(), "fix", writer_result["completed_change_id"]
+        )
+        self.assertIn("writer failed", finding)
 
     def test_correction_claim_is_stage_gated_locked_idempotent_and_single_spend(self):
         self.assertEqual(self._mechanical_create()[0], 201)
