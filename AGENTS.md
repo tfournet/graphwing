@@ -17,7 +17,7 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 | Published graphs | `graphs/*.json` then `scripts/publish_graphs.py` (reads `$GRAPHWING_HOME/rewst-install.json` + public URL from tunnel meta) |
 | Human loop | `docs/HUMAN-LOOP.md` — grill → spec → Graph → proof → PR. First run: `docs/USING.md`. Do not duplicate them here. |
 | Install / units | `start.sh` (clean machine), `install.py`, `systemd/` |
-| Omarchy bar | `plugins/graphwing.watch/` then `install.py` (copies into `~/.config/omarchy/plugins/`) |
+| Omarchy bar | `~/work/graphwing.watch` (own repo). `install.py` here runs that checkout's installer. |
 
 Do not copy `AGENTS.md` into `$GRAPHWING_HOME`. `agentRun` cwd is an allowlisted repo short name from `$GRAPHWING_HOME/repos.json` (empty until the wizard / `--repo`). That checkout's `AGENTS.md` applies there.
 
