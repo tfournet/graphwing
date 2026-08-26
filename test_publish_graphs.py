@@ -30,7 +30,7 @@ class PublishGraphsTests(unittest.TestCase):
             loaded.append((stem, source_workflow_id))
             return {"name": stem, "slug": stem, "description": stem, "spec": {"source": source_workflow_id}}
 
-        def fake_upsert(_mcp, name, _slug, _description, _spec, _tags):
+        def fake_upsert(_mcp, name, _slug, _description, _spec, _tags, *, config=None):
             published_order.append(name)
             return f"wf-{name}", f"ver-{name}", name
 
@@ -101,12 +101,13 @@ class PublishGraphsTests(unittest.TestCase):
     def test_publish_passes_source_and_listener_top_level_tags(self):
         seen = {}
 
-        def fake_upsert(_mcp, name, _slug, _description, _spec, tags):
+        def fake_upsert(_mcp, name, _slug, _description, _spec, tags, *, config=None):
             seen[name] = tags
             return f"wf-{name}", f"ver-{name}", name
 
         with mock.patch.object(publish_graphs, "upsert_workflow", side_effect=fake_upsert), \
-             mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}):
+             mock.patch.object(publish_graphs, "verify_workflow_parity", return_value={"readback": True}), \
+             mock.patch.object(publish_graphs, "verify_workflow_config_parity", return_value={"readback": True}):
             publish_graphs.publish_selected(
                 "mcp", {}, ["pre-pr-build", "build-completion-supervisor"], "instance-1", "", ""
             )
@@ -132,6 +133,50 @@ class PublishGraphsTests(unittest.TestCase):
         self.assertIn(
             ("PATCH", "/workflows/wf-1/versions/v1", {"spec": {"nodes": []}, "tags": ["tag-a"]}), calls
         )
+
+    def test_pre_pr_declares_completion_outputs_in_version_config(self):
+        graph = publish_graphs.load_graph("pre-pr-build", "instance-1")
+        config = graph["config"]
+        self.assertEqual(config["tags"]["info"], ["graphwing-supervised"])
+        self.assertEqual(
+            config["outputs"],
+            [
+                {"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"},
+                {"name": "event_id", "type": "string", "binding": "CTX.INPUT.event_id"},
+            ],
+        )
+
+    def test_upsert_applies_version_config_before_publish(self):
+        calls = []
+
+        def fake_api(_mcp, method, path, body=None, timeout=120):
+            calls.append((method, path, body))
+            if method == "GET":
+                return 404, {}
+            if method == "POST" and path == "/workflows":
+                return 201, {"id": "wf-1", "slug": "source", "currentVersion": {"id": "v1"}}
+            return 200, {}
+
+        config = {"outputs": [{"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"}]}
+        with mock.patch.object(publish_graphs, "api", side_effect=fake_api):
+            publish_graphs.upsert_workflow(
+                "mcp", "source", "source", "desc", {"nodes": []}, [], config=config
+            )
+        config_call = ("PATCH", "/workflows/wf-1/versions/v1/config", config)
+        publish_call = ("POST", "/workflows/wf-1/versions/v1/publish", {})
+        self.assertIn(config_call, calls)
+        self.assertLess(calls.index(config_call), calls.index(publish_call))
+
+    def test_config_parity_reads_fresh_endpoint_and_projects_server_defaults(self):
+        expected = {"outputs": [{"name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id"}]}
+        live = {"config": {**expected, "limits": {"workflowTimeoutSeconds": 600}}}
+        with mock.patch.object(publish_graphs, "api", return_value=(200, live)) as api:
+            receipt = publish_graphs.verify_workflow_config_parity("mcp", "wf-1", "v1", expected, "source")
+        api.assert_called_once_with("mcp", "GET", "/workflows/wf-1/versions/v1/config")
+        self.assertEqual(receipt["normalized_catalog_sha"], receipt["normalized_live_sha"])
+        with mock.patch.object(publish_graphs, "api", return_value=(200, {"config": {}})):
+            with self.assertRaisesRegex(SystemExit, "config live catalog mismatch"):
+                publish_graphs.verify_workflow_config_parity("mcp", "wf-1", "v1", expected, "source")
 
     def test_normalized_live_readback_is_required_and_never_uses_submitted_bytes(self):
         expected = {"nodes": [{"id": "a", "config": {"x": 1, "y": 2}}]}

@@ -3,6 +3,13 @@
   "name": "graphwing-pre-pr-build",
   "tags": ["graphwing-supervised"],
   "description": "One bounded invocation of the shared mechanical-and-sensitive pre-PR path. buildNext names the one step and, for review, the exact role and reviewer this run may use; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and reviews run behind wait webhooks and apply their own successful gates with the verdict write; a primary terminal provider failure stays visible while Rewst alone routes one explicit failover transition. Sensitive runs Terra behavior review and Grok security review as separate invocations against the same durable change and evidence identity. A sensitive visible build terminates at an explicit visual-evidence handoff until that separate path records its required proof. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Every refusal ends at a named fail-closed terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
+  "config": {
+    "outputs": [
+      { "name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id" },
+      { "name": "event_id", "type": "string", "binding": "CTX.INPUT.event_id" }
+    ],
+    "tags": { "info": ["graphwing-supervised"] }
+  },
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [

@@ -156,6 +156,36 @@ def verify_workflow_parity(mcp: str, workflow_id: str, expected_spec: dict, slug
     )
 
 
+def project_expected_config(live, expected):
+    """Project server-expanded config onto the exact graph-owned contract."""
+    if isinstance(expected, dict):
+        if not isinstance(live, dict):
+            return None
+        return {key: project_expected_config(live.get(key), value) for key, value in expected.items()}
+    if isinstance(expected, list):
+        if not isinstance(live, list) or len(live) != len(expected):
+            return None
+        return [project_expected_config(got, want) for got, want in zip(live, expected)]
+    return live
+
+
+def verify_workflow_config_parity(mcp: str, workflow_id: str, version_id: str, expected: dict, slug: str) -> dict:
+    status, body = api(mcp, "GET", f"/workflows/{workflow_id}/versions/{version_id}/config")
+    if status != 200:
+        raise SystemExit(f"{slug} live config readback HTTP {status}; no parity receipt")
+    live = body.get("config") if isinstance(body, dict) else None
+    projected = project_expected_config(live, expected)
+    return require_catalog_parity(expected, projected, f"{slug} config")
+
+
+def apply_workflow_config(mcp: str, workflow_id: str, version_id: str, config: dict, slug: str) -> None:
+    if not config:
+        return
+    status, body = api(mcp, "PATCH", f"/workflows/{workflow_id}/versions/{version_id}/config", config)
+    if status not in (200, 201):
+        raise SystemExit(f"config {slug} HTTP {status}: {json.dumps(body)[:800]}")
+
+
 def load_install() -> dict:
     path = HOME / "rewst-install.json"
     if not path.is_file():
@@ -345,13 +375,16 @@ def publish_selected(
             status_repo,
             source_workflow_id=source_workflow_id,
         )
+        config = g.get("config") if isinstance(g.get("config"), dict) else {}
         wid, vid, slug = upsert_workflow(
-            mcp, g["name"], g["slug"], g["description"], g["spec"], g.get("tags") or []
+            mcp, g["name"], g["slug"], g["description"], g["spec"], g.get("tags") or [], config=config
         )
         # Publishing is not proof that the server kept the graph we sent.
         # Read it again only after publication and stop before persisting any
         # success-shaped result if normalization disagrees.
         parity = verify_workflow_parity(mcp, wid, g["spec"], slug)
+        if config:
+            parity["config"] = verify_workflow_config_parity(mcp, wid, vid, config, slug)
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug, "parity": parity}
         if stem == "pre-pr-build":
             source_workflow_id = wid
@@ -375,7 +408,16 @@ def persist_published(install: dict, published: dict[str, dict]) -> None:
             install[key] = {**(install.get(key) or {}), **published[stem]}
 
 
-def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict, tags: list[str]):
+def upsert_workflow(
+    mcp: str,
+    name: str,
+    slug: str,
+    description: str,
+    spec: dict,
+    tags: list[str],
+    *,
+    config: dict | None = None,
+):
     st, by_slug = api(mcp, "GET", f"/workflows/{slug}")
     existing = by_slug if st == 200 and by_slug.get("id") else None
     if not existing:
@@ -396,6 +438,9 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
             must(st, rec, ok=(200, 201), label="create draft version")
             vid = (rec.get("currentVersion") or {}).get("id")
             print("new draft", vid)
+        vid = str(vid or "")
+        if not vid:
+            raise SystemExit(f"no version id for {slug}")
         st, patched = api(mcp, "PATCH", f"/workflows/{wid}/versions/{vid}", {"spec": spec, "tags": tags})
         print("patch", st)
         if st not in (200, 201):
@@ -406,6 +451,7 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
             raise SystemExit(f"validation errors {errors}")
         if warnings:
             print("warnings", json.dumps(warnings)[:800])
+        apply_workflow_config(mcp, wid, vid, config or {}, slug)
         st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
         if st not in (200, 201, 202):
             raise SystemExit(f"publish failed {st} {json.dumps(pub)[:500]}")
@@ -419,7 +465,10 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
     )
     must(st, created, label="create workflow")
     wid = created["id"]
-    vid = (created.get("currentVersion") or created.get("current_version") or {}).get("id")
+    version = created.get("currentVersion") or created.get("current_version") or {}
+    if not isinstance(version, dict):
+        raise SystemExit(f"no version object {created}")
+    vid = str(version.get("id") or "")
     if not vid:
         raise SystemExit(f"no version id {created}")
     st, patched = api(mcp, "PATCH", f"/workflows/{wid}/versions/{vid}", {"spec": spec, "tags": tags})
@@ -431,6 +480,7 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
         raise SystemExit(f"validation errors {errors}")
     if warnings:
         print("warnings", json.dumps(warnings)[:800])
+    apply_workflow_config(mcp, wid, vid, config or {}, slug)
     st, pub = api(mcp, "POST", f"/workflows/{wid}/versions/{vid}/publish", {})
     must(st, pub, label="publish workflow")
     print("published", slug, wid, vid)
