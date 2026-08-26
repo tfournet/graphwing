@@ -452,6 +452,9 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--session-id") + 1], session)
             self.assertIn("--output-format", cmd)
             self.assertIn("--no-subagents", cmd)
+            self.assertNotIn("-p", cmd, "Grok -p means --single and must not prefix --prompt-file")
+            self.assertIn("--prompt-file", cmd)
+            self.assertEqual(cmd[cmd.index("--prompt-file") + 1], str(jdir / "prompt.txt"))
 
     def test_harness_job_env_overrides_terminal_cwd(self):
         with mock.patch.dict(os.environ, {"TERMINAL_CWD": "/home/tim/rewst/riftwing", "PWD": "/home/tim"}):
