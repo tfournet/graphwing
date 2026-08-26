@@ -2347,7 +2347,18 @@ def codex_session_metadata(thread_id: str) -> dict[str, Any] | None:
     rows = matches[0]
     meta = next((r.get("payload") for r in rows if r.get("type") == "session_meta" and isinstance(r.get("payload"), dict)), None)
     context = next((r.get("payload") for r in rows if r.get("type") == "turn_context" and isinstance(r.get("payload"), dict)), None)
-    complete = next((r.get("payload") for r in reversed(rows) if r.get("type") == "task_complete" and isinstance(r.get("payload"), dict)), None)
+    complete = next(
+        (
+            r.get("payload")
+            for r in reversed(rows)
+            if isinstance(r.get("payload"), dict)
+            and (
+                r.get("type") == "task_complete"
+                or (r.get("type") == "event_msg" and r.get("payload", {}).get("type") == "task_complete")
+            )
+        ),
+        None,
+    )
     if not isinstance(meta, dict) or not isinstance(context, dict) or not isinstance(complete, dict):
         return None
     return {"session_id": meta.get("session_id", meta.get("id")), "originator": meta.get("originator"),
