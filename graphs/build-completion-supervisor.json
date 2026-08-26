@@ -13,8 +13,8 @@
         "position": { "x": 0, "y": 260 },
         "config": {
           "enabled": true,
-          "sourceWorkflowTags": ["graphwing-supervised"],
-          "sourceWorkflowIds": ["$GRAPHWING_SOURCE_WORKFLOW_ID"],
+          "tags": ["graphwing-supervised"],
+          "workflowIds": ["$GRAPHWING_SOURCE_WORKFLOW_ID"],
           "statuses": ["completed", "failed", "canceled", "timed_out"],
           "executionModes": ["live"],
           "contextMode": "output",
