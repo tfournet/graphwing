@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import subprocess
@@ -763,6 +764,92 @@ class DispatchTests(unittest.TestCase):
                                  (failure_class, "none" if evidence == "success" else evidence,
                                   failure_class == "provider_availability"))
 
+    def test_diagnostic_v1_is_closed_sanitized_and_evidence_scoped(self):
+        expected = {
+            "missing_binary": ("provider_availability", "binary", "deterministic_binary_check"),
+            "local_binary_missing": ("local_infrastructure", "binary", "deterministic_binary_check"),
+            "not_configured": ("local_infrastructure", "config", "deterministic_config_check"),
+            "provider_authentication": ("provider_availability", "auth", "structured_provider_error"),
+            "provider_network": ("provider_availability", "network", "structured_provider_error"),
+            "provider_rate_limit": ("provider_availability", "provider", "structured_provider_error"),
+            "provider_http_5xx": ("provider_availability", "provider", "structured_provider_error"),
+            "stack_unhealthy": ("local_infrastructure", "stack", "compose_snapshot"),
+            "port_not_listening": ("local_infrastructure", "port", "bounded_port_probe"),
+            "health_bad_status": ("local_infrastructure", "health", "bounded_loopback_probe"),
+            "cmd_failed": ("local_infrastructure", "command", "bounded_command"),
+            "timeout": ("local_infrastructure", "command", "bounded_command"),
+            "process_exit": ("workflow_failure", "execution", "closed_failure_code"),
+            "none": ("none", "none", "success"),
+        }
+        for code, want in expected.items():
+            with self.subTest(code=code):
+                got = server.compact_diagnostic(code)
+                self.assertEqual(got["diagnostic_version"], "diagnostic-v1")
+                self.assertEqual(
+                    (got["category"], got["component"], got["evidence"]), want
+                )
+                self.assertEqual(got["code"], code)
+                self.assertEqual(
+                    set(got),
+                    {"diagnostic_version", "category", "component", "code", "evidence", "summary"},
+                )
+                self.assertLessEqual(len(json.dumps(got, separators=(",", ":"))), 300)
+
+        expected_codes = (
+            (set(server.FAILURE_CLASS_BY_CODE) - {"success"})
+            | set(server.PROVIDER_AVAILABILITY_CODES)
+            | {
+                "none", "not_configured", "bad_health_config", "health_unreachable",
+                "health_bad_status", "stack_unhealthy", "port_not_listening", "cmd_failed",
+                "timeout", "local_binary_missing", "missing_port", "bad_port", "unknown_port",
+                "unknown_stack",
+            }
+        )
+        self.assertEqual(set(server.DIAGNOSTIC_METADATA), expected_codes)
+        for code in server.PROVIDER_AVAILABILITY_CODES:
+            self.assertEqual(server.compact_diagnostic(code)["category"], "provider_availability", code)
+
+        hostile = server.compact_diagnostic(
+            "tok_secret /home/user/.config/provider/auth.json raw provider output"
+        )
+        dumped = json.dumps(hostile)
+        self.assertEqual(hostile["code"], "unknown_failure")
+        for secret in ("tok_secret", "/home/user", "provider output"):
+            self.assertNotIn(secret, dumped)
+
+    def test_agent_diagnostic_adds_origin_without_changing_failure_taxonomy(self):
+        cases = (
+            ("missing_binary", "", "provider_availability", "missing_binary", True, "provider_availability"),
+            (
+                "process_exit",
+                json.dumps({"type": "error", "error": {"code": "rate_limit_exceeded"}}),
+                "provider_availability",
+                "provider_rate_limit",
+                True,
+                "provider_availability",
+            ),
+            (
+                "process_exit",
+                json.dumps({"type": "error", "error": {"code": "authentication_error"}}),
+                "provider_availability",
+                "provider_authentication",
+                True,
+                "provider_availability",
+            ),
+            ("process_exit", "raw authentication network prose", "model_execution", "process_exit", False, "workflow_failure"),
+        )
+        for evidence, output, failure_class, failure_code, eligible, category in cases:
+            with self.subTest(evidence=evidence, failure_code=failure_code):
+                got = server.classify_agent_failure(evidence, output)
+                self.assertEqual(
+                    (got["failure_class"], got["failure_code"], got["failover_eligible"]),
+                    (failure_class, failure_code, eligible),
+                )
+                self.assertEqual(got["diagnostic"]["category"], category)
+                self.assertEqual(got["diagnostic"]["code"], failure_code)
+                if eligible:
+                    self.assertEqual(got["diagnostic"]["category"], got["failure_class"])
+
     def test_structured_provider_failures_and_receipts_are_closed(self):
         fixtures = (
             ("codex", {"type": "error", "error": {"code": "rate_limit_exceeded"}}, "provider_rate_limit"),
@@ -794,29 +881,31 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual((receipt["failure_class"], receipt["failure_code"]), (failure_class, failure_code))
         self.assertEqual(receipts[-2][0]["summary"], "specific")
 
-    def test_agent_run_missing_binary(self):
-        with mock.patch.object(server, "CODEX_BIN", Path("/nope/codex")):
-            status, payload, _ = server.dispatch(
-                "POST", "/v1/agent/run", {}, True,
-                b'{"prompt":"x","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
+    def test_agent_run_missing_binary_codes_match_for_all_launchers(self):
+        cases = (
+            ("codex", "openai", "gpt-5.6-sol", "CODEX_BIN"),
+            ("claude", "anthropic", "claude-opus-5", "CLAUDE_BIN"),
+            ("grok", "xai", "grok-4.6", "GROK_BIN"),
+        )
+        for launcher, provider, model, binary_name in cases:
+            body = json.dumps({
+                "prompt": "x", "cwd": "scratch", "launcher": launcher,
+                "provider": provider, "model": model,
+            }).encode()
+            with self.subTest(launcher=launcher), \
+                 mock.patch.object(server, binary_name, Path(f"/nope/{launcher}")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/agent/run", {}, True, body,
+                )
+            self.assertEqual(status, 501)
+            self.assertEqual(
+                (payload["code"], payload["failure_code"], payload["diagnostic"]["code"]),
+                ("missing_binary", "missing_binary", "missing_binary"),
             )
-        self.assertEqual(status, 501)
-        self.assertEqual(payload["code"], "provider_unavailable")
-        self.assertEqual(payload["failure_class"], "provider_availability")
-        self.assertEqual(payload["failure_code"], "missing_binary")
-        self.assertTrue(payload["failover_eligible"])
-
-    def test_grok_agent_run_missing_binary_is_typed(self):
-        with mock.patch.object(server, "GROK_BIN", Path("/nope/grok")):
-            status, payload, _ = server.dispatch(
-                "POST", "/v1/agent/run", {}, True,
-                b'{"prompt":"x","cwd":"scratch","launcher":"grok","provider":"xai","model":"grok-4.6"}',
-            )
-        self.assertEqual(status, 501)
-        self.assertEqual(payload["code"], "missing_binary")
-        self.assertEqual(payload["failure_class"], "provider_availability")
-        self.assertEqual(payload["failure_code"], "missing_binary")
-        self.assertTrue(payload["failover_eligible"])
+            self.assertEqual(payload["failure_class"], "provider_availability")
+            self.assertTrue(payload["failover_eligible"])
+            self.assertEqual(payload["diagnostic"]["category"], "provider_availability")
+            self.assertNotIn("provider_unavailable", json.dumps(payload))
 
     def test_webhook_agent_run_missing_binary_posts_classified_receipt(self):
         cases = (
@@ -862,6 +951,8 @@ class DispatchTests(unittest.TestCase):
                 self.assertEqual(receipt["failure_class"], "provider_availability")
                 self.assertEqual(receipt["failure_code"], "missing_binary")
                 self.assertTrue(receipt["failover_eligible"])
+                self.assertEqual(receipt["diagnostic"]["category"], "provider_availability")
+                self.assertEqual(receipt["diagnostic"]["component"], "binary")
                 self.assertIn(f"missing {launcher} binary", receipt["summary"])
 
     def test_wrap_prompt_locks_cwd(self):
@@ -1567,6 +1658,46 @@ while True:
         for field in ("failure_class", "failure_code", "failover_eligible"):
             self.assertIn(field, receipt)
             self.assertIn(field, spec["components"]["schemas"]["Error"]["properties"])
+        diagnostic = spec["components"]["schemas"]["Diagnostic"]
+        self.assertEqual(
+            set(diagnostic["required"]),
+            {"diagnostic_version", "category", "component", "code", "evidence", "summary"},
+        )
+        self.assertEqual(diagnostic["properties"]["diagnostic_version"]["enum"], ["diagnostic-v1"])
+        self.assertEqual(
+            set(diagnostic["properties"]["category"]["enum"]),
+            {metadata[0] for metadata in server.DIAGNOSTIC_METADATA.values()},
+        )
+        self.assertEqual(
+            set(diagnostic["properties"]["component"]["enum"]),
+            {metadata[1] for metadata in server.DIAGNOSTIC_METADATA.values()},
+        )
+        self.assertEqual(
+            set(diagnostic["properties"]["code"]["enum"]),
+            set(server.DIAGNOSTIC_METADATA),
+        )
+        for schema_name in ("AgentReceipt", "StackStatus", "PortCheck"):
+            self.assertEqual(
+                spec["components"]["schemas"][schema_name]["properties"]["diagnostic"]["$ref"],
+                "#/components/schemas/Diagnostic",
+            )
+        self.assertNotIn("diagnostic", spec["components"]["schemas"]["Error"]["properties"])
+        diagnostic_error = spec["components"]["schemas"]["DiagnosticError"]
+        self.assertEqual(
+            diagnostic_error["properties"]["diagnostic"]["$ref"],
+            "#/components/schemas/Diagnostic",
+        )
+        for path in ("/v1/stack/status", "/v1/port/check"):
+            responses = spec["paths"][path]["get"]["responses"]
+            for status in ("400", "501"):
+                self.assertEqual(
+                    responses[status]["$ref"],
+                    "#/components/responses/DiagnosticError",
+                )
+        self.assertEqual(
+            spec["paths"]["/v1/agent/run"]["post"]["responses"]["501"]["$ref"],
+            "#/components/responses/DiagnosticError",
+        )
         self.assertEqual(set(receipt["role"]["enum"]), {"primary", "availability_fallback"})
         expected_codes = (set(server.FAILURE_CLASS_BY_CODE) - {"success"}) | {"none", "provider_http_5xx"} | {code for code, _ in server.PROVIDER_FAILURE_GROUPS}
         self.assertEqual(set(receipt["failure_code"]["enum"]), expected_codes)
@@ -2229,9 +2360,12 @@ while True:
         self.assertNotIn("hooks/secret", dumped)
 
     def test_herdr_agents(self):
-        status, payload, _ = server.dispatch("GET", "/v1/herdr/agents", {}, True, b"")
+        fixture = {"ok": True, "stdout": json.dumps({"result": {"agents": []}})}
+        with mock.patch.object(server, "run_cmd", return_value=fixture) as run:
+            status, payload, _ = server.dispatch("GET", "/v1/herdr/agents", {}, True, b"")
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["session"], "graphwing")
+        self.assertEqual(run.call_args.args[0][:2], ["herdr", "--session"])
 
     def test_gh_pr_view_requires_number(self):
         status, payload, _ = server.dispatch("GET", "/v1/gh/pr/view", {}, True, b"")
@@ -2862,6 +2996,19 @@ while True:
             actual = sum(route[f"reviewer{i}_launcher"] != "none" for i in (1, 2))
             self.assertEqual(actual, count, f"{class_name}/{size}")
 
+    def test_normal_v1_route_matrix_is_byte_for_byte_unchanged(self):
+        routes = [
+            server.slice_route_lookup(class_name, size, work_kind=work_kind)
+            for work_kind in ("go_coding", "typescript_coding", "research_ops")
+            for class_name in ("mechanical", "visual", "sensitive")
+            for size in ("S", "M", "L")
+        ]
+        encoded = json.dumps(routes, separators=(",", ":"), ensure_ascii=True).encode()
+        self.assertEqual(
+            hashlib.sha256(encoded).hexdigest(),
+            "ee0d6e700b8664c66282034a58048f9ef6435dac173382dbc4cc86f59e4c3450",
+        )
+
     def test_availability_fallback_route_locked_matrix_and_reviewers(self):
         expected = {
             "go_coding": (("codex", "openai", "gpt-5.6-sol"), ("claude", "anthropic", "claude-opus-5", "default")),
@@ -3131,21 +3278,21 @@ while True:
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         expected = {
-            "agent2": "record",
-            "agent3": "record2",
-            "agent_rn1": "record",
-            "agent_rn2": "record",
+            "agent2": "receipt",
+            "agent3": "receipt2",
+            "agent_rn1": "receipt",
+            "agent_rn2": "receipt",
         }
         for node_id, receipt in expected.items():
             config = nodes[node_id]["config"]
             if node_id in ("agent2", "agent_rn1", "agent_rn2"):
-                self.assertIn("TASKS.record_fallback.session_identity", config["session_identity"])
-                self.assertIn(f"TASKS.{receipt}.session_identity", config["session_identity"])
-                self.assertIn("TASKS.record_fallback.resume_job_id", config["resume_job_id"])
-                self.assertIn(f"TASKS.{receipt}.resume_job_id", config["resume_job_id"])
+                self.assertIn("CTX.fallback_receipt.session_identity", config["session_identity"])
+                self.assertIn(f"CTX.{receipt}.session_identity", config["session_identity"])
+                self.assertIn("CTX.fallback_receipt.resume_job_id", config["resume_job_id"])
+                self.assertIn(f"CTX.{receipt}.resume_job_id", config["resume_job_id"])
             else:
-                self.assertEqual(config["session_identity"], f"{{{{ TASKS.{receipt}.session_identity }}}}")
-                self.assertEqual(config["resume_job_id"], f"{{{{ TASKS.{receipt}.resume_job_id }}}}")
+                self.assertEqual(config["session_identity"], f"{{{{ CTX.{receipt}.session_identity }}}}")
+                self.assertEqual(config["resume_job_id"], f"{{{{ CTX.{receipt}.resume_job_id }}}}")
             self.assertIn("TASKS.fallback_route.data.provider", config["provider"])
             self.assertIn("TASKS.route.data.provider", config["provider"])
         for receipt in ("record", "record2"):
@@ -3213,29 +3360,134 @@ while True:
                 self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{slot}_{field} | default(TASKS.route.data.{slot}_{field}) }}}}")
         for node_id in ("agent2", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
-            self.assertEqual(cfg["session_identity"], "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}")
-            self.assertEqual(cfg["resume_job_id"], "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}")
-        self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ TASKS.record2.session_identity }}")
-        self.assertEqual(nodes["agent3"]["config"]["resume_job_id"], "{{ TASKS.record2.resume_job_id }}")
+            self.assertEqual(cfg["session_identity"], "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}")
+            self.assertEqual(cfg["resume_job_id"], "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}")
+        self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ CTX.receipt2.session_identity }}")
+        self.assertEqual(nodes["agent3"]["config"]["resume_job_id"], "{{ CTX.receipt2.resume_job_id }}")
+        self.assertEqual(nodes["fallback_route"]["config"]["primary_receipt"], "{{ CTX.receipt }}")
 
-    def test_implement_slice_fallback_failure_stops_with_both_receipts(self):
+    def test_implement_slice_correction_failures_end_in_canned_leaf_receipts(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        self.assertEqual(nodes["fallback_fail"]["type"], "transforms.objectBuilder")
-        outputs = {m["output"]: m["expression"] for m in nodes["fallback_fail"]["config"]["mappings"]}
-        for field in ("primary_receipt", "fallback_receipt", "fallback_route_error", "fallback_action_error", "raw_wait_receipt", "primary_route", "fallback_route"):
-            self.assertIn(field, outputs)
-        self.assertEqual(outputs["fallback_receipt"], {"kind": "getField", "path": "TASKS.record_fallback"})
-        self.assertEqual(outputs["fallback_route_error"], {"kind": "getField", "path": "TASKS.fallback_route"})
-        self.assertEqual(outputs["fallback_action_error"], {"kind": "getField", "path": "TASKS.agent_fallback"})
-        self.assertEqual(outputs["raw_wait_receipt"], {"kind": "getField", "path": "TASKS.wait_fallback.request.body"})
-        self.assertEqual(nodes["join_fallback_fail"]["type"], "logic.join.any")
-        for source, handle in (("fallback_route", "failure"), ("wait_fallback", "timeout"), ("wait_fallback", "failure"), ("agent_fallback", "failure"), ("if_fallback_receipt_ok", "fail")):
-            self.assertEqual({e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle}, {"join_fallback_fail"}, (source, handle))
-        self.assertTrue(any(e["source"] == "join_fallback_fail" and e["target"] == "fallback_fail" for e in edges))
+        writers = {"agent2", "agent3", "agent_rn1", "agent_rn2"}
+        waits = {"wait2", "wait3", "wait_rn1", "wait_rn2"}
+        cases = {
+            **{(writer, "failure"): ("correction_action_fail", "error", "correction_writer_action")
+               for writer in writers},
+            **{(wait, "timeout"): ("wait2_timeout", "timeout", "correction_writer_wait")
+               for wait in waits},
+            **{(wait, "failure"): ("wait2_fail", "error", "correction_writer_wait")
+               for wait in waits},
+        }
+        writer_actions = {
+            node_id for node_id, node in nodes.items()
+            if node["type"].endswith("/v1/agent/run")
+        }
+
+        for (source, handle), (terminal, status, stage) in cases.items():
+            starts = {
+                edge["target"] for edge in edges
+                if edge["source"] == source and edge.get("sourceHandle") == handle
+            }
+            self.assertEqual(len(starts), 1, (source, handle))
+            seen, leaves, pending = set(), set(), list(starts)
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                targets = [edge["target"] for edge in edges if edge["source"] == current]
+                if targets:
+                    pending.extend(targets)
+                else:
+                    leaves.add(current)
+            self.assertEqual(leaves, {terminal}, (source, handle, leaves))
+            self.assertTrue(writer_actions.isdisjoint(seen), (source, handle, writer_actions & seen))
+            self.assertNotIn("fallback_route", seen, (source, handle))
+
+            node = nodes[terminal]
+            self.assertEqual(node["type"], "transforms.objectBuilder")
+            mappings = node["config"]["mappings"]
+            self.assertEqual([m["id"] for m in mappings], [f"m{i}" for i in range(1, 6)])
+            outputs = {m["output"]: m["expression"] for m in mappings}
+            self.assertEqual(
+                outputs,
+                {
+                    "diagnostic_version": {"kind": "literal", "value": "diagnostic-v1"},
+                    "status": {"kind": "literal", "value": status},
+                    "workflow": {"kind": "literal", "value": "implement-slice"},
+                    "stage": {"kind": "literal", "value": stage},
+                    "summary": {
+                        "kind": "literal",
+                        "value": {
+                            "correction_action_fail": "correction writer action failed",
+                            "wait2_timeout": "correction writer receipt timed out",
+                            "wait2_fail": "correction writer wait failed",
+                        }[terminal],
+                    },
+                },
+            )
+            dumped = json.dumps(mappings).lower()
+            for unsafe in ("getfield", "tasks.", "request.body", "callback", "token", "stdout",
+                           "stderr", "trace", "log_ref", "provider_output"):
+                self.assertNotIn(unsafe, dumped, (source, handle, unsafe))
+
+    def test_implement_slice_fallback_failure_stops_with_sanitized_evidence(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        terminals = {
+            ("fallback_route", "failure"): ("fallback_route_fail", "fallback_route"),
+            ("wait_fallback", "timeout"): ("fallback_wait_timeout", "fallback_wait_timeout"),
+            ("wait_fallback", "failure"): ("fallback_wait_fail", "fallback_wait_failure"),
+            ("agent_fallback", "failure"): ("fallback_action_fail", "fallback_action"),
+            ("if_fallback_receipt_ok", "fail"): ("fallback_receipt_fail", "fallback_receipt"),
+        }
+        self.assertNotIn("join_fallback_fail", nodes)
+        self.assertNotIn("fallback_fail", nodes)
+        for (source, handle), (terminal, stage) in terminals.items():
+            self.assertEqual(
+                {e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle},
+                {terminal},
+                (source, handle),
+            )
+            node = nodes[terminal]
+            self.assertEqual(node["type"], "transforms.objectBuilder")
+            mappings = node["config"]["mappings"]
+            self.assertEqual(
+                [m["id"] for m in mappings],
+                [f"m{i}" for i in range(1, len(mappings) + 1)],
+            )
+            outputs = {m["output"]: m["expression"] for m in mappings}
+            self.assertEqual(outputs["stage"], {"kind": "literal", "value": stage})
+            self.assertEqual(
+                outputs["primary_diagnostic"],
+                {"kind": "getField", "path": "CTX.receipt.diagnostic"},
+            )
+            dumped = json.dumps(outputs).lower()
+            for unsafe in ("raw_wait", "request.body", "callback", "token", "stdout", "stderr",
+                           "trace", "log_ref", "provider_output"):
+                self.assertNotIn(unsafe, dumped)
+
+        action_outputs = {
+            m["output"]: m["expression"]
+            for m in nodes["fallback_action_fail"]["config"]["mappings"]
+        }
+        self.assertEqual(
+            action_outputs["fallback_diagnostic"],
+            {"kind": "getField", "path": "TASKS.agent_fallback.data.diagnostic"},
+        )
+        receipt_outputs = {
+            m["output"]: m["expression"]
+            for m in nodes["fallback_receipt_fail"]["config"]["mappings"]
+        }
+        self.assertEqual(
+            receipt_outputs["fallback_diagnostic"],
+            {"kind": "getField", "path": "CTX.fallback_receipt.diagnostic"},
+        )
         writer_ids = {n_id for n_id, node in nodes.items() if node["type"].endswith("/v1/agent/run")}
-        for start in ("join_fallback_fail", "fallback_fail"):
+        for start, _stage in terminals.values():
             seen, stack = set(), [start]
             while stack:
                 current = stack.pop()
@@ -3245,8 +3497,136 @@ while True:
                 stack.extend(e["target"] for e in edges if e["source"] == current)
             self.assertTrue(writer_ids.isdisjoint(seen), (start, writer_ids & seen))
         done = {m["output"]: m["expression"] for m in nodes["done"]["config"]["mappings"]}
-        for field, path in (("primary_receipt", "TASKS.record"), ("fallback_receipt", "TASKS.record_fallback"), ("primary_route", "TASKS.route.data"), ("fallback_route", "TASKS.fallback_route.data")):
+        for field, path in (("primary_receipt", "CTX.receipt"), ("fallback_receipt", "CTX.fallback_receipt"), ("primary_route", "TASKS.route.data"), ("fallback_route", "TASKS.fallback_route.data")):
             self.assertEqual(done[field], {"kind": "getField", "path": path})
+        self.assertEqual(done["primary_diagnostic"], {"kind": "getField", "path": "CTX.receipt.diagnostic"})
+        self.assertEqual(done["fallback_diagnostic"], {"kind": "getField", "path": "CTX.fallback_receipt.diagnostic"})
+
+    def test_implement_slice_carries_diagnostics_without_new_routing(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        aliases = [n.get("config", {}).get("alias") for n in nodes.values()]
+        aliases = [alias for alias in aliases if alias]
+        self.assertEqual(len(aliases), len(set(aliases)))
+
+        for receipt, wait_id in (("record", "wait"), ("record_fallback", "wait_fallback"), ("record2", "wait2")):
+            mappings = {m["output"]: m["expression"] for m in nodes[receipt]["config"]["mappings"]}
+            self.assertEqual(
+                mappings["diagnostic"],
+                {"kind": "getField", "path": f"TASKS.{wait_id}.request.body.diagnostic"},
+            )
+            self.assertEqual(
+                mappings["summary"],
+                {"kind": "getField", "path": f"TASKS.{wait_id}.request.body.summary"},
+            )
+
+        self.assertEqual(nodes["primary_action_fail"]["type"], "transforms.objectBuilder")
+        self.assertIn(("agent", "failure", "primary_action_fail"), triples)
+        terminals = (
+            "primary_action_fail", "timeout", "fail", "receipt_fail", "fallback_route_fail",
+            "fallback_wait_timeout", "fallback_wait_fail", "fallback_action_fail",
+            "fallback_receipt_fail",
+        )
+        for terminal in terminals:
+            self.assertEqual(nodes[terminal]["type"], "transforms.objectBuilder", terminal)
+            mappings = nodes[terminal]["config"]["mappings"]
+            self.assertEqual(
+                [m["id"] for m in mappings],
+                [f"m{i}" for i in range(1, len(mappings) + 1)],
+            )
+            produced = {m["output"] for m in mappings}
+            self.assertIn("diagnostic_version", produced)
+            self.assertIn("summary", produced)
+            dumped = json.dumps(mappings).lower()
+            for unsafe in ("request.body.summary", "raw_wait", "callback", "resumeurl", "resumetoken",
+                           "stdout", "stderr", "trace", "log_ref"):
+                self.assertNotIn(unsafe, dumped, terminal)
+
+        # Diagnostics terminate; they cannot route a second fallback or writer.
+        for terminal in terminals:
+            self.assertFalse(any(e["source"] == terminal for e in edges), terminal)
+        self.assertEqual(
+            [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
+            ["fallback_route"],
+        )
+        dumped_graph = json.dumps(graph)
+        for wrong_transform_path in ("TASKS.record", "TASKS.record_fallback", "TASKS.record2"):
+            self.assertNotIn(wrong_transform_path, dumped_graph)
+        for alias in ("CTX.receipt.", "CTX.fallback_receipt.", "CTX.receipt2."):
+            self.assertIn(alias, dumped_graph)
+        using = (Path(server.__file__).parent / "docs" / "USING.md").read_text()
+        self.assertNotIn("A node result is exposed as `TASKS.<node>.data.<field>`", using)
+        self.assertIn("`action.graphwing` results", using)
+        self.assertIn("`CTX.<alias>`", using)
+
+    def test_verify_stack_uses_action_data_contract_and_sanitized_failure_receipts(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "verify-stack.json").read_text())
+        spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        aliases = [n.get("config", {}).get("alias") for n in nodes.values()]
+        aliases = [alias for alias in aliases if alias]
+        self.assertEqual(len(aliases), len(set(aliases)))
+        self.assertEqual(
+            {
+                ("trigger", "out", "stack"),
+                ("stack", "success", "ports"),
+                ("ports", "success", "record"),
+            },
+            {triple for triple in triples if triple[2] in {"stack", "ports", "record"}},
+        )
+
+        action_contracts = {}
+        for node_id in ("stack", "ports"):
+            action = nodes[node_id]
+            method_path = action["type"].removeprefix("action.graphwing.")
+            method, path = method_path.split(":", 1)
+            response = spec["paths"][path][method.lower()]["responses"]["200"]
+            schema_ref = response["content"]["application/json"]["schema"]["$ref"]
+            schema_name = schema_ref.rsplit("/", 1)[-1]
+            action_contracts[node_id] = set(spec["components"]["schemas"][schema_name]["properties"])
+
+        mappings = nodes["record"]["config"]["mappings"]
+        self.assertEqual({mapping["output"] for mapping in mappings},
+                         {"stack", "healthy", "ports", "stack_diagnostic", "port_diagnostic"})
+        mapping_paths = {mapping["expression"]["path"] for mapping in mappings}
+        self.assertNotIn("TASKS.stack.stack", mapping_paths)
+        self.assertNotIn("TASKS.ports.ports", mapping_paths)
+        for mapping in mappings:
+            expression = mapping["expression"]
+            self.assertEqual(expression["kind"], "getField")
+            root, source, envelope, field = expression["path"].split(".")
+            self.assertEqual((root, envelope), ("TASKS", "data"))
+            self.assertIn(source, action_contracts)
+            self.assertIn(field, action_contracts[source])
+
+        self.assertIn(("stack", "failure", "stack_diagnostic"), triples)
+        self.assertIn(("ports", "failure", "ports_diagnostic"), triples)
+        for node_id, stage in (
+            ("stack_diagnostic", "stack_status"),
+            ("ports_diagnostic", "port_check"),
+        ):
+            node = nodes[node_id]
+            self.assertEqual(node["type"], "transforms.objectBuilder")
+            self.assertFalse(any(e["source"] == node_id for e in edges))
+            self.assertEqual(
+                [m["id"] for m in node["config"]["mappings"]],
+                [f"m{i}" for i in range(1, len(node["config"]["mappings"]) + 1)],
+            )
+            mappings = {m["output"]: m["expression"] for m in node["config"]["mappings"]}
+            self.assertEqual(mappings["diagnostic_version"], {"kind": "literal", "value": "diagnostic-v1"})
+            self.assertEqual(mappings["stage"], {"kind": "literal", "value": stage})
+            self.assertEqual(
+                mappings["summary"],
+                {"kind": "literal", "value": f"{stage} action failed"},
+            )
+            dumped = json.dumps(mappings).lower()
+            self.assertNotIn(".data.diagnostic", dumped)
+            for unsafe in ("data.error", "stdout", "stderr", "trace", "token", "url", "cwd", "secret_path"):
+                self.assertNotIn(unsafe, dumped)
 
     def test_implement_slice_routes_direct_native_reviewers(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -3830,35 +4210,152 @@ while True:
         self.assertNotIn(["tab", "close", "w1:t3"], calls)
         self.assertNotIn(["tab", "close", "w1:t6"], calls)
 
-    def test_stack_status_default(self):
-        status, payload, _ = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
-        self.assertEqual(status, 200, payload)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["stack"], "graphwing")
-        self.assertIn("containers", payload)
-        self.assertIn("health", payload)
+    def test_stack_status_dispatch_diagnostics_success_unknown_not_configured(self):
+        stack_spec = {
+            "demo": {"cwd": Path("."), "compose_file": "", "health": [], "ports": [8645]}
+        }
+        compose = {"ok": True, "stdout": json.dumps({"Name": "demo", "State": "running"})}
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {8645})), \
+             mock.patch.object(server, "run_cmd", return_value=compose):
+            success = server.dispatch("GET", "/v1/stack/status", {"stack": ["demo"]}, True, b"")
+            unknown = server.dispatch("GET", "/v1/stack/status", {"stack": ["nope"]}, True, b"")
+        with mock.patch.object(server, "load_stacks", return_value=({}, set())):
+            not_configured = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
 
-    def test_stack_unknown(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/stack/status", {"stack": ["nope"]}, True, b""
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_stack")
+        for (status, payload, _), code in (
+            (success, "none"), (unknown, "unknown_stack"), (not_configured, "not_configured")
+        ):
+            self.assertEqual(
+                set(payload["diagnostic"]),
+                {"diagnostic_version", "category", "component", "code", "evidence", "summary"},
+            )
+            self.assertEqual(payload["diagnostic"]["code"], code)
+        self.assertEqual(success[0], 200)
+        self.assertTrue(success[1]["healthy"])
+        self.assertEqual(unknown[0], 400)
+        self.assertEqual(not_configured[0], 501)
 
-    def test_port_check_graphwing(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/port/check", {"port": ["8645"]}, True, b""
+    def test_stack_status_diagnostic_precedence(self):
+        stack_spec = {
+            "demo": {
+                "cwd": Path("."), "compose_file": "", "ports": [],
+                "health": [
+                    {"name": "ok", "url": "http://127.0.0.1:1/ok"},
+                    {"name": "first-red", "url": "http://127.0.0.1:1/first"},
+                    {"name": "second-red", "url": "http://127.0.0.1:1/second"},
+                ],
+            }
+        }
+        health = (
+            {"ok": True, "diagnostic": server.compact_diagnostic("none")},
+            {"ok": False, "diagnostic": server.compact_diagnostic("health_unreachable")},
+            {"ok": False, "diagnostic": server.compact_diagnostic("health_bad_status")},
         )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(payload["ports"][0]["port"], 8645)
-        self.assertIn("listening", payload["ports"][0])
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, set())):
+            with mock.patch.object(server, "run_cmd", return_value={
+                "ok": False, "code": "cmd_failed", "error": "raw compose failure",
+            }), mock.patch.object(server, "probe_loopback", side_effect=health):
+                compose_failure = server.stack_status("demo")
+            with mock.patch.object(server, "run_cmd", return_value={
+                "ok": True, "stdout": json.dumps({"Name": "demo", "State": "running"}),
+            }), mock.patch.object(server, "probe_loopback", side_effect=health):
+                first_health_failure = server.stack_status("demo")
 
-    def test_port_check_unknown(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/port/check", {"port": ["1"]}, True, b""
+        no_health = {**stack_spec["demo"], "health": []}
+        with mock.patch.object(server, "load_stacks", return_value=({"demo": no_health}, set())), \
+             mock.patch.object(server, "run_cmd", return_value={
+                 "ok": True, "stdout": json.dumps({"Name": "demo", "State": "exited"}),
+             }):
+            otherwise_unhealthy = server.stack_status("demo")
+
+        self.assertEqual(compose_failure["diagnostic"]["code"], "cmd_failed")
+        self.assertEqual(first_health_failure["diagnostic"]["code"], "health_unreachable")
+        self.assertEqual(otherwise_unhealthy["diagnostic"]["code"], "stack_unhealthy")
+
+    def test_stack_and_port_probes_emit_only_compact_structured_diagnostics(self):
+        stack_spec = {
+            "demo": {
+                "cwd": Path("."), "compose_file": "", "health": [], "ports": [8645]
+            }
+        }
+        failed = {
+            "ok": False, "code": "cmd_failed", "status": 400,
+            "error": "command failed: /secret/provider/bin", "stdout": "raw", "stderr": "trace",
+        }
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {8645})), \
+             mock.patch.object(server, "run_cmd", return_value=failed):
+            stack = server.stack_status("demo")
+            ports = server.port_check("8645")
+        for got in (stack["diagnostic"], ports["diagnostic"], ports["ports"][0]["diagnostic"]):
+            self.assertEqual(
+                (got["diagnostic_version"], got["category"], got["component"], got["code"]),
+                ("diagnostic-v1", "local_infrastructure", "command", "cmd_failed"),
+            )
+            dumped = json.dumps(got)
+            for raw in ("/secret", "stdout", "stderr", "trace"):
+                self.assertNotIn(raw, dumped)
+
+    def test_missing_local_probe_binaries_are_not_provider_failures(self):
+        stack_spec = {
+            "demo": {"cwd": Path("."), "compose_file": "", "health": [], "ports": [8645]}
+        }
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {8645})), \
+             mock.patch.object(server.subprocess, "run", side_effect=FileNotFoundError):
+            stack = server.dispatch(
+                "GET", "/v1/stack/status", {"stack": ["demo"]}, True, b""
+            )
+            ports = server.dispatch(
+                "GET", "/v1/port/check", {"port": ["8645"]}, True, b""
+            )
+
+        self.assertEqual((stack[0], ports[0]), (200, 200))
+        diagnostics = (
+            stack[1]["diagnostic"],
+            ports[1]["diagnostic"],
+            ports[1]["ports"][0]["diagnostic"],
         )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["code"], "unknown_port")
+        for diagnostic in diagnostics:
+            self.assertEqual(diagnostic["code"], "local_binary_missing")
+            self.assertEqual(diagnostic["category"], "local_infrastructure")
+            self.assertNotEqual(diagnostic["category"], "provider_availability")
+
+    def test_loopback_probe_network_diagnostic_is_structured_not_exception_text(self):
+        with mock.patch.object(server, "urlopen", side_effect=ConnectionRefusedError("token=secret")):
+            got = server.probe_loopback("http://127.0.0.1:9999/health")
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["diagnostic"]["category"], "local_infrastructure")
+        self.assertEqual(got["diagnostic"]["component"], "network")
+        self.assertNotIn("token=secret", json.dumps(got["diagnostic"]))
+
+        response = mock.MagicMock(status=503)
+        response.__enter__.return_value = response
+        with mock.patch.object(server, "urlopen", return_value=response):
+            bad_status = server.probe_loopback("http://127.0.0.1:9999/health")
+        self.assertEqual(bad_status["diagnostic"]["category"], "local_infrastructure")
+        self.assertEqual(bad_status["diagnostic"]["component"], "health")
+        self.assertEqual(bad_status["diagnostic"]["code"], "health_bad_status")
+
+    def test_port_check_dispatch_diagnostics_success_unknown_not_configured(self):
+        with mock.patch.object(server, "load_stacks", return_value=({}, {8645})), \
+             mock.patch.object(server, "run_cmd", return_value={"ok": True, "stdout": "LISTEN"}):
+            success = server.dispatch("GET", "/v1/port/check", {"port": ["8645"]}, True, b"")
+            unknown = server.dispatch("GET", "/v1/port/check", {"port": ["1"]}, True, b"")
+        with mock.patch.object(server, "load_stacks", return_value=({}, set())):
+            not_configured = server.dispatch("GET", "/v1/port/check", {"port": ["8645"]}, True, b"")
+
+        for (status, payload, _), code in (
+            (success, "none"), (unknown, "unknown_port"), (not_configured, "not_configured")
+        ):
+            self.assertEqual(
+                set(payload["diagnostic"]),
+                {"diagnostic_version", "category", "component", "code", "evidence", "summary"},
+            )
+            self.assertEqual(payload["diagnostic"]["code"], code)
+        self.assertEqual(success[0], 200)
+        self.assertEqual(success[1]["ports"][0]["diagnostic"]["code"], "none")
+        self.assertEqual(unknown[0], 400)
+        self.assertEqual(not_configured[0], 501)
+        self.assertFalse(hasattr(server, "port_listening"))
 
     def test_test_run_compile(self):
         status, payload, _ = server.dispatch(
@@ -3959,12 +4456,6 @@ while True:
             self.assertEqual(status, 400)
             self.assertEqual(payload["code"], "unknown_rr")
 
-    def test_stack_not_configured(self):
-        with mock.patch.object(server, "STACKS_PATH", Path("/nope/stacks.json")):
-            status, payload, _ = server.dispatch("GET", "/v1/stack/status", {}, True, b"")
-        self.assertEqual(status, 501)
-        self.assertEqual(payload["code"], "not_configured")
-
     def test_load_key_from_env(self):
         with mock.patch.dict(os.environ, {"GRAPHWING_KEY": "env-secret-key"}):
             with mock.patch.object(server, "KEY_PATH", Path("/nope/api.key")):
@@ -4057,10 +4548,10 @@ while True:
         self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
-        self.assertIn("TASKS.record_fallback.session_identity", agent2["config"]["session_identity"])
-        self.assertIn("TASKS.record.session_identity", agent2["config"]["session_identity"])
-        self.assertIn("TASKS.record_fallback.resume_job_id", agent2["config"]["resume_job_id"])
-        self.assertIn("TASKS.record.resume_job_id", agent2["config"]["resume_job_id"])
+        self.assertIn("CTX.fallback_receipt.session_identity", agent2["config"]["session_identity"])
+        self.assertIn("CTX.receipt.session_identity", agent2["config"]["session_identity"])
+        self.assertIn("CTX.fallback_receipt.resume_job_id", agent2["config"]["resume_job_id"])
+        self.assertIn("CTX.receipt.resume_job_id", agent2["config"]["resume_job_id"])
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])

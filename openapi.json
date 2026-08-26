@@ -663,14 +663,7 @@
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/Error" },
-          "501": {
-            "description": "spawn failed closed (writer binary missing)",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" }
-              }
-            }
-          }
+          "501": { "$ref": "#/components/responses/DiagnosticError" }
         }
       }
     },
@@ -755,7 +748,8 @@
         ],
         "responses": {
           "200": { "description": "snapshot", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StackStatus" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
+          "400": { "$ref": "#/components/responses/DiagnosticError" },
+          "501": { "$ref": "#/components/responses/DiagnosticError" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
@@ -771,7 +765,8 @@
         ],
         "responses": {
           "200": { "description": "listen state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortCheck" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
+          "400": { "$ref": "#/components/responses/DiagnosticError" },
+          "501": { "$ref": "#/components/responses/DiagnosticError" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
@@ -880,6 +875,29 @@
           }
         }
       },
+      "Diagnostic": {
+        "type": "object",
+        "required": ["diagnostic_version", "category", "component", "code", "evidence", "summary"],
+        "additionalProperties": false,
+        "description": "Compact canned diagnostic. It never contains paths, secrets, callback data, provider output, or traces.",
+        "properties": {
+          "diagnostic_version": { "type": "string", "enum": ["diagnostic-v1"] },
+          "category": { "type": "string", "enum": ["none", "provider_availability", "local_infrastructure", "workflow_failure"] },
+          "component": { "type": "string", "enum": ["none", "provider", "binary", "config", "auth", "network", "health", "stack", "port", "command", "request", "execution"] },
+          "code": { "type": "string", "enum": ["adapter_contract_invalid", "bad_health_config", "bad_port", "branch_mismatch", "cancelled", "cmd_failed", "head_mismatch", "health_bad_status", "health_unreachable", "invalid_receipt", "local_binary_missing", "missing_binary", "missing_port", "missing_prompt", "model_reported_error", "model_stopped", "none", "not_configured", "port_not_listening", "process_exit", "provider_authentication", "provider_http_5xx", "provider_network", "provider_overloaded", "provider_quota", "provider_rate_limit", "reported_timeout", "repository_mismatch", "run_budget_exceeded", "session_identity_mismatch", "session_identity_missing", "session_provenance_invalid", "spawn_failed", "stack_unhealthy", "timeout", "unknown_failure", "unknown_port", "unknown_stack"] },
+          "evidence": { "type": "string" },
+          "summary": { "type": "string", "maxLength": 80 }
+        }
+      },
+      "DiagnosticError": {
+        "type": "object",
+        "required": ["error", "code", "diagnostic"],
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
+        }
+      },
       "StackStatus": {
         "type": "object",
         "properties": {
@@ -889,7 +907,8 @@
           "healthy": { "type": "boolean" },
           "containers": { "type": "array", "items": { "type": "object" } },
           "health": { "type": "array", "items": { "type": "object" } },
-          "compose_ok": { "type": "boolean" }
+          "compose_ok": { "type": "boolean" },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
         }
       },
       "PortCheck": {
@@ -902,10 +921,12 @@
               "type": "object",
               "properties": {
                 "port": { "type": "integer" },
-                "listening": { "type": "boolean" }
+                "listening": { "type": "boolean" },
+                "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
               }
             }
-          }
+          },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
         }
       },
       "GitStatus": {
@@ -1395,7 +1416,8 @@
             "description": "Closed launcher outcome class. Only provider_availability may be failover eligible."
           },
           "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"], "description": "Stable machine code within failure_class; none on success." },
-          "failover_eligible": { "type": "boolean", "description": "True only for structured or deterministic provider availability failures." }
+          "failover_eligible": { "type": "boolean", "description": "True only for structured or deterministic provider availability failures." },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
         }
       },
       "AgentJob": {
@@ -1440,6 +1462,14 @@
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "DiagnosticError": {
+        "description": "stack, port, or initial writer error with a compact diagnostic",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/DiagnosticError" }
           }
         }
       },

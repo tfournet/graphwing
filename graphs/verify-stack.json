@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-verify-stack",
   "name": "graphwing-verify-stack",
-  "description": "Hard-coded: stackStatus then portCheck. Payload: stack, ports.",
+  "description": "Hard-coded: stackStatus then portCheck. Success retains diagnostic-v1 evidence; action failures end with sanitized stage receipts. Payload: stack, ports.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
@@ -38,17 +38,23 @@
           "alias": "snapshot",
           "version": 1,
           "mappings": [
-            { "id": "m1", "output": "stack", "expression": { "kind": "getField", "path": "TASKS.stack.stack" } },
-            { "id": "m2", "output": "healthy", "expression": { "kind": "getField", "path": "TASKS.stack.healthy" } },
-            { "id": "m3", "output": "ports", "expression": { "kind": "getField", "path": "TASKS.ports.ports" } }
+            { "id": "m1", "output": "stack", "expression": { "kind": "getField", "path": "TASKS.stack.data.stack" } },
+            { "id": "m2", "output": "healthy", "expression": { "kind": "getField", "path": "TASKS.stack.data.healthy" } },
+            { "id": "m3", "output": "ports", "expression": { "kind": "getField", "path": "TASKS.ports.data.ports" } },
+            { "id": "m4", "output": "stack_diagnostic", "expression": { "kind": "getField", "path": "TASKS.stack.data.diagnostic" } },
+            { "id": "m5", "output": "port_diagnostic", "expression": { "kind": "getField", "path": "TASKS.ports.data.diagnostic" } }
           ]
         }
-      }
+      },
+      { "id": "stack_diagnostic", "type": "transforms.objectBuilder", "label": "stackStatus diagnostic", "position": { "x": 560, "y": -80 }, "config": { "alias": "stack_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "stack_status" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "stack_status action failed" } }] } },
+      { "id": "ports_diagnostic", "type": "transforms.objectBuilder", "label": "portCheck diagnostic", "position": { "x": 840, "y": -80 }, "config": { "alias": "port_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "port_check" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "port_check action failed" } }] } }
     ],
     "edges": [
       { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "stack", "targetHandle": "in" },
       { "id": "e2", "source": "stack", "sourceHandle": "success", "target": "ports", "targetHandle": "in" },
-      { "id": "e3", "source": "ports", "sourceHandle": "success", "target": "record", "targetHandle": "in" }
+      { "id": "e3", "source": "ports", "sourceHandle": "success", "target": "record", "targetHandle": "in" },
+      { "id": "e_stack_diagnostic", "source": "stack", "sourceHandle": "failure", "target": "stack_diagnostic", "targetHandle": "in" },
+      { "id": "e_ports_diagnostic", "source": "ports", "sourceHandle": "failure", "target": "ports_diagnostic", "targetHandle": "in" }
     ]
   }
 }
