@@ -451,6 +451,24 @@ class DispatchTests(unittest.TestCase):
                  mock.patch.object(server.shutil, "which", return_value="/provider/cli/must-not-run"):
                 self.assertEqual(server.resolve_launcher_binary_now("codex"), configured)
 
+    def test_shared_resolver_prefers_mise_selected_native_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            native = Path(td) / "native-gh"
+            native.write_text("fixture")
+            native.chmod(0o755)
+            selected = subprocess.CompletedProcess(
+                ["/usr/bin/mise", "which", "gh"], 0, stdout=f"{native}\n", stderr=""
+            )
+            with mock.patch.dict(os.environ, {"GRAPHWING_GH_BIN": ""}), mock.patch.object(
+                server.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/mise" if name == "mise" else "/shim/gh",
+            ), mock.patch.object(server.subprocess, "run", return_value=selected):
+                self.assertEqual(
+                    server.resolve_executable("gh", "GRAPHWING_GH_BIN", Path("/fallback/gh")),
+                    native,
+                )
+
     def test_native_reviews_use_request_time_launcher_resolution(self):
         class FakeCompleted:
             returncode = 0
@@ -3197,6 +3215,19 @@ while True:
         with mock.patch.object(server, "run_cmd", return_value={"ok": False, "returncode": 1, "stdout": "not-json", "stderr": "boom", "truncated": False, "status": 400}):
             self.assertFalse(server.gh_json(Path("/tmp"), ["pr", "checks", "7"])["ok"])
 
+    def test_gh_operations_bypass_path_shims_with_resolved_binary(self):
+        result = {"ok": True, "returncode": 0, "stdout": "[]", "stderr": "", "truncated": False}
+        native = Path("/resolved/bin/gh")
+        with mock.patch.object(server, "GH_BIN", native), mock.patch.object(
+            server, "run_cmd", return_value=result
+        ) as run:
+            self.assertTrue(server.gh_json(Path("/tmp"), ["pr", "list"])["ok"])
+            self.assertTrue(server.gh_text(Path("/tmp"), ["pr", "merge", "7"])["ok"])
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [["/resolved/bin/gh", "pr", "list"], ["/resolved/bin/gh", "pr", "merge", "7"]],
+        )
+
     def test_check_classification_is_nonempty_strict_and_fail_closed(self):
         cases = (
             ({"ok": True, "data": []}, "no_checks"),
@@ -3655,6 +3686,11 @@ while True:
         self.assertIn("remote_ready", dumped)
         self.assertIn("named_test_required", dumped)
         self.assertNotIn('"mergeable"', dumped)
+        for node_id in ("view", "checks"):
+            self.assertEqual(nodes[node_id]["config"]["number"], "{{ CTX.INPUT.pr }}")
+        self.assertFalse(nodes["hook"]["config"]["enabled"])
+        ready_mappings = {m["output"]: m["expression"] for m in ready["config"]["mappings"]}
+        self.assertEqual(ready_mappings["pr"], {"kind": "getField", "path": "CTX.INPUT.pr"})
 
     def test_pr_graph_action_configs_match_openapi_request_shapes(self):
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
@@ -5220,6 +5256,8 @@ while True:
         aliases = [n.get("config", {}).get("alias") for n in nodes.values()]
         aliases = [alias for alias in aliases if alias]
         self.assertEqual(len(aliases), len(set(aliases)))
+        self.assertEqual(nodes["ports"]["config"]["port"], "{{ CTX.INPUT.port }}")
+        self.assertNotIn("ports", nodes["ports"]["config"])
         self.assertEqual(
             {
                 ("trigger", "out", "stack"),
@@ -6346,8 +6384,8 @@ while True:
 
         topology_caption = (
             "*Topology-only: webhook starts are known-disabled; use the documented "
-            "manual/form/API starts for `implement-slice` and `pr-drive`; `pr-status` "
-            "has no working start.*"
+            "manual/form/API starts for `implement-slice` and `pr-drive`, and the API "
+            "start for `pr-status`.*"
         )
         self.assertIn(
             '<img src="docs/images/architecture.svg" '
@@ -6356,9 +6394,8 @@ while True:
             readme_source,
         )
         self.assertIn(
-            "| `graphwing-pr-status` | `pr` | Source-parity input only; currently "
-            "non-operational through webhook or manual/form/API because `pr` does not "
-            "reach `CTX.INPUT` until that field is renamed/fixed. |",
+            "| `graphwing-pr-status` | `pr` | Read remote-only PR state through an API "
+            "start. Webhook starts remain disabled. |",
             readme_source,
         )
 
@@ -6366,10 +6403,8 @@ while True:
         self.assertNotIn("`kick_url` starts the next", catalog_source)
         self.assertIn(
             "Use a manual/form or `/workflows/{slug}/run` start with "
-            '`{ "input": {...} }` only for `implement-slice` and `pr-drive`. '
-            "`pr-status` has no working start: its sole trigger input is named `pr`, "
-            "and that field does not reach `CTX.INPUT` through webhook or "
-            "manual/form/API until it is renamed/fixed.",
+            '`{ "input": {...} }` for `implement-slice` and `pr-drive`; only the API '
+            "start is proven for `pr-status`.",
             catalog_source,
         )
         self.assertIn(
@@ -6387,10 +6422,9 @@ while True:
         nodes = {node["id"]: node for node in pr_drive["spec"]["nodes"]}
         self.assertEqual(nodes["view"]["config"]["number"], "{{ CTX.INPUT.pr_number }}")
         self.assertIn(
-            "| `graphwing-pr-status` | `pr` | source-parity input only; currently "
-            "non-operational through webhook or manual/form/API because `pr` does not "
-            "reach `CTX.INPUT` until that field is renamed/fixed; intended "
-            "classification is remote-only and performs no named-test job or git write |",
+            "| `graphwing-pr-status` | `pr` | API-started remote-only classification; "
+            "webhook starts remain disabled; performs no named-test "
+            "job or git write |",
             catalog_source,
         )
 
@@ -6398,9 +6432,9 @@ while True:
         self.assertIn("generic catalog wiring", using_source)
         self.assertIn("cannot continue", using_source)
         self.assertIn(
-            "| `graphwing-pr-status` | No working start today: its source-parity `pr` "
-            "input does not reach `CTX.INPUT` through webhook or manual/form/API until "
-            "that field is renamed/fixed. |",
+            "| `graphwing-pr-status` | Read remote-only PR state with "
+            '`{ "input": { "pr": 3624 } }` through an API start. Webhook '
+            "starts remain disabled because they do not create `CTX.INPUT`. |",
             using_source,
         )
 
@@ -6412,10 +6446,10 @@ while True:
             "remote_ready still requires final named-test evidence before merge. Payload: pr."
         )
         expected_description = (
-            "Read-only remote PR status is currently non-operational: its sole trigger input "
-            "pr does not reach CTX.INPUT through webhook or manual/form/API until that field "
-            "is renamed/fixed. Never creates named-test evidence or writes git; remote_ready "
-            "still requires final named-test evidence before merge. Payload: pr."
+            "Read-only remote PR status. Start through the API with input.pr; webhook starts "
+            "are disabled because they do not create CTX.INPUT. Never "
+            "creates named-test evidence or writes git; remote_ready still requires final "
+            "named-test evidence before merge. Payload: pr."
         )
         self.assertEqual(pr_status["description"], expected_description)
         self.assertNotEqual(pr_status["description"], old_description)
@@ -6425,15 +6459,15 @@ while True:
         self.assertEqual(json.loads(spec_bytes), pr_status["spec"])
         self.assertEqual(
             hashlib.sha256(spec_bytes).hexdigest(),
-            "206462e492ec75f4dc32d9e1caaed508c91dcc8d5cbdcd92a60d1474874dd509",
+            "7d2024cae9a8897bcbb1c1ff7ba7272fd800ea1e3e1be1ddd542221099e18d1b",
         )
 
-    def test_pr_status_graph_is_read_only_and_unauthenticated(self):
+    def test_pr_status_graph_is_read_only_and_webhook_disabled(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "pr-status.json"
         graph = json.loads(graph_path.read_text())
         nodes = graph["spec"]["nodes"]
         webhook = next(node for node in nodes if node["id"] == "hook")
-        self.assertFalse(webhook["config"]["requireAuthHeader"])
+        self.assertFalse(webhook["config"]["enabled"])
         banned = ("agent", "git/commit", "git/push", "git/checkout", "git/restore")
         node_types = [node["type"].lower() for node in nodes]
         for term in banned:
@@ -8539,6 +8573,7 @@ class InstallTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                env={**os.environ, "GRAPHWING_GH_BIN": "/fixture/bin/gh"},
             )
             self.assertTrue((home / "server.py").is_file())
             self.assertTrue((home / "openapi.json").is_file())
@@ -8555,6 +8590,8 @@ class InstallTests(unittest.TestCase):
             api_unit = (units / "graphwing-api.service").read_text()
             self.assertIn(str(home), api_unit)
             self.assertNotIn("@GRAPHWING_HOME@", api_unit)
+            self.assertIn("Environment=GRAPHWING_GH_BIN=/fixture/bin/gh", api_unit)
+            self.assertNotIn("@GH@", api_unit)
             self.assertFalse((units / "graphwing-tunnel.service").exists())
             self.assertNotIn("copied secrets", proc.stdout.lower())
             spec = json.loads((home / "openapi.json").read_text())
@@ -8566,6 +8603,23 @@ class InstallTests(unittest.TestCase):
             self.assertFalse((home / "SOUL.md").exists())
             self.assertFalse((home / "profiles.json").exists())
             self.assertFalse((home / "bin" / "graphwing").exists())
+
+    def test_installer_prefers_mise_selected_native_binary(self):
+        import install
+
+        with tempfile.TemporaryDirectory() as td:
+            native = Path(td) / "native-gh"
+            native.write_text("fixture")
+            native.chmod(0o755)
+            selected = subprocess.CompletedProcess(
+                ["/usr/bin/mise", "which", "gh"], 0, stdout=f"{native}\n", stderr=""
+            )
+            with mock.patch.dict(os.environ, {"GRAPHWING_GH_BIN": ""}), mock.patch.object(
+                install.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/mise" if name == "mise" else "/shim/gh",
+            ), mock.patch.object(install.subprocess, "run", return_value=selected):
+                self.assertEqual(install.which_or("gh", Path("/fallback/gh")), native)
 
     def test_ensure_repos_noninteractive_empty(self):
         import install

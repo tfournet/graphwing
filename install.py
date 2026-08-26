@@ -74,6 +74,17 @@ def which_or(name: str, fallback: Path) -> Path:
     env = os.environ.get(f"GRAPHWING_{name.upper()}_BIN", "").strip()
     if env:
         return Path(env)
+    mise = shutil.which("mise")
+    if mise:
+        try:
+            selected = subprocess.run(
+                [mise, "which", name], check=False, capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            selected = None
+        candidate = Path(selected.stdout.strip()) if selected and selected.returncode == 0 else None
+        if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     found = shutil.which(name)
     if found:
         return Path(found)
@@ -229,6 +240,7 @@ def mapping_for(home: Path, port: int) -> dict[str, str]:
         "HOME": str(Path.home()),
         "PATH": unit_path(),
         "PYTHON": python_bin(),
+        "GH": str(which_or("gh", Path.home() / ".local/bin/gh")),
         "HERDR": str(which_or("herdr", Path.home() / ".local/bin/herdr")),
         "CLOUDFLARED": str(which_or("cloudflared", Path.home() / ".local/bin/cloudflared")),
         "HERDR_SESSION": os.environ.get("GRAPHWING_HERDR_SESSION", "graphwing") or "graphwing",

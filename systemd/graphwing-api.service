@@ -9,6 +9,7 @@ WorkingDirectory=@GRAPHWING_HOME@
 Environment=GRAPHWING_HOME=@GRAPHWING_HOME@
 Environment=HOME=@HOME@
 Environment=PATH=@PATH@
+Environment=GRAPHWING_GH_BIN=@GH@
 ExecStart=@PYTHON@ @GRAPHWING_HOME@/server.py
 Restart=on-failure
 RestartSec=3
