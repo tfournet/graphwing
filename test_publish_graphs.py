@@ -127,7 +127,7 @@ class PublishGraphsTests(unittest.TestCase):
         with mock.patch.object(publish_graphs, "api", side_effect=fake_api):
             publish_graphs.upsert_workflow("mcp", "source", "source", "desc", {"nodes": []}, ["tag-a"])
         self.assertIn(
-            ("POST", "/workflows", {"name": "source", "description": "desc", "tags": ["tag-a"]}), calls
+            ("POST", "/workflows", {"name": "source", "description": "desc"}), calls
         )
         self.assertIn(
             ("PATCH", "/workflows/wf-1/versions/v1", {"spec": {"nodes": []}, "tags": ["tag-a"]}), calls

@@ -412,8 +412,10 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
         print("published", slug, wid, vid)
         return wid, vid, slug
     print(f"create {slug}")
+    # The create endpoint accepts workflow identity only. Tags belong to the
+    # version PATCH below; sending them here is rejected before a draft exists.
     st, created = api(
-        mcp, "POST", "/workflows", {"name": name, "description": description, "tags": tags}
+        mcp, "POST", "/workflows", {"name": name, "description": description}
     )
     must(st, created, label="create workflow")
     wid = created["id"]
