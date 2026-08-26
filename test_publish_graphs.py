@@ -199,6 +199,17 @@ class PublishGraphsTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "config live catalog mismatch"):
                 publish_graphs.verify_workflow_config_parity("mcp", "wf-1", "v1", expected, "source")
 
+    def test_output_schema_apply_accepts_no_content(self):
+        schema = {"type": "object", "properties": {}}
+        with mock.patch.object(publish_graphs, "api", return_value=(204, {})) as api:
+            publish_graphs.apply_workflow_output_schema("mcp", "wf-1", "v1", schema, "source")
+        api.assert_called_once_with(
+            "mcp",
+            "PUT",
+            "/workflows/wf-1/versions/v1/output-schema",
+            {"outputSchema": schema},
+        )
+
     def test_output_schema_parity_uses_fresh_published_version(self):
         expected = {"type": "object", "properties": {"build_id": {"type": "string"}}}
         body = {"currentVersion": {"outputSchema": expected}}
