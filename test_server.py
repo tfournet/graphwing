@@ -1979,6 +1979,8 @@ while True:
         result = {"stopReason":cfg.get("stop_reason", "end_turn")}
     else: result = {}
     send({"jsonrpc":"2.0","id":response_id(request),"result":result})
+    if cfg.get("notification_after_method") == method:
+        send({"jsonrpc":"2.0","method":"_x.ai/mcp/servers_updated"})
     if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
     if cfg.get("hang_after_method") == method:
         while True: time.sleep(1)
@@ -2088,6 +2090,13 @@ while True:
         self.assertEqual(saved["receipt"]["failure_code"], "none")
         self.assertFalse(saved["receipt"]["failover_eligible"])
         self.assertEqual((jdir / "last-message.txt").read_text(), '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}')
+
+    def test_grok_acp_accepts_vendor_server_update_notification(self):
+        saved, _capture, _jdir = self._run_grok_fixture({
+            "notification_after_method": "authenticate",
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["summary"], "done")
 
     def test_grok_acp_command_uses_the_requested_immutable_model(self):
         saved, capture, _ = self._run_grok_fixture(model="grok-fixture-immutable")
