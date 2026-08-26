@@ -1905,7 +1905,7 @@ while True:
         self.assertEqual(set(identity["provider"]["enum"]), {"openai", "anthropic", "xai"})
         self.assertEqual(
             set(identity["model"]["enum"]),
-            {"gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"},
+            {"gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "grok-4.6"},
         )
         self.assertIn("/v1/git/status", spec["paths"])
         self.assertIn("/v1/git/checkout", spec["paths"])
@@ -7620,10 +7620,13 @@ class CodeOffTests(unittest.TestCase):
             ("fable-exact-launch", "judge-fable", "claude-fable-5"),
         ):
             body = self._agent_body(experiment_id, slot)
+            mismatched = {**body, "provider": "anthropic" if body["provider"] == "openai" else "openai"}
             with self.subTest(model=expected), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
                  mock.patch.object(server, "enqueue_agent") as enqueue:
+                mismatch_status, mismatch = self._post("/v1/agent/run", mismatched)
                 status, payload = self._post("/v1/agent/run", body)
+            self.assertEqual((mismatch_status, mismatch["code"]), (400, "codeoff_identity_mismatch"))
             self.assertEqual((body["model"], status), (expected, 202), payload)
             enqueue.assert_called_once()
 
@@ -8319,6 +8322,71 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(payload["code"], "not_finalized")
         status, payload = self._post("/v1/code-off/audit", {"experiment_id": "experiment-0001"}, authed=False)
         self.assertEqual(status, 401)
+
+    def test_codeoff_openapi_identity_contract_matches_runtime_without_widening_ordinary_routes(self):
+        spec = json.loads(server.openapi_bytes())
+        schemas = spec["components"]["schemas"]
+
+        def tuples(name, fields):
+            return {
+                tuple(variant["properties"][field]["const"] for field in fields)
+                for variant in schemas[name]["oneOf"]
+            }
+
+        ordinary = {
+            (launcher, details["provider"], model)
+            for launcher, details in server.NATIVE_LAUNCHERS.items()
+            for model in details["models"]
+        }
+        codeoff = {
+            (identity["launcher"], identity["provider"], identity["exact_model"])
+            for identity in server.CODEOFF_MODEL_MANIFEST["models"].values()
+        }
+        request = schemas["AgentRunRequest"]
+        conditions = {
+            tuple(rule["if"]["required"]): rule["then"]["$ref"]
+            for rule in request["allOf"]
+        }
+        self.assertEqual(conditions, {
+            ("prompt",): "#/components/schemas/OrdinaryAgentRequestIdentity",
+            ("codeoff_workspace",): "#/components/schemas/CodeOffAgentRequestIdentity",
+        })
+        self.assertEqual(tuples("OrdinaryIdentityTuple", ("launcher", "provider", "model")), ordinary)
+        self.assertEqual(tuples("CodeOffIdentityTuple", ("launcher", "provider", "model")), codeoff)
+        self.assertEqual(
+            schemas["SessionIdentity"]["allOf"],
+            [{"$ref": "#/components/schemas/CodeOffIdentityTuple"}],
+        )
+        for name, tuple_name in (
+            ("OrdinaryAgentRequestIdentity", "OrdinaryIdentityTuple"),
+            ("CodeOffAgentRequestIdentity", "CodeOffIdentityTuple"),
+        ):
+            nested = schemas[name]["allOf"][1]["properties"]["session_identity"]["allOf"]
+            self.assertEqual(nested, [
+                {"$ref": "#/components/schemas/SessionIdentity"},
+                {"$ref": f"#/components/schemas/{tuple_name}"},
+            ])
+        self.assertNotIn(("codex", "anthropic", "gpt-5.6-terra"), codeoff)
+        self.assertNotIn(("claude", "openai", "claude-fable-5"), codeoff)
+        self.assertNotIn(("codex", "openai", "gpt-5.6-terra"), ordinary)
+        self.assertNotIn(("claude", "anthropic", "claude-fable-5"), ordinary)
+
+        execution = schemas["CodeOffExecutionIdentity"]
+        self.assertFalse(execution["additionalProperties"])
+        self.assertEqual(
+            set(execution["required"]),
+            {"version", "source", "launcher", "provider", "model", "native_session_id"},
+        )
+        self.assertEqual(
+            tuples("CodeOffExecutionIdentity", ("launcher", "provider", "model", "source")),
+            {(*identity, server._codeoff_provenance_source(identity[0])) for identity in codeoff},
+        )
+        self.assertEqual(
+            schemas["AgentReceipt"]["properties"]["execution_identity"]["$ref"],
+            "#/components/schemas/CodeOffExecutionIdentity",
+        )
+        for name in ("AgentJob", "CodeOffCompact"):
+            self.assertNotIn("execution_identity", schemas[name]["properties"])
 
     def test_codeoff_openapi_is_strict_authenticated_and_agent_workspace_has_no_path(self):
         spec = json.loads(server.openapi_bytes())
