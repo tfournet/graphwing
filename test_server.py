@@ -6664,6 +6664,33 @@ class CompletionSupervisorTests(unittest.TestCase):
         job["receipt"] = {**receipt, "change_id": "wrong"}
         self.assertIsNone(server.supervisor_bound_job_receipt(build, job))
 
+    def test_bound_review_job_receipt_must_match_terminal_attempt(self):
+        job_id = "d" * 32
+        attempt = {
+            "attempt_id": job_id,
+            "status": "terminal",
+            "reviewer": "terra",
+            "verdict": "PASS",
+            "failure_class": None,
+        }
+        build = {"build_id": self.BUILD, "review_attempts": [attempt]}
+        receipt = {
+            "job_id": job_id,
+            "reviewer": "terra",
+            "verdict": "PASS",
+            "no_verdict": False,
+        }
+        job = {
+            "job_id": job_id,
+            "build_id": self.BUILD,
+            "kind": "build_review",
+            "status": "completed",
+            "receipt": receipt,
+        }
+        self.assertIsNotNone(server.supervisor_bound_job_receipt(build, job))
+        job["receipt"] = {**receipt, "reviewer": "grok"}
+        self.assertIsNone(server.supervisor_bound_job_receipt(build, job))
+
     def test_a_run_that_recorded_its_terminal_receipt_repeats_no_work(self):
         job = self._write_job("1" * 32, "running")
         self.assertEqual(self._register()[0], 201)

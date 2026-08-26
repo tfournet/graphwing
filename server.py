@@ -11575,6 +11575,20 @@ def supervisor_bound_job_receipt(
             return None
         fingerprint = event_fingerprint({"job_id": job_id, "receipt": actual})
         return {"fingerprint": fingerprint, "receipt": redact_secrets(receipt)}
+    if job.get("kind") == "build_review":
+        attempt = build_find_review_attempt(build, job_id)
+        if not isinstance(attempt, dict) or attempt.get("status") != "terminal":
+            return None
+        expected = {
+            "reviewer": attempt.get("reviewer"),
+            "verdict": attempt.get("verdict"),
+            "no_verdict": attempt.get("failure_class") == "no_verdict",
+        }
+        actual = {key: receipt.get(key) for key in expected}
+        if job.get("build_id") != build.get("build_id") or actual != expected:
+            return None
+        fingerprint = event_fingerprint({"job_id": job_id, "receipt": actual})
+        return {"fingerprint": fingerprint, "receipt": redact_secrets(receipt)}
     return None
 
 
