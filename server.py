@@ -240,6 +240,8 @@ SLICE_BUDGET = {
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 JOB_LOCK = threading.Lock()
+REPO_LOCKS_LOCK = threading.Lock()
+REPO_LOCKS: dict[str, threading.RLock] = {}
 RUNS_LOCK = threading.Lock()
 HERDR_LINGER_LOCK = threading.Lock()
 HERDR_LINGER: dict[str, float] = {}
@@ -248,6 +250,8 @@ JWKS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 GITHUB_OIDC_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks"
 DOORBELL_PROMPT = "Doorbell: checks or review changed. If checks red, one fix slice. If mergeable, stop. Do not merge."
+PR_EVIDENCE_VERSION = "pr-merge-evidence-v1"
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 def public_base_url() -> str | None:
@@ -1013,6 +1017,25 @@ def repo_from_body(data: dict[str, Any], repos: dict[str, str]):
     return resolve_repo(key, repos)
 
 
+def repo_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with REPO_LOCKS_LOCK:
+        return REPO_LOCKS.setdefault(key, threading.RLock())
+
+
+def repo_write_locked(operation: Any) -> Any:
+    """Serialize only Graphwing mutations/evidence for the same checkout."""
+    def locked(body: bytes, repos: dict[str, str]):
+        try:
+            raw = json.loads(body)
+            path = repos.get(raw.get("repo")) if isinstance(raw, dict) else None
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            path = None
+        with repo_lock(Path(path)) if path else nullcontext():
+            return operation(body, repos)
+    return locked
+
+
 def git_write_result(name: str, r: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     payload = {
         "ok": bool(r.get("ok")),
@@ -1067,6 +1090,7 @@ def _codeoff_git_gate(data: dict[str, Any], repo_name: str, repo: Path, phase: s
     return None
 
 
+@repo_write_locked
 def git_checkout(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1102,6 +1126,7 @@ def git_checkout(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any
     return git_write_result(name, out)
 
 
+@repo_write_locked
 def git_restore(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1124,6 +1149,7 @@ def git_restore(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     return git_write_result(name, run_git(resolved, ["clean", "-fd"]))
 
 
+@repo_write_locked
 def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1172,6 +1198,7 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     return git_write_result(name, out)
 
 
+@repo_write_locked
 def git_push(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1999,58 +2026,136 @@ def slice_route_recovery(body: bytes) -> tuple[int, dict[str, Any]]:
     return derive_slice_recovery_route(data)
 
 
+def validate_writer_evidence(job_id: Any, repo_name: str, repo: Path, branch: str) -> dict[str, Any] | None:
+    job = read_job(job_id) if isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id) else None
+    receipt = job.get("receipt") if isinstance(job, dict) else None
+    identity = job.get("session_identity") if isinstance(job, dict) else None
+    parsed, identity_err = parse_session_identity(identity)
+    if not (
+        isinstance(job, dict) and job.get("status") == "completed" and job.get("kind") not in {"test", "script", "rr", "review"}
+        and job.get("repo") == repo_name and job.get("cwd") == str(repo.resolve())
+        and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id
+        and receipt.get("failure_class") == "none" and receipt.get("failure_code") == "none" and receipt.get("failover_eligible") is False
+        and isinstance(identity, dict) and not identity_err and parsed == identity and identity.get("native_session_id") and identity.get("repo") == repo_name
+        and identity.get("branch") == branch and receipt.get("session_identity") == identity
+        and all(job.get(key) == identity.get(key) for key in ("launcher", "provider", "model"))
+    ):
+        return {"error": "writer/session job is incomplete or mismatched", "code": "writer_evidence_mismatch"}
+    return None
+
+
+def validate_merge_test(data: dict[str, Any], repo_name: str, repo: Path, number: str, live: dict[str, Any]) -> dict[str, Any] | None:
+    job_id = data.get("evidence_job_id")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return {"error": "valid evidence_job_id is required", "code": "bad_test_evidence_id"}
+    path = job_path(job_id)
+    if not path.is_file():
+        return {"error": "persisted final test evidence is missing", "code": "missing_test_evidence"}
+    job = read_job(job_id)
+    if not isinstance(job, dict):
+        return {"error": "persisted final test evidence is corrupt", "code": "corrupt_test_evidence"}
+    evidence, receipt = job.get("merge_evidence"), job.get("receipt")
+    if not isinstance(evidence, dict) or evidence.get("version") != PR_EVIDENCE_VERSION:
+        return {"error": "legacy or unstamped test job cannot authorize merge", "code": "legacy_test_evidence"}
+    if job.get("kind") != "test":
+        return {"error": "evidence job is not a named test", "code": "wrong_test_evidence_kind"}
+    if job.get("status") in {"queued", "running"}:
+        return {"error": "final test evidence is not terminal", "code": "test_evidence_running"}
+    if job.get("status") != "completed" or job.get("returncode") != 0 or not isinstance(receipt, dict) or receipt.get("status") != "ok" or receipt.get("job_id") != job_id:
+        return {"error": "final named test did not pass", "code": "test_evidence_failed"}
+    head, branch, recipe = live.get("headRefOid"), live.get("headRefName"), data.get("test")
+    expected = {"branch": branch, "sha": head, "clean": True}
+    if not (
+        isinstance(recipe, str) and recipe and job.get("script") == recipe == evidence.get("recipe")
+        and job.get("repo") == repo_name and job.get("cwd") == str(repo.resolve()) == evidence.get("cwd") and evidence.get("repo") == repo_name
+        and evidence.get("pr") == number and evidence.get("run_id") == str(data.get("run_id") or "")
+        and evidence.get("expected_head") == head == evidence.get("live_head")
+        and evidence.get("head_ref") == branch and evidence.get("start") == expected and evidence.get("final") == expected
+    ):
+        code = "head_moved" if head not in {evidence.get("expected_head"), evidence.get("live_head")} else "test_evidence_mismatch"
+        return {"error": "final test evidence does not match this PR/run/head", "code": code}
+    if "writer_job_id" in evidence:
+        return validate_writer_evidence(evidence.get("writer_job_id"), repo_name, repo, branch)
+    return None
+
+
+@repo_write_locked
 def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    """Merge a PR, but only after reading its state here and re-deciding."""
+    """Merge once, from strict live state and one persisted final test job."""
     data, err = parse_json_object(body)
     if err:
         return 400, err
     assert data is not None
+    allowed_fields = {"repo", "number", "auto_merge", "run_id", "test", "evidence_job_id", "merge_method", "codeoff_experiment_id", "final_verification_hash"}
+    unexpected = sorted(set(data) - allowed_fields)
+    if unexpected:
+        return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
     repo_name = str(data.get("repo") or "").strip()
     repo_path = repos.get(repo_name)
     if not repo_path:
         return 400, {"error": f"unknown repo '{repo_name}'", "code": "unknown_repo",
                      "allowed": sorted(repos)}
-    number = str(data.get("number") or data.get("pr") or "").strip()
-    if not number:
+    number = str(data.get("number") or "").strip()
+    if not number.isdigit():
         return 400, {"error": "number is required", "code": "missing_number"}
     # Not `method`: the connector reads a field of that name as the HTTP verb,
     # so the graph's method: "squash" made Rewst issue `SQUASH /v1/gh/pr/merge`.
     # Same trap as `path` being read as the URL path.
-    how = str(data.get("merge_method") or data.get("method") or "squash").strip()
+    how = str(data.get("merge_method") or "squash").strip()
     if how not in {"squash", "merge", "rebase"}:
         return 400, {"error": "method must be squash, merge, or rebase", "code": "bad_method"}
+    experiment_pair = (data.get("codeoff_experiment_id") not in (None, ""), data.get("final_verification_hash") not in (None, ""))
+    if experiment_pair[0] != experiment_pair[1]:
+        return 400, {"error": "both code-off evidence fields are required", "code": "codeoff_gate_incomplete"}
+    auto_merge = data.get("auto_merge") is True or str(data.get("auto_merge") or "").lower() == "true"
+    allowed, why = pr_merge_allowed({}, auto_merge=auto_merge, run_id=str(data.get("run_id") or ""))
+    if not allowed and why and why["code"] in {"auto_merge_not_requested", "no_run_id"}:
+        return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number, **why}
 
-    view = annotate_pr_view(gh_json(repo_path, ["pr", "view", number, "--json",
-        "number,title,state,url,headRefName,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus,labels"]))
+    repo = Path(repo_path)
+    codeoff_err = _codeoff_git_gate(data, repo_name, repo, "push") if experiment_pair[0] else None
+    if codeoff_err:
+        return 409, codeoff_err
+    view = fresh_pr_view(repo, number)
     if not view.get("ok"):
         return int(view.get("status", 400)), view
     vd = view.get("data") or {}
-    checks = annotate_pr_checks(gh_json(repo_path, ["pr", "checks", number, "--json",
+    checks = annotate_pr_checks(gh_json(repo, ["pr", "checks", number, "--json",
         "name,state,bucket,link"]))
-
+    if not checks.get("ok"):
+        return int(checks.get("status", 502)), checks
+    confirmed = fresh_pr_view(repo, number)
+    if not confirmed.get("ok"):
+        return int(confirmed.get("status", 502)), confirmed
+    if (vd.get("headRefName"), vd.get("headRefOid")) != ((confirmed.get("data") or {}).get("headRefName"), (confirmed.get("data") or {}).get("headRefOid")):
+        return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number, "error": "PR head moved during final verification", "code": "head_moved"}
+    view, vd = confirmed, confirmed.get("data") or {}
     state = {
-        # annotate_pr_checks sets all_green on the result, not inside data.
         "all_green": bool(checks.get("all_green")),
         "mergeable": vd.get("mergeable"),
-        "is_draft": bool(vd.get("isDraft")),
-        "holds": sorted(l.get("name", "") for l in (vd.get("labels") or [])
-                        if str(l.get("name", "")).startswith("hold:")),
+        "is_draft": vd.get("isDraft"), "holds": view.get("holds"), "remote_state": view.get("remote_state"),
+        "checks_state": checks.get("checks_state"), "review_decision": view.get("review_decision"),
+        "head_ref": vd.get("headRefName"), "head": vd.get("headRefOid"),
     }
-    allowed, why = pr_merge_allowed(
-        state,
-        auto_merge=bool(data.get("auto_merge")),
-        run_id=str(data.get("run_id") or ""),
-    )
-    if not allowed:
-        assert why is not None
+    if str(vd.get("number")) != number:
+        why = {"error": "fresh PR number is inconsistent", "code": "pr_state_mismatch"}
+    elif view.get("remote_state") != "ready":
+        why = {"error": "fresh PR state is not remotely ready", "code": str(view.get("remote_state") or "malformed")}
+    elif checks.get("checks_state") != "green":
+        why = {"error": "declared GitHub checks are not terminal passing", "code": str(checks.get("checks_state") or "malformed_checks")}
+    else:
+        why = validate_merge_test(data, repo_name, repo, number, vd)
+    if why:
         return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number,
                      "state": state, **why}
-
-    out = gh_text(repo_path, ["pr", "merge", number, "--" + how, "--delete-branch"])
-    return (200 if out.get("ok") else int(out.get("status", 400))), {
+    head = str(vd["headRefOid"])
+    out = gh_text(repo, ["pr", "merge", number, "--" + how, "--delete-branch", "--match-head-commit", head])
+    moved = not out.get("ok") and "head" in (str(out.get("error") or "") + str(out.get("stderr") or "")).lower()
+    return (200 if out.get("ok") else 409), {
         "ok": bool(out.get("ok")), "merged": bool(out.get("ok")), "repo": repo_name,
         "number": number, "method": how, "state": state,
-        "error": out.get("error"), "code": out.get("code"),
+        "error": out.get("error"), "code": "head_moved" if moved else (None if out.get("ok") else "merge_refused"),
+        "retryable": False if not out.get("ok") else None,
     }
 
 
@@ -2463,13 +2568,14 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
 
 def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
     r = run_cmd(["gh", *args], cwd=path)
-    if not r.get("ok"):
+    verdict_exit = args[:2] == ["pr", "checks"] and r.get("returncode") in (1, 8)
+    if not r.get("ok") and not verdict_exit:
         return r
     try:
         parsed = json.loads(r["stdout"] or "null")
     except json.JSONDecodeError:
         return {"ok": False, "error": "gh returned non-JSON", "code": "gh_json", "status": 502}
-    return {"ok": True, "data": parsed, "truncated": r["truncated"]}
+    return {"ok": True, "data": parsed, "truncated": r["truncated"], "gh_exit": r.get("returncode", 0)}
 
 
 def gh_text(path: Path, args: list[str]) -> dict[str, Any]:
@@ -2478,48 +2584,93 @@ def gh_text(path: Path, args: list[str]) -> dict[str, Any]:
     return run_cmd(["gh", *args], cwd=path)
 
 
-GH_CHECK_PASS = frozenset({"pass", "skipping", "skip", "success"})
-GH_CHECK_FAIL = frozenset({"fail", "failure", "cancel", "cancelled", "cancelling", "error"})
+PR_VIEW_FIELDS = "number,title,state,url,headRefName,headRefOid,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus,labels"
+
+
+def fresh_pr_view(path: Path, number: str) -> dict[str, Any]:
+    return annotate_pr_view(gh_json(path, ["pr", "view", number, "--json", PR_VIEW_FIELDS]))
+
+
+GH_CHECK_PASS = frozenset({"pass", "passing", "skipping", "skipped", "skip", "success", "neutral"})
+GH_CHECK_FAIL = frozenset({"fail", "failure", "cancel", "cancelled", "cancelling", "error", "timed_out", "action_required", "startup_failure", "stale"})
+GH_CHECK_PENDING = frozenset({"pending", "queued", "in_progress", "expected", "waiting", "requested"})
 
 
 def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
-    """Expose review state at the action result level for Graph switches."""
+    """Strictly classify the remote-only PR state for Graph switches."""
     if not out.get("ok"):
         return out
     data = out.get("data")
-    if not isinstance(data, dict):
-        data = {}
-    review_decision = str(data.get("reviewDecision") or "")
+    data = data if isinstance(data, dict) else {}
+    raw_review = data.get("reviewDecision")
+    review_decision = str(raw_review or "").strip().upper() if raw_review is None or isinstance(raw_review, str) else "?"
     reviews_blocking = review_decision in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}
     out["review_decision"] = review_decision
     out["merge_state"] = str(data.get("mergeStateStatus") or "")
     out["reviews_blocking"] = reviews_blocking
-    out["reviews_ok"] = not reviews_blocking
+    out["reviews_ok"] = review_decision in {"", "APPROVED"}
+    labels = data.get("labels")
+    label_rows = labels if isinstance(labels, list) else []
+    well_formed = (
+        isinstance(out.get("data"), dict) and str(data.get("number") or "").isdigit()
+        and data.get("state") in {"OPEN", "CLOSED", "MERGED"}
+        and isinstance(data.get("isDraft"), bool) and valid_branch(data.get("headRefName"))
+        and bool(GIT_SHA_RE.fullmatch(str(data.get("headRefOid") or "")))
+        and data.get("mergeable") in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}
+        and data.get("mergeStateStatus") in {"CLEAN", "BLOCKED", "BEHIND", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}
+        and review_decision in {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+        and isinstance(labels, list) and all(isinstance(label, dict) and isinstance(label.get("name"), str) for label in labels)
+    )
+    holds = sorted(label["name"] for label in label_rows if isinstance(label, dict) and label.get("name", "").startswith("hold:"))
+    if review_decision not in {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}: state = "unknown"
+    elif not well_formed: state = "malformed"
+    elif data["state"] != "OPEN": state = "closed"
+    elif data["isDraft"]: state = "draft"
+    elif holds: state = "held"
+    elif reviews_blocking: state = "blocking_review"
+    elif data["mergeable"] == "UNKNOWN" or data["mergeStateStatus"] == "UNKNOWN": state = "unknown"
+    elif data["mergeable"] == "CONFLICTING" and data["mergeStateStatus"] == "DIRTY": state = "conflicting"
+    elif data["mergeable"] == "MERGEABLE" and data["mergeStateStatus"] == "CLEAN": state = "ready"
+    else: state = "inconsistent_merge_state"
+    out.update({"holds": holds, "remote_state": state, "remote_reason": state, "remote_ready": state == "ready"})
     return out
 
 
 def annotate_pr_checks(out: dict[str, Any]) -> dict[str, Any]:
-    """HTTP 200 means gh ran. Graph gates on all_green / any_red, not the agent."""
+    """Classify a nonempty, structurally known GitHub check set."""
     if not out.get("ok"):
         return out
     rows = out.get("data")
-    if not isinstance(rows, list):
-        rows = []
     failing: list[str] = []
     pending: list[str] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        bucket = str(row.get("bucket") or row.get("state") or "").strip().lower()
-        name = str(row.get("name") or "")
-        if bucket in GH_CHECK_FAIL:
-            failing.append(name)
-        elif bucket not in GH_CHECK_PASS:
-            pending.append(name)
+    unknown: list[str] = []
+    valid_rows = rows if isinstance(rows, list) else []
+    malformed = not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip() for row in valid_rows)
+    inconsistent = False
+    for row in valid_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip(): continue
+        name = str(row["name"]).strip()
+        values = [str(row[key]).strip().lower().replace("-", "_") for key in ("bucket", "state") if row.get(key) not in (None, "")]
+        kinds = [{**{x: "pass" for x in GH_CHECK_PASS}, **{x: "fail" for x in GH_CHECK_FAIL}, **{x: "pending" for x in GH_CHECK_PENDING}}.get(value) for value in values]
+        if not values: malformed = True
+        elif None in kinds: unknown.append(name)
+        elif len(set(kinds)) != 1: inconsistent = True
+        elif kinds[0] == "fail": failing.append(name)
+        elif kinds[0] == "pending": pending.append(name)
+    if malformed: state = "malformed"
+    elif not rows: state = "no_checks"
+    elif inconsistent: state = "inconsistent"
+    elif unknown: state = "unknown"
+    elif failing: state = "red"
+    elif pending: state = "pending"
+    else: state = "green"
     out["failing"] = failing
     out["pending"] = pending
+    out["unknown"] = unknown
     out["any_red"] = bool(failing)
-    out["all_green"] = not failing and not pending
+    out["all_green"] = state == "green"
+    out["no_checks"] = state == "no_checks"
+    out["checks_state"] = state
     return out
 
 
@@ -3288,6 +3439,14 @@ def current_branch_head(repo: Path) -> tuple[str | None, str | None, dict[str, A
     if not branch.get("ok") or not head.get("ok"):
         return None, None, {"error": "could not read current git identity", "code": "git_state_unavailable"}
     return str(branch["stdout"]).strip(), str(head["stdout"]).strip(), None
+
+
+def evidence_git_state(repo: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    branch, sha, err = current_branch_head(repo)
+    status = run_git(repo, ["status", "--porcelain=v1"])
+    if err or not status.get("ok") or not GIT_SHA_RE.fullmatch(str(sha or "")):
+        return None, err or {"error": "could not read clean git state", "code": "git_state_unavailable"}
+    return {"branch": branch, "sha": sha, "clean": not bool(str(status.get("stdout") or "").strip())}, None
 
 
 def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -4128,6 +4287,56 @@ def script_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any
     }
 
 
+def prepare_merge_evidence(data: dict[str, Any], spec: dict[str, Any], repos: dict[str, str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    fields = ("evidence_mode", "repo", "pr", "run_id", "expected_head", "writer_job_id")
+    if not any(data.get(key) not in (None, "") for key in fields):
+        return None, None
+    required = fields[:-1]
+    if data.get("evidence_mode") != "pr_merge" or any(not isinstance(data.get(key), str) or not data[key].strip() for key in required):
+        return None, {"error": "complete pr_merge evidence context is required", "code": "merge_evidence_incomplete", "status": 400}
+    repo_name, resolved = repo_from_body(data, repos)
+    if repo_name is None:
+        return None, {**resolved, "status": 400}
+    assert isinstance(resolved, Path)
+    number, run_id, expected = data["pr"].strip(), data["run_id"].strip(), data["expected_head"].strip()
+    writer = data.get("writer_job_id")
+    if not number.isdigit() or not GIT_SHA_RE.fullmatch(expected) or len(run_id) > 200 or (writer not in (None, "") and (not isinstance(writer, str) or not JOB_ID_RE.fullmatch(writer))):
+        return None, {"error": "invalid pr_merge evidence context", "code": "bad_merge_evidence", "status": 400}
+    if Path(spec["cwd"]).resolve() != resolved.resolve():
+        return None, {"error": "named test recipe belongs to another repo", "code": "evidence_recipe_repo_mismatch", "status": 409}
+    view = fresh_pr_view(resolved, number)
+    if not view.get("ok"):
+        return None, {**view, "status": int(view.get("status", 502))}
+    vd = view.get("data") or {}
+    if str(vd.get("number")) != number or not view.get("remote_ready"):
+        return None, {"error": "PR is not remotely ready for final evidence", "code": str(view.get("remote_state") or "pr_state_invalid"), "status": 409}
+    if vd.get("headRefOid") != expected:
+        return None, {"error": "declared PR head is stale", "code": "head_moved", "status": 409}
+    evidence = {"version": PR_EVIDENCE_VERSION, "repo": repo_name, "cwd": str(resolved.resolve()), "pr": number,
+                "run_id": run_id, "recipe": str(spec["name"]), "expected_head": expected, "live_head": vd["headRefOid"],
+                "head_ref": vd["headRefName"], "start": None, "final": None}
+    if writer not in (None, ""):
+        evidence["writer_job_id"] = writer
+    return evidence, None
+
+
+def execute_script_job(job: dict[str, Any]) -> dict[str, Any]:
+    evidence = job.get("merge_evidence")
+    if not isinstance(evidence, dict):
+        return run_cmd(list(job["argv"]), cwd=Path(job["cwd"]), timeout=int(job["timeout_seconds"]))
+    with repo_lock(Path(job["cwd"])):
+        before, err = evidence_git_state(Path(job["cwd"]))
+        if err or before != evidence.get("start"):
+            result = {"ok": False, "returncode": 1, "stdout": "", "stderr": "", "error": "merge-evidence start state moved", "code": "evidence_state_changed"}
+        else:
+            result = run_cmd(list(job["argv"]), cwd=Path(job["cwd"]), timeout=int(job["timeout_seconds"]))
+        final, final_err = evidence_git_state(Path(job["cwd"]))
+        evidence["final"] = final
+        if final_err or final != evidence.get("start"):
+            result = {**result, "ok": False, "error": "merge-evidence test changed git state", "code": "evidence_state_changed"}
+    return result
+
+
 def run_script_job(job_id: str) -> None:
     job = read_job(job_id)
     if not job:
@@ -4135,7 +4344,8 @@ def run_script_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    result = run_cmd(list(job["argv"]), cwd=Path(job["cwd"]), timeout=int(job["timeout_seconds"]))
+    result = execute_script_job(job)
+    write_job(job)
     jdir = job_dir(job_id)
     try:
         (jdir / "stdout.log").write_text(result.get("stdout") or "")
@@ -4163,6 +4373,7 @@ def named_cmd_run(
     body: bytes,
     catalog_name: str,
     unknown_code: str,
+    repos: dict[str, str],
 ) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -4174,14 +4385,22 @@ def named_cmd_run(
     name = name.strip()
     if data.get("argv") is not None:
         return 400, {"error": f"argv is not accepted; use a {catalog_name} name", "code": "argv_forbidden"}
+    allowed = {"name", "response_webhook_url", "response_webhook_token", "resume_url"}
+    if kind == "test": allowed.update({"evidence_mode", "repo", "pr", "run_id", "expected_head", "writer_job_id"})
+    unexpected = sorted(set(data) - allowed)
+    if unexpected:
+        return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
     spec = catalog.get(name)
     if spec is None:
         return 400, {"error": f"unknown {kind} '{name}'", "code": unknown_code, "allowed": sorted(catalog)}
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
+    evidence, evidence_err = prepare_merge_evidence(data, spec, repos) if kind == "test" else (None, None)
+    if evidence_err:
+        return int(evidence_err.pop("status", 400)), evidence_err
     timeout = int(spec["timeout_seconds"])
-    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT
+    async_run = bool(spec["async"]) or timeout > SCRIPT_SYNC_TIMEOUT or evidence is not None
     if not async_run:
         result = run_cmd(list(spec["argv"]), cwd=spec["cwd"], timeout=timeout)
         if result.get("code") == "local_binary_missing":
@@ -4208,7 +4427,16 @@ def named_cmd_run(
             "truncated": bool(result.get("truncated")),
             "compact": compact_cmd_signal(result),
         }
-    with JOB_LOCK:
+    with (repo_lock(Path(spec["cwd"])) if evidence is not None else nullcontext()), JOB_LOCK:
+        if evidence is not None:
+            start, state_err = evidence_git_state(Path(spec["cwd"]))
+            if state_err:
+                return 409, state_err
+            if not start["clean"]:
+                return 409, {"error": "merge-evidence test must start clean", "code": "dirty_evidence_start"}
+            if start["branch"] != evidence["head_ref"] or start["sha"] != evidence["live_head"]:
+                return 409, {"error": "local checkout does not match live PR head", "code": "evidence_checkout_mismatch"}
+            evidence["start"] = start
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
@@ -4232,6 +4460,9 @@ def named_cmd_run(
             "error": None,
             "webhook": None,
         }
+        if evidence is not None:
+            job["merge_evidence"] = evidence
+            job["repo"] = evidence["repo"]
         job_dir(job_id).mkdir(parents=True, exist_ok=True)
         write_job(job)
     enqueue_script(job)
@@ -4246,18 +4477,18 @@ def named_cmd_run(
 
 
 def script_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    return named_cmd_run("script", load_scripts(repos), body, "scripts.json", "unknown_script")
+    return named_cmd_run("script", load_scripts(repos), body, "scripts.json", "unknown_script", repos)
 
 
 def test_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    return named_cmd_run("test", load_tests(repos), body, "tests.json", "unknown_test")
+    return named_cmd_run("test", load_tests(repos), body, "tests.json", "unknown_test", repos)
 
 
 def rr_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     catalog = load_rr(repos)
     if not catalog:
         return 501, {"error": "rr is not configured", "code": "not_configured"}
-    return named_cmd_run("rr", catalog, body, "rr.json", "unknown_rr")
+    return named_cmd_run("rr", catalog, body, "rr.json", "unknown_rr", repos)
 
 
 def codeoff_canonical_json(value: Any) -> bytes:
@@ -5748,18 +5979,7 @@ def dispatch_inner(
             number = first_query(qs, "number")
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
-            out = annotate_pr_view(
-                gh_json(
-                    repo_path,
-                    [
-                        "pr",
-                        "view",
-                        number,
-                        "--json",
-                        "number,title,state,url,headRefName,baseRefName,mergeable,isDraft,reviewDecision,mergeStateStatus",
-                    ],
-                )
-            )
+            out = fresh_pr_view(repo_path, number)
         elif method == "GET" and path == "/v1/gh/pr/findings":
             number = first_query(qs, "number")
             if not number:

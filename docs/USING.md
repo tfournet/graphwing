@@ -146,10 +146,10 @@ artifact stub: `TASKS.checks.data.all_green` is unreadable because that node ret
 ~21KB, which is why the findings endpoint runs `gh pr checks` itself and returns a small
 flat result.
 
-`auto_merge` is per-run and defaults false. When true and the PR is green, mergeable,
-and carries no `hold:*` label, the run merges with `--squash --delete-branch`. The
-endpoint re-reads the PR and re-decides rather than trusting the graph, and refuses
-without a `run_id`, so a hand-rolled curl cannot merge anything.
+`auto_merge` is per-run and defaults false. Initial-green and after-fix routes both checkout the freshly read PR head and run one final named test. The earlier after-fix test remains advisory.
+Only the final async job carries persisted `pr-merge-evidence-v1` repo/recipe/PR/run/head and clean start/end provenance; after-fix pins the successful writer/session job while initial-green has no writer reference.
+Merge accepts that final job ID, then freshly requires an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
+Code-off receipts remain independent issue-67 commit/push gates and cannot waive this final test. `graphwing-pr-status` reports remote readiness only; `remote_ready` means `named_test_required`, not merge-safe.
 
 ## Other graphs
 

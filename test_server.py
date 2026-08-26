@@ -2720,13 +2720,13 @@ while True:
         self.assertEqual(payload["code"], "missing_number")
 
     def test_gh_pr_list(self):
-        status, payload, _ = server.dispatch(
-            "GET", "/v1/gh/pr/list", {"n": ["1"]}, True, b""
-        )
-        self.assertIn(status, (200, 400), payload)
-        if status == 200:
-            self.assertTrue(payload["ok"])
-            self.assertIsInstance(payload["data"], list)
+        with mock.patch.object(server, "gh_json", return_value={"ok": True, "data": []}):
+            status, payload, _ = server.dispatch(
+                "GET", "/v1/gh/pr/list", {"n": ["1"]}, True, b""
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertIsInstance(payload["data"], list)
 
     def test_annotate_pr_view_approved(self):
         out = server.annotate_pr_view({"ok": True, "data": {"reviewDecision": "APPROVED", "mergeStateStatus": "CLEAN"}})
@@ -2974,55 +2974,32 @@ while True:
         # merge attempt crashed with AttributeError. The unit tests above
         # passed a hand-built state dict and sailed straight past it. Drive
         # the real function with the real gh payload shapes instead.
-        calls = []
-
-        def fake_gh_json(repo_path, argv):
-            calls.append(argv[:3])
-            if argv[1] == "view":
-                return {"ok": True, "data": {"number": 1, "mergeable": "MERGEABLE",
-                                             "isDraft": False, "reviewDecision": "APPROVED",
-                                             "mergeStateStatus": "CLEAN", "labels": []}}
-            if argv[1] == "checks":
-                return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
-            return {"ok": True, "data": {}}
-
-        def fake_gh_text(repo_path, argv):
-            calls.append(argv[:3])
-            return {"ok": True, "stdout": "Squashed and merged pull request #1"}
-
-        with mock.patch.object(server, "gh_json", fake_gh_json), \
-             mock.patch.object(server, "gh_text", fake_gh_text):
-            status, payload = server.gh_pr_merge(
-                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
-                            "run_id": "r1"}).encode(),
-                {"r": "/tmp"},
-            )
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            repo, jobs = Path(td) / "repo", Path(td) / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            status, payload, merge, calls = self._merge_with_fakes(jobs, repo, head)
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["merged"], payload)
         self.assertTrue(payload["state"]["all_green"], payload["state"])
-        self.assertIn(["pr", "merge", "1"], calls)
+        self.assertEqual(merge.call_args.args[1][:3], ["pr", "merge", "7"])
+        self.assertTrue(any(call[1] == "checks" for call in calls))
 
     def test_pr_merge_does_not_call_gh_merge_when_it_refuses(self):
         # A refusal that still shelled out to `gh pr merge` would be the worst
         # possible version of this bug.
-        calls = []
-
-        def fake_gh_json(repo_path, argv):
-            calls.append(argv[1])
-            if argv[1] == "view":
-                return {"ok": True, "data": {"mergeable": "MERGEABLE", "isDraft": False,
-                                             "labels": [{"name": "hold:pm-review"}]}}
-            return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
-
-        with mock.patch.object(server, "gh_json", fake_gh_json):
-            status, payload = server.gh_pr_merge(
-                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
-                            "run_id": "r1"}).encode(),
-                {"r": "/tmp"},
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            repo, jobs = Path(td) / "repo", Path(td) / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            status, payload, merge, _ = self._merge_with_fakes(
+                jobs, repo, head, view=self._strict_pr_view(head, labels=[{"name": "hold:pm-review"}])
             )
         self.assertEqual(status, 409)
         self.assertEqual(payload["code"], "held")
-        self.assertNotIn("merge", calls)
+        merge.assert_not_called()
 
     def test_pr_merge_reports_success_for_a_plain_text_merge(self):
         # `gh pr merge` prints plain text, but the endpoint sent it through
@@ -3030,21 +3007,13 @@ while True:
         # code=gh_json. A caller retrying on that error would re-attempt an
         # action that had already happened. This is not hypothetical: it is
         # exactly what riftwing#3523 reported after it had already merged.
-        def fake_gh_json(repo_path, argv):
-            if argv[1] == "view":
-                return {"ok": True, "data": {"mergeable": "MERGEABLE", "isDraft": False,
-                                             "labels": []}}
-            return {"ok": True, "data": [{"name": "ci", "bucket": "pass"}]}
-
-        def fake_gh_text(repo_path, argv):
-            return {"ok": True, "stdout": "Squashed and merged pull request #1\n"}
-
-        with mock.patch.object(server, "gh_json", fake_gh_json), \
-             mock.patch.object(server, "gh_text", fake_gh_text):
-            status, payload = server.gh_pr_merge(
-                json.dumps({"repo": "r", "number": 1, "auto_merge": True,
-                            "run_id": "abc"}).encode(),
-                {"r": "/tmp"},
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            repo, jobs = Path(td) / "repo", Path(td) / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            status, payload, _, _ = self._merge_with_fakes(
+                jobs, repo, head, merge={"ok": True, "stdout": "Squashed and merged pull request #7\n"}
             )
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["merged"], payload)
@@ -3140,6 +3109,603 @@ while True:
         )
         self.assertTrue(ok, err)
         self.assertIsNone(err)
+
+    @staticmethod
+    def _strict_pr_view(head, **overrides):
+        data = {
+            "number": 7,
+            "title": "fixture",
+            "state": "OPEN",
+            "url": "https://example.invalid/pull/7",
+            "headRefName": "feature",
+            "headRefOid": head,
+            "baseRefName": "main",
+            "mergeable": "MERGEABLE",
+            "isDraft": False,
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "CLEAN",
+            "labels": [],
+        }
+        data.update(overrides)
+        return {"ok": True, "data": data}
+
+    @staticmethod
+    def _strict_checks(bucket="pass"):
+        return {"ok": True, "data": [{"name": "ci", "bucket": bucket}]}
+
+    def _write_merge_job(self, jobs, repo, head, **overrides):
+        job_id = overrides.pop("job_id", "a" * 32)
+        evidence = {
+            "version": "pr-merge-evidence-v1",
+            "repo": "r",
+            "cwd": str(repo.resolve()),
+            "pr": "7",
+            "run_id": "run-7",
+            "recipe": "catalog-compile",
+            "expected_head": head,
+            "live_head": head,
+            "head_ref": "feature",
+            "start": {"branch": "feature", "sha": head, "clean": True},
+            "final": {"branch": "feature", "sha": head, "clean": True},
+        }
+        evidence.update(overrides.pop("evidence", {}))
+        job = {
+            "job_id": job_id,
+            "kind": "test",
+            "status": "completed",
+            "script": "catalog-compile",
+            "repo": "r",
+            "cwd": str(repo.resolve()),
+            "returncode": 0,
+            "receipt": {"status": "ok", "job_id": job_id},
+            "merge_evidence": evidence,
+        }
+        job.update(overrides)
+        path = jobs / job_id / "job.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(job) + "\n")
+        return job_id, job
+
+    @staticmethod
+    def _merge_body(evidence_job_id="a" * 32, **overrides):
+        body = {
+            "repo": "r",
+            "number": "7",
+            "auto_merge": True,
+            "run_id": "run-7",
+            "test": "catalog-compile",
+            "evidence_job_id": evidence_job_id,
+            "merge_method": "squash",
+        }
+        body.update(overrides)
+        return json.dumps(body).encode()
+
+    def _merge_with_fakes(self, jobs, repo, head, *, view=None, checks=None, merge=None, body=None):
+        calls = []
+
+        def fake_json(_repo, argv):
+            calls.append(list(argv))
+            return deepcopy(view or self._strict_pr_view(head)) if argv[1] == "view" else deepcopy(checks or self._strict_checks())
+
+        merge = merge or {"ok": True, "stdout": "merged"}
+        with mock.patch.object(server, "JOBS_DIR", jobs), \
+             mock.patch.object(server, "gh_json", fake_json), \
+             mock.patch.object(server, "gh_text", return_value=merge) as gh_merge, \
+             mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+             mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+            status, payload = server.gh_pr_merge(body or self._merge_body(), {"r": str(repo)})
+        return status, payload, gh_merge, calls
+
+    def test_gh_checks_nonzero_verdict_json_is_not_a_transport_failure(self):
+        fixtures = (
+            (1, [{"name": "ci", "bucket": "fail"}], "red"),
+            (8, [{"name": "ci", "bucket": "pending"}], "pending"),
+        )
+        for returncode, rows, state in fixtures:
+            with self.subTest(returncode=returncode), mock.patch.object(
+                server,
+                "run_cmd",
+                return_value={"ok": False, "returncode": returncode, "stdout": json.dumps(rows), "stderr": "", "truncated": False, "status": 400},
+            ):
+                out = server.annotate_pr_checks(server.gh_json(Path("/tmp"), ["pr", "checks", "7", "--json", "name,state,bucket,link"]))
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["checks_state"], state, out)
+        with mock.patch.object(server, "run_cmd", return_value={"ok": False, "returncode": 1, "stdout": "not-json", "stderr": "boom", "truncated": False, "status": 400}):
+            self.assertFalse(server.gh_json(Path("/tmp"), ["pr", "checks", "7"])["ok"])
+
+    def test_check_classification_is_nonempty_strict_and_fail_closed(self):
+        cases = (
+            ({"ok": True, "data": []}, "no_checks"),
+            ({"ok": True, "data": [{"name": "ci", "bucket": "mystery"}]}, "unknown"),
+            ({"ok": True, "data": {}}, "malformed"),
+            ({"ok": True, "data": [None]}, "malformed"),
+            ({"ok": True, "data": [{"name": "", "bucket": "pass"}]}, "malformed"),
+            ({"ok": True, "data": [{"name": "ci", "bucket": "pass", "state": "FAILURE"}]}, "inconsistent"),
+        )
+        for raw, expected in cases:
+            with self.subTest(expected=expected):
+                out = server.annotate_pr_checks(deepcopy(raw))
+                self.assertFalse(out.get("all_green"), out)
+                self.assertEqual(out.get("checks_state"), expected, out)
+
+    def test_pr_view_classifies_only_truthful_remote_ready_state(self):
+        head = "1" * 40
+        cases = (
+            ({}, "ready", True),
+            ({"state": "CLOSED"}, "closed", False),
+            ({"isDraft": True}, "draft", False),
+            ({"labels": [{"name": "hold:pm-review"}]}, "held", False),
+            ({"reviewDecision": "CHANGES_REQUESTED"}, "blocking_review", False),
+            ({"reviewDecision": "REVIEW_REQUIRED"}, "blocking_review", False),
+            ({"reviewDecision": "SURPRISE"}, "unknown", False),
+            ({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}, "conflicting", False),
+            ({"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}, "unknown", False),
+            ({"mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED"}, "inconsistent_merge_state", False),
+            ({"headRefOid": None}, "malformed", False),
+            ({"labels": ["hold:bad"]}, "malformed", False),
+        )
+        for changes, expected, ready in cases:
+            with self.subTest(changes=changes):
+                out = server.annotate_pr_view(self._strict_pr_view(head, **changes))
+                self.assertEqual(out.get("remote_state"), expected, out)
+                self.assertIs(out.get("remote_ready"), ready, out)
+        # No effective review decision is not invented as an approval; CLEAN
+        # remains the source of truth when the repository requires no review.
+        out = server.annotate_pr_view(self._strict_pr_view(head, reviewDecision=None))
+        self.assertEqual(out["review_decision"], "")
+        self.assertTrue(out["remote_ready"])
+
+    def test_merge_evidence_creation_stamps_server_side_pr_and_git_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"], check=True, capture_output=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            jobs = root / "jobs"
+            spec = {"catalog-compile": {"name": "catalog-compile", "argv": [sys.executable, "-c", "pass"], "cwd": repo.resolve(), "timeout_seconds": 120, "async": True}}
+            body = json.dumps({
+                "name": "catalog-compile", "evidence_mode": "pr_merge", "repo": "r",
+                "pr": "7", "run_id": "run-7", "expected_head": head,
+                "response_webhook_url": "https://example.invalid/resume",
+            }).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_tests", return_value=spec), \
+                 mock.patch.object(server, "gh_json", return_value=self._strict_pr_view(head)), \
+                 mock.patch.object(server, "enqueue_script") as enqueue, \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")):
+                status, payload = server.test_run(body, {"r": str(repo)})
+            self.assertEqual(status, 202, payload)
+            job = json.loads((jobs / payload["job_id"] / "job.json").read_text())
+            evidence = job["merge_evidence"]
+            self.assertEqual(evidence["repo"], "r")
+            self.assertEqual(job["repo"], "r")
+            self.assertEqual(evidence["cwd"], str(repo.resolve()))
+            self.assertEqual(evidence["pr"], "7")
+            self.assertEqual(evidence["run_id"], "run-7")
+            self.assertEqual(evidence["recipe"], job["script"])
+            self.assertEqual((evidence["expected_head"], evidence["live_head"], evidence["head_ref"]), (head, head, "feature"))
+            self.assertEqual(evidence["start"], {"branch": "feature", "sha": head, "clean": True})
+            self.assertIsNone(evidence["final"])
+            enqueue.assert_called_once()
+
+    def test_merge_evidence_creation_rejects_stale_branch_dirty_and_wrong_recipe_cwd(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"], check=True, capture_output=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            base_spec = {"name": "catalog-compile", "argv": [sys.executable, "-c", "pass"], "cwd": repo.resolve(), "timeout_seconds": 120, "async": True}
+            base = {"name": "catalog-compile", "evidence_mode": "pr_merge", "repo": "r", "pr": "7", "run_id": "run-7", "expected_head": head}
+            cases = (
+                ("stale", {**base, "expected_head": "2" * 40}, self._strict_pr_view(head), base_spec),
+                ("branch", base, self._strict_pr_view(head, headRefName="elsewhere"), base_spec),
+                ("cwd", base, self._strict_pr_view(head), {**base_spec, "cwd": root.resolve()}),
+            )
+            for label, request, view, spec in cases:
+                with self.subTest(label=label), mock.patch.object(server, "JOBS_DIR", root / f"jobs-{label}"), \
+                     mock.patch.object(server, "load_tests", return_value={"catalog-compile": spec}), \
+                     mock.patch.object(server, "gh_json", return_value=view), \
+                     mock.patch.object(server, "enqueue_script") as enqueue:
+                    status, payload = server.test_run(json.dumps(request).encode(), {"r": str(repo)})
+                self.assertEqual(status, 409, payload)
+                enqueue.assert_not_called()
+            (repo / "dirty").write_text("x")
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs-dirty"), \
+                 mock.patch.object(server, "load_tests", return_value={"catalog-compile": base_spec}), \
+                 mock.patch.object(server, "gh_json", return_value=self._strict_pr_view(head)), \
+                 mock.patch.object(server, "enqueue_script") as enqueue:
+                status, payload = server.test_run(json.dumps(base).encode(), {"r": str(repo)})
+            self.assertEqual(status, 409, payload)
+            self.assertEqual(payload["code"], "dirty_evidence_start")
+            enqueue.assert_not_called()
+
+    def test_merge_evidence_job_fails_when_test_changes_branch_sha_or_cleanliness(self):
+        commands = (
+            [sys.executable, "-c", "open('dirty-after-test','w').write('x')"],
+            ["git", "checkout", "-b", "other"],
+            ["git", "commit", "--allow-empty", "-m", "move head"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                repo = self._scratch_git(root)
+                subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"], check=True, capture_output=True)
+                head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+                jobs = root / "jobs"
+                job_id = "b" * 32
+                job = {
+                    "job_id": job_id, "kind": "test", "status": "queued", "script": "catalog-compile",
+                    "argv": argv, "cwd": str(repo), "timeout_seconds": 30, "log_ref": str(jobs / job_id / "stdout.log"),
+                    "response_webhook_url": None, "response_webhook_token": None,
+                    "merge_evidence": {
+                        "version": "pr-merge-evidence-v1", "repo": "r", "cwd": str(repo.resolve()), "pr": "7",
+                        "run_id": "run-7", "recipe": "catalog-compile", "expected_head": head, "live_head": head,
+                        "head_ref": "feature", "start": {"branch": "feature", "sha": head, "clean": True}, "final": None,
+                    },
+                }
+                (jobs / job_id).mkdir(parents=True)
+                (jobs / job_id / "job.json").write_text(json.dumps(job) + "\n")
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "deliver_webhook", return_value=None), \
+                     mock.patch.object(server, "herdr_job_done", return_value=None):
+                    server.run_script_job(job_id)
+                stored = json.loads((jobs / job_id / "job.json").read_text())
+                self.assertEqual(stored["status"], "failed", stored)
+                self.assertEqual(stored["receipt"]["status"], "error", stored)
+                self.assertIsNotNone(stored["merge_evidence"]["final"])
+                self.assertNotEqual(stored["merge_evidence"]["final"], stored["merge_evidence"]["start"])
+
+    def test_merge_rejects_every_unbound_or_nonterminal_test_evidence_fixture(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            cases = []
+            job_id, base = self._write_merge_job(jobs, repo, head)
+            cases.extend([
+                ("legacy", {k: v for k, v in base.items() if k != "merge_evidence"}),
+                ("wrong_kind", {**base, "kind": "script"}),
+                ("running", {**base, "status": "running", "receipt": None}),
+                ("red", {**base, "status": "failed", "returncode": 1, "receipt": {"status": "error", "job_id": job_id}}),
+                ("wrong_repo", {**base, "merge_evidence": {**base["merge_evidence"], "repo": "other"}}),
+                ("wrong_test", {**base, "script": "other"}),
+                ("wrong_pr", {**base, "merge_evidence": {**base["merge_evidence"], "pr": "8"}}),
+                ("wrong_run", {**base, "merge_evidence": {**base["merge_evidence"], "run_id": "other"}}),
+                ("wrong_head", {**base, "merge_evidence": {**base["merge_evidence"], "live_head": "2" * 40}}),
+                ("branch_mismatch", {**base, "merge_evidence": {**base["merge_evidence"], "final": {"branch": "other", "sha": head, "clean": True}}}),
+                ("dirty_start", {**base, "merge_evidence": {**base["merge_evidence"], "start": {"branch": "feature", "sha": head, "clean": False}}}),
+                ("dirty_end", {**base, "merge_evidence": {**base["merge_evidence"], "final": {"branch": "feature", "sha": head, "clean": False}}}),
+            ])
+            for label, job in cases:
+                with self.subTest(label=label):
+                    (jobs / job_id / "job.json").write_text(json.dumps(job) + "\n")
+                    status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head)
+                    self.assertEqual(status, 409, payload)
+                    self.assertFalse(payload.get("merged"), payload)
+                    merge.assert_not_called()
+            (jobs / job_id / "job.json").write_text("not-json")
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head)
+            self.assertEqual((status, payload["code"]), (409, "corrupt_test_evidence"))
+            merge.assert_not_called()
+            (jobs / job_id / "job.json").unlink()
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head)
+            self.assertEqual((status, payload["code"]), (409, "missing_test_evidence"))
+            merge.assert_not_called()
+
+    def test_merge_fresh_state_matrix_refuses_without_invoking_merge(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            fixtures = (
+                ("empty_checks", self._strict_pr_view(head), {"ok": True, "data": []}),
+                ("red_checks", self._strict_pr_view(head), self._strict_checks("fail")),
+                ("pending_checks", self._strict_pr_view(head), self._strict_checks("pending")),
+                ("unknown_checks", self._strict_pr_view(head), self._strict_checks("mystery")),
+                ("malformed_checks", self._strict_pr_view(head), {"ok": True, "data": {}}),
+                ("closed", self._strict_pr_view(head, state="CLOSED"), self._strict_checks()),
+                ("draft", self._strict_pr_view(head, isDraft=True), self._strict_checks()),
+                ("held", self._strict_pr_view(head, labels=[{"name": "hold:pm-review"}]), self._strict_checks()),
+                ("blocking_review", self._strict_pr_view(head, reviewDecision="CHANGES_REQUESTED"), self._strict_checks()),
+                ("unknown_review", self._strict_pr_view(head, reviewDecision="SURPRISE"), self._strict_checks()),
+                ("conflicting", self._strict_pr_view(head, mergeable="CONFLICTING", mergeStateStatus="DIRTY"), self._strict_checks()),
+                ("unknown_merge", self._strict_pr_view(head, mergeable="UNKNOWN", mergeStateStatus="UNKNOWN"), self._strict_checks()),
+                ("inconsistent", self._strict_pr_view(head, mergeStateStatus="BLOCKED"), self._strict_checks()),
+            )
+            for label, view, checks in fixtures:
+                with self.subTest(label=label):
+                    status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head, view=view, checks=checks)
+                    self.assertEqual(status, 409, payload)
+                    merge.assert_not_called()
+
+    def test_merge_binds_valid_evidence_to_match_head_and_never_retries_moved_head(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head)
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["merged"])
+            argv = merge.call_args.args[1]
+            self.assertIn("--match-head-commit", argv)
+            self.assertEqual(argv[argv.index("--match-head-commit") + 1], head)
+
+            moved = {"ok": False, "status": 400, "code": "cmd_failed", "error": "head commit does not match", "stderr": "head commit does not match"}
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head, merge=moved)
+            self.assertEqual((status, payload["code"]), (409, "head_moved"), payload)
+            self.assertFalse(payload["merged"])
+            merge.assert_called_once()
+
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, "2" * 40, view=self._strict_pr_view("2" * 40))
+            self.assertEqual((status, payload["code"]), (409, "head_moved"), payload)
+            merge.assert_not_called()
+
+    def test_merge_refuses_head_change_between_fresh_and_confirmation_views(self):
+        first_head, confirmed_head = "1" * 40, "2" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, first_head)
+            views = iter((self._strict_pr_view(first_head), self._strict_pr_view(confirmed_head)))
+
+            def fake_json(_repo, argv):
+                return next(views) if argv[1] == "view" else self._strict_checks()
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "gh_json", fake_json), \
+                 mock.patch.object(server, "gh_text") as merge, \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, payload = server.gh_pr_merge(self._merge_body(), {"r": str(repo)})
+            self.assertEqual((status, payload["code"]), (409, "head_moved"), payload)
+            merge.assert_not_called()
+
+    def test_merge_refuses_confirmation_view_for_a_different_pr(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            views = iter((self._strict_pr_view(head), self._strict_pr_view(head, number=8)))
+
+            def fake_json(_repo, argv):
+                return next(views) if argv[1] == "view" else self._strict_checks()
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "gh_json", fake_json), \
+                 mock.patch.object(server, "gh_text") as merge, \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider CLI forbidden")):
+                status, payload = server.gh_pr_merge(self._merge_body(), {"r": str(repo)})
+            self.assertEqual((status, payload["code"]), (409, "pr_state_mismatch"), payload)
+            merge.assert_not_called()
+
+    def test_optional_writer_session_evidence_is_strict_but_initial_green_needs_none(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            # Initial-green evidence intentionally has no writer reference.
+            self._write_merge_job(jobs, repo, head)
+            status, payload, _, _ = self._merge_with_fakes(jobs, repo, head)
+            self.assertEqual(status, 200, payload)
+
+            writer_id = "c" * 32
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "r", "branch": "feature", "starting_head": "0" * 40,
+                "native_session_id": "session-7",
+            }
+            writer = {
+                "job_id": writer_id, "status": "completed", "repo": "r", "cwd": str(repo.resolve()),
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity,
+                "receipt": {"status": "ok", "job_id": writer_id, "session_identity": identity, "failure_class": "none", "failure_code": "none", "failover_eligible": False},
+            }
+            wp = jobs / writer_id / "job.json"
+            wp.parent.mkdir(parents=True)
+            wp.write_text(json.dumps(writer) + "\n")
+            self._write_merge_job(jobs, repo, head, evidence={"writer_job_id": writer_id})
+            status, payload, _, _ = self._merge_with_fakes(jobs, repo, head)
+            self.assertEqual(status, 200, payload)
+            for label, broken in (
+                ("running", {**writer, "status": "running"}),
+                ("receipt", {**writer, "receipt": {**writer["receipt"], "status": "error"}}),
+                ("repo", {**writer, "repo": "other"}),
+                ("cwd", {**writer, "cwd": str(root / "other")}),
+                ("session", {**writer, "session_identity": {**identity, "native_session_id": None}}),
+                ("route", {**writer, "provider": "anthropic"}),
+            ):
+                with self.subTest(label=label):
+                    wp.write_text(json.dumps(broken) + "\n")
+                    status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head)
+                    self.assertEqual(status, 409, payload)
+                    merge.assert_not_called()
+
+    def test_precommit_test_and_codeoff_receipts_never_waive_final_evidence(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            precommit_id = "d" * 32
+            precommit = {"job_id": precommit_id, "kind": "test", "status": "completed", "script": "catalog-compile", "cwd": str(repo), "returncode": 0, "receipt": {"status": "ok", "job_id": precommit_id}}
+            pp = jobs / precommit_id / "job.json"
+            pp.parent.mkdir(parents=True)
+            pp.write_text(json.dumps(precommit) + "\n")
+            status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head, body=self._merge_body(precommit_id))
+            self.assertEqual(status, 409, payload)
+            merge.assert_not_called()
+            for extra in (
+                {"codeoff_experiment_id": "experiment-0001"},
+                {"final_verification_hash": "e" * 64},
+            ):
+                status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head, body=self._merge_body("e" * 32, **extra))
+                self.assertEqual((status, payload["code"]), (400, "codeoff_gate_incomplete"), payload)
+                merge.assert_not_called()
+            complete = {"codeoff_experiment_id": "experiment-0001", "final_verification_hash": "e" * 64}
+            with mock.patch.object(server, "_codeoff_git_gate", return_value=None) as issue67_gate:
+                status, payload, merge, _ = self._merge_with_fakes(jobs, repo, head, body=self._merge_body("e" * 32, **complete))
+            self.assertEqual((status, payload["code"]), (409, "missing_test_evidence"), payload)
+            issue67_gate.assert_called_once_with(mock.ANY, "r", repo, "push")
+            merge.assert_not_called()
+
+    def test_keyed_repo_lock_serializes_evidence_tests_git_writes_and_merge(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"], check=True, capture_output=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True)
+            self.assertIs(server.repo_lock(repo), server.repo_lock(repo.resolve()))
+            self.assertIsNot(server.repo_lock(repo), server.repo_lock(root / "other"))
+
+            def blocked_while_held(target):
+                started, done = threading.Event(), threading.Event()
+                def run():
+                    started.set()
+                    target()
+                    done.set()
+                lock = server.repo_lock(repo)
+                with lock:
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    self.assertTrue(started.wait(1))
+                    self.assertFalse(done.wait(.05), "same-repo operation escaped the keyed lock")
+                thread.join(2)
+                self.assertTrue(done.is_set())
+
+            blocked_while_held(lambda: server.git_checkout(
+                json.dumps({"repo": "r", "branch": "feature"}).encode(), {"r": str(repo)}
+            ))
+
+            jobs = root / "jobs"
+            test_id = "f" * 32
+            evidence = {"version": "pr-merge-evidence-v1", "repo": "r", "cwd": str(repo.resolve()), "pr": "7", "run_id": "run-7", "recipe": "catalog-compile", "expected_head": head, "live_head": head, "head_ref": "feature", "start": {"branch": "feature", "sha": head, "clean": True}, "final": None}
+            test_job = {"job_id": test_id, "kind": "test", "status": "queued", "script": "catalog-compile", "argv": [sys.executable, "-c", "pass"], "cwd": str(repo), "timeout_seconds": 30, "log_ref": str(jobs / test_id / "stdout.log"), "response_webhook_url": None, "response_webhook_token": None, "merge_evidence": evidence}
+            (jobs / test_id).mkdir(parents=True)
+            (jobs / test_id / "job.json").write_text(json.dumps(test_job) + "\n")
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "deliver_webhook", return_value=None), mock.patch.object(server, "herdr_job_done", return_value=None):
+                blocked_while_held(lambda: server.run_script_job(test_id))
+            self.assertEqual(json.loads((jobs / test_id / "job.json").read_text())["status"], "completed")
+
+            # The merge wrapper uses the identical key, so it cannot overtake
+            # a Graphwing checkout/test operation for this repo.
+            self._write_merge_job(jobs, repo, head)
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "gh_json", side_effect=lambda _p, a: self._strict_pr_view(head) if a[1] == "view" else self._strict_checks()), mock.patch.object(server, "gh_text", return_value={"ok": True, "stdout": "merged"}):
+                blocked_while_held(lambda: server.gh_pr_merge(self._merge_body(), {"r": str(repo)}))
+
+    def test_pr_drive_has_one_final_evidence_leg_and_no_merge_bypass(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        description = graph["description"].lower()
+        self.assertIn("remote-ready", description)
+        self.assertIn("final head-bound named test", description)
+        self.assertIn("evidence gate", description)
+        self.assertIn("optional merge", description)
+        self.assertNotIn("green + reviews_ok is mergeable", description)
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        self.assertIn(("switch_review", "case-2", "join_final"), triples)
+        self.assertIn(("switch_review", "default", "herdr_remote_not_ready"), triples)
+        self.assertIn(("if_green2", "pass", "join_final"), triples)
+        self.assertIn(("join_final", "out", "final_view"), triples)
+        self.assertIn(("final_view", "success", "final_checkout"), triples)
+        self.assertIn(("final_checkout", "success", "final_wait"), triples)
+        self.assertIn(("final_wait", "pending", "final_test"), triples)
+        self.assertIn(("final_wait", "out", "if_final_test"), triples)
+        self.assertEqual(nodes["final_test"]["config"]["evidence_mode"], "pr_merge")
+        self.assertEqual(nodes["final_test"]["config"]["response_webhook_url"], "{{ TASKS.final_wait.pending.resumeUrl }}")
+        self.assertNotIn("evidence_mode", nodes["fix_test"]["config"])
+        merge_cfg = nodes["merge"]["config"]
+        self.assertEqual(merge_cfg["evidence_job_id"], "{{ TASKS.final_wait.request.body.job_id }}")
+        self.assertEqual(merge_cfg["test"], "{{ CTX.INPUT.test }}")
+        self.assertIn("WORKFLOW.runId", merge_cfg["run_id"])
+
+        outgoing = {}
+        for edge in edges:
+            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        def reaches(start, goal, seen=None):
+            seen = set() if seen is None else seen
+            if start == goal:
+                return True
+            if start in seen:
+                return False
+            seen.add(start)
+            return any(reaches(nxt, goal, seen.copy()) for nxt in outgoing.get(start, []))
+        for edge in edges:
+            if edge["target"] == "merge":
+                self.assertEqual((edge["source"], edge.get("sourceHandle")), ("switch_merge", "case-0"))
+        def merge_paths(node, path=()):
+            current = (*path, node)
+            if node == "merge":
+                return [current]
+            return [found for nxt in outgoing.get(node, []) if nxt not in current for found in merge_paths(nxt, current)]
+        paths = merge_paths("join_start")
+        self.assertTrue(paths)
+        for path in paths:
+            self.assertTrue({"join_final", "final_view", "final_checkout", "final_wait", "if_final_test"} <= set(path), path)
+        for source, handle in (("final_wait", "timeout"), ("final_wait", "failure"), ("if_final_test", "fail"), ("final_test", "failure")):
+            targets = [e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle]
+            self.assertTrue(targets, (source, handle))
+            self.assertTrue(all(not reaches(target, "merge") for target in targets), (source, handle, targets))
+
+    def test_pr_status_reports_remote_only_states_without_side_effects(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-status.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        types = {n["type"].lower() for n in nodes.values()}
+        for banned in ("/v1/test/run", "/v1/agent/run", "/v1/git/", "/v1/gh/pr/merge"):
+            self.assertFalse(any(banned in node_type for node_type in types), banned)
+        labels = " ".join(str(n.get("label", "")).lower() for n in nodes.values())
+        for state in ("no checks", "red", "pending", "blocking review", "malformed", "unknown", "inconsistent"):
+            self.assertIn(state, labels)
+        ready = nodes["done_remote_ready"]
+        dumped = json.dumps(ready).lower()
+        self.assertIn("remote_ready", dumped)
+        self.assertIn("named_test_required", dumped)
+        self.assertNotIn('"mergeable"', dumped)
+
+    def test_pr_graph_action_configs_match_openapi_request_shapes(self):
+        spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
+        ignored = {"integrationInstanceId", "timeout", "_comment"}
+        for filename in ("pr-drive.json", "pr-status.json"):
+            graph = json.loads((Path(server.__file__).parent / "graphs" / filename).read_text())
+            for node in graph["spec"]["nodes"]:
+                match = re.fullmatch(r"action\.graphwing\.(GET|POST):(.+)", node["type"])
+                if not match:
+                    continue
+                method, route = match.groups()
+                op = spec["paths"][route][method.lower()]
+                parameters = []
+                for parameter in op.get("parameters", []):
+                    if "$ref" in parameter:
+                        parameter = spec["components"]["parameters"][parameter["$ref"].split("/")[-1]]
+                    parameters.append(parameter)
+                allowed = {p.get("name") for p in parameters if isinstance(p, dict) and p.get("name")}
+                schema = op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+                if "$ref" in schema:
+                    schema = spec["components"]["schemas"][schema["$ref"].split("/")[-1]]
+                allowed |= set(schema.get("properties", {}))
+                configured = set(node.get("config", {})) - ignored
+                self.assertLessEqual(configured, allowed, (filename, node["id"], configured - allowed))
+
+    def test_openapi_documents_narrow_merge_evidence_contract_exactly(self):
+        spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
+        test_props = spec["components"]["schemas"]["TestRunRequest"]["properties"]
+        self.assertEqual(
+            {"evidence_mode", "repo", "pr", "run_id", "expected_head", "writer_job_id"},
+            set(test_props) - {"name", "response_webhook_url", "response_webhook_token", "resume_url"},
+        )
+        merge = spec["components"]["schemas"]["GhPrMergeRequest"]
+        self.assertEqual(set(merge["required"]), {"repo", "number", "auto_merge", "run_id", "test", "evidence_job_id"})
+        self.assertIn("match-head", spec["paths"]["/v1/gh/pr/merge"]["post"]["summary"].lower())
 
     def test_git_commit_names_an_empty_commit_for_what_it_is(self):
         # A run handed the writer findings that were already fixed. It
