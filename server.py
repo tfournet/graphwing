@@ -76,9 +76,9 @@ SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 NATIVE_LAUNCHERS = {
-    "codex": {"provider": "openai", "models": ("gpt-5.6-sol",)},
-    "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
-    "grok": {"provider": "xai", "models": ("grok-4.6",)},
+    "codex": {"provider": "openai", "models": ("gpt-5.6-sol",), "binary": "CODEX_BIN"},
+    "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5"), "binary": "CLAUDE_BIN"},
+    "grok": {"provider": "xai", "models": ("grok-4.6",), "binary": "GROK_BIN"},
 }
 FAILURE_CLASS_CODES = {
     "none": {"success"},
@@ -99,6 +99,10 @@ PROVIDER_FAILURE_GROUPS = (
     ("provider_network", {"network_error", "connection_error", "dns_error", "tls_error"}),
     ("provider_overloaded", {"overloaded", "overloaded_error", "service_unavailable"}),
 )
+PROVIDER_AVAILABILITY_CODES = frozenset(
+    FAILURE_CLASS_CODES["provider_availability"]
+    | {"provider_http_5xx", *(code for code, _ in PROVIDER_FAILURE_GROUPS)}
+)
 SLICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SLICE_KINDS = frozenset({"build", "decision"})
 SLICE_STATUSES = frozenset({"open", "done"})
@@ -106,10 +110,16 @@ SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
 ROUTE_VERSION = "normal-v1"
+FALLBACK_ROUTE_VERSION = "availability-fallback-v1"
 NORMAL_WRITER_ROUTES = {
     "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
     "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
     "research_ops": ("grok", "xai", "grok-4.6", "default"),
+}
+AVAILABILITY_FALLBACK_WRITER_ROUTES = {
+    "go_coding": ("claude", "anthropic", "claude-opus-5", "default"),
+    "typescript_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
+    "research_ops": ("claude", "anthropic", "claude-sonnet-5", "default"),
 }
 NORMAL_REVIEWER_ROUTES = {
     "openai": (
@@ -1477,24 +1487,50 @@ def slice_route_lookup(
     seams: int | None = None,
     work_kind: str | None = None,
 ) -> dict[str, Any]:
-    sized = bump_slice_size(size_floor, class_name, ac_count, seams)
-    turns, wait = SLICE_BUDGET[(class_name, sized)]
     if work_kind is None:
         raise ValueError("work_kind is required")
-    launcher, provider, model, effort = NORMAL_WRITER_ROUTES[work_kind]
+    return build_slice_route(
+        class_name,
+        size_floor,
+        ac_count,
+        seams,
+        work_kind,
+        NORMAL_WRITER_ROUTES[work_kind],
+        ROUTE_VERSION,
+        f"work_kind={work_kind}",
+    )
+
+
+def build_slice_route(
+    class_name: str,
+    size_floor: str,
+    ac_count: int | None,
+    seams: int | None,
+    work_kind: str,
+    writer: tuple[str, str, str, str],
+    route_version: str,
+    reason: str,
+    unavailable_provider: str | None = None,
+) -> dict[str, Any]:
+    sized = bump_slice_size(size_floor, class_name, ac_count, seams)
+    turns, wait = SLICE_BUDGET[(class_name, sized)]
+    launcher, provider, model, effort = writer
     if class_name == "sensitive":
         review_count = 2
     elif class_name == "mechanical" and sized == "S":
         review_count = 0
     else:
         review_count = 1
-    reviewers = list(NORMAL_REVIEWER_ROUTES[provider][:review_count])
+    reviewer_candidates = list(NORMAL_REVIEWER_ROUTES[provider])
+    if unavailable_provider:
+        reviewer_candidates.sort(key=lambda reviewer: reviewer[1] == unavailable_provider)
+    reviewers = reviewer_candidates[:review_count]
     while len(reviewers) < 2:
         reviewers.append(("none", "none", "none", "none"))
     reviewer1, reviewer2 = reviewers
     return {
         "ok": True,
-        "route_version": ROUTE_VERSION,
+        "route_version": route_version,
         "class": class_name,
         "work_kind": work_kind,
         "size_floor": size_floor,
@@ -1503,7 +1539,7 @@ def slice_route_lookup(
         "provider": provider,
         "model": model,
         "effort": effort,
-        "reason": f"work_kind={work_kind}",
+        "reason": reason,
         "max_turns": turns,
         "run_budget_seconds": wait,
         "reviewer1": reviewer1[2],
@@ -1524,30 +1560,124 @@ def slice_route_lookup(
     }
 
 
-def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
-    data, err = parse_json_object(body)
-    if err:
-        return 400, err
-    assert data is not None
+def parse_slice_route_common(data: dict[str, Any]) -> tuple[str, str, str, int | None, int | None, dict[str, Any] | None]:
     class_name = str(data.get("class") or "mechanical").strip()
     size_floor = str(data.get("size") or "M").strip()
     work_kind = str(data.get("work_kind") or "").strip()
     if class_name not in SLICE_CLASSES:
-        return 400, {"error": "class must be mechanical, visual, or sensitive", "code": "bad_class"}
+        return "", "", "", None, None, {"error": "class must be mechanical, visual, or sensitive", "code": "bad_class"}
     if size_floor not in SLICE_SIZES:
-        return 400, {"error": "size must be S, M, or L", "code": "bad_size"}
+        return "", "", "", None, None, {"error": "size must be S, M, or L", "code": "bad_size"}
     if work_kind not in SLICE_WORK_KINDS:
-        return 400, {
+        return "", "", "", None, None, {
             "error": "work_kind must be go_coding, typescript_coding, or research_ops",
             "code": "bad_work_kind",
         }
     ac_count, ac_err = parse_optional_int(data, "ac_count", 0, 99)
     if ac_err:
-        return 400, ac_err
+        return "", "", "", None, None, ac_err
     seams, seams_err = parse_optional_int(data, "seams", 0, 20)
     if seams_err:
-        return 400, seams_err
+        return "", "", "", None, None, seams_err
+    return class_name, size_floor, work_kind, ac_count, seams, None
+
+
+def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    class_name, size_floor, work_kind, ac_count, seams, common_err = parse_slice_route_common(data)
+    if common_err:
+        return 400, common_err
     return 200, slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
+
+
+def slice_route_fallback(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    class_name, size_floor, work_kind, ac_count, seams, common_err = parse_slice_route_common(data)
+    if common_err:
+        return 400, common_err
+    primary_route = data.get("primary_route")
+    if not isinstance(primary_route, dict):
+        return 400, {"error": "primary_route is required", "code": "missing_primary_route"}
+    receipt = data.get("primary_receipt")
+    if not isinstance(receipt, dict):
+        return 400, {"error": "primary_receipt is required", "code": "missing_primary_receipt"}
+
+    expected_primary_route = slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
+    if primary_route != expected_primary_route:
+        return 400, {"error": "primary route does not match normal route", "code": "primary_provider_mismatch"}
+    normal_launcher, normal_provider, normal_model, _ = NORMAL_WRITER_ROUTES[work_kind]
+
+    eligible = receipt.get("failover_eligible")
+    if not isinstance(eligible, bool):
+        return 400, {"error": "failover_eligible must be a boolean", "code": "bad_failover_eligible"}
+    if (
+        receipt.get("status") != "error"
+        or receipt.get("role") != "primary"
+        or receipt.get("failure_class") != "provider_availability"
+        or not eligible
+    ):
+        return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
+    session_identity = receipt.get("session_identity")
+    if not isinstance(session_identity, dict) or any(
+        session_identity.get(key) != value
+        for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
+    ):
+        return 400, {"error": "receipt session_identity does not match normal route", "code": "primary_provider_mismatch"}
+
+    failure_code = str(receipt.get("failure_code") or "unknown_failure").strip() or "unknown_failure"
+    if failure_code not in PROVIDER_AVAILABILITY_CODES:
+        return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"error": "invalid primary receipt job_id", "code": "bad_job_id"}
+    stored_job = read_job(job_id)
+    stored_receipt = stored_job.get("receipt") if isinstance(stored_job, dict) else None
+    receipt_fields = (
+        "status", "job_id", "session_identity", "failure_class", "failure_code", "failover_eligible",
+    )
+    if (
+        not isinstance(stored_receipt, dict)
+        or stored_job.get("status") != "failed"
+        or stored_job.get("session_identity") != session_identity
+        or any(receipt.get(key) != stored_receipt.get(key) for key in receipt_fields)
+        or any(
+            stored_job.get(key) != value
+            for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
+        )
+    ):
+        return 400, {"error": "primary receipt does not match its stored job", "code": "primary_receipt_mismatch"}
+    fallback = build_slice_route(
+        class_name,
+        size_floor,
+        ac_count,
+        seams,
+        work_kind,
+        AVAILABILITY_FALLBACK_WRITER_ROUTES[work_kind],
+        FALLBACK_ROUTE_VERSION,
+        f"availability_fallback:{failure_code}",
+        normal_provider,
+    )
+    selected = {
+        key: fallback[key]
+        for key in ("route_version", "launcher", "provider", "model", "effort", "reason")
+    }
+    fallback.update(
+        {
+            "role": "availability_fallback",
+            "primary_route_version": primary_route.get("route_version"),
+            "primary_reason": primary_route.get("reason"),
+            "fallback_reason": fallback["reason"],
+            "fallback_code": failure_code,
+            "selected_alternate_route": selected,
+        }
+    )
+    return 200, fallback
 
 
 def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -3488,7 +3618,10 @@ def run_agent_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    if job.get("launcher") == "grok":
+    binary = globals()[NATIVE_LAUNCHERS[job["launcher"]]["binary"]]
+    if not binary.is_file():
+        proc, err = None, {"error": f"missing {job['launcher']} binary: {binary}", "code": "missing_binary"}
+    elif job.get("launcher") == "grok":
         returncode, timed_out, session_id, protocol_error = run_grok_acp(job)
         proc, err = None, None
     else:
@@ -3502,6 +3635,7 @@ def run_agent_job(job_id: str) -> None:
             evidence_code=str(err.get("code") or "unknown_failure"),
         )
         job["receipt"]["summary"] = err.get("error")
+        write_job(job)
         hook = deliver_webhook(job, job["receipt"])
         if hook is not None:
             job["webhook"] = hook
@@ -3527,7 +3661,7 @@ def run_agent_job(job_id: str) -> None:
     session_id = session_id or parse_native_session_id(stdout, str(job.get("launcher") or ""))
     session_error: str | None = None
     session_evidence: str | None = None
-    if returncode == 0 and not timed_out:
+    if (returncode == 0 and not timed_out) or (session_id and structured_provider_failure(stdout)):
         expected_session = (job.get("session_identity") or {}).get("native_session_id")
         session_error = record_native_session(job, session_id)
         if session_error:
@@ -3545,8 +3679,8 @@ def run_agent_job(job_id: str) -> None:
         receipt["status"] = "error"
         receipt["summary"] = failure_summary
     job = read_job(job_id) or job
-    if session_id and not failure_summary and isinstance(job.get("session_identity"), dict):
-        job["session_identity"]["native_session_id"] = session_id
+    if isinstance(receipt.get("session_identity"), dict):
+        job["session_identity"] = dict(receipt["session_identity"])
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
     job["receipt"] = receipt
@@ -3555,6 +3689,7 @@ def run_agent_job(job_id: str) -> None:
         job["error"] = "agent run budget exceeded"
     elif receipt["status"] != "ok" and not job.get("error"):
         job["error"] = receipt.get("summary") or f"agent exited {returncode}"
+    write_job(job)
     hook = deliver_webhook(job, receipt)
     if hook is not None:
         job["webhook"] = hook
@@ -3778,8 +3913,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
     if budget_err:
         return 400, budget_err
-    binary = {"claude": CLAUDE_BIN, "codex": CODEX_BIN, "grok": GROK_BIN}[launcher]
-    if not binary.is_file():
+    binary = globals()[native_spec["binary"]]
+    if not binary.is_file() and not webhook_url:
         code = "missing_binary" if launcher == "grok" else "provider_unavailable"
         classified = classify_agent_failure("missing_binary")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": code, **classified}
@@ -3934,6 +4069,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route":
         status, payload = slice_route(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/route/fallback":
+        status, payload = slice_route_fallback(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/review/run":
         status, payload = review_run(body, repos)

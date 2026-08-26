@@ -457,6 +457,22 @@
         }
       }
     },
+    "/v1/slice/route/fallback": {
+      "post": {
+        "operationId": "sliceRouteFallback",
+        "tags": ["slice"],
+        "summary": "Deterministic one-hop alternate writer for initial provider availability failures only.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRouteFallbackRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "fallback row", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRoute" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/slice/e2e": {
       "post": {
         "operationId": "sliceE2e",
@@ -1140,11 +1156,24 @@
           "seams": { "type": "integer" }
         }
       },
+      "SliceRouteFallbackRequest": {
+        "type": "object",
+        "required": ["work_kind", "primary_route", "primary_receipt"],
+        "properties": {
+          "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
+          "size": { "type": "string", "enum": ["S", "M", "L"] },
+          "ac_count": { "type": "integer" },
+          "seams": { "type": "integer" },
+          "primary_route": { "$ref": "#/components/schemas/SliceRoute" },
+          "primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" }
+        }
+      },
       "SliceRoute": {
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
-          "route_version": { "type": "string", "enum": ["normal-v1"] },
+          "route_version": { "type": "string", "enum": ["normal-v1", "availability-fallback-v1"] },
           "class": { "type": "string" },
           "work_kind": { "type": "string" },
           "size": { "type": "string" },
@@ -1168,7 +1197,13 @@
           "reviewer2_model": { "type": "string" },
           "reviewer2_effort": { "type": "string", "enum": ["none", "high", "default"] },
           "reviewer2_reason": { "type": "string" },
-          "review": { "type": "string" }
+          "review": { "type": "string" },
+          "role": { "type": "string", "enum": ["primary", "availability_fallback"] },
+          "primary_route_version": { "type": "string" },
+          "primary_reason": { "type": "string" },
+          "fallback_reason": { "type": "string" },
+          "fallback_code": { "type": "string" },
+          "selected_alternate_route": { "type": "object" }
         }
       },
       "SliceE2eRequest": {
@@ -1348,6 +1383,7 @@
         "properties": {
           "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
           "job_id": { "type": "string" },
+          "role": { "type": "string", "enum": ["primary", "availability_fallback"] },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
