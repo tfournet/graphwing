@@ -325,7 +325,7 @@
       "post": {
         "operationId": "gitCommit",
         "tags": ["git"],
-        "summary": "Commit in an allowlisted repo. Optional add is relative paths only. Default does not git add -A; omitted add commits already-staged files.",
+        "summary": "Commit in an allowlisted repo. Without writer_job_id, commit the real staged index after optional explicit adds. With writer_job_id, commit only attributed writer paths plus explicit add paths using an isolated index.",
         "requestBody": {
           "required": true,
           "content": {
@@ -344,7 +344,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -680,6 +681,7 @@
           },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "501": { "$ref": "#/components/responses/DiagnosticError" }
         }
@@ -1069,8 +1071,9 @@
           "message": { "type": "string", "description": "Commit message. Empty refused." },
           "codeoff_experiment_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,63}$", "description": "Optional terminal code-off gate; requires matching final_verification_hash." },
           "final_verification_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "writer_job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "Successful writer job whose server-attributed paths are the only model changes committed. The commit fails closed if any attributed path changes after the successful receipt." },
           "add": {
-            "description": "Relative paths to git add before commit, or a single path string. Omitted: commit already-staged files only. No .. or absolute paths. Default does not add -A.",
+            "description": "Relative paths to add before commit, or a single path string. Without writer_job_id, paths are added to the real index and omitted add commits the real staged index. With writer_job_id, explicit paths are also added to the real index, but the commit is built from only attributed writer paths plus explicit paths using an isolated index. No .. or absolute paths; add -A is never used.",
             "oneOf": [
               { "type": "string" },
               { "type": "array", "items": { "type": "string" } }
@@ -1541,7 +1544,9 @@
             "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"]
           },
           "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"] },
-          "failover_eligible": { "type": "boolean" }
+          "failover_eligible": { "type": "boolean" },
+          "blocker_kind": { "type": "string", "enum": ["agent", "codeoff", "script", "test", "rr", "review"] },
+          "blocker_job_id": { "type": "string", "pattern": "^([0-9a-f]{32}|unknown)$" }
         }
       }
     },

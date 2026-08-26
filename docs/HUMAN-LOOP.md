@@ -37,7 +37,7 @@ Use your normal editor or terminal. Do not reconstruct operating rules from an o
 3. `agentRun` starts one bounded native session and returns a receipt with structured session identity.
 4. `testRun` runs the allowlisted ticket and story recipe.
 5. Opposing-provider review gates commit when required.
-6. The writer stages named files. Graph commits and pushes only after green gates.
+6. Graphwing attributes and stages only the writer-produced paths after a valid receipt. Graph commits and pushes only after green gates.
 
 Go uses Codex, TypeScript uses Claude, and research/operations uses Grok. Mechanical S skips model review. Other work gets one opposing-provider review; sensitive work gets two. Missing launchers, model mismatches, untraceable resumes, missing session identity, and invalid receipts fail closed.
 

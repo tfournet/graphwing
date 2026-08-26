@@ -884,6 +884,98 @@ def run_git(cwd: Path, args: list[str]) -> dict[str, Any]:
     return run_cmd(["git", "-C", str(cwd), *args], cwd=cwd)
 
 
+def run_git_pathspec(cwd: Path, args: list[str], paths: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="graphwing-pathspec-") as temp_dir:
+        source = Path(temp_dir) / "paths"
+        source.write_bytes(b"".join(os.fsencode(f":(literal){rel}") + b"\0" for rel in paths))
+        return run_cmd([
+            "git", "-C", str(cwd), *args, f"--pathspec-from-file={source}", "--pathspec-file-nul",
+        ], cwd=cwd, env=env)
+
+
+def _writer_status_paths(path: Path) -> tuple[set[str] | None, dict[str, Any] | None]:
+    result = run_git(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    if not result.get("ok") or result.get("truncated"):
+        return None, {"error": "could not snapshot complete writer paths", "code": "repository_mismatch"}
+    fields, paths, index = result["stdout"].split("\0"), set(), 0
+    while index < len(fields) and fields[index]:
+        record = fields[index]
+        if len(record) < 4:
+            return None, {"error": "malformed git status", "code": "repository_mismatch"}
+        paths.add(record[3:])
+        if record[0] in "RC" or record[1] in "RC":
+            index += 1
+            if index >= len(fields) or not fields[index]:
+                return None, {"error": "malformed git rename status", "code": "repository_mismatch"}
+            paths.add(fields[index])
+        index += 1
+    return paths, None
+
+
+def _writer_path_fingerprint(repo: Path, rel: str) -> str:
+    digest = hashlib.sha256()
+    index = run_git(repo, ["ls-files", "-s", "--", f":(literal){rel}"])
+    digest.update((index.get("stdout") or "").encode())
+    target = repo / rel
+    try:
+        mode = target.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            digest.update(b"symlink\0" + os.readlink(target).encode())
+        elif stat.S_ISREG(mode):
+            digest.update(b"file\0")
+            with target.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(f"mode:{mode}".encode())
+    except OSError:
+        digest.update(b"missing")
+    return digest.hexdigest()
+
+
+def capture_writer_baseline(repo: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    paths, err = _writer_status_paths(repo)
+    if err:
+        return None, err
+    return {"dirty": {rel: _writer_path_fingerprint(repo, rel) for rel in sorted(paths or ())}}, None
+
+
+def stage_writer_changes(job: dict[str, Any]) -> dict[str, Any] | None:
+    repo = Path(job["cwd"])
+    baseline = job.get("git_baseline")
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("dirty"), dict):
+        return {"error": "writer baseline is missing", "code": "repository_mismatch"}
+    identity = job.get("session_identity") or {}
+    if identity.get("starting_head"):
+        branch, head, err = current_branch_head(repo)
+        if err or branch != identity.get("branch") or head != identity.get("starting_head"):
+            return {"error": "repository changed during writer job", "code": "repository_mismatch"}
+    current, err = _writer_status_paths(repo)
+    if err:
+        return err
+    inherited = set(job.get("writer_parent_paths") or ())
+    dirty = baseline["dirty"]
+    conflicts = sorted(rel for rel, before in dirty.items() if rel not in inherited and _writer_path_fingerprint(repo, rel) != before)
+    if conflicts:
+        return {"error": "writer changed pre-existing dirty paths", "code": "writer_dirty_conflict", "paths": conflicts[:8], "more_paths": max(0, len(conflicts) - 8)}
+    paths = sorted(((current or set()) - set(dirty)) | (inherited & (current or set())))
+    for rel in paths:
+        _target, path_err = safe_relpath(repo, rel)
+        if path_err:
+            return path_err
+    if paths:
+        added = run_git_pathspec(repo, ["add"], paths)
+        if not added.get("ok"):
+            return {"error": "Graphwing could not stage writer paths", "code": "repository_mismatch"}
+        staged, staged_err = _writer_status_paths(repo)
+        if staged_err:
+            return staged_err
+        paths = sorted(set(paths) & (staged or set()))
+    job["writer_paths"] = paths
+    job["writer_fingerprints"] = {rel: _writer_path_fingerprint(repo, rel) for rel in paths}
+    return None
+
+
 def git_status(path: Path) -> dict[str, Any]:
     r = run_git(path, ["status", "--porcelain=v1", "-b"])
     if not r.get("ok"):
@@ -1201,21 +1293,81 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     add = data.get("add")
     if isinstance(add, str):
         add = [add]
-    if add is not None:
-        if not isinstance(add, list) or not all(isinstance(x, str) for x in add):
-            return 400, {"error": "add must be a list of relative paths or one path string", "code": "bad_add"}
-        rels: list[str] = []
-        for rel in add:
-            _target, perr = safe_relpath(resolved, rel)
-            if perr:
-                perr["ok"] = False
-                return 400, perr
-            rels.append(rel)
+    if add is not None and (not isinstance(add, list) or not all(isinstance(x, str) for x in add)):
+        return 400, {"error": "add must be a list of relative paths or one path string", "code": "bad_add"}
+    rels: list[str] = []
+    for rel in add or []:
+        _target, perr = safe_relpath(resolved, rel)
+        if perr:
+            perr["ok"] = False
+            return 400, perr
+        rels.append(rel)
+    writer_id = data.get("writer_job_id")
+    if writer_id == "":
+        writer_id = None
+    writer_paths: list[str] = []
+    if writer_id is not None:
+        writer = read_job(writer_id) if isinstance(writer_id, str) and JOB_ID_RE.fullmatch(writer_id) else None
+        descendants: dict[str, list[dict[str, Any]]] = {}
+        for path in JOBS_DIR.glob("*/job.json"):
+            child = read_job(path.parent.name) or {}
+            parent_id = child.get("writer_parent_job_id")
+            if parent_id and child.get("status") == "completed" and (child.get("receipt") or {}).get("status") == "ok":
+                descendants.setdefault(parent_id, []).append(child)
+        visited_writer_jobs: set[str] = set()
+        while writer:
+            current_writer_id = writer.get("job_id")
+            if not isinstance(current_writer_id, str) or current_writer_id in visited_writer_jobs:
+                return 409, {"error": "writer resume chain is cyclic", "code": "writer_job_mismatch"}
+            visited_writer_jobs.add(current_writer_id)
+            children = descendants.get(current_writer_id, [])
+            if len(children) > 1:
+                return 409, {"error": "writer resume chain is ambiguous", "code": "writer_job_mismatch"}
+            if not children:
+                break
+            writer = children[0]
+        receipt = writer.get("receipt") if isinstance(writer, dict) else None
+        identity = writer.get("session_identity") if isinstance(writer, dict) else None
+        branch, head, state_err = current_branch_head(resolved)
+        if (
+            not writer or writer.get("status") != "completed" or not isinstance(receipt, dict)
+            or receipt.get("status") != "ok" or writer.get("repo") != name
+            or Path(str(writer.get("cwd") or "")).resolve() != resolved.resolve()
+            or not isinstance(identity, dict) or branch != identity.get("branch")
+            or head != identity.get("starting_head") or state_err
+        ):
+            return 409, {"error": "writer job is not valid for this commit", "code": "writer_job_mismatch"}
+        writer_paths = writer.get("writer_paths") if isinstance(writer.get("writer_paths"), list) else []
+        dirty_before = set((writer.get("git_baseline") or {}).get("dirty") or {})
+        overlap = sorted(rel for rel in rels if rel in dirty_before and rel not in writer_paths)
+        if overlap:
+            return 409, {"error": "commit paths overlap pre-existing dirty state", "code": "writer_dirty_conflict", "paths": overlap[:8], "more_paths": max(0, len(overlap) - 8)}
+        changed = sorted(rel for rel in writer_paths if _writer_path_fingerprint(resolved, rel) != (writer.get("writer_fingerprints") or {}).get(rel))
+        if changed:
+            return 409, {"error": "writer paths changed after their receipt", "code": "writer_paths_changed", "paths": changed[:8], "more_paths": max(0, len(changed) - 8)}
+    commit_paths = list(dict.fromkeys([*writer_paths, *rels]))
+    if writer_id is not None and not commit_paths:
+        return 400, {"ok": False, "repo": name, "code": "nothing_staged", "error": "writer job produced no commit paths"}
+    if writer_id is None:
         if rels:
-            added = run_git(resolved, ["add", "--", *rels])
+            added = run_git_pathspec(resolved, ["add"], rels)
             if not added.get("ok"):
                 return git_write_result(name, added)
-    out = run_git(resolved, ["commit", "-m", message.strip()])
+        out = run_git(resolved, ["commit", "-m", message.strip()])
+    else:
+        if rels:
+            added = run_git_pathspec(resolved, ["add"], rels)
+            if not added.get("ok"):
+                return git_write_result(name, added)
+        with tempfile.TemporaryDirectory(prefix="graphwing-commit-") as temp_dir:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
+            prepared = run_cmd(["git", "-C", str(resolved), "read-tree", "HEAD"], cwd=resolved, env=env)
+            if not prepared.get("ok"):
+                return git_write_result(name, prepared)
+            added = run_git_pathspec(resolved, ["add"], commit_paths, env=env)
+            if not added.get("ok"):
+                return git_write_result(name, added)
+            out = run_cmd(["git", "-C", str(resolved), "commit", "-m", message.strip()], cwd=resolved, env=env)
     if not out.get("ok"):
         blob = ((out.get("stdout") or "") + (out.get("stderr") or "")).lower()
         # An empty commit is still a failed slice, per the lock. It is just a
@@ -3185,6 +3337,70 @@ def active_job_count() -> int:
     return n
 
 
+PROCESS_JOB_KINDS = frozenset({"agent", "script", "test", "review", "rr"})
+
+
+def interrupted_job_receipt(job: dict[str, Any], kind: str) -> dict[str, Any]:
+    summary = f"{kind} job interrupted by Graphwing restart"[:500]
+    if kind == "agent":
+        return {
+            "status": "error", "job_id": job["job_id"],
+            "session_identity": job.get("session_identity"), "sha": None, "pr_url": None,
+            "log_ref": job.get("log_ref"), "summary": summary,
+            **classify_agent_failure("cancelled"),
+        }
+    if kind == "review":
+        return {
+            "status": "nack", "job_id": job["job_id"], "verdict": None,
+            "no_verdict": True, "reviewer": job.get("model"),
+            "launcher": job.get("launcher"), "provider": job.get("provider"),
+            "model": job.get("model"), "summary": summary, "compact": summary,
+        }
+    return {
+        "status": "error", "job_id": job["job_id"],
+        "log_ref": job.get("log_ref"), "summary": summary,
+    }
+
+
+def recover_interrupted_agent_jobs() -> int:
+    """At process startup only, close process-owned jobs no process can still own."""
+    recovered: list[dict[str, Any]] = []
+    with JOB_LOCK:
+        for path in JOBS_DIR.glob("*/job.json") if JOBS_DIR.is_dir() else ():
+            job = read_job(path.parent.name) or {}
+            raw_kind = job.get("kind")
+            kind = "agent" if raw_kind in (None, "agent") else (raw_kind if isinstance(raw_kind, str) else None)
+            launcher = job.get("launcher")
+            job_id = job.get("job_id")
+            if (
+                job.get("status") not in ("queued", "running")
+                or kind not in PROCESS_JOB_KINDS
+                or (kind == "agent" and (not isinstance(launcher, str) or launcher not in NATIVE_LAUNCHERS))
+                or job.get("codeoff_workspace")
+                or not isinstance(job_id, str)
+                or not JOB_ID_RE.fullmatch(job_id)
+                or job_id != path.parent.name
+            ):
+                continue
+            receipt = interrupted_job_receipt(job, kind)
+            job.update({
+                "status": "failed", "finished_at": utcnow(), "receipt": receipt,
+                "error": receipt["summary"], "returncode": None,
+            })
+            job.pop("pid", None)
+            write_job(job)
+            recovered.append(job)
+    for job in recovered:
+        try:
+            delivered = deliver_webhook(job, job["receipt"])
+        except Exception:
+            delivered = {"ok": False}
+        if delivered is not None:
+            job["webhook"] = {key: delivered[key] for key in ("ok", "status") if key in delivered}
+            write_job(job)
+    return len(recovered)
+
+
 WATCH_RECENT = 8
 WATCH_TITLE_CHARS = 72
 WATCH_ERROR_CHARS = 120
@@ -3590,7 +3806,7 @@ def wrap_prompt(job_id: str, prompt: str, cwd: str) -> str:
         "Do not research+write+review+ship.\n"
         f"Working directory is {root}. Create and edit files only inside that directory. "
         "Do not write to any other path.\n"
-        "Stage the files you changed with `git add --` and relative paths only. No `git add -A`.\n"
+        "Do not stage files. Graphwing stages only paths attributed to this job after your receipt.\n"
         "Do not git commit, git push, or open a PR. Graph owns those ops.\n"
         "Do not `git checkout` another branch. Graph already checked out the job branch.\n"
         "Finish with a single JSON object and nothing after it:\n"
@@ -4340,6 +4556,17 @@ def _codeoff_execution_identity(
     return compact
 
 
+def staging_failure_summary(failure: dict[str, Any]) -> str:
+    summary = str(failure.get("error") or "Graphwing could not verify or stage writer paths")[:300]
+    raw_paths = failure.get("paths") if isinstance(failure.get("paths"), list) else []
+    paths = []
+    for raw in raw_paths[:3]:
+        safe = "".join(char if char.isprintable() and char not in "\r\n" else "?" for char in str(raw))[:80]
+        if safe:
+            paths.append(safe)
+    return (summary + (": " + ", ".join(paths) if paths else ""))[:500]
+
+
 def run_agent_job(job_id: str) -> None:
     job = read_job(job_id)
     if not job:
@@ -4421,6 +4648,16 @@ def run_agent_job(job_id: str) -> None:
     job = read_job(job_id) or job
     if isinstance(receipt.get("session_identity"), dict):
         job["session_identity"] = dict(receipt["session_identity"])
+    if receipt["status"] == "ok" and job.get("git_baseline"):
+        try:
+            with repo_lock(Path(job["cwd"])):
+                staging_err = stage_writer_changes(job)
+        except Exception:
+            staging_err = {"error": "Graphwing could not verify or stage writer paths", "code": "repository_mismatch"}
+        if staging_err:
+            receipt["status"] = "error"
+            receipt["summary"] = staging_failure_summary(staging_err)
+            receipt.update(classify_agent_failure("repository_mismatch"))
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
     job["receipt"] = receipt
@@ -5931,6 +6168,10 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if not binary.is_file() and not webhook_url:
         classified = classify_agent_failure("missing_binary")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": "missing_binary", **classified}
+    if codeoff is None:
+        top = run_git(resolved, ["rev-parse", "--show-toplevel"])
+        if not top.get("ok") or Path(str(top.get("stdout") or "").strip()).resolve() != resolved.resolve():
+            return 400, {"error": "ordinary writer repo alias must be the Git worktree top level", "code": "repo_not_toplevel"}
     branch, head, git_err = current_branch_head(resolved)
     if git_err:
         return 400, git_err
@@ -5941,6 +6182,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "launcher": launcher, "provider": provider, "model": model,
         "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
     }
+    resume_parent: dict[str, Any] | None = None
     if requested_identity is not None:
         if requested_identity.get("native_session_id") is None:
             return 400, {"error": "resume session_identity requires native_session_id", "code": "missing_native_session"}
@@ -5950,10 +6192,29 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         provenance_err = validate_native_resume_provenance(data, requested_identity, launcher)
         if provenance_err:
             return 400, provenance_err
+        if codeoff is None:
+            resume_parent = read_job(str(data["resume_job_id"])) or {}
+            try:
+                same_cwd = (
+                    isinstance(resume_parent.get("cwd"), str)
+                    and Path(resume_parent["cwd"]).resolve() == resolved.resolve()
+                )
+            except (OSError, RuntimeError, ValueError):
+                same_cwd = False
+            if resume_parent.get("repo") != repo_name or not same_cwd:
+                return 400, {
+                    "error": "resume job belongs to another repository checkout",
+                    "code": "resume_repository_mismatch",
+                }
         session_identity = requested_identity
     elif data.get("resume_job_id") not in (None, ""):
         return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
-    with (CODEOFF_LOCK if codeoff is not None else nullcontext()), JOB_LOCK:
+    writer_parent_paths: list[str] = []
+    if resume_parent is not None:
+        parent_paths = resume_parent.get("writer_paths")
+        if isinstance(parent_paths, list):
+            writer_parent_paths = [path for path in parent_paths if isinstance(path, str)]
+    with (CODEOFF_LOCK if codeoff is not None else nullcontext()), (repo_lock(resolved) if codeoff is None else nullcontext()), JOB_LOCK:
         if codeoff is not None:
             fresh_root, fresh_manifest, fresh_state, fresh_err = _codeoff_load(codeoff["manifest"]["experiment_id"], active=True)
             if fresh_err:
@@ -5966,6 +6227,23 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             if resume_job_id in (None, "") and prior_jobs:
                 return 409, {"error": "slot is already launched; replacement/redraw is forbidden", "code": "slot_already_launched"}
             codeoff.update({"root": fresh_root, "manifest": fresh_manifest, "state": fresh_state})
+        if codeoff is None:
+            for path in JOBS_DIR.glob("*/job.json"):
+                active = read_job(path.parent.name) or {}
+                if active.get("status") not in ("queued", "running") or Path(str(active.get("cwd") or "")).resolve() != resolved.resolve():
+                    continue
+                raw_kind = str(active.get("kind") or "")
+                blocker_kind = "codeoff" if active.get("codeoff_workspace") else (raw_kind if raw_kind in {"script", "test", "rr", "review"} else "agent")
+                blocker_id = str(active.get("job_id") or path.parent.name)
+                return 409, {
+                    "error": f"{blocker_kind} job owns this checkout", "code": "writer_checkout_busy",
+                    "blocker_kind": blocker_kind, "blocker_job_id": blocker_id if JOB_ID_RE.fullmatch(blocker_id) else "unknown",
+                }
+            git_baseline, baseline_err = capture_writer_baseline(resolved)
+            if baseline_err:
+                return 409, baseline_err
+        else:
+            git_baseline = None
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
@@ -5993,6 +6271,10 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "error": None,
             "webhook": None,
         }
+        if git_baseline is not None:
+            job["git_baseline"] = git_baseline
+            job["writer_parent_paths"] = writer_parent_paths
+            job["writer_parent_job_id"] = data.get("resume_job_id")
         if codeoff is not None:
             job["codeoff_workspace"] = {"experiment_id": codeoff["manifest"]["experiment_id"], "slot": codeoff["slot"]}
             job["prompt_hash"] = codeoff["prompt_hash"]
@@ -6329,6 +6611,7 @@ def main() -> None:
     if not OPENAPI_PATH.is_file():
         raise SystemExit(f"missing {OPENAPI_PATH}")
     httpd = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    recover_interrupted_agent_jobs()
     print(f"graphwing listening on http://{LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     httpd.serve_forever()
 
