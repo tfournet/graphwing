@@ -11419,7 +11419,7 @@ def supervisor_decide(
     stage = str(build.get("stage") or "")
     out["build_stage"] = stage
 
-    receipt = (build_event_seen(build) or {}).get(event_id)
+    receipt = supervisor_terminal_event_receipt(build, event_id, launch.get("job_id"))
     job_state, _job = supervisor_local_job(launch.get("job_id"))
     out["local_job_status"] = job_state
     if job_state == "active":
@@ -11498,6 +11498,45 @@ def supervisor_decide(
         out["attempts"] = counters["attempts"]
         return {**out, "action": "retry_event", "park_reason": None}
     return give_up("deterministic_failure" if failure["class"] == "deterministic" else "retry_exhausted")
+
+
+def supervisor_terminal_event_receipt(
+    build: dict[str, Any], event_id: str, job_id: Any = None
+) -> dict[str, Any] | None:
+    """Find this source run's terminal Graphwing receipt under its bounded event prefix.
+
+    The Rewst run registers one base event id. Individual Graphwing operations
+    append stable suffixes (`.claim-initial`, `.writer-done`, `.fast`, and so
+    on), so looking up only the base id misses the receipt the same run wrote.
+    A bound local job is the strongest link. Synchronous phases have no job and
+    use the latest non-claim receipt under the exact registered prefix.
+    """
+    seen = build_event_seen(build) or {}
+    exact = seen.get(event_id)
+    if isinstance(exact, dict) and exact.get("fingerprint"):
+        return exact
+    prefix = event_id + "."
+    candidates: list[dict[str, Any]] = []
+    for key in reversed(build.get("event_order") or []):
+        if not isinstance(key, str) or not key.startswith(prefix):
+            continue
+        entry = seen.get(key)
+        receipt = entry.get("receipt") if isinstance(entry, dict) else None
+        if not isinstance(entry, dict) or not entry.get("fingerprint") or not isinstance(receipt, dict):
+            continue
+        if receipt.get("action") == "claim":
+            continue
+        if isinstance(job_id, str) and job_id:
+            if receipt.get("job_id") == job_id:
+                return entry
+            if receipt.get("job_id") in (None, ""):
+                candidates.append(entry)
+            continue
+        return entry
+    # A registered job may have a terminal operation receipt that predates the
+    # bind field on legacy state. Accept only when there is one unambiguous
+    # non-claim candidate under this event prefix.
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def supervisor_reconcile(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:

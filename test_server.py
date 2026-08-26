@@ -6576,6 +6576,27 @@ class CompletionSupervisorTests(unittest.TestCase):
 
     # -- reconciliation: the resolved paths ---------------------------------
 
+    def test_suffixed_terminal_receipt_is_bound_to_the_registered_job(self):
+        job = "a" * 32
+        build = {
+            "event_order": [f"{self.EVENT}.claim-initial", f"{self.EVENT}.writer-done"],
+            "event_seen": {
+                f"{self.EVENT}.claim-initial": {
+                    "fingerprint": "claim",
+                    "receipt": {"action": "claim", "job_id": job},
+                },
+                f"{self.EVENT}.writer-done": {
+                    "fingerprint": "done",
+                    "receipt": {"action": "writer_done", "job_id": job},
+                },
+            },
+        }
+        found = server.supervisor_terminal_event_receipt(build, self.EVENT, job)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["receipt"]["action"], "writer_done")
+        self.assertIsNone(server.supervisor_terminal_event_receipt(build, self.EVENT, "b" * 32))
+
     def test_a_run_that_recorded_its_terminal_receipt_repeats_no_work(self):
         job = self._write_job("1" * 32, "running")
         self.assertEqual(self._register()[0], 201)
