@@ -5,8 +5,8 @@
   "description": "One bounded invocation of the shared mechanical-and-sensitive pre-PR path. buildNext names the one step and, for review, the exact role and reviewer this run may use; the caller never asserts a stage. The initial turn is preflight → buildClaim → buildWriterLaunch → buildWriterComplete. A correction uses the same authoritative operations and resumes the claimed writer session. buildClaim is durable, keyed on the event id, and charges the job budget before an agent exists. Every idempotent build operation uses the event-scoped holder, so another Rewst run can replay the same event. Fast checks and reviews run behind wait webhooks and apply their own successful gates with the verdict write; a primary terminal provider failure stays visible while Rewst alone routes one explicit failover transition. Sensitive runs Terra behavior review and Grok security review as separate invocations against the same durable change and evidence identity. A sensitive visible build terminates at an explicit visual-evidence handoff until that separate path records its required proof. Their direct success paths end the invocation; buildGate remains only for a buildNext recovery step. A reviewer finding ends in correction state. Integration runs on a named clean stack. buildFinalize is the only commit and push operation. Every refusal ends at a named fail-closed terminal. Payload: build_id, event_id, commit_message, optional stack and reviewer. No cycle, no self-kick: the next step is a new invocation. The source workflow is tagged graphwing-supervised and supervisorRegister is the first executable action: it durably records the Rewst run, exact planning pane, expected stage, deadline, and continuation inputs before any mechanical side effect. Every acknowledged local writer, check, or review job is bound to that source run; registration or binding failure ends fail closed.",
   "config": {
     "outputs": [
-      { "name": "build_id", "type": "string", "binding": "CTX.INPUT.build_id" },
-      { "name": "event_id", "type": "string", "binding": "CTX.INPUT.event_id" }
+      { "name": "build_id", "type": "string", "binding": "CTX.build_id" },
+      { "name": "event_id", "type": "string", "binding": "CTX.event_id" }
     ],
     "tags": { "info": ["graphwing-supervised"] }
   },
@@ -71,6 +71,30 @@
         "label": "Start from any trigger",
         "position": { "x": 140, "y": 200 },
         "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "completion_build_id",
+        "type": "transforms.codeExpression",
+        "label": "Completion output: build id",
+        "position": { "x": 210, "y": 160 },
+        "config": {
+          "alias": "build_id",
+          "outputType": "string",
+          "outputSchema": { "type": "string" },
+          "code": { "inputKind": "code", "language": "jinja", "code": "{{ CTX.INPUT.build_id }}" }
+        }
+      },
+      {
+        "id": "completion_event_id",
+        "type": "transforms.codeExpression",
+        "label": "Completion output: event id",
+        "position": { "x": 250, "y": 160 },
+        "config": {
+          "alias": "event_id",
+          "outputType": "string",
+          "outputSchema": { "type": "string" },
+          "code": { "inputKind": "code", "language": "jinja", "code": "{{ CTX.INPUT.event_id }}" }
+        }
       },
 
       {
@@ -1082,7 +1106,9 @@
       { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
       { "id": "e_start_form", "source": "form", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
       { "id": "e_start_hook", "source": "hook", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
-      { "id": "e_start_register", "source": "join_start", "sourceHandle": "out", "target": "register", "targetHandle": "in" },
+      { "id": "e_start_build_output", "source": "join_start", "sourceHandle": "out", "target": "completion_build_id", "targetHandle": "in" },
+      { "id": "e_start_event_output", "source": "completion_build_id", "sourceHandle": "out", "target": "completion_event_id", "targetHandle": "in" },
+      { "id": "e_start_register", "source": "completion_event_id", "sourceHandle": "out", "target": "register", "targetHandle": "in" },
 
       { "id": "e_next_ok", "source": "next", "sourceHandle": "success", "target": "switch_step", "targetHandle": "in" },
       { "id": "e_next_bad", "source": "next", "sourceHandle": "failure", "target": "map_next_fail", "targetHandle": "in" },

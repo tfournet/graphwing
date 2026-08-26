@@ -207,7 +207,8 @@ def verify_workflow_output_schema_parity(mcp: str, workflow_id: str, expected: d
         raise SystemExit(f"{slug} output schema readback HTTP {status}; no parity receipt")
     current = body.get("currentVersion") if isinstance(body, dict) else None
     live = current.get("outputSchema") if isinstance(current, dict) else None
-    return require_catalog_parity(expected, live, f"{slug} output schema")
+    projected = project_expected_config(live, expected)
+    return require_catalog_parity(expected, projected, f"{slug} output schema")
 
 
 def load_install() -> dict:
