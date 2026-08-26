@@ -2960,6 +2960,26 @@ class DirectHarnessCorrectionTests(unittest.TestCase):
         for bad in ({}, {**grok, "sessionId": str(uuid.uuid4())}, {**grok, "modelUsage": {"grok-4.6-build": {"modelCalls": 1}, "other": {"modelCalls": 1}}}, {k: v for k, v in grok.items() if k != "requestId"}):
             self.assertIsNotNone(server.harness_terminal_output(job, json.dumps(bad))[2])
 
+    def test_codex_session_metadata_accepts_wrapped_task_complete(self):
+        thread = "01a03c57-c302-77a0-aeca-2848eda45d80"
+        turn = "01a03c57-c3d0-7843-ba15-d344b5a14ced"
+        with tempfile.TemporaryDirectory() as td:
+            sessions = Path(td) / "sessions" / "2026" / "08" / "25"
+            sessions.mkdir(parents=True)
+            path = sessions / f"rollout-{thread}.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"session_id": thread, "originator": "codex_exec", "source": "exec", "model_provider": "openai"}},
+                {"type": "turn_context", "payload": {"turn_id": turn, "model": "gpt-5.6-terra"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn, "last_agent_message": "VERDICT: PASS"}},
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": td}):
+                metadata = server.codex_session_metadata(thread)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["complete_turn_id"], turn)
+        self.assertEqual(metadata["last_agent_message"], "VERDICT: PASS")
+
     def test_exact_native_codex_claude_and_grok_adapters(self):
         # Fixtures are copied byte-for-byte from the controller captures in
         # triage-evidence; Codex metadata below is its exact recorded fields.
