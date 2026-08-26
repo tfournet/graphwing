@@ -6091,19 +6091,30 @@ while True:
             self.assertIn(f"CTX.active_route.{slot}_provider", config["provider"])
             self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
             self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
-        second = nodes["switch_rev2"]["config"]
-        self.assertEqual(second["cases"][0]["rules"], [
-            {"path": "data.reviewer2_launcher", "op": "equals", "value": "none"}
-        ])
+        for index in (1, 2):
+            field = f"reviewer{index}_launcher"
+            mapping = nodes[f"map_switch_rev{'' if index == 1 else index}"]["config"]["mappings"]
+            self.assertEqual(mapping, [{
+                "id": "m1", "output": field,
+                "expression": {"kind": "getField", "path": f"CTX.active_route.{field}"},
+            }])
+            switch = nodes[f"switch_rev{'' if index == 1 else index}"]["config"]
+            self.assertEqual(switch["cases"][0]["rules"], [
+                {"path": field, "op": "equals", "value": "none"}
+            ])
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
-        self.assertEqual(
-            (edges["e_rev2_skip"]["sourceHandle"], edges["e_rev2_skip"]["target"]),
-            ("case-0", "join_commit"),
-        )
-        self.assertEqual(
-            (edges["e_rev2_need"]["sourceHandle"], edges["e_rev2_need"]["target"]),
-            ("default", "wait_rev2"),
-        )
+        for skip, need, wait in (
+            ("e_rev_skip", "e_rev_run", "wait_rev1"),
+            ("e_rev2_skip", "e_rev2_need", "wait_rev2"),
+        ):
+            self.assertEqual(
+                (edges[skip]["sourceHandle"], edges[skip]["target"]),
+                ("case-0", "join_commit"),
+            )
+            self.assertEqual(
+                (edges[need]["sourceHandle"], edges[need]["target"]),
+                ("default", wait),
+            )
 
     def test_graph_receipts_keep_route_provenance(self):
         root = Path(server.__file__).parent / "graphs"
@@ -9375,7 +9386,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "118562f8d3c905d15a3f57c474d86010a9718710b43c0188b02043c3c257bf9a")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "997f74581247a933abf1fe4b41cfa248d2e5dcdae81318d12d7b7a95882d76dc")
 
 
 class InstallTests(unittest.TestCase):
