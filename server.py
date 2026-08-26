@@ -6,16 +6,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import select
 import shutil
 import signal
+import stat
 import subprocess
+import tarfile
+import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +38,8 @@ TESTS_PATH = HOME / "tests.json"
 RR_PATH = HOME / "rr.json"
 KEY_PATH = HOME / "api.key"
 JOBS_DIR = HOME / "jobs"
+CODEOFFS_DIR = HOME / "codeoffs"
+CODEOFF_WORKSPACES_DIR = HOME / "codeoff-workspaces"
 RUNS_PATH = HOME / "workflow-runs.jsonl"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GRAPHWING_PORT", "8645"))
@@ -80,6 +88,42 @@ NATIVE_LAUNCHERS = {
     "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
     "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
+CODEOFF_PROTOCOL_VERSION = "code-off-v1"
+CODEOFF_CATEGORY_VERSION = "code-category-v1"
+CODEOFF_DRAW_VERSION = "code-off-draw-v1"
+CODEOFF_POLICY_VERSION = "code-off-policy-v1"
+CODEOFF_AGGREGATION_VERSION = "code-off-aggregation-v1"
+CODEOFF_RUBRIC_VERSION = "code-off-rubric-v1"
+CODEOFF_AUTHOR_POOL = ["grok", "sol", "terra", "sonnet", "opus"]
+CODEOFF_CATEGORIES = frozenset({"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
+CODEOFF_TAGS = frozenset({"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
+CODEOFF_MODEL_MANIFEST: dict[str, Any] = {
+    "version": "approved-model-manifest-v1",
+    "as_of": "2026-08-26",
+    "max_age_days": 30,
+    "limitation": "Embedded approvals require a code change when stale; no moving aliases, fallback, or substitution. Same-user worktrees are not an OS security boundary.",
+    "models": {
+        "grok": {"exact_model": "grok-4.6", "provider": "xai", "launcher": "grok", "runnable": True, "proven": True, "reason": "approved"},
+        "sol": {"exact_model": "gpt-5.6-sol", "provider": "openai", "launcher": "codex", "runnable": True, "proven": True, "reason": "approved"},
+        "terra": {"exact_model": "gpt-5.6-terra", "provider": "openai", "launcher": "codex", "runnable": False, "proven": False, "reason": "historical identity is not currently runnable or proven"},
+        "sonnet": {"exact_model": "claude-sonnet-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "approved"},
+        "opus": {"exact_model": "claude-opus-5", "provider": "anthropic", "launcher": "claude", "runnable": True, "proven": True, "reason": "approved"},
+        "fable": {"exact_model": "claude-fable-5", "provider": "anthropic", "launcher": "claude", "runnable": False, "proven": False, "reason": "historical fixed judge is not currently runnable or proven"},
+    },
+}
+CODEOFF_RUBRIC = {
+    "version": CODEOFF_RUBRIC_VERSION, "dimensions": {"correctness": 40, "tests": 20, "quality": 20, "scope": 10, "maintainability": 10},
+    "preference": ["candidate-1", "candidate-2", "abstain"], "aggregation": "three equal preferences; majority, then summed scores, exact tie parks",
+}
+CODEOFF_EXPERIMENT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
+CODEOFF_SEED_RE = re.compile(r"^[0-9a-f]{64}$")
+CODEOFF_MAX_FILES = 10000
+CODEOFF_MAX_FILE_BYTES = 32 * 1024 * 1024
+CODEOFF_MAX_TREE_BYTES = 100 * 1024 * 1024
+CODEOFF_MAX_LOG_BYTES = 256 * 1024
+CODEOFF_MAX_RATIONALE = 1200
+CODEOFF_LOCK = threading.RLock()
+class CodeOffArtifactError(RuntimeError): pass
 FAILURE_CLASS_CODES = {
     "none": {"success"},
     "provider_availability": {"missing_binary"},
@@ -985,6 +1029,44 @@ def git_write_result(name: str, r: dict[str, Any]) -> tuple[int, dict[str, Any]]
     return 200, payload
 
 
+def _codeoff_git_gate(data: dict[str, Any], repo_name: str, repo: Path, phase: str) -> dict[str, Any] | None:
+    experiment_id = data.get("codeoff_experiment_id")
+    receipt_hash = data.get("final_verification_hash")
+    if experiment_id in (None, "") and receipt_hash in (None, ""):
+        return None
+    if not isinstance(experiment_id, str) or not isinstance(receipt_hash, str):
+        return {"error": "both codeoff_experiment_id and final_verification_hash are required", "code": "codeoff_gate_incomplete"}
+    root, manifest, state, err = _codeoff_load(experiment_id, active=False)
+    if err:
+        return err
+    assert root and manifest and state
+    final = state.get("final_verification") or {}
+    if not (state.get("finalized") and state.get("status") == "completed" and final.get("commit_eligible") is True and final.get("push_eligible") is True and hmac.compare_digest(str(final.get("receipt_hash") or ""), receipt_hash)):
+        return {"error": "code-off final verification is not eligible or does not match", "code": "codeoff_gate_rejected"}
+    if manifest.get("repo") != repo_name:
+        return {"error": "code-off receipt belongs to a different repo", "code": "codeoff_repo_mismatch"}
+    if phase == "commit" and data.get("message", "").strip() != manifest.get("commit_message"):
+        return {"error": "commit message differs from the immutable code-off contract", "code": "codeoff_commit_mismatch"}
+    try:
+        snapshot = codeoff_tree_snapshot(repo, manifest["base_sha"])
+    except (OSError, RuntimeError):
+        return {"error": "could not verify promoted code-off tree", "code": "codeoff_tree_unavailable"}
+    if snapshot["manifest_hash"] != final.get("tree_manifest_hash"):
+        return {"error": "repo tree no longer equals the frozen winner", "code": "codeoff_tree_mismatch"}
+    branch, head, git_err = current_branch_head(repo)
+    if git_err or branch != manifest["branch"] or (phase == "commit" and (head != manifest["base_sha"] or not run_git(repo, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok"))):
+        return {"error": "repo HEAD is not eligible for this code-off operation", "code": "codeoff_head_mismatch"}
+    if phase == "push":
+        parents = run_git(repo, ["rev-list", "--parents", "-n", "1", "HEAD"])
+        message = run_git(repo, ["show", "-s", "--format=%B", "HEAD"]); committed_tree = run_git(repo, ["rev-parse", "HEAD^{tree}"])
+        lineage = str(parents.get("stdout") or "").split()
+        if head == manifest["base_sha"]:
+            return {"error": "verified winner has not been committed", "code": "codeoff_head_mismatch"}
+        if not parents.get("ok") or lineage != [head, manifest["base_sha"]] or not message.get("ok") or str(message.get("stdout") or "").strip() != manifest["commit_message"] or not committed_tree.get("ok") or str(committed_tree.get("stdout") or "").strip() != state.get("promotion", {}).get("git_tree"):
+            return {"error": "push HEAD is not the single immutable winner commit", "code": "codeoff_push_mismatch"}
+    return None
+
+
 def git_checkout(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -1055,6 +1137,9 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 400, {"error": "message is required", "code": "empty_message"}
     if data.get("add_all") is True:
         return 400, {"error": "add_all is not enabled; pass add as relative paths or commit staged files", "code": "add_all_disabled"}
+    gate_err = _codeoff_git_gate(data, name, resolved, "commit")
+    if gate_err:
+        return 409, gate_err
     add = data.get("add")
     if isinstance(add, str):
         add = [add]
@@ -1095,6 +1180,9 @@ def git_push(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     name, resolved = repo_from_body(data, repos)
     if name is None:
         return 400, resolved
+    gate_err = _codeoff_git_gate(data, name, resolved, "push")
+    if gate_err:
+        return 409, gate_err
     if data.get("force") or data.get("force_with_lease") or data.get("delete"):
         return 400, {"error": "force/delete push is not allowed", "code": "force_rejected"}
     remote = data.get("remote") if data.get("remote") not in ("", None) else "origin"
@@ -2890,6 +2978,12 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "webhook",
     )
     out = {k: job.get(k) for k in keys}
+    if job.get("codeoff_workspace"):
+        out.pop("cwd", None)
+        out.pop("prompt", None)
+        out.pop("log_ref", None)
+        out["codeoff_workspace"] = job["codeoff_workspace"]
+        out["prompt_hash"] = job.get("prompt_hash")
     out["ok"] = True
     return out
 
@@ -4166,6 +4260,1156 @@ def rr_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     return named_cmd_run("rr", catalog, body, "rr.json", "unknown_rr")
 
 
+def codeoff_canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+def _codeoff_atomic_bytes(path: Path, data: bytes, *, immutable: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        if not immutable:
+            tmp.replace(path); return
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise RuntimeError(f"immutable record already differs: {path.name}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _codeoff_atomic_json(path: Path, value: Any, *, immutable: bool = False) -> None:
+    _codeoff_atomic_bytes(path, codeoff_canonical_json(value) + b"\n", immutable=immutable)
+
+def _codeoff_id(raw: Any) -> tuple[str | None, dict[str, Any] | None]:
+    if not isinstance(raw, str) or not CODEOFF_EXPERIMENT_RE.fullmatch(raw):
+        return None, {"error": "experiment_id must be 8-64 lowercase letters, digits, or hyphens", "code": "bad_experiment_id"}
+    return raw, None
+
+def _codeoff_body(body: bytes, allowed: set[str], *, exact: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    data, err = parse_json_object(body)
+    if err:
+        return None, err
+    assert data is not None
+    unexpected = sorted(set(data) ^ allowed if exact else set(data) - allowed)
+    if unexpected:
+        return None, {"error": "request has missing or unsupported fields" if exact else "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
+    return data, None
+
+def codeoff_workspace_path(experiment_id: str, slot: str) -> Path:
+    if not CODEOFF_EXPERIMENT_RE.fullmatch(experiment_id) or not re.fullmatch(r"(?:author-[12]|judge-(?:fable|[12]))", slot):
+        raise ValueError("invalid opaque code-off workspace reference")
+    return CODEOFF_WORKSPACES_DIR / experiment_id / slot
+
+def _codeoff_root(experiment_id: str) -> Path:
+    return CODEOFFS_DIR / experiment_id
+
+def _codeoff_artifact(root: Path, data: bytes) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    _codeoff_atomic_bytes(root / "artifacts" / digest, data, immutable=True)
+    return digest
+
+def _codeoff_read_artifact(root: Path, digest: str) -> bytes:
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise CodeOffArtifactError("invalid artifact hash")
+    data = (root / "artifacts" / digest).read_bytes()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise CodeOffArtifactError("artifact hash mismatch")
+    return data
+
+def _codeoff_manifest_current(manifest: dict[str, Any], now: datetime | None = None) -> bool:
+    try:
+        as_of = datetime.strptime(str(manifest["as_of"]), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        max_age = int(manifest["max_age_days"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    checked = now or datetime.now(timezone.utc)
+    age = (checked.date() - as_of.date()).days
+    return 0 <= age <= max_age
+
+def _codeoff_rank(seed: bytes, domain: str, values: list[str]) -> list[str]:
+    prefix = b"graphwing/code-off/draw-v1\0" + domain.encode() + b"\0"
+    canonical = {value: index for index, value in enumerate(values)}
+    return sorted(
+        values,
+        key=lambda value: (
+            hmac.new(seed, prefix + value.encode(), hashlib.sha256).digest(),
+            canonical[value],
+        ),
+    )
+
+def codeoff_draw(seed_hex: str) -> dict[str, Any]:
+    if not isinstance(seed_hex, str) or not CODEOFF_SEED_RE.fullmatch(seed_hex):
+        raise ValueError("seed must be exactly 32 lowercase hex bytes")
+    seed = bytes.fromhex(seed_hex)
+    authors = _codeoff_rank(seed, "authors", list(CODEOFF_AUTHOR_POOL))[:2]
+    remainder = [logical for logical in CODEOFF_AUTHOR_POOL if logical not in authors]
+    random_judges = _codeoff_rank(seed, "judges", remainder)[:2]
+    return {
+        "algorithm_version": CODEOFF_DRAW_VERSION,
+        "policy_version": CODEOFF_POLICY_VERSION,
+        "ordered_pool": list(CODEOFF_AUTHOR_POOL),
+        "authors": authors,
+        "fixed_judge": "fable",
+        "random_judges": random_judges,
+        "seed_commitment": hashlib.sha256(b"graphwing/code-off/seed-commitment/v1\0" + seed).hexdigest(),
+    }
+
+def _codeoff_event(root: Path, state: dict[str, Any], kind: str, data: dict[str, Any]) -> str:
+    sequence = int(state.get("event_count") or 0) + 1
+    event = {
+        "sequence": sequence,
+        "at": utcnow(),
+        "kind": kind,
+        "data": data,
+        "previous_hash": state.get("event_head") or "0" * 64,
+    }
+    event["hash"] = hashlib.sha256(codeoff_canonical_json(event)).hexdigest()
+    _codeoff_atomic_json(root / "events" / f"{sequence:08d}-{event['hash']}.json", event, immutable=True)
+    state["event_count"] = sequence
+    state["event_head"] = event["hash"]
+    return event["hash"]
+
+def _codeoff_events(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    sequence, current, events = state.get("event_count"), state.get("event_head"), []
+    if type(sequence) is not int or sequence < 0 or not isinstance(current, str):
+        raise RuntimeError("event chain pointer is invalid")
+    while sequence:
+        event = json.loads((root / "events" / f"{sequence:08d}-{current}.json").read_text())
+        claimed = event.get("hash")
+        unhashed = {key: value for key, value in event.items() if key != "hash"}
+        if event.get("sequence") != sequence or claimed != current or hashlib.sha256(codeoff_canonical_json(unhashed)).hexdigest() != claimed:
+            raise RuntimeError("event chain is invalid")
+        events.append(event)
+        current, sequence = event.get("previous_hash"), sequence - 1
+    if current != "0" * 64:
+        raise RuntimeError("event chain genesis is invalid")
+    return list(reversed(events))
+
+def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    exp, err = _codeoff_id(experiment_id)
+    if err:
+        return None, None, None, err
+    assert exp is not None
+    root = _codeoff_root(exp)
+    try:
+        manifest_bytes = (root / "manifest.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        state = json.loads((root / "state.json").read_text())
+    except FileNotFoundError:
+        return None, None, None, {"error": "experiment not found", "code": "experiment_not_found"}
+    except (OSError, json.JSONDecodeError):
+        return None, None, None, {"error": "experiment record is unreadable", "code": "record_unreadable"}
+    if hashlib.sha256(manifest_bytes).hexdigest() != state.get("manifest_file_hash"):
+        return None, None, None, {"error": "immutable manifest hash mismatch", "code": "manifest_tampered"}
+    try:
+        _codeoff_events(root, state)
+    except (OSError, RuntimeError, json.JSONDecodeError):
+        return None, None, None, {"error": "event hash chain is invalid", "code": "event_chain_tampered"}
+    final_path = root / "final.json"
+    if state.get("finalized"):
+        final_bytes = codeoff_canonical_json(_codeoff_final_value(manifest, state)) + b"\n"
+        if hashlib.sha256(final_bytes).hexdigest() != state.get("final_file_hash"):
+            return None, None, None, {"error": "final record hash differs", "code": "final_tampered"}
+        try:
+            if not final_path.is_file() or final_path.is_symlink() or final_path.read_bytes() != final_bytes:
+                return None, None, None, {"error": "final record differs", "code": "final_tampered"}
+        except OSError:
+            return None, None, None, {"error": "final record is unreadable", "code": "record_unreadable"}
+    elif os.path.lexists(final_path):
+        return None, None, None, {"error": "unexpected final record", "code": "final_tampered"}
+    if active and state.get("finalized"):
+        return None, None, None, {"error": "experiment is finalized and cannot reopen", "code": "experiment_finalized"}
+    return root, manifest, state, None
+
+def _codeoff_write_state(root: Path, state: dict[str, Any]) -> None:
+    _codeoff_atomic_json(root / "state.json", state)
+
+def _codeoff_commit_event(root: Path, state: dict[str, Any], kind: str, data: dict[str, Any]) -> None:
+    _codeoff_event(root, state, kind, data)
+    _codeoff_write_state(root, state)
+
+def _codeoff_elapsed(start: str | None, end: str | None) -> float | None:
+    try:
+        return max(0.0, (datetime.strptime(str(end), "%Y-%m-%dT%H:%M:%SZ") - datetime.strptime(str(start), "%Y-%m-%dT%H:%M:%SZ")).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+def _codeoff_final_value(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "protocol_version": CODEOFF_PROTOCOL_VERSION,
+        "experiment_id": manifest["experiment_id"],
+        "status": state["status"],
+        "reason": state.get("reason"),
+        "started_at": manifest["created_at"],
+        "finished_at": state["finished_at"],
+        "elapsed_seconds": _codeoff_elapsed(manifest["created_at"], state["finished_at"]),
+        "manifest_file_hash": state["manifest_file_hash"],
+        "event_head": state["event_head"],
+        "aggregation": state.get("aggregation"),
+        "promotion": state.get("promotion"),
+        "final_verification": state.get("final_verification"),
+    }
+
+def _codeoff_finalize_record(root: Path, manifest: dict[str, Any], state: dict[str, Any], status: str, reason: str | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    if state.get("finalized"):
+        raise RuntimeError("finalized experiment cannot reopen")
+    state.update({"status": status, "reason": reason, "finalized": True, "finished_at": utcnow()})
+    if extra:
+        state.update(extra)
+    _codeoff_event(root, state, "finalized", {"status": status, "reason": reason})
+    final = _codeoff_final_value(manifest, state)
+    final_bytes = codeoff_canonical_json(final) + b"\n"
+    state["final_file_hash"] = hashlib.sha256(final_bytes).hexdigest()
+    _codeoff_atomic_bytes(root / "final.json", final_bytes, immutable=True)
+    try:
+        _codeoff_write_state(root, state)
+    except BaseException:
+        (root / "final.json").unlink(missing_ok=True)
+        raise
+    return final
+
+def _codeoff_fs_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
+    entries: list[dict[str, Any]] = []
+    total = 0
+
+    def walk(directory: Path, prefix: str = "") -> None:
+        nonlocal total
+        children = sorted(os.scandir(directory), key=lambda item: os.fsencode(item.name))
+        for child in children:
+            rel = f"{prefix}/{child.name}" if prefix else child.name
+            if ".git" in Path(rel).parts:
+                continue
+            try:
+                rel.encode("utf-8")
+                info = child.stat(follow_symlinks=False)
+            except UnicodeEncodeError as exc:
+                raise CodeOffArtifactError("candidate_freeze_failed") from exc
+            mode = f"{stat.S_IMODE(info.st_mode):04o}"
+            if stat.S_ISDIR(info.st_mode):
+                entries.append({"path": rel, "type": "directory", "mode": mode})
+                walk(Path(child.path), rel)
+            elif stat.S_ISLNK(info.st_mode):
+                target = os.readlink(child.path)
+                try: target.encode("utf-8")
+                except UnicodeEncodeError as exc: raise CodeOffArtifactError("candidate_freeze_failed") from exc
+                normalized = Path(os.path.normpath((Path(rel).parent / target).as_posix()))
+                if Path(target).is_absolute() or normalized.is_absolute() or (normalized.parts and normalized.parts[0] == "..") or ".git" in normalized.parts: raise CodeOffArtifactError("candidate_unsafe_symlink")
+                entries.append({"path": rel, "type": "symlink", "mode": mode, "target": target})
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_size > CODEOFF_MAX_FILE_BYTES:
+                    raise RuntimeError("candidate file exceeds artifact limit")
+                data = Path(child.path).read_bytes()
+                total += len(data)
+                if total > CODEOFF_MAX_TREE_BYTES:
+                    raise RuntimeError("candidate tree exceeds artifact limit")
+                entries.append({"path": rel, "type": "file", "mode": mode, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            else:
+                raise RuntimeError("candidate tree contains an unsupported file type")
+            if len(entries) > CODEOFF_MAX_FILES:
+                raise RuntimeError("candidate tree exceeds file-count limit")
+
+    walk(root)
+    return entries, total
+
+def _codeoff_changes(root: Path, base_sha: str) -> list[dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="gw-codeoff-index-") as td:
+        index = str(Path(td) / "index")
+        env = {"GIT_INDEX_FILE": index}
+        read = run_cmd(["git", "-C", str(root), "read-tree", base_sha], cwd=root, env=env)
+        add = run_cmd(["git", "-C", str(root), "add", "-A"], cwd=root, env=env)
+        diff = run_cmd(["git", "-C", str(root), "diff", "--cached", "--name-status", "-z", "--find-renames", base_sha], cwd=root, env=env)
+    if not read.get("ok") or not add.get("ok") or not diff.get("ok") or diff.get("truncated"):
+        raise OSError("could not compare candidate with base")
+    fields = (diff.get("stdout") or "").split("\x00")
+    changes: list[dict[str, Any]] = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        status_code = fields[i]
+        i += 1
+        if i >= len(fields) or not fields[i]:
+            raise RuntimeError("malformed git change record")
+        first = fields[i]
+        i += 1
+        if status_code.startswith(("R", "C")):
+            if i >= len(fields) or not fields[i]:
+                raise RuntimeError("malformed git rename record")
+            second = fields[i]
+            i += 1
+            changes.append({"status": status_code, "old_path": first, "path": second})
+        else:
+            changes.append({"status": status_code, "path": first})
+    return changes
+
+def _codeoff_ignored(root: Path) -> bool:
+    result = run_git(root, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])
+    if not result.get("ok") or result.get("truncated"): raise OSError("could not verify ignored candidate paths")
+    return bool(result.get("stdout"))
+
+def codeoff_tree_snapshot(root: Path, base_sha: str | None = None) -> dict[str, Any]:
+    if base_sha is None:
+        got = run_git(root, ["rev-parse", "HEAD"])
+        if not got.get("ok"):
+            raise RuntimeError("candidate base is unavailable")
+        base_sha = str(got["stdout"]).strip()
+    entries, total = _codeoff_fs_entries(root)
+    manifest = {
+        "format": "code-off-tree-v1",
+        "base_sha": base_sha,
+        "entries": entries,
+        "changes": _codeoff_changes(root, base_sha),
+    }
+    raw = codeoff_canonical_json(manifest)
+    return {"manifest": manifest, "manifest_bytes": raw, "manifest_hash": hashlib.sha256(raw).hexdigest(), "bytes": total}
+
+def _codeoff_tar(root: Path, entries: list[dict[str, Any]]) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for entry in entries:
+            info = tarfile.TarInfo(entry["path"])
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mtime = 0
+            info.mode = int(entry["mode"], 8)
+            kind = entry["type"]
+            if kind == "directory":
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = entry["target"]
+                archive.addfile(info)
+            else:
+                data = (root / entry["path"]).read_bytes()
+                if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise RuntimeError("candidate mutated while freezing")
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    return output.getvalue()
+
+def _codeoff_extract(data: bytes, destination: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        members = archive.getmembers()
+        names, symlinks = set(), {Path(member.name) for member in members if member.issym()}
+        for member in members:
+            rel = Path(member.name)
+            if not rel.parts or rel.is_absolute() or ".." in rel.parts or ".git" in rel.parts or member.islnk() or rel in names or any(parent in symlinks for parent in rel.parents):
+                raise CodeOffArtifactError("unsafe candidate artifact")
+            names.add(rel)
+            if member.issym():
+                link = Path(member.linkname)
+                normalized = Path(os.path.normpath((rel.parent / link).as_posix()))
+                if not member.linkname or link.is_absolute() or normalized.is_absolute() or (normalized.parts and normalized.parts[0] == ".."):
+                    raise CodeOffArtifactError("unsafe candidate artifact")
+            elif not (member.isdir() or member.isfile()):
+                raise CodeOffArtifactError("candidate artifact has unsupported entry")
+        destination.mkdir(parents=True, exist_ok=False)
+        directory_modes: list[tuple[Path, int]] = []
+        try:
+            for member in [*filter(lambda item: item.isdir(), members), *filter(lambda item: item.isfile(), members), *filter(lambda item: item.issym(), members)]:
+                target = destination / member.name
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    directory_modes.append((target, member.mode))
+                elif member.issym():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(member.linkname)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise CodeOffArtifactError("candidate artifact is incomplete")
+                    target.write_bytes(source.read())
+                    target.chmod(member.mode)
+            for directory, mode in reversed(directory_modes):
+                directory.chmod(mode)
+        except BaseException:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+
+def _codeoff_sanitize_log(raw: str) -> str:
+    clipped = raw.encode("utf-8", "replace")[:CODEOFF_MAX_LOG_BYTES].decode("utf-8", "replace")
+    clipped = re.sub(r"(?i)\b(token|password|secret|authorization)\b\s*[:=]\s*\S+", r"\1=[REDACTED]", clipped)
+    clipped = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~-]+", "Bearer [REDACTED]", clipped)
+    clipped = re.sub(r"\b(?:gh[opsu]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b", "[REDACTED_TOKEN]", clipped)
+    return re.sub(r"https://[^\s]+(?:hook|callback|token=)[^\s]*", "[REDACTED_URL]", clipped, flags=re.I)
+
+def _codeoff_run_tests(record_root: Path, manifest: dict[str, Any], cwd: Path, phase: str) -> dict[str, Any]:
+    started = utcnow()
+    receipts = []
+    all_pass = True
+    for spec in manifest.get("test_specs") or []:
+        timeout = min(int(spec["timeout_seconds"]), int(manifest["budgets"]["test_seconds"]))
+        before = time.monotonic()
+        result = run_cmd(list(spec["argv"]), cwd=cwd, timeout=timeout, env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"})
+        elapsed = round(time.monotonic() - before, 6)
+        passed = bool(result.get("ok"))
+        all_pass = all_pass and passed
+        log = codeoff_canonical_json({
+            "name": spec["name"], "stdout": _codeoff_sanitize_log(result.get("stdout") or ""),
+            "stderr": _codeoff_sanitize_log(result.get("stderr") or result.get("error") or ""),
+            "truncated": bool(result.get("truncated")),
+        })
+        receipts.append({"name": spec["name"], "pass": passed, "returncode": result.get("returncode"), "elapsed_seconds": elapsed, "log_hash": _codeoff_artifact(record_root, log)})
+    finished = utcnow()
+    receipt = {"version": "code-off-test-receipt-v1", "phase": phase, "started_at": started, "finished_at": finished, "elapsed_seconds": _codeoff_elapsed(started, finished), "pass": all_pass, "tests": receipts}
+    receipt["receipt_hash"] = _codeoff_artifact(record_root, codeoff_canonical_json(receipt))
+    return receipt
+
+def _codeoff_author_prompt(task: str, base_sha: str, base_tree: str, tests: list[str], toolchain: dict[str, str], budgets: dict[str, int]) -> bytes:
+    header = (
+        "CODE-OFF AUTHOR CONTRACT code-off-v1\n"
+        "Work only in the current isolated worktree. Do not inspect parent directories, other worktrees, sessions, branches, or model/provider metadata. "
+        "Do not use network, commit, push, or open a PR. Implement the task and leave the complete candidate tree in place.\n"
+        f"Base SHA: {base_sha}\nBase tree: {base_tree}\nNamed tests: {json.dumps(tests, separators=(',', ':'))}\n"
+        f"Toolchain: {json.dumps(toolchain, sort_keys=True, separators=(',', ':'))}\nBudgets: {json.dumps(budgets, sort_keys=True, separators=(',', ':'))}\n"
+        "Finish with exactly one JSON object: {\"status\":\"ok\"|\"error\",\"sha\":null,\"pr_url\":null,\"summary\":\"one line\"}\n\nTask:\n"
+    )
+    return header.encode() + task.encode()
+
+def _codeoff_launch_plan(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out = {}
+    for slot, identity in manifest["identities"].items():
+        key = slot.replace("-", "_")
+        out[key] = {
+            "slot": slot, "logical_model": identity["logical_model"],
+            "launcher": identity["launcher"], "provider": identity["provider"],
+            "model": identity["exact_model"], "max_turns": manifest["budgets"]["max_turns"],
+            "run_budget_seconds": manifest["budgets"]["author_seconds" if slot.startswith("author-") else "judge_seconds"],
+        }
+    return out
+
+def _codeoff_parse_interpolated(data: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("tags", "tests", "toolchain", "budgets"):
+        raw = data.get(key)
+        if not isinstance(raw, str):
+            continue
+        if len(raw) > 8192:
+            return {"error": f"{key} JSON string exceeds 8192 characters", "code": f"bad_{key}"}
+        try:
+            data[key] = json.loads(raw)
+        except (json.JSONDecodeError, RecursionError):
+            return {"error": f"{key} must be native JSON or a whole-value JSON string", "code": f"bad_{key}"}
+    return None
+
+def _codeoff_remove_worktree(repo: Path, path: Path) -> None:
+    if path.exists() and not run_git(repo, ["worktree", "remove", "--force", str(path)]).get("ok"):
+        shutil.rmtree(path, ignore_errors=True)
+    run_git(repo, ["worktree", "prune"])
+
+def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id", "repo", "base_sha", "seed", "category", "tags", "category_source", "prompt", "tests", "toolchain", "budgets", "commit_message"})
+    if err:
+        return 400, err
+    assert data is not None
+    interpolated_err = _codeoff_parse_interpolated(data)
+    if interpolated_err:
+        return 400, interpolated_err
+    experiment_id, eid_err = _codeoff_id(data.get("experiment_id"))
+    if eid_err:
+        return 400, eid_err
+    category = data.get("category")
+    if category not in CODEOFF_CATEGORIES:
+        return 400, {"error": "category is not in code-category-v1", "code": "bad_category", "allowed": sorted(CODEOFF_CATEGORIES)}
+    raw_tags = data.get("tags", [])
+    if not isinstance(raw_tags, list) or len(raw_tags) > 12 or not all(isinstance(tag, str) for tag in raw_tags) or not set(raw_tags) <= CODEOFF_TAGS:
+        return 400, {"error": "tags must use code-category-v1", "code": "bad_tags", "allowed": sorted(CODEOFF_TAGS)}
+    category_source = data.get("category_source")
+    if not isinstance(category_source, str) or not category_source.strip() or len(category_source) > 80:
+        return 400, {"error": "category_source is required and bounded", "code": "bad_category_source"}
+    seed = data.get("seed")
+    if not isinstance(seed, str) or not CODEOFF_SEED_RE.fullmatch(seed):
+        return 400, {"error": "seed must be exactly 32 lowercase hex bytes", "code": "bad_seed"}
+    task = data.get("prompt")
+    if not isinstance(task, str) or not task.strip() or len(task) > PROMPT_MAX_CHARS:
+        return 400, {"error": "prompt is required and bounded", "code": "bad_prompt"}
+    names = data.get("tests")
+    if not isinstance(names, list) or not 1 <= len(names) <= 10 or not all(isinstance(name, str) and 1 <= len(name) <= 120 for name in names) or len(set(names)) != len(names):
+        return 400, {"error": "tests must be 1-10 unique named recipes", "code": "bad_tests"}
+    toolchain = data.get("toolchain")
+    if not isinstance(toolchain, dict) or not 1 <= len(toolchain) <= 20 or not all(isinstance(k, str) and k and isinstance(v, str) and v and len(k) <= 40 and len(v) <= 120 for k, v in toolchain.items()):
+        return 400, {"error": "toolchain must be a bounded string map", "code": "bad_toolchain"}
+    budgets = data.get("budgets")
+    limits = {"author_seconds": (30, 1200), "judge_seconds": (30, 1200), "test_seconds": (1, 1200), "max_turns": (1, 80)}
+    if not isinstance(budgets, dict) or set(budgets) != set(limits) or any(type(budgets.get(key)) is not int or not lo <= budgets[key] <= hi for key, (lo, hi) in limits.items()):
+        return 400, {"error": "budgets must contain the exact versioned keys", "code": "bad_budgets"}
+    commit_message = data.get("commit_message")
+    if not isinstance(commit_message, str) or not commit_message.strip() or len(commit_message) > 300:
+        return 400, {"error": "commit_message is required and bounded", "code": "bad_commit_message"}
+    name, repo = repo_from_body(data, repos)
+    if name is None:
+        return 400, repo
+    base_sha = data.get("base_sha")
+    if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40,64}", base_sha):
+        return 400, {"error": "base_sha must be an exact object id", "code": "bad_base_sha"}
+    branch, head, git_err = current_branch_head(repo)
+    if git_err or head != base_sha:
+        return 409, {"error": "repo HEAD does not equal base_sha", "code": "base_mismatch"}
+    status = run_git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])
+    ignored = run_git(repo, ["ls-files", "--others", "--ignored", "--exclude-standard"])
+    if not status.get("ok") or not ignored.get("ok") or status.get("stdout") or ignored.get("stdout"):
+        return 409, {"error": "base worktree must contain only the exact committed tree", "code": "base_not_pristine"}
+    tree = run_git(repo, ["rev-parse", f"{base_sha}^{{tree}}"])
+    if not tree.get("ok"):
+        return 400, {"error": "base tree is unavailable", "code": "bad_base_sha"}
+    base_tree = str(tree["stdout"]).strip()
+    catalog = load_tests(repos)
+    specs = []
+    for test_name in names:
+        spec = catalog.get(test_name)
+        if spec is None or Path(spec["cwd"]).resolve() != Path(repo).resolve():
+            return 400, {"error": f"test '{test_name}' is not allowlisted for repo", "code": "unknown_test", "allowed": sorted(catalog)}
+        specs.append({"name": test_name, "argv": list(spec["argv"]), "timeout_seconds": int(spec["timeout_seconds"])})
+    draw = codeoff_draw(seed)
+    embedded = json.loads(json.dumps(CODEOFF_MODEL_MANIFEST))
+    manifest_checked_at = datetime.now(timezone.utc)
+    current = _codeoff_manifest_current(embedded, manifest_checked_at)
+    slot_logical = {"author-1": draw["authors"][0], "author-2": draw["authors"][1], "judge-fable": "fable", "judge-1": draw["random_judges"][0], "judge-2": draw["random_judges"][1]}
+    identities: dict[str, dict[str, Any]] = {}
+    for slot, logical in slot_logical.items():
+        approved = embedded.get("models", {}).get(logical) or {}
+        identities[slot] = {
+            "logical_model": logical, "exact_model": approved.get("exact_model"), "provider": approved.get("provider"), "launcher": approved.get("launcher"),
+            "runnable": approved.get("runnable") is True, "proven": approved.get("proven") is True, "reason": approved.get("reason") or "identity absent from manifest",
+            "manifest_version": embedded.get("version"), "manifest_as_of": embedded.get("as_of"),
+            "manifest_max_age_days": embedded.get("max_age_days"), "manifest_current": current,
+        }
+    fable_provider = identities["judge-fable"]["provider"]
+    overlaps = [{"fixed_judge": "judge-fable", "other": slot, "provider": fable_provider} for slot, identity in identities.items() if slot != "judge-fable" and identity["provider"] == fable_provider]
+    canonical_prompt = _codeoff_author_prompt(task, base_sha, base_tree, names, dict(sorted(toolchain.items())), budgets)
+    if len(canonical_prompt) > PROMPT_MAX_CHARS + 8192:
+        return 400, {"error": "canonical prompt exceeds limit", "code": "prompt_too_large"}
+    base_snapshot = codeoff_tree_snapshot(repo, base_sha)
+    assert experiment_id is not None
+    record_root = _codeoff_root(experiment_id)
+    workspace_root = CODEOFF_WORKSPACES_DIR / experiment_id
+    with CODEOFF_LOCK:
+        if record_root.exists():
+            return 409, {"error": "experiment_id already exists; redraw/reopen is forbidden", "code": "experiment_exists"}
+        if workspace_root.exists():
+            return 409, {"error": "opaque workspace already exists", "code": "workspace_exists"}
+        CODEOFFS_DIR.mkdir(parents=True, exist_ok=True)
+        record_build = Path(tempfile.mkdtemp(prefix=f".prepare-{experiment_id}-", dir=CODEOFFS_DIR))
+        created: list[Path] = []
+        try:
+            prompt_hash = _codeoff_artifact(record_build, canonical_prompt)
+            rubric_hash = _codeoff_artifact(record_build, codeoff_canonical_json(CODEOFF_RUBRIC))
+            manifest = {
+                "protocol_version": CODEOFF_PROTOCOL_VERSION, "experiment_id": experiment_id, "created_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "repo": name, "branch": branch, "base_sha": base_sha, "base_tree": base_tree, "base_snapshot_hash": base_snapshot["manifest_hash"],
+                "classification": {"version": CODEOFF_CATEGORY_VERSION, "category": category, "tags": sorted(set(raw_tags))}, "original_classification": {"category": category, "tags": raw_tags}, "category_source": category_source.strip(),
+                "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps, "approved_model_manifest": embedded,
+                "approved_model_manifest_current": current, "approved_model_manifest_checked_at": manifest_checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "limitation": embedded.get("limitation"), "task": task, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash,
+                "tests": names, "test_specs": specs, "toolchain": dict(sorted(toolchain.items())), "budgets": budgets,
+                "artifact_limits": {"max_files": CODEOFF_MAX_FILES, "max_file_bytes": CODEOFF_MAX_FILE_BYTES, "max_tree_bytes": CODEOFF_MAX_TREE_BYTES, "max_log_bytes": CODEOFF_MAX_LOG_BYTES},
+                "worktree_isolation": {"version": "opaque-worktree-v1", "slots": ["author-1", "author-2"], "caller_paths": False, "os_security_boundary": False},
+                "aggregation_policy_version": CODEOFF_AGGREGATION_VERSION, "rubric_version": CODEOFF_RUBRIC_VERSION, "commit_message": commit_message.strip(),
+            }
+            _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
+            manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
+            state = {"status": "preparing", "reason": None, "finalized": False, "manifest_file_hash": manifest_file_hash, "event_count": 0, "event_head": "0" * 64, "agent_jobs": {slot: [] for slot in slot_logical}, "candidates": {"author-1": {}, "author-2": {}}, "judges": {}, "aggregation": None}
+            _codeoff_commit_event(record_build, state, "prepared_manifest", {"manifest_file_hash": manifest_file_hash, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash})
+            reasons = ([] if current else ["approved_model_manifest_stale"]) + [f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}" for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]]
+            if reasons:
+                _codeoff_finalize_record(record_build, manifest, state, "parked", ";".join(reasons))
+                record_build.replace(record_root)
+                return 200, {"ok": True, "experiment_id": experiment_id, "status": "parked", "reasons": reasons, "authors": draw["authors"], "random_judges": draw["random_judges"], "seed_commitment": draw["seed_commitment"], "manifest_file_hash": manifest_file_hash, "launches": _codeoff_launch_plan(manifest)}
+            workspace_root.mkdir(parents=True, mode=0o700)
+            for slot in ("author-1", "author-2"):
+                path = codeoff_workspace_path(experiment_id, slot)
+                created.append(path)
+                if not run_git(repo, ["worktree", "add", "--detach", str(path), base_sha]).get("ok"):
+                    raise RuntimeError(f"isolated worktree creation failed: {slot}")
+                if codeoff_tree_snapshot(path, base_sha)["manifest_hash"] != base_snapshot["manifest_hash"]:
+                    raise RuntimeError(f"isolated worktree base mismatch: {slot}")
+            state["status"] = "prepared"
+            _codeoff_commit_event(record_build, state, "workspaces_created", {"slots": ["author-1", "author-2"], "isolation_version": "opaque-worktree-v1"})
+            record_build.replace(record_root)
+        except BaseException:
+            for path in reversed(created):
+                _codeoff_remove_worktree(repo, path)
+            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(record_build, ignore_errors=True)
+            raise
+    return 200, {"ok": True, "experiment_id": experiment_id, "status": "prepared", "authors": draw["authors"], "random_judges": draw["random_judges"], "seed_commitment": draw["seed_commitment"], "prompt_hash": prompt_hash, "rubric_hash": rubric_hash, "manifest_file_hash": manifest_file_hash, "workspace_slots": ["author-1", "author-2"], "launches": _codeoff_launch_plan(manifest)}
+
+def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str, Any], slot: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id) or job_id not in state.get("agent_jobs", {}).get(slot, []):
+        return None, {"error": "job is not pinned to this experiment slot", "code": "job_mismatch"}
+    job = read_job(job_id)
+    if isinstance(job, dict) and job.get("status") in ("queued", "running"): return None, {"error": "slot agent has not reached a terminal receipt", "code": "agent_not_terminal"}
+    identity = manifest["identities"][slot]
+    receipt = job.get("receipt") if isinstance(job, dict) else None
+    if not (isinstance(job, dict) and job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and receipt.get("session_identity") == job.get("session_identity") and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot} and (job.get("launcher"), job.get("provider"), job.get("model")) == (identity["launcher"], identity["provider"], identity["exact_model"])):
+        return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
+    return job, None
+
+def _codeoff_verify_artifact(root: Path, manifest: dict[str, Any], repo: Path, candidate: dict[str, Any], phase: str) -> dict[str, Any]:
+    parent = CODEOFF_WORKSPACES_DIR / manifest["experiment_id"]
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = parent / f".verify-{phase}-{uuid.uuid4().hex}"
+    extracted = parent / f".extract-{phase}-{uuid.uuid4().hex}"
+    if not run_git(repo, ["worktree", "add", "--detach", str(staging), manifest["base_sha"]]).get("ok"):
+        _codeoff_remove_worktree(repo, staging); raise RuntimeError("git-faithful verification worktree creation failed")
+    try:
+        frozen_manifest = _codeoff_read_artifact(root, candidate["tree_manifest_hash"])
+        _codeoff_extract(_codeoff_read_artifact(root, candidate["artifact_hash"]), extracted)
+        _codeoff_clear_tree(staging)
+        for child in os.scandir(extracted):
+            Path(child.path).replace(staging / child.name)
+        extracted.rmdir()
+        if _codeoff_ignored(staging): raise CodeOffArtifactError("candidate artifact contains ignored paths")
+        before = codeoff_tree_snapshot(staging, manifest["base_sha"])
+        _branch, head, git_err = current_branch_head(staging)
+        if before["manifest_bytes"] != frozen_manifest or before["manifest_hash"] != candidate["tree_manifest_hash"] or git_err or head != manifest["base_sha"] or not run_git(staging, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok"):
+            raise CodeOffArtifactError("frozen artifact does not materialize as its exact git tree")
+        tests = _codeoff_run_tests(root, manifest, staging, phase)
+        after = codeoff_tree_snapshot(staging, manifest["base_sha"])
+        _branch, after_head, after_err = current_branch_head(staging)
+        no_mutation = after["manifest_hash"] == candidate["tree_manifest_hash"] and not after_err and after_head == manifest["base_sha"] and run_git(staging, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok") is True
+        git_tree = None
+        if no_mutation:
+            added = run_git(staging, ["add", "-A"])
+            tree = run_git(staging, ["write-tree"])
+            if not added.get("ok") or not tree.get("ok"):
+                raise RuntimeError("verified winner could not be represented as a git tree")
+            git_tree = str(tree["stdout"]).strip()
+        return {"tests": tests, "no_mutation": no_mutation, "git_faithful": True, "git_tree": git_tree, "entries": after["manifest"]["entries"]}
+    finally:
+        shutil.rmtree(extracted, ignore_errors=True)
+        _codeoff_remove_worktree(repo, staging)
+
+def _codeoff_park_candidate(experiment_id: Any, slot: str, code: str) -> tuple[int, dict[str, Any]]:
+    with CODEOFF_LOCK:
+        root, manifest, state, err = _codeoff_load(experiment_id, active=True)
+        if err: return 409, err
+        assert root and manifest and state
+        _codeoff_finalize_record(root, manifest, state, "parked", f"{code}:{slot}")
+    return 422, {"ok": False, "error": "candidate failed an immutable terminal gate", "code": code, "experiment_id": manifest["experiment_id"], "slot": slot, "status": "parked"}
+
+def codeoff_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id", "slot", "action", "job_id"})
+    if err:
+        return 400, err
+    assert data is not None
+    slot, action = data.get("slot"), data.get("action")
+    if slot not in ("author-1", "author-2"):
+        return 400, {"error": "slot must be author-1 or author-2", "code": "bad_slot"}
+    if action not in ("freeze", "test"):
+        return 400, {"error": "action must be freeze or test", "code": "bad_action"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        candidate = state["candidates"][slot]
+        workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
+        if action == "freeze":
+            if set(data) != {"experiment_id", "slot", "action", "job_id"}:
+                return 400, {"error": "freeze requires job_id", "code": "missing_job_id"}
+            if candidate.get("tree_manifest_hash"):
+                return 409, {"error": "candidate is already frozen", "code": "candidate_frozen"}
+            job, job_err = _codeoff_validate_job(data.get("job_id"), state, manifest, slot)
+            if job_err:
+                if job_err["code"] == "agent_receipt_mismatch": return _codeoff_park_candidate(data.get("experiment_id"), slot, job_err["code"])
+                return 409, job_err
+            try:
+                if _codeoff_ignored(workspace): return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_ignored_paths")
+                snapshot = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+                tar_bytes = _codeoff_tar(workspace, snapshot["manifest"]["entries"])
+                if codeoff_tree_snapshot(workspace, manifest["base_sha"])["manifest_hash"] != snapshot["manifest_hash"]:
+                    raise RuntimeError("candidate mutated while freezing")
+                tree_manifest_hash = _codeoff_artifact(root, snapshot["manifest_bytes"])
+                artifact_hash = _codeoff_artifact(root, tar_bytes)
+            except CodeOffArtifactError as exc:
+                return _codeoff_park_candidate(data.get("experiment_id"), slot, str(exc) if str(exc).startswith("candidate_") else "candidate_freeze_failed")
+            except RuntimeError:
+                return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_freeze_failed")
+            receipt = {"version": "code-off-freeze-receipt-v1", "slot": slot, "job_id": job["job_id"], "identity": manifest["identities"][slot], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash, "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "bytes": snapshot["bytes"]}
+            receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
+            candidate.update({**receipt, "freeze_receipt_hash": receipt_hash, "tests": None})
+            state["status"] = "candidates_running"
+            _codeoff_commit_event(root, state, "candidate_frozen", {"slot": slot, "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash, "receipt_hash": receipt_hash})
+            return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "slot": slot, "status": "frozen", "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash, "freeze_receipt_hash": receipt_hash}
+        if set(data) != {"experiment_id", "slot", "action"}:
+            return 400, {"error": "test accepts only the opaque experiment and slot", "code": "unexpected_fields"}
+        if not candidate.get("artifact_hash"):
+            return 409, {"error": "candidate must be frozen before testing", "code": "candidate_not_frozen"}
+        if candidate.get("tests"):
+            return 409, {"error": "candidate tests are already recorded", "code": "candidate_tested"}
+        expected = {key: candidate[key] for key in ("artifact_hash", "tree_manifest_hash")}
+    try:
+        current = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+        if current["manifest_hash"] != expected["tree_manifest_hash"]: return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_mutated")
+        verified = _codeoff_verify_artifact(root, manifest, workspace, candidate, "candidate")
+    except (CodeOffArtifactError, FileNotFoundError, tarfile.TarError):
+        return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_artifact_invalid")
+    if not verified["no_mutation"]:
+        return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_test_mutated")
+    try: current = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+    except CodeOffArtifactError: return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_mutated")
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        candidate = state["candidates"][slot]
+        if any(candidate.get(key) != value for key, value in expected.items()) or current["manifest_hash"] != expected["tree_manifest_hash"]:
+            return _codeoff_park_candidate(data.get("experiment_id"), slot, "candidate_mutated")
+        if candidate.get("tests"):
+            return 409, {"error": "candidate tests are already recorded", "code": "candidate_tested"}
+        tests = verified["tests"]
+        candidate["tests"] = tests
+        if all(state["candidates"][item].get("tests") for item in ("author-1", "author-2")):
+            state["status"] = "candidates_tested"
+        _codeoff_commit_event(root, state, "candidate_tested", {"slot": slot, "pass": tests["pass"], "receipt_hash": tests["receipt_hash"]})
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "slot": slot, "status": "tested", "tests_pass": tests["pass"], "test_receipt_hash": tests["receipt_hash"], "log_hashes": [item["log_hash"] for item in tests["tests"]]}
+
+def _codeoff_leakage(root: Path, source: Path, base_sha: str, changes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    signals = (
+        ("protocol_identity", r"\b(?:codeoff_workspace|logical_model|exact_model|session_identity|identity_snapshot_hash|code-off author contract)\b|\b(?:provider|launcher)\s*[:=]\s*[\"']?(?:openai|anthropic|xai|codex|claude|grok)\b"),
+        ("exact_model", r"\b(?:gpt-5\.6-(?:sol|terra)|claude-(?:sonnet|opus|fable)-5|grok-4\.6)\b"),
+        ("self_identity", r"\b(?:i am|authored by|generated by)\b[^\n]{0,96}\b(?:grok|sol|terra|sonnet|opus|fable|openai|anthropic|xai|codex|claude)\b"),
+    )
+    findings = []
+    for change in sorted(changes, key=lambda item: item.get("path", "")):
+        rel = change.get("path", "")
+        path = root / rel
+        if path.is_symlink(): raw = os.readlink(path).encode("utf-8", "surrogateescape")
+        elif not path.is_file(): continue
+        else: raw = path.read_bytes()
+        text = rel.lower() + "\n" + raw.decode("utf-8", "ignore").lower()
+        prior = ""
+        if not str(change.get("status", "")).startswith("A"):
+            base = subprocess.run(["git", "-C", str(source), "show", f"{base_sha}:{change.get('old_path', rel)}"], check=False, capture_output=True, timeout=CMD_TIMEOUT)
+            if base.returncode: raise OSError("could not compare candidate leakage with base")
+            prior = change.get("old_path", rel).lower() + "\n" + base.stdout.decode("utf-8", "ignore").lower()
+        for signal, pattern in signals:
+            if Counter(re.findall(pattern, text)) - Counter(re.findall(pattern, prior)):
+                findings.append({"path_hash": hashlib.sha256(rel.encode()).hexdigest(), "signal": signal})
+    return findings[:200]
+
+def _codeoff_init_blind_repo(path: Path) -> None:
+    env = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+    for args in (["init", "-q", "-b", "blind"], ["config", "user.email", "blind@graphwing.invalid"], ["config", "user.name", "graphwing-blind"], ["add", "-A"]):
+        result = run_cmd(["git", "-C", str(path), *args], cwd=path, env=env)
+        if not result.get("ok"):
+            raise RuntimeError("could not initialize blind judge workspace")
+    result = run_cmd(["git", "-C", str(path), "commit", "-q", "-m", "blind bundle"], cwd=path, env=env)
+    if not result.get("ok"):
+        raise RuntimeError("could not freeze blind judge workspace")
+
+def codeoff_blind(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        if state.get("blind_bundle_hashes") or state.get("status") in ("blinded", "judging"):
+            return 409, {"error": "blind bundles are already frozen", "code": "already_blinded"}
+        for judge_slot in ("judge-fable", "judge-1", "judge-2"):
+            shutil.rmtree(codeoff_workspace_path(manifest["experiment_id"], judge_slot), ignore_errors=True)
+        if not all(state["candidates"][slot].get("tests") for slot in ("author-1", "author-2")):
+            return 409, {"error": "both frozen candidates must be tested", "code": "candidates_incomplete"}
+        for slot in ("author-1", "author-2"):
+            current = codeoff_tree_snapshot(codeoff_workspace_path(manifest["experiment_id"], slot), manifest["base_sha"])
+            if current["manifest_hash"] != state["candidates"][slot]["tree_manifest_hash"]:
+                _codeoff_finalize_record(root, manifest, state, "parked", f"candidate_mutated:{slot}"); return 422, {"error": "candidate changed after freeze", "code": "candidate_mutated", "slot": slot}
+        leakage = []
+        for author_slot in ("author-1", "author-2"):
+            candidate = state["candidates"][author_slot]
+            try: tree = json.loads(_codeoff_read_artifact(root, candidate["tree_manifest_hash"]))
+            except (CodeOffArtifactError, FileNotFoundError, tarfile.TarError, json.JSONDecodeError): _codeoff_finalize_record(root, manifest, state, "parked", f"candidate_artifact_invalid:{author_slot}"); return 422, {"ok": False, "error": "frozen candidate artifact failed integrity", "code": "candidate_artifact_invalid", "slot": author_slot}
+            scan = Path(tempfile.mkdtemp(prefix=f".scan-{author_slot}-", dir=CODEOFF_WORKSPACES_DIR / manifest["experiment_id"]))
+            scan.rmdir()
+            try:
+                _codeoff_extract(_codeoff_read_artifact(root, candidate["artifact_hash"]), scan)
+                source = codeoff_workspace_path(manifest["experiment_id"], author_slot)
+                leakage.extend({"candidate": author_slot, **finding} for finding in _codeoff_leakage(scan, source, manifest["base_sha"], tree["changes"]))
+            except (CodeOffArtifactError, FileNotFoundError, tarfile.TarError):
+                _codeoff_finalize_record(root, manifest, state, "parked", f"candidate_artifact_invalid:{author_slot}"); return 422, {"ok": False, "error": "frozen candidate artifact failed integrity", "code": "candidate_artifact_invalid", "slot": author_slot}
+            finally:
+                shutil.rmtree(scan, ignore_errors=True)
+        if leakage:
+            _codeoff_finalize_record(root, manifest, state, "parked", "candidate_identity_leakage")
+            return 422, {"ok": False, "error": "frozen candidate contains private protocol or author identity leakage", "code": "candidate_identity_leakage", "experiment_id": manifest["experiment_id"], "status": "parked", "leakage_findings": len(leakage)}
+        seed = bytes.fromhex(manifest["selection"]["seed"])
+        judges = {}
+        public = []
+        for slot in ("judge-fable", "judge-1", "judge-2"):
+            order = _codeoff_rank(seed, f"blind:{manifest['identities'][slot]['logical_model']}", ["author-1", "author-2"])
+            labels = {f"candidate-{index + 1}": author_slot for index, author_slot in enumerate(order)}
+            workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
+            if workspace.exists():
+                return 409, {"error": "judge workspace already exists", "code": "workspace_exists"}
+            workspace.mkdir(parents=True)
+            bundle_candidates = {}
+            try:
+                for label, author_slot in labels.items():
+                    candidate = state["candidates"][author_slot]
+                    _codeoff_extract(_codeoff_read_artifact(root, candidate["artifact_hash"]), workspace / label)
+                    bundle_candidates[label] = {"tree_manifest_hash": candidate["tree_manifest_hash"], "artifact_hash": candidate["artifact_hash"]}
+                bundle = {"version": "code-off-blind-bundle-v1", "rubric_hash": manifest["rubric_hash"], "candidates": bundle_candidates, "leakage_count": 0}
+                bundle_hash = _codeoff_artifact(root, codeoff_canonical_json(bundle))
+                _codeoff_init_blind_repo(workspace)
+            except (OSError, RuntimeError, tarfile.TarError):
+                shutil.rmtree(workspace, ignore_errors=True)
+                _codeoff_finalize_record(root, manifest, state, "parked", f"blind_bundle_failed:{slot}")
+                return 409, {"error": "blind bundle construction failed", "code": "blind_bundle_failed", "slot": slot}
+            snapshot_hash = hashlib.sha256(codeoff_canonical_json(manifest["identities"][slot])).hexdigest()
+            judges[slot] = {"labels": labels, "judge_snapshot_hash": snapshot_hash, "bundle_hash": bundle_hash}
+            public.append({"slot": slot, "bundle_hash": bundle_hash, "judge_snapshot_hash": snapshot_hash, "leakage_count": 0})
+        private = {"version": "code-off-blinding-v1", "judges": judges}
+        _codeoff_atomic_json(root / "private" / "blinding.json", private, immutable=True)
+        state["status"] = "blinded"
+        state["blind_bundle_hashes"] = {slot: item["bundle_hash"] for slot, item in judges.items()}
+        _codeoff_commit_event(root, state, "blind_bundles_created", {"bundle_hashes": state["blind_bundle_hashes"], "leakage_findings": 0})
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "blinded", "bundles": public, "leakage_findings": 0}
+
+def _codeoff_judge_prompt(manifest: dict[str, Any], private: dict[str, Any], slot: str) -> bytes:
+    expected = private["judges"][slot]["judge_snapshot_hash"]
+    return (
+        "CODE-OFF BLIND JUDGE CONTRACT code-off-rubric-v1\n"
+        "Compare candidate-1 and candidate-2 in the current blind workspace. Do not inspect .git, parent directories, APIs, sessions, or model/provider metadata. Do not use network. "
+        "Use the exact rubric and write judge-result.json with no extra keys. Scores: correctness 0..40, tests 0..20, quality 0..20, scope 0..10, maintainability 0..10. "
+        "Each candidate needs scores, boolean pass, and rationale <=1200 characters. Top level needs rubric_version, judge_snapshot_hash, candidates, preference candidate-1|candidate-2|abstain, and rationale.\n"
+        f"Locked task category: {manifest['classification']['category']}; tags: {','.join(manifest['classification']['tags'])}\nTask:\n{manifest['task']}\n"
+        f"Judge snapshot hash: {expected}\nRubric hash: {manifest['rubric_hash']}\n"
+        "Then finish with exactly one JSON object: {\"status\":\"ok\"|\"error\",\"sha\":null,\"pr_url\":null,\"summary\":\"one line\"}\n"
+    ).encode()
+
+def parse_codeoff_judge_result(raw: Any, expected_snapshot_hash: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(raw, dict) or set(raw) != {"rubric_version", "judge_snapshot_hash", "candidates", "preference", "rationale"}:
+        return None, {"error": "judge result must be the exact structured object", "code": "invalid_judge_result"}
+    if raw["rubric_version"] != CODEOFF_RUBRIC_VERSION or raw["judge_snapshot_hash"] != expected_snapshot_hash:
+        return None, {"error": "judge rubric or exact snapshot differs", "code": "judge_snapshot_mismatch"}
+    if raw["preference"] not in CODEOFF_RUBRIC["preference"] or not isinstance(raw["rationale"], str) or not raw["rationale"].strip() or len(raw["rationale"]) > CODEOFF_MAX_RATIONALE:
+        return None, {"error": "judge preference/rationale is invalid", "code": "invalid_judge_result"}
+    candidates = raw.get("candidates")
+    if not isinstance(candidates, dict) or set(candidates) != {"candidate-1", "candidate-2"}:
+        return None, {"error": "judge must score exactly both blind candidates", "code": "invalid_judge_result"}
+    parsed_candidates = {}
+    dimensions = CODEOFF_RUBRIC["dimensions"]
+    for label, candidate in candidates.items():
+        if not isinstance(candidate, dict) or set(candidate) != {"scores", "pass", "rationale"} or type(candidate.get("pass")) is not bool or not isinstance(candidate.get("rationale"), str) or not candidate["rationale"].strip() or len(candidate["rationale"]) > CODEOFF_MAX_RATIONALE:
+            return None, {"error": f"{label} result is invalid", "code": "invalid_judge_result"}
+        scores = candidate.get("scores")
+        if not isinstance(scores, dict) or set(scores) != set(dimensions):
+            return None, {"error": f"{label} scores have wrong keys", "code": "invalid_judge_result"}
+        for key, maximum in dimensions.items():
+            if type(scores[key]) is not int or not 0 <= scores[key] <= maximum:
+                return None, {"error": f"{label}.{key} is out of range", "code": "invalid_judge_result"}
+        parsed_candidates[label] = {"scores": dict(scores), "total": sum(scores.values()), "pass": candidate["pass"], "rationale": candidate["rationale"].strip()}
+    return {"rubric_version": CODEOFF_RUBRIC_VERSION, "judge_snapshot_hash": expected_snapshot_hash, "candidates": parsed_candidates, "preference": raw["preference"], "rationale": raw["rationale"].strip()}, None
+
+def codeoff_judge(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id", "slot", "job_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    slot = data.get("slot")
+    if slot not in ("judge-fable", "judge-1", "judge-2"):
+        return 400, {"error": "invalid judge slot", "code": "bad_slot"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        if state.get("status") not in ("blinded", "judging"):
+            return 409, {"error": "blind bundles must be frozen before judging", "code": "not_blinded"}
+        if slot in state["judges"]:
+            return 409, {"error": "judge receipt is already immutable", "code": "judge_recorded"}
+        job, job_err = _codeoff_validate_job(data.get("job_id"), state, manifest, slot)
+        if job_err:
+            return 409, job_err
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        path = codeoff_workspace_path(manifest["experiment_id"], slot) / "judge-result.json"
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024:
+                raise ValueError("judge result exceeds limit")
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            _codeoff_finalize_record(root, manifest, state, "parked", f"invalid_judge_result:{slot}")
+            return 422, {"error": "judge result file is missing or invalid", "code": "invalid_judge_result", "slot": slot}
+        parsed, parse_err = parse_codeoff_judge_result(raw, private["judges"][slot]["judge_snapshot_hash"])
+        if parse_err:
+            _codeoff_finalize_record(root, manifest, state, "parked", f"{parse_err['code']}:{slot}")
+            return 422, parse_err
+        assert parsed and job
+        receipt = {"version": "code-off-judge-receipt-v1", "slot": slot, "identity": manifest["identities"][slot], "job_id": job["job_id"], "started_at": job.get("started_at"), "finished_at": job.get("finished_at"), "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")), **parsed}
+        receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
+        state["judges"][slot] = {**parsed, "receipt_hash": receipt_hash}
+        state["status"] = "judging"
+        _codeoff_commit_event(root, state, "judge_recorded", {"slot": slot, "receipt_hash": receipt_hash, "preference": parsed["preference"]})
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "slot": slot, "status": "recorded", "judge_receipt_hash": receipt_hash, "preference": parsed["preference"], "totals": {label: item["total"] for label, item in parsed["candidates"].items()}}
+
+def aggregate_codeoff_results(mapping: dict[str, dict[str, str]], receipts: dict[str, dict[str, Any]], tests: dict[str, bool]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    expected = {"judge-fable", "judge-1", "judge-2"}
+    missing = sorted(expected - set(receipts))
+    if missing or set(mapping) != expected:
+        return None, {"error": "all three fixed judge slots are required; no replacement", "code": "missing_judges", "missing": missing}
+    votes = {"author-1": 0, "author-2": 0}
+    totals = {"author-1": 0, "author-2": 0}
+    preferences = {}
+    for judge in sorted(expected):
+        labels = mapping[judge]
+        receipt = receipts[judge]
+        preference = receipt["preference"]
+        actual = labels.get(preference) if preference != "abstain" else None
+        preferences[judge] = actual or "abstain"
+        if actual:
+            votes[actual] += 1
+        for label in ("candidate-1", "candidate-2"):
+            totals[labels[label]] += int(receipt["candidates"][label]["total"])
+    winner = next((slot for slot, count in votes.items() if count >= 2), None)
+    basis = "preference-majority"
+    if winner is None:
+        basis = "summed-scores"
+        if totals["author-1"] == totals["author-2"]:
+            return {"version": CODEOFF_AGGREGATION_VERSION, "decision": "parked", "reason": "exact_score_tie", "winner": None, "basis": basis, "votes": votes, "preferences": preferences, "summed_scores": totals, "tests": tests, "promotion_eligible": False}, None
+        winner = max(totals, key=totals.get)
+    return {"version": CODEOFF_AGGREGATION_VERSION, "decision": "winner", "reason": None, "winner": winner, "basis": basis, "votes": votes, "preferences": preferences, "summed_scores": totals, "tests": tests, "promotion_eligible": tests.get(winner) is True}, None
+
+def codeoff_aggregate(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        private = json.loads((root / "private" / "blinding.json").read_text()) if (root / "private" / "blinding.json").is_file() else {"judges": {}}
+        mapping = {slot: item["labels"] for slot, item in private["judges"].items()}
+        tests = {slot: state["candidates"][slot].get("tests", {}).get("pass") is True for slot in ("author-1", "author-2")}
+        aggregation, aggregate_err = aggregate_codeoff_results(mapping, state["judges"], tests)
+        if aggregate_err:
+            _codeoff_finalize_record(root, manifest, state, "parked", aggregate_err["code"])
+            return 409, aggregate_err
+        assert aggregation
+        state["aggregation"] = aggregation
+        _codeoff_event(root, state, "aggregated", {"decision": aggregation["decision"], "winner": aggregation["winner"], "basis": aggregation["basis"], "promotion_eligible": aggregation["promotion_eligible"]})
+        if aggregation["decision"] == "parked":
+            _codeoff_finalize_record(root, manifest, state, "parked", aggregation["reason"])
+        elif not aggregation["promotion_eligible"]:
+            _codeoff_finalize_record(root, manifest, state, "parked", "winner_tests_failed")
+        else:
+            state["status"] = "aggregated"
+            _codeoff_write_state(root, state)
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], **aggregation}
+
+def _codeoff_clear_tree(root: Path) -> None:
+    for child in os.scandir(root):
+        if child.name == ".git":
+            continue
+        path = Path(child.path)
+        if child.is_dir(follow_symlinks=False):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+def _codeoff_apply_verified(verified: dict[str, Any], target: Path, base_sha: str) -> None:
+    tree = verified.get("git_tree")
+    if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("verified git tree is unavailable")
+    if not run_git(target, ["read-tree", "--reset", "-u", tree]).get("ok"):
+        raise RuntimeError("git refused verified tree application")
+    for entry in verified["entries"]:
+        if entry["type"] == "directory":
+            path = target / entry["path"]
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(int(entry["mode"], 8))
+        elif entry["type"] == "file":
+            (target / entry["path"]).chmod(int(entry["mode"], 8))
+    if not run_git(target, ["reset", "--mixed", base_sha]).get("ok"):
+        raise RuntimeError("git index reset failed after verified tree application")
+
+def _codeoff_restore_base(target: Path, manifest: dict[str, Any]) -> bool:
+    hard = run_git(target, ["reset", "--hard", manifest["base_sha"]])
+    clean = run_git(target, ["clean", "-fdx"])
+    try:
+        snapshot = codeoff_tree_snapshot(target, manifest["base_sha"])
+    except RuntimeError:
+        return False
+    branch, head, err = current_branch_head(target)
+    return bool(hard.get("ok") and clean.get("ok") and snapshot["manifest_hash"] == manifest["base_snapshot_hash"] and not err and branch == manifest["branch"] and head == manifest["base_sha"])
+
+def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
+        assert root and manifest and state
+        aggregation = state.get("aggregation") or {}
+        if state.get("status") != "aggregated" or aggregation.get("promotion_eligible") is not True:
+            return 409, {"error": "a tested aggregate winner is required", "code": "not_promotion_eligible"}
+        winner = aggregation["winner"]
+        candidate = dict(state["candidates"][winner])
+        repo_raw = repos.get(manifest["repo"])
+        repo = Path(repo_raw) if isinstance(repo_raw, str) and repo_raw else Path("/__graphwing_missing_repo__")
+        if not repo.is_dir():
+            return 409, {"error": "target repo is no longer allowlisted", "code": "repo_unavailable"}
+        branch, head, git_err = current_branch_head(repo)
+        if git_err or branch != manifest["branch"] or head != manifest["base_sha"] or not run_git(repo, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok"):
+            return 409, {"error": "target repo identity changed", "code": "promotion_base_mismatch"}
+        target_before = codeoff_tree_snapshot(repo, manifest["base_sha"])
+        winner_path = codeoff_workspace_path(manifest["experiment_id"], winner)
+        winner_now = codeoff_tree_snapshot(winner_path, manifest["base_sha"])
+        _codeoff_read_artifact(root, candidate["artifact_hash"])
+        if target_before["manifest_hash"] != manifest["base_snapshot_hash"]:
+            return 409, {"error": "target worktree is not the exact pristine base", "code": "promotion_base_mutated"}
+        if winner_now["manifest_hash"] != candidate["tree_manifest_hash"]:
+            return 409, {"error": "frozen winner equality check failed", "code": "winner_mutated"}
+    verified = _codeoff_verify_artifact(root, manifest, repo, candidate, "final")
+    verification, exact = verified["tests"], verified["no_mutation"]
+    eligible = verification["pass"] and exact
+    if not eligible:
+        with CODEOFF_LOCK:
+            root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+            if load_err:
+                return 409, load_err
+            assert root and manifest and state
+            final_receipt = {"version": "code-off-final-verification-v1", "winner": winner, "artifact_hash": candidate["artifact_hash"], "tree_manifest_hash": candidate["tree_manifest_hash"], "no_mutation": exact, "tests_pass": verification["pass"], "test_receipt_hash": verification["receipt_hash"], "commit_eligible": False, "push_eligible": False}
+            receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(final_receipt))
+            final_receipt["receipt_hash"] = receipt_hash
+            state["final_verification"] = final_receipt
+            _codeoff_event(root, state, "final_verification", {"winner": winner, "receipt_hash": receipt_hash, "tests_pass": verification["pass"], "no_mutation": exact, "eligible": False})
+            _codeoff_finalize_record(root, manifest, state, "parked", "final_tests_failed" if not verification["pass"] else "final_tree_mutated")
+        return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "parked", **final_receipt}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root and manifest and state
+        current_candidate = state["candidates"][winner]
+        target_now = codeoff_tree_snapshot(repo, manifest["base_sha"])
+        winner_now = codeoff_tree_snapshot(winner_path, manifest["base_sha"])
+        if target_now["manifest_hash"] != manifest["base_snapshot_hash"] or current_branch_head(repo) != (manifest["branch"], manifest["base_sha"], None) or not run_git(repo, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok"):
+            return 409, {"error": "target changed during isolated verification", "code": "promotion_base_mutated"}
+        if winner_now["manifest_hash"] != candidate["tree_manifest_hash"] or current_candidate.get("artifact_hash") != candidate["artifact_hash"]:
+            return 409, {"error": "winner changed during isolated verification", "code": "winner_mutated"}
+        try:
+            _codeoff_apply_verified(verified, repo, manifest["base_sha"])
+            after = codeoff_tree_snapshot(repo, manifest["base_sha"])
+            after_branch, after_head, after_err = current_branch_head(repo)
+            exact = after["manifest_hash"] == candidate["tree_manifest_hash"] and not after_err and after_branch == manifest["branch"] and after_head == manifest["base_sha"] and run_git(repo, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok") is True
+            if not exact:
+                raise RuntimeError("applied tree differs from verified winner")
+        except (OSError, RuntimeError):
+            restored = _codeoff_restore_base(repo, manifest)
+            return 500, {"ok": False, "error": "verified winner application failed and target was restored" if restored else "verified winner application and base restoration failed", "code": "promotion_apply_failed" if restored else "promotion_restore_failed", "retryable": restored}
+        final_receipt = {"version": "code-off-final-verification-v1", "winner": winner, "artifact_hash": candidate["artifact_hash"], "tree_manifest_hash": candidate["tree_manifest_hash"], "promoted_tree_hash": after["manifest_hash"], "no_mutation": True, "tests_pass": True, "test_receipt_hash": verification["receipt_hash"], "commit_eligible": True, "push_eligible": True}
+        try:
+            receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(final_receipt))
+            final_receipt["receipt_hash"] = receipt_hash
+            state["promotion"] = {"winner": winner, "artifact_hash": candidate["artifact_hash"], "tree_manifest_hash": candidate["tree_manifest_hash"], "promoted_tree_hash": after["manifest_hash"], "git_tree": verified["git_tree"]}
+            state["final_verification"] = final_receipt
+            _codeoff_event(root, state, "final_verification", {"winner": winner, "receipt_hash": receipt_hash, "tests_pass": True, "no_mutation": True, "eligible": True})
+            _codeoff_finalize_record(root, manifest, state, "completed", None)
+        except (OSError, RuntimeError):
+            try:
+                disk = json.loads((root / "state.json").read_text())
+                committed = disk.get("finalized") and disk.get("final_verification", {}).get("receipt_hash") == final_receipt.get("receipt_hash")
+            except (OSError, json.JSONDecodeError):
+                committed = False
+            if not committed and not _codeoff_restore_base(repo, manifest):
+                return 500, {"ok": False, "error": "final receipt persistence failed and base restoration failed", "code": "promotion_restore_failed", "retryable": False}
+            if not committed:
+                raise
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "completed", **final_receipt}
+
+def codeoff_audit(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    with CODEOFF_LOCK: root, manifest, state, err = _codeoff_load(first_query(qs, "experiment_id"), active=False)
+    if err:
+        return 404 if err["code"] == "experiment_not_found" else 400, err
+    assert root and manifest and state
+    identities = {slot: {key: identity.get(key) for key in ("logical_model", "exact_model", "provider", "launcher", "runnable", "proven", "manifest_version", "manifest_current")} for slot, identity in manifest["identities"].items()}
+    selection = {key: manifest["selection"][key] for key in ("algorithm_version", "policy_version", "ordered_pool", "authors", "fixed_judge", "random_judges", "seed_commitment")}
+    candidates = {slot: {key: value.get(key) for key in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash") if value.get(key)} | ({"tests_pass": value["tests"]["pass"], "test_receipt_hash": value["tests"]["receipt_hash"]} if value.get("tests") else {}) for slot, value in state["candidates"].items()}
+    judges = {slot: ({"receipt_hash": value.get("receipt_hash"), "preference": value.get("preference"), "totals": {label: item.get("total") for label, item in value.get("candidates", {}).items()}} if state.get("finalized") is True else {"receipt_hash": value.get("receipt_hash")}) for slot, value in state.get("judges", {}).items()}
+    return 200, {"ok": True, "protocol_version": manifest["protocol_version"], "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": state["finalized"], "classification": manifest["classification"], "original_classification": manifest["original_classification"], "category_source": manifest["category_source"], "selection": selection, "identities": identities, "fable_provider_overlap": manifest["fable_provider_overlap"], "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "prompt_hash": manifest["prompt_hash"], "rubric_hash": manifest["rubric_hash"], "manifest_file_hash": state["manifest_file_hash"], "event_head": state["event_head"], "event_count": state["event_count"], "candidates": candidates, "judges": judges, "aggregation": state.get("aggregation") if state.get("finalized") or not state.get("aggregation") else {key: value for key, value in state["aggregation"].items() if key != "preferences"}, "promotion": state.get("promotion"), "final_verification": state.get("final_verification"), "final_file_hash": state.get("final_file_hash")}
+
+def codeoff_cleanup(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+    if load_err:
+        return 400, load_err
+    assert root and manifest and state
+    if not state.get("finalized"):
+        return 409, {"error": "cleanup is refused before finalization", "code": "not_finalized"}
+    workspace_root = CODEOFF_WORKSPACES_DIR / manifest["experiment_id"]
+    repo_raw = repos.get(manifest["repo"])
+    repo = Path(repo_raw) if isinstance(repo_raw, str) and repo_raw else Path("/__graphwing_missing_repo__")
+    removed = []
+    for slot in ("author-1", "author-2"):
+        path = codeoff_workspace_path(manifest["experiment_id"], slot)
+        if path.exists() and repo.is_dir():
+            result = run_git(repo, ["worktree", "remove", "--force", str(path)])
+            if not result.get("ok"):
+                return 500, {"error": "git refused code-off worktree cleanup", "code": "cleanup_failed", "slot": slot}
+            removed.append(slot)
+    for slot in ("judge-fable", "judge-1", "judge-2"):
+        path = codeoff_workspace_path(manifest["experiment_id"], slot)
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(slot)
+    if workspace_root.exists() and not any(workspace_root.iterdir()):
+        workspace_root.rmdir()
+    return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "cleaned", "removed_slots": removed, "record_preserved": True}
+
+def _codeoff_boundary(operation: Any, *args: Any) -> tuple[int, dict[str, Any]]:
+    try:
+        return operation(*args)
+    except (OSError, RuntimeError, UnicodeError, subprocess.TimeoutExpired, tarfile.TarError, json.JSONDecodeError):
+        return 500, {"ok": False, "error": "code-off operation was interrupted; retry the same immutable request", "code": "codeoff_runtime_failure", "retryable": True}
+
+def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(raw, dict) or set(raw) != {"experiment_id", "slot"}:
+        return None, {"error": "codeoff_workspace accepts only experiment_id and slot", "code": "bad_codeoff_workspace"}
+    slot = raw.get("slot")
+    if slot not in ("author-1", "author-2", "judge-fable", "judge-1", "judge-2"):
+        return None, {"error": "unknown code-off slot", "code": "bad_codeoff_workspace"}
+    root, manifest, state, err = _codeoff_load(raw.get("experiment_id"), active=True)
+    if err:
+        return None, err
+    assert root and manifest and state
+    workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
+    if not workspace.is_dir():
+        return None, {"error": "opaque code-off workspace is unavailable", "code": "workspace_unavailable"}
+    if slot.startswith("author-"):
+        if state["status"] not in ("prepared", "authors_running", "candidates_running", "candidates_tested"):
+            return None, {"error": "author launch is not allowed in this stage", "code": "bad_experiment_stage"}
+        prompt_hash = manifest["prompt_hash"]
+        prompt = _codeoff_read_artifact(root, prompt_hash)
+        budget = manifest["budgets"]["author_seconds"]
+    else:
+        if state["status"] not in ("blinded", "judging"):
+            return None, {"error": "judge launch requires frozen blind bundles", "code": "bad_experiment_stage"}
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        prompt = _codeoff_judge_prompt(manifest, private, slot)
+        prompt_hash = hashlib.sha256(prompt).hexdigest()
+        budget = manifest["budgets"]["judge_seconds"]
+    return {"root": root, "manifest": manifest, "state": state, "slot": slot, "cwd": workspace, "repo_name": f"codeoff:{manifest['experiment_id']}:{slot}", "prompt": prompt, "prompt_hash": prompt_hash, "identity": manifest["identities"][slot], "budget": budget, "max_turns": manifest["budgets"]["max_turns"]}, None
+
+
 def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
@@ -4174,23 +5418,35 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     allowed = {
         "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
         "session_identity", "resume_job_id", "cwd", "response_webhook_url",
-        "response_webhook_token", "resume_url",
+        "response_webhook_token", "resume_url", "codeoff_workspace",
     }
     unexpected = sorted(set(data) - allowed)
     if unexpected:
         return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
-    prompt = data.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return 400, {"error": "prompt is required", "code": "missing_prompt"}
-    prompt = prompt.strip()
-    if len(prompt) > PROMPT_MAX_CHARS:
-        return 400, {"error": "prompt too large", "code": "prompt_too_large"}
-    cwd_raw = data.get("cwd")
-    if cwd_raw is not None and not isinstance(cwd_raw, str):
-        return 400, {"error": "cwd must be a repo short name", "code": "bad_cwd"}
-    repo_name, resolved = resolve_run_cwd(cwd_raw, repos)
-    if repo_name is None:
-        return 400, resolved
+    codeoff: dict[str, Any] | None = None
+    if data.get("codeoff_workspace") is not None:
+        if data.get("prompt") not in (None, "") or data.get("cwd") not in (None, ""):
+            return 400, {"error": "code-off jobs resolve prompt and cwd from the opaque reference", "code": "bad_codeoff_workspace"}
+        codeoff, codeoff_err = _resolve_codeoff_agent(data.get("codeoff_workspace"))
+        if codeoff_err:
+            return 409 if codeoff_err.get("code") in ("experiment_finalized", "bad_experiment_stage") else 400, codeoff_err
+        assert codeoff is not None
+        prompt_bytes = codeoff["prompt"]
+        prompt = prompt_bytes.decode("utf-8")
+        repo_name, resolved = codeoff["repo_name"], codeoff["cwd"]
+    else:
+        prompt = data.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return 400, {"error": "prompt is required", "code": "missing_prompt"}
+        prompt = prompt.strip()
+        if len(prompt) > PROMPT_MAX_CHARS:
+            return 400, {"error": "prompt too large", "code": "prompt_too_large"}
+        cwd_raw = data.get("cwd")
+        if cwd_raw is not None and not isinstance(cwd_raw, str):
+            return 400, {"error": "cwd must be a repo short name", "code": "bad_cwd"}
+        repo_name, resolved = resolve_run_cwd(cwd_raw, repos)
+        if repo_name is None:
+            return 400, resolved
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
@@ -4211,7 +5467,11 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     model = model.strip()
     if len(model) > 80:
         return 400, {"error": "model is invalid", "code": "bad_model"}
-    if provider != native_spec["provider"] or model not in native_spec["models"]:
+    if codeoff is not None:
+        exact = codeoff["identity"]
+        if (launcher, provider, model) != (exact["launcher"], exact["provider"], exact["exact_model"]):
+            return 400, {"error": "code-off identity differs from the immutable snapshot; fallback/substitution is forbidden", "code": "codeoff_identity_mismatch"}
+    elif provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
@@ -4219,6 +5479,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
     if budget_err:
         return 400, budget_err
+    if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
+        return 400, {"error": "code-off job must use the immutable turn and time budgets", "code": "codeoff_budget_mismatch"}
     binary = resolve_launcher_binary_now(launcher)
     if not binary.is_file() and not webhook_url:
         classified = classify_agent_failure("missing_binary")
@@ -4245,7 +5507,19 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         session_identity = requested_identity
     elif data.get("resume_job_id") not in (None, ""):
         return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
-    with JOB_LOCK:
+    with (CODEOFF_LOCK if codeoff is not None else nullcontext()), JOB_LOCK:
+        if codeoff is not None:
+            fresh_root, fresh_manifest, fresh_state, fresh_err = _codeoff_load(codeoff["manifest"]["experiment_id"], active=True)
+            if fresh_err:
+                return 409, fresh_err
+            assert fresh_root and fresh_manifest and fresh_state
+            prior_jobs = fresh_state.get("agent_jobs", {}).get(codeoff["slot"], [])
+            resume_job_id = data.get("resume_job_id")
+            if resume_job_id not in (None, "") and resume_job_id not in prior_jobs:
+                return 400, {"error": "resume job is not pinned to this code-off slot", "code": "codeoff_resume_mismatch"}
+            if resume_job_id in (None, "") and prior_jobs:
+                return 409, {"error": "slot is already launched; replacement/redraw is forbidden", "code": "slot_already_launched"}
+            codeoff.update({"root": fresh_root, "manifest": fresh_manifest, "state": fresh_state})
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
@@ -4255,7 +5529,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "status": "queued",
             "repo": repo_name,
             "cwd": str(resolved),
-            "prompt": prompt,
+            "prompt": prompt if codeoff is None else f"[code-off prompt {codeoff['prompt_hash']}]",
             "launcher": launcher,
             "provider": provider,
             "model": model,
@@ -4273,9 +5547,27 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "error": None,
             "webhook": None,
         }
+        if codeoff is not None:
+            job["codeoff_workspace"] = {"experiment_id": codeoff["manifest"]["experiment_id"], "slot": codeoff["slot"]}
+            job["prompt_hash"] = codeoff["prompt_hash"]
         job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        (job_dir(job_id) / "prompt.txt").write_text(wrap_prompt(job_id, prompt, str(resolved)))
+        prompt_path = job_dir(job_id) / "prompt.txt"
+        if codeoff is not None and codeoff["slot"].startswith("author-"):
+            prompt_path.symlink_to(codeoff["root"] / "artifacts" / codeoff["prompt_hash"])
+        elif codeoff is not None:
+            prompt_path.write_bytes(prompt_bytes)
+        else:
+            prompt_path.write_text(wrap_prompt(job_id, prompt, str(resolved)))
         write_job(job)
+        if codeoff is not None:
+            try:
+                state = codeoff["state"]
+                state["agent_jobs"][codeoff["slot"]].append(job_id)
+                state["status"] = "authors_running" if codeoff["slot"].startswith("author-") else "judging"
+                _codeoff_commit_event(codeoff["root"], state, "agent_launched", {"slot": codeoff["slot"], "job_id": job_id, "identity_snapshot_hash": hashlib.sha256(codeoff_canonical_json(codeoff["identity"])).hexdigest(), "prompt_hash": codeoff["prompt_hash"]})
+            except (OSError, RuntimeError):
+                shutil.rmtree(job_dir(job_id), ignore_errors=True)
+                return 500, {"ok": False, "error": "code-off launch persistence was interrupted; retry the same slot", "code": "codeoff_runtime_failure", "retryable": True}
     enqueue_agent(job)
     return 202, {
         "ok": True,
@@ -4327,6 +5619,31 @@ def dispatch_inner(
         return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
     if method == "GET" and path == "/v1/watch":
         return json_out(200, watch_snapshot())
+
+    if method == "POST" and path == "/v1/code-off/prepare":
+        status, payload = _codeoff_boundary(codeoff_prepare, body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/candidate":
+        status, payload = _codeoff_boundary(codeoff_candidate, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/blind":
+        status, payload = _codeoff_boundary(codeoff_blind, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/judge":
+        status, payload = _codeoff_boundary(codeoff_judge, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/aggregate":
+        status, payload = _codeoff_boundary(codeoff_aggregate, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/finalize":
+        status, payload = _codeoff_boundary(codeoff_finalize, body, repos)
+        return json_out(status, payload)
+    if method == "GET" and path == "/v1/code-off/audit":
+        status, payload = _codeoff_boundary(codeoff_audit, qs)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/cleanup":
+        status, payload = _codeoff_boundary(codeoff_cleanup, body, repos)
+        return json_out(status, payload)
 
     if method == "GET" and path == "/v1/herdr/agents":
         out = herdr_agents()

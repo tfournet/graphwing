@@ -58,6 +58,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 | `graphwing-verify-stack` | stack, ports | Check that a local stack is up. |
 | `graphwing-pr-status` | PR number | Read GitHub checks. No writes. |
 | `graphwing-pr-drive` | repo, PR, test | One fix attempt when CI is red. |
+| `graphwing-code-off` | repo, exact base SHA, 32-byte seed, locked category, task, named tests/toolchain/budgets | Freeze two isolated candidates, obtain three blind structured judgments, promote only a test-green exact winner, then gate commit/push. No redraw, fallback, loop, or merge. |
 
 How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules for the human: [docs/HUMAN-LOOP.md](docs/HUMAN-LOOP.md).
 
@@ -87,6 +88,10 @@ GRAPHWING_HOME=. python3 test_server.py
 ```
 
 Git write endpoints only work on those short names. No `--force`. No `git add -A` unless you pass paths. Tests and scripts are allowlisted names in `tests.json` / `scripts.json`.
+
+Code-off state is a hash-chained, content-addressed record under `$GRAPHWING_HOME/codeoffs`; audit exposes the seed commitment but never the seed or blind map. Candidate/final tests use the
+same disposable Git-worktree recipe, and only a verified hash is safely applied. Fixed Fable is
+historical/unproven, so production parks before any launcher until a reviewed manifest update.
 
 Publish workflows after you have `$GRAPHWING_HOME/rewst-install.json` and a Rewst MCP token:
 

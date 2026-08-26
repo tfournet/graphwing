@@ -159,6 +159,14 @@ without a `run_id`, so a hand-rolled curl cannot merge anything.
 | `graphwing-pr-status` | Read-only PR checks. Unauthenticated webhook. |
 | `graphwing-pr-drive` | One fix slice when CI is red. Authenticated webhook / doorbell OIDC. |
 
+## Run a deterministic code-off
+
+`graphwing-code-off` is one bounded DAG. Supply an unused lowercase `experiment_id`, an allowlisted repo at the exact clean `base_sha`, a 64-character lowercase hex seed, locked category/tags/source, the task, named tests, toolchain, budgets, and a commit message. Whole-value Graph interpolation may serialize tags, tests, toolchain, and budgets as bounded JSON strings; the server parses them before strict native validation. Callers never supply workspace paths; `agentRun` resolves only `{experiment_id, slot}`.
+
+`code-off-draw-v1` uses the seed as an HMAC-SHA-256 key to rank the canonical pool and each judge's `[author-1, author-2]` order without modulo bias. The public commitment is `SHA-256("graphwing/code-off/seed-commitment/v1\\0" + seed)`; audit never returns the seed or a blind ordering before completion. There is no redraw, fallback, or cherry-picking.
+
+The immutable record holds hash-chained events and content-addressed artifacts. Candidate/final recipes run identically with bytecode disabled in disposable Git worktrees; judges receive the locked task/category but no author identity. Finalization proves the frozen hash before a Git-safe target apply; ignored candidate paths, introduced identity leakage, or terminal candidate corruption park for cleanup, while infrastructure/persistence interruptions remain retryable. Audit is read-only. Fixed Fable (and historical Terra when drawn) stays unproven/non-runnable, so production parks before launch and never redraws.
+
 ## Publish catalog graphs
 
 Seat file `$GRAPHWING_HOME/rewst-install.json` (copy [`examples/rewst-install.example.json`](../examples/rewst-install.example.json)). Public OpenAPI URL comes from named-tunnel meta or `GRAPHWING_PUBLIC_URL`.

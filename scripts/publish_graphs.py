@@ -249,7 +249,7 @@ def main():
         raise SystemExit("rewst-install.json missing instance_id")
     hook_secret = os.environ.get("GRAPHWING_HOOK_SECRET") or install.get("hook_secret") or ""
     integration = install.get("custom_integration_id")
-    stems = ["verify-stack", "implement-slice", "pr-drive", "pr-status"] if args.only == "all" else [args.only]
+    stems = ["verify-stack", "implement-slice", "pr-drive", "pr-status", "code-off"] if args.only == "all" else [args.only]
     status_repo = (
         os.environ.get("GRAPHWING_STATUS_REPO")
         or install.get("pr_status_repo")
@@ -289,6 +289,8 @@ def main():
         install["verify_stack"] = {**(install.get("verify_stack") or {}), **published["verify-stack"]}
     if "implement-slice" in published:
         install["implement_slice"] = {**(install.get("implement_slice") or {}), **published["implement-slice"]}
+    if "code-off" in published:
+        install["code_off"] = {**(install.get("code_off") or {}), **published["code-off"]}
     save_install(install)
     print("=== DONE ===")
     print(json.dumps(published, indent=2))
