@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
@@ -76,9 +76,9 @@ SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 NATIVE_LAUNCHERS = {
-    "codex": {"provider": "openai", "models": ("gpt-5.6-sol",), "binary": "CODEX_BIN"},
-    "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5"), "binary": "CLAUDE_BIN"},
-    "grok": {"provider": "xai", "models": ("grok-4.6",), "binary": "GROK_BIN"},
+    "codex": {"provider": "openai", "models": ("gpt-5.6-sol",)},
+    "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
+    "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
 FAILURE_CLASS_CODES = {
     "none": {"success"},
@@ -155,6 +155,7 @@ SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
 ROUTE_VERSION = "normal-v1"
 FALLBACK_ROUTE_VERSION = "availability-fallback-v1"
+RECOVERY_VERSION = "provider-recovery-v1"
 NORMAL_WRITER_ROUTES = {
     "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
     "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
@@ -1381,6 +1382,29 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "path": nxt.get("path"),
         "kicked": False,
     }
+    recovery_fields = (
+        "prior_primary_route", "prior_primary_receipt", "prior_fallback_route",
+        "prior_fallback_receipt",
+    )
+    recovery_values = {key: data.get(key) for key in recovery_fields}
+    recovery_version = data.get("recovery_version")
+    fresh_primary_receipt = data.get("fresh_primary_receipt")
+    recovery_supplied = recovery_version not in (None, "") or any(
+        data.get(key) not in (None, "")
+        for key in (*recovery_fields, "fresh_primary_receipt")
+    )
+    if recovery_supplied and (
+        recovery_version != RECOVERY_VERSION
+        or any(not isinstance(value, dict) for value in recovery_values.values())
+        or (
+            fresh_primary_receipt not in (None, "")
+            and not isinstance(fresh_primary_receipt, dict)
+        )
+    ):
+        return 400, {
+            "error": "complete versioned recovery evidence is required",
+            "code": "malformed_recovery_evidence",
+        }
     if nxt.get("kind") != "build":
         return 200, out
     kick_url = data.get("kick_url")
@@ -1409,6 +1433,11 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "kick_url": kick_url,
         "kick_token": token,
     }
+    if recovery_version == RECOVERY_VERSION:
+        payload["recovery_version"] = RECOVERY_VERSION
+        payload.update(recovery_values)
+        if fresh_primary_receipt not in (None, ""):
+            payload["fresh_primary_receipt"] = fresh_primary_receipt
     hook = post_receipt(kick_url, payload, token=token)
     out["kicked"] = bool(hook.get("ok"))
     out["kick"] = hook
@@ -1637,11 +1666,8 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     return 200, slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
 
 
-def slice_route_fallback(body: bytes) -> tuple[int, dict[str, Any]]:
-    data, err = parse_json_object(body)
-    if err:
-        return 400, err
-    assert data is not None
+def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Derive the one allowed fallback from an already-decoded request object."""
     class_name, size_floor, work_kind, ac_count, seams, common_err = parse_slice_route_common(data)
     if common_err:
         return 400, common_err
@@ -1722,6 +1748,167 @@ def slice_route_fallback(body: bytes) -> tuple[int, dict[str, Any]]:
         }
     )
     return 200, fallback
+
+
+def slice_route_fallback(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    return derive_slice_fallback_route(data)
+
+
+def resolve_launcher_binary_now(launcher: str) -> Path:
+    """Resolve the configured launcher at the request/worker boundary."""
+    fallbacks = {
+        "codex": Path.home() / ".local" / "bin" / "codex",
+        "claude": Path.home() / ".local" / "bin" / "claude",
+        "grok": Path.home() / ".local" / "bin" / "grok",
+    }
+    if launcher not in fallbacks:
+        raise ValueError("unknown launcher")
+    return resolve_executable(
+        launcher,
+        f"GRAPHWING_{launcher.upper()}_BIN",
+        fallbacks[launcher],
+    )
+
+
+RECOVERY_RECEIPT_FIELDS = ("status", "job_id", "session_identity", "failure_class", "failure_code", "failover_eligible")
+
+
+def recovery_job_evidence(
+    receipt: Any, role: str, route: dict[str, Any], receipt_status: str, job_status: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(receipt, dict):
+        return None, {"error": "recovery receipt must be an object", "code": "malformed_recovery_evidence"}
+    job_id, identity = receipt.get("job_id"), receipt.get("session_identity")
+    if (
+        not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id)
+        or receipt.get("role") != role or receipt.get("status") != receipt_status
+        or not isinstance(identity, dict)
+    ):
+        return None, {"error": "recovery receipt is malformed", "code": "malformed_recovery_evidence"}
+    parsed_identity, identity_err = parse_session_identity(identity)
+    if identity_err or parsed_identity != identity or (receipt_status == "ok" and not identity.get("native_session_id")):
+        return None, {"error": "recovery session identity is malformed", "code": "malformed_recovery_evidence"}
+    if any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model")):
+        return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
+    if receipt_status == "ok" and (
+        receipt.get("failure_class") != "none" or receipt.get("failure_code") != "none"
+        or receipt.get("failover_eligible") is not False
+    ):
+        return None, {"error": "successful recovery receipt is malformed", "code": "malformed_recovery_evidence"}
+    job = read_job(job_id)
+    if not isinstance(job, dict):
+        return None, {"error": "recovery receipt has no durable job", "code": "recovery_evidence_mismatch"}
+    if job.get("status") in ("queued", "running"):
+        return None, {"error": "recovery job is not terminal", "code": "nonterminal_recovery_evidence"}
+    stored = job.get("receipt")
+    if (
+        job.get("status") != job_status or not isinstance(stored, dict)
+        or job.get("session_identity") != identity
+        or any(job.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
+        or any(receipt.get(key) != stored.get(key) for key in RECOVERY_RECEIPT_FIELDS)
+    ):
+        return None, {"error": "recovery receipt does not match its durable job", "code": "recovery_evidence_mismatch"}
+    return job, None
+
+
+def recovery_job_time(job: dict[str, Any], field: str) -> str | None:
+    raw = job.get(field)
+    return raw if isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", raw) else None
+
+
+def recovery_job_precedes(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_finished = recovery_job_time(first, "finished_at")
+    second_created = recovery_job_time(second, "created_at")
+    second_finished = recovery_job_time(second, "finished_at")
+    return bool(first_finished and second_created and second_finished and first_finished <= second_created <= second_finished)
+
+
+def recovery_route_identity(route: dict[str, Any], receipt: dict[str, Any]) -> dict[str, str]:
+    return {"job_id": receipt["job_id"], **{key: route[key] for key in ("route_version", "launcher", "provider", "model")}}
+
+
+def derive_slice_recovery_route(data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Select normal or the existing fallback from prior, durable evidence only."""
+    class_name, size_floor, work_kind, ac_count, seams, common_err = parse_slice_route_common(data)
+    if common_err:
+        return 400, common_err
+    required = ("primary_route", "primary_receipt", "fallback_route", "fallback_receipt")
+    if any(data.get(key) is None for key in required):
+        return 400, {"error": "complete prior primary and fallback evidence is required", "code": "missing_recovery_evidence"}
+    if any(not isinstance(data.get(key), dict) for key in required):
+        return 400, {"error": "recovery routes and receipts must be objects", "code": "malformed_recovery_evidence"}
+    primary_route, primary_receipt = data["primary_route"], data["primary_receipt"]
+    fallback_route, fallback_receipt = data["fallback_route"], data["fallback_receipt"]
+    expected_primary = slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
+    if primary_route != expected_primary:
+        return 400, {"error": "prior primary route mismatches normal route", "code": "recovery_evidence_mismatch"}
+
+    fallback_keys = ("class", "size", "work_kind", "ac_count", "seams", "primary_route", "primary_receipt")
+    fallback_request = {key: data[key] for key in fallback_keys if key in data}
+    fallback_status, expected_fallback = derive_slice_fallback_route(fallback_request)
+    if fallback_status != 200:
+        return fallback_status, expected_fallback
+    if fallback_route != expected_fallback:
+        return 400, {"error": "prior fallback route mismatches deterministic fallback", "code": "recovery_evidence_mismatch"}
+
+    primary_job, evidence_err = recovery_job_evidence(primary_receipt, "primary", expected_primary, "error", "failed")
+    if evidence_err:
+        return 400, evidence_err
+    fallback_job, evidence_err = recovery_job_evidence(fallback_receipt, "availability_fallback", expected_fallback, "ok", "completed")
+    if evidence_err:
+        return 400, evidence_err
+    assert primary_job is not None and fallback_job is not None
+    primary_identity, fallback_identity = primary_receipt["session_identity"], fallback_receipt["session_identity"]
+    if any(primary_identity.get(key) != fallback_identity.get(key) for key in ("repo", "branch")):
+        return 400, {"error": "prior jobs do not share repository provenance", "code": "recovery_evidence_mismatch"}
+    if primary_receipt["job_id"] == fallback_receipt["job_id"] or not recovery_job_precedes(primary_job, fallback_job):
+        return 400, {"error": "prior fallback evidence is stale", "code": "stale_recovery_evidence"}
+
+    failure_code, fresh_receipt = primary_receipt["failure_code"], data.get("fresh_primary_receipt")
+    fresh_job: dict[str, Any] | None = None
+    if failure_code == "missing_binary":
+        if fresh_receipt not in (None, ""):
+            return 400, {"error": "fresh primary receipt is not used for local binary recovery", "code": "malformed_recovery_evidence"}
+        available = resolve_launcher_binary_now(expected_primary["launcher"]).is_file()
+        selected, decision, basis = (
+            (expected_primary, "primary_recovered", "configured_binary_available") if available
+            else (expected_fallback, "fallback_retained", "configured_binary_unavailable")
+        )
+    elif fresh_receipt in (None, ""):
+        selected, decision, basis = expected_fallback, "fallback_retained", "fresh_primary_success_required"
+    else:
+        fresh_job, evidence_err = recovery_job_evidence(fresh_receipt, "primary", expected_primary, "ok", "completed")
+        if evidence_err:
+            return 400, evidence_err
+        assert fresh_job is not None
+        if fresh_receipt["job_id"] in {primary_receipt["job_id"], fallback_receipt["job_id"]} or not recovery_job_precedes(fallback_job, fresh_job):
+            return 400, {"error": "fresh primary evidence is stale", "code": "stale_recovery_evidence"}
+        selected, decision, basis = expected_primary, "primary_recovered", "fresh_primary_success"
+
+    evidence: dict[str, Any] = {
+        "recovery_version": RECOVERY_VERSION, "basis": basis, "failure_code": failure_code,
+        "primary": recovery_route_identity(expected_primary, primary_receipt),
+        "fallback": recovery_route_identity(expected_fallback, fallback_receipt),
+    }
+    if fresh_job is not None:
+        evidence["fresh_primary"] = recovery_route_identity(expected_primary, fresh_receipt)
+    return 200, {
+        "ok": True, "recovery_version": RECOVERY_VERSION, "decision": decision,
+        "role": "primary" if selected["route_version"] == ROUTE_VERSION else "availability_fallback",
+        "selected_route": selected, "evidence": evidence,
+    }
+
+
+def slice_route_recovery(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    return derive_slice_recovery_route(data)
 
 
 def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -1953,7 +2140,7 @@ def native_review_result(
     if provider != spec["provider"] or model not in spec["models"]:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
-    binary = {"codex": CODEX_BIN, "claude": CLAUDE_BIN, "grok": GROK_BIN}[launcher]
+    binary = resolve_launcher_binary_now(launcher)
     if not binary.is_file():
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"{launcher} binary missing: {binary}", "code": "not_implemented"}
@@ -1990,7 +2177,9 @@ def native_review_result(
             "run_budget_seconds": 180,
             "session_identity": None,
         })
-        returncode, timed_out, _session_id, error = run_grok_acp(grok_job)
+        returncode, timed_out, _session_id, error = run_grok_acp(
+            grok_job, binary, mode="review"
+        )
         text = read_bounded_output(path / "last-message.txt")
     else:
         run_id = job_id or uuid.uuid4().hex
@@ -1998,7 +2187,7 @@ def native_review_result(
         path.mkdir(parents=True, exist_ok=True)
         if launcher == "codex":
             cmd = [
-                str(CODEX_BIN), "exec", "--json", "--model", model,
+                str(binary), "exec", "--json", "--model", model,
                 "-c", "model_reasoning_effort=high", "-C", str(resolved),
                 "--sandbox", "read-only",
                 "--output-last-message", str(path / "last-message.txt"), "-",
@@ -2006,7 +2195,7 @@ def native_review_result(
             run_input = receipt_prompt.encode()
         else:
             cmd = [
-                str(CLAUDE_BIN), "-p", "--output-format", "text",
+                str(binary), "-p", "--output-format", "text",
                 "--permission-mode", "plan", "--max-turns", str(REVIEW_MAX_TURNS),
                 "--model", model, body_prompt,
             ]
@@ -3323,9 +3512,12 @@ def native_job_env(job: dict[str, Any]) -> dict[str, str]:
     return env
 
 
-def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if not CLAUDE_BIN.is_file():
-        return None, {"error": f"missing claude binary: {CLAUDE_BIN}", "code": "missing_binary"}
+def spawn_claude(
+    job: dict[str, Any], binary: Path | None = None
+) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    binary = binary or CLAUDE_BIN
+    if not binary.is_file():
+        return None, {"error": f"missing claude binary: {binary}", "code": "missing_binary"}
     prompt_path = job_dir(job["job_id"]) / "prompt.txt"
     stdout_path = job_dir(job["job_id"]) / "stdout.log"
     stderr_path = job_dir(job["job_id"]) / "stderr.log"
@@ -3339,7 +3531,7 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     env = {k: v for k, v in os.environ.items()}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "PWD": cwd})
     cmd = [
-        str(CLAUDE_BIN),
+        str(binary),
         "-p",
         "--output-format",
         "json",
@@ -3374,9 +3566,12 @@ def spawn_claude(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, d
     return proc, None
 
 
-def codex_command(job: dict[str, Any], prompt_path: Path, cwd: str) -> list[str]:
+def codex_command(
+    job: dict[str, Any], prompt_path: Path, cwd: str, binary: Path | None = None
+) -> list[str]:
+    binary = binary or CODEX_BIN
     command = [
-        str(CODEX_BIN), "exec", "--json", "--model", str(job["model"]),
+        str(binary), "exec", "--json", "--model", str(job["model"]),
         "-c", "model_reasoning_effort=high",
         "-C", cwd, "--sandbox", "workspace-write",
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
@@ -3388,9 +3583,12 @@ def codex_command(job: dict[str, Any], prompt_path: Path, cwd: str) -> list[str]
     return command
 
 
-def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
-    if not CODEX_BIN.is_file():
-        return None, {"error": f"missing codex binary: {CODEX_BIN}", "code": "missing_binary"}
+def spawn_codex(
+    job: dict[str, Any], binary: Path | None = None
+) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+    binary = binary or CODEX_BIN
+    if not binary.is_file():
+        return None, {"error": f"missing codex binary: {binary}", "code": "missing_binary"}
     prompt_path = job_dir(job["job_id"]) / "prompt.txt"
     stdout_path = job_dir(job["job_id"]) / "stdout.log"
     stderr_path = job_dir(job["job_id"]) / "stderr.log"
@@ -3400,7 +3598,7 @@ def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, di
     stderr_f = stderr_path.open("wb")
     try:
         proc = subprocess.Popen(
-            codex_command(job, prompt_path, cwd), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
+            codex_command(job, prompt_path, cwd, binary), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
             cwd=cwd, env=native_job_env(job), start_new_session=True,
         )
     except OSError as exc:
@@ -3414,17 +3612,28 @@ def spawn_codex(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, di
     return proc, None
 
 
-def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None]:
-    """Run one bounded ACP turn and return its structured session identity."""
+def run_grok_acp(
+    job: dict[str, Any], binary: Path | None = None, *,
+    mode: Literal["writer", "review"],
+) -> tuple[int, bool, str | None, str | None]:
+    """Run one bounded ACP writer or read-only review turn."""
+    if mode not in ("writer", "review"):
+        job["_adapter_failure_code"] = "adapter_contract_invalid"
+        return 1, False, None, "invalid Grok ACP mode"
+    binary = binary or GROK_BIN
     path = job_dir(job["job_id"])
     stdout_path = path / "stdout.log"
     stderr_path = path / "stderr.log"
     cwd = str(Path(job["cwd"]).resolve())
     env = native_job_env(job)
     env["GROK_DISABLE_AUTOUPDATER"] = "1"
+    command = [str(binary), "agent"]
+    if mode == "writer":
+        command.append("--always-approve")
+    command.extend(["--model", "grok-4.6", "stdio"])
     try:
         proc = subprocess.Popen(
-            [str(GROK_BIN), "agent", "--always-approve", "--model", "grok-4.6", "stdio"],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, env=env, start_new_session=True, bufsize=0,
         )
@@ -3457,6 +3666,18 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
     chunk_bytes = 0
     session_id: str | None = (job.get("session_identity") or {}).get("native_session_id")
 
+    def write_message(message: dict[str, Any]) -> None:
+        payload = (json.dumps(message) + "\n").encode()
+        sent = 0
+        while sent < len(payload):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [proc.stdin], [], remaining)[1]:
+                raise TimeoutError("Grok ACP request timed out")
+            written = os.write(proc.stdin.fileno(), payload[sent : sent + 4096])
+            if not written:
+                raise BrokenPipeError("Grok ACP stdin closed")
+            sent += written
+
     def read_message(log: Any) -> dict[str, Any]:
         nonlocal wire, wire_bytes
         while b"\n" not in wire:
@@ -3485,18 +3706,21 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
     def request(log: Any, method: str, params: dict[str, Any], collect: bool = False) -> dict[str, Any]:
         nonlocal request_id, chunk_bytes
         request_id += 1
-        payload = (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n").encode()
-        sent = 0
-        while sent < len(payload):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([], [proc.stdin], [], remaining)[1]:
-                raise TimeoutError("Grok ACP request timed out")
-            written = os.write(proc.stdin.fileno(), payload[sent : sent + 4096])
-            if not written:
-                raise BrokenPipeError("Grok ACP stdin closed")
-            sent += written
+        write_message({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         while True:
             message = read_message(log)
+            if message.get("method") == "session/request_permission" and mode == "review":
+                permission_id = message.get("id")
+                if type(permission_id) not in (int, str):
+                    job["_adapter_failure_code"] = "adapter_contract_invalid"
+                    raise ValueError("malformed Grok review permission request")
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": permission_id,
+                    "result": {"outcome": {"outcome": "cancelled"}},
+                })
+                job["_adapter_failure_code"] = "adapter_contract_invalid"
+                raise RuntimeError("Grok review requested tool permission")
             if message.get("method") == "session/update":
                 if any(key in message for key in ("id", "result", "error")):
                     raise ValueError("malformed Grok session update")
@@ -3650,11 +3874,13 @@ def run_grok_acp(job: dict[str, Any]) -> tuple[int, bool, str | None, str | None
     return returncode, timed_out, session_id, error
 
 
-def spawn_writer(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
+def spawn_writer(
+    job: dict[str, Any], binary: Path | None = None
+) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
     if job.get("launcher") == "codex":
-        return spawn_codex(job)
+        return spawn_codex(job, binary)
     if job.get("launcher") == "claude":
-        return spawn_claude(job)
+        return spawn_claude(job, binary)
     return None, {"error": "unknown native launcher", "code": "bad_launcher"}
 
 
@@ -3696,14 +3922,16 @@ def run_agent_job(job_id: str) -> None:
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
-    binary = globals()[NATIVE_LAUNCHERS[job["launcher"]]["binary"]]
+    binary = resolve_launcher_binary_now(str(job["launcher"]))
     if not binary.is_file():
         proc, err = None, {"error": f"missing {job['launcher']} binary: {binary}", "code": "missing_binary"}
     elif job.get("launcher") == "grok":
-        returncode, timed_out, session_id, protocol_error = run_grok_acp(job)
+        returncode, timed_out, session_id, protocol_error = run_grok_acp(
+            job, binary, mode="writer"
+        )
         proc, err = None, None
     else:
-        proc, err = spawn_writer(job)
+        proc, err = spawn_writer(job, binary)
     if err:
         job["status"] = "failed"
         job["finished_at"] = utcnow()
@@ -3991,7 +4219,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
     if budget_err:
         return 400, budget_err
-    binary = globals()[native_spec["binary"]]
+    binary = resolve_launcher_binary_now(launcher)
     if not binary.is_file() and not webhook_url:
         classified = classify_agent_failure("missing_binary")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": "missing_binary", **classified}
@@ -4149,6 +4377,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route/fallback":
         status, payload = slice_route_fallback(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/slice/route/recovery":
+        status, payload = slice_route_recovery(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/review/run":
         status, payload = review_run(body, repos)
