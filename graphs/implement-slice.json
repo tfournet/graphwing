@@ -153,7 +153,7 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "none", "rules": [{ "path": "data.reviewer1_launcher", "op": "equals", "value": "none" }] }
+            { "label": "none", "rules": [{ "path": "reviewer1_launcher", "op": "equals", "value": "none" }] }
           ],
           "default": { "label": "review" }
         }
@@ -166,7 +166,7 @@
         "config": {
           "mode": "rules",
           "cases": [
-            { "label": "none", "rules": [{ "path": "data.reviewer2_launcher", "op": "equals", "value": "none" }] }
+            { "label": "none", "rules": [{ "path": "reviewer2_launcher", "op": "equals", "value": "none" }] }
           ],
           "default": { "label": "review" }
         }
