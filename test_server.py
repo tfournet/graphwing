@@ -506,6 +506,8 @@ class DispatchTests(unittest.TestCase):
             self.assertIn("--resume", cmd)
             self.assertEqual(cmd[cmd.index("--resume") + 1], session)
             self.assertNotIn("--session-id", cmd)
+        self.assertIn("--dangerously-skip-permissions", captured[0])
+        self.assertNotIn("--dangerously-skip-permissions", captured[1])
 
     def test_run_agent_completes_receipt(self):
         with tempfile.TemporaryDirectory() as td:

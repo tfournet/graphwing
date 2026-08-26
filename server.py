@@ -3883,7 +3883,7 @@ def spawn_harness(job: dict[str, Any]) -> tuple[subprocess.Popen[bytes] | None, 
         return None, {"error": "missing configured model", "code": "unavailable_provider"}
     resume_session = job.get("claim_kind") in ("correction", "design")
     if launcher == "claude":
-        cmd = [str(CLAUDE_BIN), "-p", "--output-format", "json", "--permission-mode", "acceptEdits",
+        cmd = [str(CLAUDE_BIN), "-p", "--output-format", "json", "--dangerously-skip-permissions",
                "--max-turns", str(job["max_turns"]), "--add-dir", cwd, "--model", model]
         cmd.extend(["--resume", str(session)] if resume_session else ["--session-id", str(session)])
         cmd.append(prompt)
