@@ -210,7 +210,7 @@
           "timeoutSeconds": 960
         }
       },
-      {"id": "agent_rn1", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review1 nack", "position": {"x": 1300, "y": 200}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.fallback_receipt.session_identity.launcher | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.fallback_receipt.session_identity.provider | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.fallback_receipt.session_identity.model | default(CTX.receipt.session_identity.model) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev1.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn1.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn1.pending.resumeToken }}"}},
+      {"id": "agent_rn1", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review1 nack", "position": {"x": 1300, "y": 200}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt3.session_identity | default(CTX.receipt2.session_identity) | default(CTX.fallback_receipt.session_identity) | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.receipt3.resume_job_id | default(CTX.receipt2.resume_job_id) | default(CTX.fallback_receipt.resume_job_id) | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.receipt3.session_identity.launcher | default(CTX.receipt2.session_identity.launcher) | default(CTX.fallback_receipt.session_identity.launcher) | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.receipt3.session_identity.provider | default(CTX.receipt2.session_identity.provider) | default(CTX.fallback_receipt.session_identity.provider) | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.receipt3.session_identity.model | default(CTX.receipt2.session_identity.model) | default(CTX.fallback_receipt.session_identity.model) | default(CTX.receipt.session_identity.model) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev1.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn1.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn1.pending.resumeToken }}"}},
       {
         "id": "test_rn1",
         "type": "action.graphwing.POST:/v1/test/run",
@@ -271,7 +271,7 @@
           "timeoutSeconds": 960
         }
       },
-      {"id": "agent_rn2", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review2 nack", "position": {"x": 1420, "y": 280}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.fallback_receipt.session_identity.launcher | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.fallback_receipt.session_identity.provider | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.fallback_receipt.session_identity.model | default(CTX.receipt.session_identity.model) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev2.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn2.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn2.pending.resumeToken }}"}},
+      {"id": "agent_rn2", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review2 nack", "position": {"x": 1420, "y": 280}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt_rn1.session_identity | default(CTX.receipt3.session_identity) | default(CTX.receipt2.session_identity) | default(CTX.fallback_receipt.session_identity) | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.receipt_rn1.resume_job_id | default(CTX.receipt3.resume_job_id) | default(CTX.receipt2.resume_job_id) | default(CTX.fallback_receipt.resume_job_id) | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.receipt_rn1.session_identity.launcher | default(CTX.receipt3.session_identity.launcher) | default(CTX.receipt2.session_identity.launcher) | default(CTX.fallback_receipt.session_identity.launcher) | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.receipt_rn1.session_identity.provider | default(CTX.receipt3.session_identity.provider) | default(CTX.receipt2.session_identity.provider) | default(CTX.fallback_receipt.session_identity.provider) | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.receipt_rn1.session_identity.model | default(CTX.receipt3.session_identity.model) | default(CTX.receipt2.session_identity.model) | default(CTX.fallback_receipt.session_identity.model) | default(CTX.receipt.session_identity.model) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev2.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn2.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn2.pending.resumeToken }}"}},
       {
         "id": "test_rn2",
         "type": "action.graphwing.POST:/v1/test/run",
@@ -456,6 +456,9 @@
       },
       {"id": "agent2", "type": "action.graphwing.POST:/v1/agent/run", "label": "retry agentRun", "position": {"x": 1840, "y": 440}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.fallback_receipt.session_identity.launcher | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.fallback_receipt.session_identity.provider | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.fallback_receipt.session_identity.model | default(CTX.receipt.session_identity.model) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.wait_test.request.body.summary }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.", "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"}},
       {"id": "record2", "type": "transforms.objectBuilder", "label": "Retry receipt", "position": {"x": 1840, "y": 320}, "config": {"alias": "receipt2", "version": 1, "mappings": [{"id": "m1", "output": "summary", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.summary"}}, {"id": "m2", "output": "status", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.status"}}, {"id": "m3", "output": "job_id", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.job_id"}}, {"id": "m4", "output": "sha", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.sha"}}, {"id": "m5", "output": "repo", "expression": {"kind": "getField", "path": "TASKS.git.repo"}}, {"id": "m6", "output": "branch", "expression": {"kind": "getField", "path": "TASKS.git.branch"}}, {"id": "m7", "output": "session_identity", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.session_identity"}}, {"id": "m8", "output": "resume_job_id", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.job_id"}}, {"id": "m9", "output": "route", "expression": {"kind": "getField", "path": "CTX.active_route"}}, {"id": "m10", "output": "fallback_route", "expression": {"kind": "getField", "path": "CTX.fallback_route_choice"}}, {"id": "m11", "output": "diagnostic", "expression": {"kind": "getField", "path": "TASKS.wait2.request.body.diagnostic"}}]}},
+      {"id": "record3", "type": "transforms.objectBuilder", "label": "Second retry receipt", "position": {"x": 2580, "y": 320}, "config": {"alias": "receipt3", "version": 1, "mappings": [{"id": "m1", "output": "status", "expression": {"kind": "getField", "path": "TASKS.wait3.request.body.status"}}, {"id": "m2", "output": "job_id", "expression": {"kind": "getField", "path": "TASKS.wait3.request.body.job_id"}}, {"id": "m3", "output": "resume_job_id", "expression": {"kind": "getField", "path": "TASKS.wait3.request.body.job_id"}}, {"id": "m4", "output": "session_identity", "expression": {"kind": "getField", "path": "TASKS.wait3.request.body.session_identity"}}]}},
+      {"id": "record_rn1", "type": "transforms.objectBuilder", "label": "Review1 correction receipt", "position": {"x": 1330, "y": 200}, "config": {"alias": "receipt_rn1", "version": 1, "mappings": [{"id": "m1", "output": "status", "expression": {"kind": "getField", "path": "TASKS.wait_rn1.request.body.status"}}, {"id": "m2", "output": "job_id", "expression": {"kind": "getField", "path": "TASKS.wait_rn1.request.body.job_id"}}, {"id": "m3", "output": "resume_job_id", "expression": {"kind": "getField", "path": "TASKS.wait_rn1.request.body.job_id"}}, {"id": "m4", "output": "session_identity", "expression": {"kind": "getField", "path": "TASKS.wait_rn1.request.body.session_identity"}}]}},
+      {"id": "record_rn2", "type": "transforms.objectBuilder", "label": "Review2 correction receipt", "position": {"x": 1450, "y": 360}, "config": {"alias": "receipt_rn2", "version": 1, "mappings": [{"id": "m1", "output": "status", "expression": {"kind": "getField", "path": "TASKS.wait_rn2.request.body.status"}}, {"id": "m2", "output": "job_id", "expression": {"kind": "getField", "path": "TASKS.wait_rn2.request.body.job_id"}}, {"id": "m3", "output": "resume_job_id", "expression": {"kind": "getField", "path": "TASKS.wait_rn2.request.body.job_id"}}, {"id": "m4", "output": "session_identity", "expression": {"kind": "getField", "path": "TASKS.wait_rn2.request.body.session_identity"}}]}},
       {
         "id": "if_receipt_ok2",
         "type": "logic.filter",
@@ -468,21 +471,21 @@
         "type": "logic.filter",
         "label": "second retry writer receipt ok?",
         "position": { "x": 2580, "y": 320 },
-        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
       },
       {
         "id": "if_receipt_ok_rn1",
         "type": "logic.filter",
         "label": "review1 resume receipt ok?",
         "position": { "x": 1330, "y": 200 },
-        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
       },
       {
         "id": "if_receipt_ok_rn2",
         "type": "logic.filter",
         "label": "review2 resume receipt ok?",
         "position": { "x": 1450, "y": 360 },
-        "config": { "group": "AND", "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }] }
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
       },
       {
         "id": "test2",
@@ -577,7 +580,8 @@
           "timeout": 30,
           "repo": "{{ CTX.INPUT.repo }}",
           "message": "{{ CTX.INPUT.commit_message }}",
-          "add": "{{ CTX.INPUT.index }}"
+          "add": "{{ CTX.INPUT.index }}",
+          "writer_job_id": "{{ CTX.receipt_rn2.job_id | default(CTX.receipt_rn1.job_id) | default(CTX.receipt3.job_id) | default(CTX.receipt2.job_id) | default(CTX.fallback_receipt.job_id) | default(CTX.receipt.job_id) }}"
         }
       },
       {
@@ -867,7 +871,8 @@
       { "id": "e_rev1_pass", "source": "if_review1", "sourceHandle": "pass", "target": "join_switch_rev2", "targetHandle": "in" },
       { "id": "e_rev1_nack", "source": "if_review1", "sourceHandle": "fail", "target": "wait_rn1", "targetHandle": "in" },
       { "id": "e_rn1_pend", "source": "wait_rn1", "sourceHandle": "pending", "target": "agent_rn1", "targetHandle": "in" },
-      { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "if_receipt_ok_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "record_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_record", "source": "record_rn1", "sourceHandle": "out", "target": "if_receipt_ok_rn1", "targetHandle": "in" },
       { "id": "e_rn1_receipt_ok", "source": "if_receipt_ok_rn1", "sourceHandle": "pass", "target": "test_rn1", "targetHandle": "in" },
       { "id": "e_rn1_receipt_bad", "source": "if_receipt_ok_rn1", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn1_to", "source": "wait_rn1", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
@@ -888,7 +893,8 @@
       { "id": "e_rev2_pass", "source": "if_review2", "sourceHandle": "pass", "target": "join_commit", "targetHandle": "in" },
       { "id": "e_rev2_nack", "source": "if_review2", "sourceHandle": "fail", "target": "wait_rn2", "targetHandle": "in" },
       { "id": "e_rn2_pend", "source": "wait_rn2", "sourceHandle": "pending", "target": "agent_rn2", "targetHandle": "in" },
-      { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "if_receipt_ok_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "record_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_record", "source": "record_rn2", "sourceHandle": "out", "target": "if_receipt_ok_rn2", "targetHandle": "in" },
       { "id": "e_rn2_receipt_ok", "source": "if_receipt_ok_rn2", "sourceHandle": "pass", "target": "test_rn2", "targetHandle": "in" },
       { "id": "e_rn2_receipt_bad", "source": "if_receipt_ok_rn2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn2_to", "source": "wait_rn2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
@@ -919,7 +925,8 @@
       { "id": "e_complete_fail", "source": "complete", "sourceHandle": "failure", "target": "complete_fail", "targetHandle": "in" },
       { "id": "e31", "source": "if_test_ok2", "sourceHandle": "fail", "target": "wait3", "targetHandle": "in" },
       { "id": "e31b", "source": "wait3", "sourceHandle": "pending", "target": "agent3", "targetHandle": "in" },
-      { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "if_receipt_ok3", "targetHandle": "in" },
+      { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "record3", "targetHandle": "in" },
+      { "id": "e31c_record", "source": "record3", "sourceHandle": "out", "target": "if_receipt_ok3", "targetHandle": "in" },
       { "id": "e31c_ok", "source": "if_receipt_ok3", "sourceHandle": "pass", "target": "test3", "targetHandle": "in" },
       { "id": "e31c_bad", "source": "if_receipt_ok3", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e31d", "source": "wait3", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },

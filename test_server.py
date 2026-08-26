@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -546,6 +547,9 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(payload["session_identity"]["model"], model)
                     self.assertEqual(payload["session_identity"]["repo"], "scratch")
                     self.assertIsNone(payload["session_identity"]["native_session_id"])
+                    stored = server.read_job(payload["job_id"])
+                    stored["status"] = "completed"
+                    server.write_job(stored)
                 for provider, model in (
                     ("openai", "claude-opus-5"),
                     ("anthropic", "gpt-5.6-sol"),
@@ -618,7 +622,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "grok",
-                "session_identity": identity,
+                "repo": "scratch", "cwd": str(repo), "session_identity": identity,
                 "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
@@ -699,7 +703,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "codex",
-                "session_identity": identity,
+                "repo": "scratch", "cwd": str(repo), "session_identity": identity,
                 "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
@@ -732,7 +736,14 @@ class DispatchTests(unittest.TestCase):
                 status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, json.dumps({**base, "session_identity": identity, "resume_job_id": bad_identity_job["job_id"]}).encode())
                 self.assertEqual(status, 400)
                 self.assertEqual(payload["code"], "untraceable_resume_session")
-                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, json.dumps({**base, "session_identity": identity, "resume_job_id": prior_job_id}).encode())
+                valid_resume = json.dumps({**base, "session_identity": identity, "resume_job_id": prior_job_id}).encode()
+                for mismatch in ({"repo": "other"}, {"cwd": str(root / "other-checkout")}):
+                    (prior_dir / "job.json").write_text(json.dumps({**prior, **mismatch}))
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid_resume)
+                    self.assertEqual(status, 400, mismatch)
+                    self.assertEqual(payload["code"], "resume_repository_mismatch", mismatch)
+                (prior_dir / "job.json").write_text(json.dumps(prior))
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid_resume)
             self.assertEqual(status, 202, payload)
             self.assertEqual(payload["session_identity"], identity)
 
@@ -761,7 +772,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "claude",
-                "session_identity": identity,
+                "repo": "scratch", "cwd": str(repo), "session_identity": identity,
                 "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
@@ -804,7 +815,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "codex",
-                "session_identity": identity,
+                "repo": "scratch", "cwd": str(repo), "session_identity": identity,
                 "receipt": {"status": "ok", "session_identity": identity, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
@@ -1115,14 +1126,685 @@ class DispatchTests(unittest.TestCase):
                 self.assertEqual(receipt["diagnostic"]["component"], "binary")
                 self.assertIn(f"missing {launcher} binary", receipt["summary"])
 
-    def test_wrap_prompt_locks_cwd(self):
+    def test_wrap_prompt_locks_cwd_and_leaves_staging_to_graph(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
         self.assertIn("/home/tim/work/gw-real-slice", text)
         self.assertIn("only inside that directory", text)
-        self.assertIn("git add --", text)
-        self.assertIn("relative paths only", text)
+        self.assertNotIn("git add", text)
+        self.assertIn("Graphwing stages", text)
         self.assertIn("Do not git commit, git push", text)
         self.assertIn("Do not `git checkout`", text)
+
+    def test_writer_staging_and_commit_preserve_dirty_operator_state_in_linked_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            primary = self._scratch_git(root)
+            for name in ("modified.txt", "deleted.txt", "operator-staged.txt", "operator-worktree.txt", "note1.md", "index.json"):
+                (primary / name).write_text("base\n")
+            subprocess.run(["git", "-C", str(primary), "add", "--", "modified.txt", "deleted.txt", "operator-staged.txt", "operator-worktree.txt", "note1.md", "index.json"], check=True)
+            subprocess.run(["git", "-C", str(primary), "commit", "-m", "fixtures"], check=True, capture_output=True)
+            linked = root / "linked"
+            subprocess.run(["git", "-C", str(primary), "worktree", "add", "-b", "writer", str(linked), "HEAD"], check=True, capture_output=True)
+            (linked / "operator-staged.txt").write_text("operator staged\n")
+            subprocess.run(["git", "-C", str(linked), "add", "--", "operator-staged.txt"], check=True)
+            (linked / "operator-worktree.txt").write_text("operator unstaged\n")
+            (linked / "note1.md").write_text("operator glob collision\n")
+            baseline, err = server.capture_writer_baseline(linked)
+            self.assertIsNone(err)
+            (linked / "modified.txt").write_text("writer modified\n")
+            (linked / "new.txt").write_text("writer new\n")
+            (linked / "note[1].md").write_text("literal writer path\n")
+            (linked / "deleted.txt").unlink()
+            job_id = "ab" * 16
+            job = {
+                "job_id": job_id, "repo": "scratch", "cwd": str(linked),
+                "status": "completed", "git_baseline": baseline,
+                "session_identity": {"branch": "writer", "starting_head": subprocess.run(
+                    ["git", "-C", str(linked), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+                ).stdout.strip()},
+                "receipt": {"status": "ok"},
+            }
+            staged_err = server.stage_writer_changes(job)
+            self.assertIsNone(staged_err)
+            self.assertEqual(job["writer_paths"], ["deleted.txt", "modified.txt", "new.txt", "note[1].md"])
+            (linked / "index.json").write_text("graph complete\n")
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"):
+                server.write_job(job)
+                status, payload = server.git_commit(json.dumps({
+                    "repo": "scratch", "message": "writer result", "writer_job_id": job_id,
+                    "add": "index.json",
+                }).encode(), {"scratch": str(linked)})
+            self.assertEqual(status, 200, payload)
+            committed = subprocess.run(
+                ["git", "-C", str(linked), "show", "--format=", "--name-only", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            self.assertEqual(set(committed), {"deleted.txt", "index.json", "modified.txt", "new.txt", "note[1].md"})
+            cached = subprocess.run(
+                ["git", "-C", str(linked), "diff", "--cached", "--name-only"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            self.assertEqual(cached, ["operator-staged.txt"])
+            self.assertEqual((linked / "operator-worktree.txt").read_text(), "operator unstaged\n")
+            self.assertEqual((linked / "note1.md").read_text(), "operator glob collision\n")
+            self.assertIn("note1.md", subprocess.run(
+                ["git", "-C", str(linked), "diff", "--name-only"], check=True, capture_output=True, text=True,
+            ).stdout.splitlines())
+
+    def test_writer_commit_stops_before_commit_when_temp_index_seed_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            baseline = server.capture_writer_baseline(repo)[0]
+            (repo / "writer.txt").write_text("writer\n")
+            job_id = "ef" * 16
+            branch = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"], check=True, capture_output=True, text=True).stdout.strip()
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            job = {
+                "job_id": job_id, "repo": "scratch", "cwd": str(repo), "status": "completed",
+                "git_baseline": baseline, "writer_parent_paths": [], "receipt": {"status": "ok"},
+                "session_identity": {"branch": branch, "starting_head": head},
+            }
+            self.assertIsNone(server.stage_writer_changes(job))
+            original = server.run_cmd
+            commit_attempted = False
+            temp_parent = None
+            temp_mode = None
+
+            def fail_read_tree(args, **kwargs):
+                nonlocal commit_attempted, temp_parent, temp_mode
+                if "GIT_INDEX_FILE" in (kwargs.get("env") or {}) and "read-tree" in args:
+                    temp_parent = Path(kwargs["env"]["GIT_INDEX_FILE"]).parent
+                    temp_mode = stat.S_IMODE(temp_parent.stat().st_mode)
+                    return {"ok": False, "returncode": 1, "stderr": "seed failed", "stdout": "", "truncated": False}
+                if "GIT_INDEX_FILE" in (kwargs.get("env") or {}) and "commit" in args:
+                    commit_attempted = True
+                return original(args, **kwargs)
+
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"), mock.patch.object(server, "run_cmd", side_effect=fail_read_tree):
+                server.write_job(job)
+                status, _ = server.git_commit(json.dumps({
+                    "repo": "scratch", "message": "must not commit", "writer_job_id": job_id,
+                }).encode(), {"scratch": str(repo)})
+            self.assertEqual(status, 400)
+            self.assertFalse(commit_attempted)
+            self.assertEqual(temp_mode, 0o700)
+            self.assertFalse(temp_parent.exists())
+            self.assertEqual(subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+            ).stdout.strip(), head)
+
+    def test_writer_snapshot_rejects_truncated_status(self):
+        with mock.patch.object(server, "run_git", return_value={"ok": True, "stdout": "", "truncated": True}):
+            baseline, err = server.capture_writer_baseline(Path("/unused"))
+        self.assertIsNone(baseline)
+        self.assertEqual(err["code"], "repository_mismatch")
+
+    def test_staging_exception_finishes_job_and_delivers_failure_webhook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            job_id = "91" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            job = {
+                "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(repo),
+                "prompt": "x", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": head, "native_session_id": None},
+                "created_at": "t", "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None, "log_ref": str(jdir / "stdout.log"),
+                "error": None, "webhook": None, "response_webhook_url": "https://example.invalid/resume",
+                "git_baseline": {"dirty": {}}, "writer_parent_paths": [],
+            }
+            (jdir / "job.json").write_text(json.dumps(job))
+            (jdir / "prompt.txt").write_text("x")
+
+            class FakeProc:
+                pid = 42
+                returncode = 0
+                def wait(self, timeout=None):
+                    (jdir / "stdout.log").write_text(
+                        '{"type":"thread.started","thread_id":"codex-123"}\n'
+                        + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
+                    )
+                    return 0
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=root / "codex"), \
+                 mock.patch.object(Path, "is_file", return_value=True), \
+                 mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)), \
+                 mock.patch.object(server, "stage_writer_changes", side_effect=OSError("private detail")), \
+                 mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted:
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["failure_class"], "repository_state")
+            self.assertEqual(saved["receipt"]["failure_code"], "repository_mismatch")
+            self.assertNotIn("private detail", json.dumps(saved["receipt"]))
+            posted.assert_called_once()
+            self.assertEqual(posted.call_args.args[1], saved["receipt"])
+
+    def test_dirty_conflict_receipt_summary_names_only_bounded_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            (repo / "dirty.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "dirty.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "dirty"], check=True, capture_output=True)
+            (repo / "dirty.txt").write_text("operator private bytes\n")
+            baseline = server.capture_writer_baseline(repo)[0]
+            jobs = root / "jobs"
+            job_id = "99" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            job = {
+                "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(repo), "prompt": "x",
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": head, "native_session_id": None},
+                "created_at": "t", "started_at": None, "finished_at": None, "max_turns": 1, "run_budget_seconds": 30,
+                "receipt": None, "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": None, "git_baseline": baseline, "writer_parent_paths": [],
+            }
+            (jdir / "job.json").write_text(json.dumps(job))
+            class FakeProc:
+                pid = 42
+                returncode = 0
+                def wait(self, timeout=None):
+                    (repo / "dirty.txt").write_text("writer payload must not leak\n")
+                    (jdir / "stdout.log").write_text(
+                        '{"type":"thread.started","thread_id":"codex-123"}\n'
+                        + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
+                    )
+                    return 0
+            binary = root / "codex"
+            binary.write_text("fixture")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+                 mock.patch.object(server, "spawn_writer", return_value=(FakeProc(), None)):
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["summary"], "writer changed pre-existing dirty paths: dirty.txt")
+            self.assertNotIn("payload", json.dumps(saved["receipt"]))
+            self.assertNotIn("operator private", json.dumps(saved["receipt"]))
+
+    def test_writer_pathspec_file_is_bounded_and_nul_literal(self):
+        paths = [f"dir/file-{i:05d}[x].txt" for i in range(5000)]
+        captured = {}
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            option = next(arg for arg in args if arg.startswith("--pathspec-from-file="))
+            source = Path(option.split("=", 1)[1])
+            captured["mode"] = stat.S_IMODE(source.parent.stat().st_mode)
+            captured["data"] = source.read_bytes()
+            return {"ok": True, "returncode": 0, "stdout": "", "stderr": "", "truncated": False}
+        with mock.patch.object(server, "run_cmd", side_effect=fake_run):
+            result = server.run_git_pathspec(Path("/repo"), ["add"], paths)
+        self.assertTrue(result["ok"])
+        self.assertLess(len(captured["args"]), 10)
+        self.assertEqual(captured["mode"], 0o700)
+        self.assertEqual(captured["data"].count(b"\0"), len(paths))
+        self.assertIn(b":(literal)dir/file-00000[x].txt\0", captured["data"])
+
+    def test_agent_run_rejects_overlapping_ordinary_writer_for_same_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                first_status, first, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                second_status, second, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(first_status, 202, first)
+            self.assertEqual(second_status, 409, second)
+            self.assertEqual(second["code"], "writer_checkout_busy")
+            self.assertEqual(json.loads((jobs / first["job_id"] / "job.json").read_text())["status"], "queued")
+
+    def test_two_thread_same_checkout_admission_allows_exactly_one_writer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            barrier = threading.Barrier(3)
+            results = []
+            def launch():
+                barrier.wait()
+                results.append(server.dispatch("POST", "/v1/agent/run", {}, True, body)[:2])
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                threads = [threading.Thread(target=launch) for _ in range(2)]
+                for thread in threads: thread.start()
+                barrier.wait()
+                for thread in threads: thread.join(timeout=5)
+            self.assertEqual(sorted(status for status, _ in results), [202, 409])
+            self.assertEqual(len(list(jobs.glob("*/job.json"))), 1)
+            blocker = next(payload for status, payload in results if status == 409)
+            accepted = next(payload for status, payload in results if status == 202)
+            self.assertEqual(blocker["blocker_kind"], "agent")
+            self.assertEqual(blocker["blocker_job_id"], accepted["job_id"])
+
+    def test_script_job_blocker_is_identified_without_reaping_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            blocker_id = "93" * 16
+            (jobs / blocker_id).mkdir(parents=True)
+            (jobs / blocker_id / "job.json").write_text(json.dumps({
+                "job_id": blocker_id, "kind": "script", "status": "running", "cwd": str(repo),
+            }))
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 409, payload)
+            self.assertEqual((payload["blocker_kind"], payload["blocker_job_id"]), ("script", blocker_id))
+            self.assertEqual(json.loads((jobs / blocker_id / "job.json").read_text())["status"], "running")
+
+    def test_startup_recovery_cancels_interrupted_agents_delivers_webhook_and_unblocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            interrupted_id = "94" * 16
+            jdir = jobs / interrupted_id
+            jdir.mkdir(parents=True)
+            job = {
+                "job_id": interrupted_id, "status": "running", "repo": "scratch", "cwd": str(repo),
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": "0" * 40, "native_session_id": "codex-old"},
+                "created_at": "t", "started_at": "t", "finished_at": None, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": "raw secret must disappear",
+                "response_webhook_url": "https://example.invalid/resume", "response_webhook_token": "tok_secret", "webhook": None,
+            }
+            (jdir / "job.json").write_text(json.dumps(job))
+            queued_id = "90" * 16
+            queued_dir = jobs / queued_id
+            queued_dir.mkdir(parents=True)
+            queued = {**job, "job_id": queued_id, "status": "queued", "started_at": None,
+                      "response_webhook_url": None, "response_webhook_token": None,
+                      "log_ref": str(queued_dir / "stdout.log")}
+            (queued_dir / "job.json").write_text(json.dumps(queued))
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted:
+                recovered = server.recover_interrupted_agent_jobs()
+                saved = server.read_job(interrupted_id)
+            self.assertEqual(recovered, 2)
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["status"], "error")
+            self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]), ("cancelled", "cancelled"))
+            self.assertEqual(saved["receipt"]["summary"], "agent job interrupted by Graphwing restart")
+            self.assertNotIn("secret", json.dumps(saved["receipt"]))
+            posted.assert_called_once()
+            self.assertEqual(posted.call_args.args[1], saved["receipt"])
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                queued_saved = server.read_job(queued_id)
+            self.assertEqual(queued_saved["status"], "failed")
+            self.assertEqual(queued_saved["receipt"]["failure_code"], "cancelled")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 202, payload)
+
+    def test_main_binds_single_instance_socket_before_recovery(self):
+        events = []
+        class FakeHTTPD:
+            def __init__(self, *args): events.append("bind")
+            def serve_forever(self): events.append("serve")
+        with mock.patch.object(server, "load_key", return_value=b"key"), \
+             mock.patch.object(server, "load_repos", return_value={}), \
+             mock.patch.object(server, "load_scripts", return_value={}), \
+             mock.patch.object(server, "load_tests", return_value={}), \
+             mock.patch.object(server, "load_rr", return_value={}), \
+             mock.patch.object(server, "load_stacks", return_value=({}, set())), \
+             mock.patch.object(server, "recover_interrupted_agent_jobs", side_effect=lambda: events.append("recover") or 0), \
+             mock.patch.object(server, "ThreadingHTTPServer", FakeHTTPD), \
+             mock.patch("builtins.print"):
+            server.main()
+        self.assertEqual(events, ["bind", "recover", "serve"])
+
+    def test_startup_recovery_closes_every_process_job_kind_but_not_codeoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            fixtures = {
+                "95" * 16: {"launcher": "codex", "session_identity": {"native_session_id": "codex-old"}},
+                "96" * 16: {"kind": "script", "script": "lint"},
+                "97" * 16: {"kind": "test", "script": "unit"},
+                "98" * 16: {"kind": "review", "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5"},
+                "99" * 16: {"kind": "rr", "script": "rr"},
+            }
+            for job_id, extra in fixtures.items():
+                path = jobs / job_id
+                path.mkdir(parents=True)
+                (path / "job.json").write_text(json.dumps({
+                    "job_id": job_id, "status": "running", "repo": "scratch", "cwd": str(repo),
+                    "log_ref": str(path / "stdout.log"),
+                    "response_webhook_url": "https://example.invalid/resume",
+                    "response_webhook_token": "secret", **extra,
+                }))
+            codeoff_id = "9a" * 16
+            codeoff_dir = jobs / codeoff_id
+            codeoff_dir.mkdir(parents=True)
+            (codeoff_dir / "job.json").write_text(json.dumps({
+                "job_id": codeoff_id, "status": "running", "cwd": str(root / "codeoff"),
+                "launcher": "codex", "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
+            }))
+            persisted_before_delivery = []
+            def post(_url, receipt, token=None):
+                persisted_before_delivery.append(json.loads((jobs / receipt["job_id"] / "job.json").read_text())["status"])
+                return {"ok": True, "status": 200}
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "post_receipt", side_effect=post) as posted:
+                self.assertEqual(server.recover_interrupted_agent_jobs(), 5)
+            self.assertEqual(persisted_before_delivery, ["failed"] * 5)
+            self.assertEqual(posted.call_count, 5)
+            for job_id, extra in fixtures.items():
+                saved = json.loads((jobs / job_id / "job.json").read_text())
+                self.assertEqual(saved["status"], "failed", extra)
+                self.assertLessEqual(len(saved["receipt"]["summary"]), 500)
+                self.assertNotIn("secret", json.dumps(saved["receipt"]))
+                if extra.get("kind") == "review":
+                    self.assertEqual(saved["receipt"]["status"], "nack")
+                    self.assertTrue(saved["receipt"]["no_verdict"])
+                elif extra.get("kind") in {"script", "test", "rr"}:
+                    self.assertEqual(saved["receipt"]["status"], "error")
+                    self.assertEqual(saved["receipt"]["log_ref"], saved["log_ref"])
+                else:
+                    self.assertEqual(saved["receipt"]["failure_code"], "cancelled")
+                    self.assertEqual(saved["receipt"]["session_identity"], extra["session_identity"])
+            self.assertEqual(json.loads((codeoff_dir / "job.json").read_text())["status"], "running")
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: None):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 202, payload)
+
+    def test_startup_recovery_ignores_malformed_records_without_crashing(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            malformed = {
+                "a1" * 16: "not json",
+                "a2" * 16: json.dumps(["not", "an", "object"]),
+                "a3" * 16: json.dumps({"status": "running", "kind": "script"}),
+                "a4" * 16: json.dumps({"job_id": "ff" * 16, "status": "queued", "kind": "test"}),
+                "a5" * 16: json.dumps({"job_id": "a5" * 16, "status": "running", "kind": "unknown"}),
+                "a6" * 16: json.dumps({"job_id": "a6" * 16, "status": "running", "kind": ["agent"]}),
+                "a7" * 16: json.dumps({"job_id": "a7" * 16, "status": "queued", "kind": "agent", "launcher": {"name": "codex"}}),
+            }
+            for job_id, body in malformed.items():
+                path = jobs / job_id
+                path.mkdir(parents=True)
+                (path / "job.json").write_text(body)
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "post_receipt") as posted:
+                self.assertEqual(server.recover_interrupted_agent_jobs(), 0)
+            posted.assert_not_called()
+
+    def test_agent_run_rejects_repo_alias_below_git_top_level(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            nested = repo / "nested"
+            nested.mkdir()
+            codex = root / "codex"
+            codex.write_text("fixture")
+            body = json.dumps({"prompt": "x", "cwd": "nested", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
+            with mock.patch.object(server, "load_repos", return_value={"nested": str(nested)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(payload["code"], "repo_not_toplevel")
+
+    def test_empty_writer_job_id_uses_legacy_staged_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "staged.txt").write_text("staged\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "staged.txt"], check=True)
+            status, payload = server.git_commit(json.dumps({
+                "repo": "scratch", "message": "staged", "writer_job_id": "",
+            }).encode(), {"scratch": str(repo)})
+            self.assertEqual(status, 200, payload)
+            self.assertIn("staged.txt", subprocess.run(
+                ["git", "-C", str(repo), "show", "--format=", "--name-only", "HEAD"], check=True, capture_output=True, text=True,
+            ).stdout.splitlines())
+
+    def test_writer_commit_rejects_cyclic_resume_descendants(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            job_id = "9b" * 16
+            branch = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            job = {
+                "job_id": job_id, "writer_parent_job_id": job_id, "status": "completed",
+                "repo": "scratch", "cwd": str(repo), "receipt": {"status": "ok"},
+                "session_identity": {"branch": branch, "starting_head": head}, "writer_paths": [],
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.write_job(job)
+                status, payload = server.git_commit(json.dumps({
+                    "repo": "scratch", "message": "must not hang", "writer_job_id": job_id,
+                }).encode(), {"scratch": str(repo)})
+            self.assertEqual((status, payload["code"]), (409, "writer_job_mismatch"))
+
+    def test_writer_commit_rejects_ambiguous_successful_resume_children(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            parent_id, child1_id, child2_id = "9c" * 16, "9d" * 16, "9e" * 16
+            (repo / "operator.txt").write_text("staged\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "operator.txt"], check=True)
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            index = subprocess.run(
+                ["git", "-C", str(repo), "write-tree"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            parent = {"job_id": parent_id, "status": "completed", "receipt": {"status": "ok"}}
+            children = [
+                {"job_id": job_id, "writer_parent_job_id": parent_id, "status": "completed", "receipt": {"status": "ok"}}
+                for job_id in (child1_id, child2_id)
+            ]
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                for job in (parent, *children):
+                    server.write_job(job)
+                status, payload = server.git_commit(json.dumps({
+                    "repo": "scratch", "message": "must stay ambiguous", "writer_job_id": parent_id,
+                }).encode(), {"scratch": str(repo)})
+            self.assertEqual((status, payload["code"]), (409, "writer_job_mismatch"))
+            self.assertEqual(payload["error"], "writer resume chain is ambiguous")
+            self.assertEqual(subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip(), head)
+            self.assertEqual(subprocess.run(
+                ["git", "-C", str(repo), "write-tree"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip(), index)
+
+    def test_writer_commit_rejects_post_receipt_mutation_and_dirty_add_overlap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            (repo / "operator.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "operator.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "operator fixture"], check=True, capture_output=True)
+            (repo / "operator.txt").write_text("operator staged\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "operator.txt"], check=True)
+            baseline = server.capture_writer_baseline(repo)[0]
+            (repo / "writer.txt").write_text("receipt bytes\n")
+            job_id = "92" * 16
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            job = {"job_id": job_id, "repo": "scratch", "cwd": str(repo), "status": "completed", "git_baseline": baseline, "writer_parent_paths": [], "receipt": {"status": "ok"}, "session_identity": {"branch": "main", "starting_head": head}}
+            self.assertIsNone(server.stage_writer_changes(job))
+            operator_index = subprocess.run(["git", "-C", str(repo), "show", ":operator.txt"], check=True, capture_output=True).stdout
+            jobs = root / "jobs"
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.write_job(job)
+                overlap_status, overlap = server.git_commit(json.dumps({"repo": "scratch", "message": "no", "writer_job_id": job_id, "add": "operator.txt"}).encode(), {"scratch": str(repo)})
+                (repo / "writer.txt").write_text("mutated after receipt\n")
+                changed_status, changed = server.git_commit(json.dumps({"repo": "scratch", "message": "no", "writer_job_id": job_id}).encode(), {"scratch": str(repo)})
+            self.assertEqual((overlap_status, overlap["code"]), (409, "writer_dirty_conflict"))
+            self.assertEqual(overlap["paths"], ["operator.txt"])
+            self.assertEqual(overlap["more_paths"], 0)
+            self.assertEqual((changed_status, changed["code"]), (409, "writer_paths_changed"))
+            self.assertEqual(changed["paths"], ["writer.txt"])
+            self.assertEqual(changed["more_paths"], 0)
+            self.assertEqual(subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(), head)
+            self.assertEqual(subprocess.run(["git", "-C", str(repo), "show", ":operator.txt"], check=True, capture_output=True).stdout, operator_index)
+
+    def test_real_agent_resume_inherits_paths_and_ancestor_commit_uses_child_tip(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            codex = root / "codex"
+            codex.write_text("fixture")
+            attempt = 0
+            class FakeProc:
+                pid = 42
+                returncode = 0
+                def __init__(self, job, number): self.job, self.number = job, number
+                def wait(self, timeout=None):
+                    target = repo / "writer.txt"
+                    target.write_text("first\n" if self.number == 1 else "corrected\n")
+                    if self.number == 1:
+                        (repo / "ephemeral.txt").write_text("remove me\n")
+                        (repo / "helper.py").write_text("rename me\n")
+                    else:
+                        (repo / "ephemeral.txt").unlink()
+                        (repo / "helper.py").rename(repo / "util.py")
+                        (repo / "child.txt").write_text("child\n")
+                    jdir = jobs / self.job["job_id"]
+                    (jdir / "stdout.log").write_text(
+                        '{"type":"thread.started","thread_id":"codex-123"}\n'
+                        + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
+                    )
+                    return 0
+            def spawn(job, binary):
+                nonlocal attempt
+                attempt += 1
+                return FakeProc(job, attempt), None
+            base = {"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: server.run_agent_job(job["job_id"])), \
+                 mock.patch.object(server, "spawn_writer", side_effect=spawn):
+                status1, first, _ = server.dispatch("POST", "/v1/agent/run", {}, True, json.dumps(base).encode())
+                first_job = server.read_job(first["job_id"])
+                resume = {**base, "session_identity": first_job["session_identity"], "resume_job_id": first["job_id"]}
+                status2, second, _ = server.dispatch("POST", "/v1/agent/run", {}, True, json.dumps(resume).encode())
+                second_job = server.read_job(second["job_id"])
+                commit_status, committed = server.git_commit(json.dumps({"repo": "scratch", "message": "corrected", "writer_job_id": first["job_id"]}).encode(), {"scratch": str(repo)})
+            self.assertEqual((status1, status2, commit_status), (202, 202, 200), (first, second, committed))
+            self.assertEqual(second_job["writer_parent_job_id"], first["job_id"])
+            self.assertEqual(second_job["writer_paths"], ["child.txt", "util.py", "writer.txt"])
+            self.assertEqual((repo / "writer.txt").read_text(), "corrected\n")
+            self.assertFalse((repo / "ephemeral.txt").exists())
+            self.assertFalse((repo / "helper.py").exists())
+            self.assertEqual(subprocess.run(["git", "-C", str(repo), "show", "HEAD:writer.txt"], check=True, capture_output=True, text=True).stdout, "corrected\n")
+            self.assertEqual(subprocess.run(["git", "-C", str(repo), "show", "HEAD:util.py"], check=True, capture_output=True, text=True).stdout, "rename me\n")
+
+    def test_writer_staging_fails_closed_on_dirty_conflict_and_unsafe_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "dirty.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "dirty.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "dirty fixture"], check=True, capture_output=True)
+            (repo / "dirty.txt").write_text("operator\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "dirty.txt"], check=True)
+            baseline, err = server.capture_writer_baseline(repo)
+            self.assertIsNone(err)
+            before = subprocess.run(["git", "-C", str(repo), "show", ":dirty.txt"], check=True, capture_output=True).stdout
+            (repo / "dirty.txt").write_text("writer collision\n")
+            job = {"cwd": str(repo), "git_baseline": baseline, "writer_parent_paths": []}
+            conflict = server.stage_writer_changes(job)
+            self.assertEqual(conflict["code"], "writer_dirty_conflict")
+            after = subprocess.run(["git", "-C", str(repo), "show", ":dirty.txt"], check=True, capture_output=True).stdout
+            self.assertEqual(after, before)
+
+            (repo / "dirty.txt").write_text("operator\n")
+            outside = Path(td) / "outside.txt"
+            outside.write_text("outside\n")
+            baseline2 = server.capture_writer_baseline(repo)[0]
+            (repo / "unsafe").symlink_to(outside)
+            unsafe = server.stage_writer_changes({"cwd": str(repo), "git_baseline": baseline2, "writer_parent_paths": []})
+            self.assertEqual(unsafe["code"], "bad_path")
+
+    def test_resume_writer_reowns_and_restages_corrected_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            (repo / "fix.txt").write_text("base\n")
+            (repo / "remove.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(repo), "add", "--", "fix.txt", "remove.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "resume fixtures"], check=True, capture_output=True)
+            first = {"cwd": str(repo), "git_baseline": server.capture_writer_baseline(repo)[0], "writer_parent_paths": []}
+            (repo / "fix.txt").write_text("first attempt\n")
+            self.assertIsNone(server.stage_writer_changes(first))
+            second = {
+                "cwd": str(repo), "git_baseline": server.capture_writer_baseline(repo)[0],
+                "writer_parent_paths": first["writer_paths"],
+            }
+            (repo / "fix.txt").write_text("corrected\n")
+            (repo / "new.txt").write_text("new\n")
+            (repo / "remove.txt").unlink()
+            self.assertIsNone(server.stage_writer_changes(second))
+            self.assertEqual(second["writer_paths"], ["fix.txt", "new.txt", "remove.txt"])
+            self.assertEqual(subprocess.run(
+                ["git", "-C", str(repo), "show", ":fix.txt"], check=True, capture_output=True, text=True
+            ).stdout, "corrected\n")
+            branch = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"], check=True, capture_output=True, text=True).stdout.strip()
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            for job, job_id in ((first, "ab" * 16), (second, "cd" * 16)):
+                job.update({
+                    "job_id": job_id, "repo": "scratch", "status": "completed",
+                    "receipt": {"status": "ok"},
+                    "session_identity": {"branch": branch, "starting_head": head},
+                })
+            second["writer_parent_job_id"] = first["job_id"]
+            jobs = Path(td) / "jobs"
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.write_job(first)
+                server.write_job(second)
+                status, payload = server.git_commit(json.dumps({
+                    "repo": "scratch", "message": "corrected writer", "writer_job_id": first["job_id"],
+                }).encode(), {"scratch": str(repo)})
+            self.assertEqual(status, 200, payload)
+            committed = subprocess.run(
+                ["git", "-C", str(repo), "show", "--format=", "--name-only", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            self.assertEqual(set(committed), {"fix.txt", "new.txt", "remove.txt"})
 
     def test_spawn_codex_uses_supported_fixture_contract(self):
         captured = {}
@@ -1702,6 +2384,52 @@ while True:
         self.assertEqual(saved["session_identity"]["native_session_id"], "codex-123")
         self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "codex-123")
 
+    def test_native_writer_job_stages_server_attributed_paths_after_valid_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            codex = root / "codex"
+            codex.write_text("fixture")
+
+            class FakeProc:
+                pid = 42
+                returncode = 0
+
+                def __init__(self, job):
+                    self.job = job
+
+                def wait(self, timeout=None):
+                    (repo / "writer.txt").write_text("written\n")
+                    jdir = jobs / self.job["job_id"]
+                    (jdir / "stdout.log").write_text(
+                        '{"type":"thread.started","thread_id":"codex-123"}\n'
+                        + json.dumps({"type": "item.completed", "item": {
+                            "id": "i", "type": "agent_message",
+                            "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                        }})
+                    )
+                    return 0
+
+            body = json.dumps({
+                "prompt": "write it", "cwd": "scratch", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
+            }).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "enqueue_agent", lambda job: server.run_agent_job(job["job_id"])), \
+                 mock.patch.object(server, "spawn_writer", side_effect=lambda job, binary: (FakeProc(job), None)):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                saved = server.read_job(payload["job_id"])
+            self.assertEqual(status, 202, payload)
+            self.assertEqual(saved["status"], "completed")
+            self.assertEqual(saved["writer_paths"], ["writer.txt"])
+            self.assertEqual(subprocess.run(
+                ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(), "writer.txt")
+
     def test_claude_job_completes_only_with_structured_session_and_receipt(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1851,6 +2579,18 @@ while True:
         self.assertIn("session_identity", props)
         self.assertIn("resume_job_id", props)
         self.assertEqual(set(props["launcher"]["enum"]), {"claude", "codex", "grok"})
+        commit_op = spec["paths"]["/v1/git/commit"]["post"]
+        commit_request = spec["components"]["schemas"]["GitCommitRequest"]["properties"]
+        self.assertEqual(commit_request["writer_job_id"]["pattern"], "^[0-9a-f]{32}$")
+        self.assertIn("real staged index", commit_op["summary"])
+        self.assertIn("isolated index", commit_op["summary"])
+        self.assertIn("real staged index", commit_request["add"]["description"])
+        self.assertIn("isolated index", commit_request["add"]["description"])
+        self.assertIn("409", commit_op["responses"])
+        self.assertIn("409", spec["paths"]["/v1/agent/run"]["post"]["responses"])
+        error_props = spec["components"]["schemas"]["Error"]["properties"]
+        self.assertEqual(set(error_props["blocker_kind"]["enum"]), {"agent", "codeoff", "script", "test", "rr", "review"})
+        self.assertEqual(error_props["blocker_job_id"]["pattern"], "^([0-9a-f]{32}|unknown)$")
         request_schema = spec["components"]["schemas"]["AgentRunRequest"]
         self.assertEqual(
             set(request_schema["required"]),
@@ -4794,7 +5534,7 @@ while True:
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "test2"), "wait3": ("if_receipt_ok3", "test3"), "wait_rn1": ("if_receipt_ok_rn1", "test_rn1"), "wait_rn2": ("if_receipt_ok_rn2", "test_rn2")}
+        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "test2"), "record3": ("if_receipt_ok3", "test3"), "record_rn1": ("if_receipt_ok_rn1", "test_rn1"), "record_rn2": ("if_receipt_ok_rn2", "test_rn2")}
         for source, (gate, target) in cases.items():
             self.assertEqual(nodes[gate]["type"], "logic.filter")
             self.assertTrue(any(e["source"] == source and e["target"] == gate for e in edges), source)
@@ -4810,25 +5550,18 @@ while True:
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         expected = {
-            "agent2": "receipt",
-            "agent3": "receipt2",
-            "agent_rn1": "receipt",
-            "agent_rn2": "receipt",
+            "agent2": ("fallback_receipt", "receipt"),
+            "agent3": ("receipt2",),
+            "agent_rn1": ("receipt3", "receipt2", "fallback_receipt", "receipt"),
+            "agent_rn2": ("receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt"),
         }
-        for node_id, receipt in expected.items():
+        for node_id, receipts in expected.items():
             config = nodes[node_id]["config"]
-            if node_id in ("agent2", "agent_rn1", "agent_rn2"):
-                self.assertIn("CTX.fallback_receipt.session_identity", config["session_identity"])
+            for receipt in receipts:
                 self.assertIn(f"CTX.{receipt}.session_identity", config["session_identity"])
-                self.assertIn("CTX.fallback_receipt.resume_job_id", config["resume_job_id"])
                 self.assertIn(f"CTX.{receipt}.resume_job_id", config["resume_job_id"])
-            else:
-                self.assertEqual(config["session_identity"], f"{{{{ CTX.{receipt}.session_identity }}}}")
-                self.assertEqual(config["resume_job_id"], f"{{{{ CTX.{receipt}.resume_job_id }}}}")
-            self.assertIn(f"CTX.{receipt}.session_identity.provider", config["provider"])
-            if node_id != "agent3":
-                self.assertIn("CTX.fallback_receipt.session_identity.provider", config["provider"])
-        for receipt in ("record", "record2"):
+                self.assertIn(f"CTX.{receipt}.session_identity.provider", config["provider"])
+        for receipt in ("record", "record2", "record3", "record_rn1", "record_rn2"):
             outputs = {m["output"] for m in nodes[receipt]["config"]["mappings"]}
             self.assertIn("session_identity", outputs)
             self.assertIn("resume_job_id", outputs)
@@ -5000,21 +5733,19 @@ while True:
     def test_implement_slice_active_resumes_are_pinned_to_successful_receipt(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
-        first_identity = {
-            field: f"{{{{ CTX.fallback_receipt.session_identity.{field} | default(CTX.receipt.session_identity.{field}) }}}}"
-            for field in ("launcher", "provider", "model")
+        expected_receipts = {
+            "agent2": ("fallback_receipt", "receipt"),
+            "agent_rn1": ("receipt3", "receipt2", "fallback_receipt", "receipt"),
+            "agent_rn2": ("receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt"),
         }
-        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+        for node_id, receipts in expected_receipts.items():
             config = nodes[node_id]["config"]
-            for field, expected in first_identity.items():
-                self.assertEqual(config[field], expected, (node_id, field))
-                self.assertNotIn("TASKS.recovery", config[field])
-                self.assertNotIn("TASKS.fallback_route", config[field])
-                self.assertNotIn("TASKS.route", config[field])
-            self.assertEqual(
-                config["session_identity"],
-                "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}",
-            )
+            for field in ("launcher", "provider", "model"):
+                for receipt in receipts:
+                    self.assertIn(f"CTX.{receipt}.session_identity.{field}", config[field])
+                self.assertNotIn("TASKS.", config[field])
+            for receipt in receipts:
+                self.assertIn(f"CTX.{receipt}.session_identity", config["session_identity"])
         for field in ("launcher", "provider", "model"):
             self.assertEqual(
                 nodes["agent3"]["config"][field],
@@ -5052,10 +5783,16 @@ while True:
     def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
-        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+        correction_receipts = {
+            "agent2": ("fallback_receipt", "receipt"),
+            "agent_rn1": ("receipt3", "receipt2", "fallback_receipt", "receipt"),
+            "agent_rn2": ("receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt"),
+        }
+        for node_id, receipts in correction_receipts.items():
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
-                self.assertEqual(cfg[field], f"{{{{ CTX.fallback_receipt.session_identity.{field} | default(CTX.receipt.session_identity.{field}) }}}}")
+                for receipt in receipts:
+                    self.assertIn(f"CTX.{receipt}.session_identity.{field}", cfg[field])
         for field in ("launcher", "provider", "model"):
             self.assertEqual(nodes["agent3"]["config"][field], f"{{{{ CTX.receipt2.session_identity.{field} }}}}")
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
@@ -5067,10 +5804,11 @@ while True:
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
                 self.assertEqual(cfg[field], f"{{{{ CTX.active_route.{slot}_{field} }}}}")
-        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+        for node_id, receipts in correction_receipts.items():
             cfg = nodes[node_id]["config"]
-            self.assertEqual(cfg["session_identity"], "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}")
-            self.assertEqual(cfg["resume_job_id"], "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}")
+            for receipt in receipts:
+                self.assertIn(f"CTX.{receipt}.session_identity", cfg["session_identity"])
+                self.assertIn(f"CTX.{receipt}.resume_job_id", cfg["resume_job_id"])
         self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ CTX.receipt2.session_identity }}")
         self.assertEqual(nodes["agent3"]["config"]["resume_job_id"], "{{ CTX.receipt2.resume_job_id }}")
         self.assertEqual(nodes["fallback_route"]["config"]["primary_receipt"], "{{ CTX.receipt }}")
@@ -6533,6 +7271,49 @@ while True:
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
         self.assertNotIn("CTX.INPUT.prompt", agent2["config"]["prompt"])
 
+    def test_correction_receipt_templates_have_exact_precedence_and_gates(self):
+        graph = json.loads((Path(__file__).resolve().parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"]) for edge in graph["spec"]["edges"]}
+        agent2 = nodes["agent2"]["config"]
+        self.assertEqual(agent2["session_identity"], "{{ CTX.fallback_receipt.session_identity | default(CTX.receipt.session_identity) }}")
+        self.assertEqual(agent2["resume_job_id"], "{{ CTX.fallback_receipt.resume_job_id | default(CTX.receipt.resume_job_id) }}")
+        for field in ("launcher", "provider", "model"):
+            self.assertEqual(agent2[field], f"{{{{ CTX.fallback_receipt.session_identity.{field} | default(CTX.receipt.session_identity.{field}) }}}}")
+        chains = {
+            "agent_rn1": ("receipt3", "receipt2", "fallback_receipt", "receipt"),
+            "agent_rn2": ("receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt"),
+        }
+        for node_id, aliases in chains.items():
+            config = nodes[node_id]["config"]
+            for field in ("session_identity", "resume_job_id"):
+                expected = f"CTX.{aliases[0]}.{field}" + "".join(f" | default(CTX.{alias}.{field})" for alias in aliases[1:])
+                self.assertEqual(config[field], f"{{{{ {expected} }}}}")
+            for field in ("launcher", "provider", "model"):
+                expected = f"CTX.{aliases[0]}.session_identity.{field}" + "".join(
+                    f" | default(CTX.{alias}.session_identity.{field})" for alias in aliases[1:]
+                )
+                self.assertEqual(config[field], f"{{{{ {expected} }}}}")
+        commit = nodes["commit"]["config"]["writer_job_id"]
+        aliases = ("receipt_rn2", "receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt")
+        expected = f"CTX.{aliases[0]}.job_id" + "".join(f" | default(CTX.{alias}.job_id)" for alias in aliases[1:])
+        self.assertEqual(commit, f"{{{{ {expected} }}}}")
+        for record, wait, filt in (
+            ("record3", "wait3", "if_receipt_ok3"),
+            ("record_rn1", "wait_rn1", "if_receipt_ok_rn1"),
+            ("record_rn2", "wait_rn2", "if_receipt_ok_rn2"),
+        ):
+            mappings = {m["output"]: m["expression"] for m in nodes[record]["config"]["mappings"]}
+            self.assertEqual(mappings, {
+                "status": {"kind": "getField", "path": f"TASKS.{wait}.request.body.status"},
+                "job_id": {"kind": "getField", "path": f"TASKS.{wait}.request.body.job_id"},
+                "resume_job_id": {"kind": "getField", "path": f"TASKS.{wait}.request.body.job_id"},
+                "session_identity": {"kind": "getField", "path": f"TASKS.{wait}.request.body.session_identity"},
+            })
+            self.assertEqual(nodes[filt]["config"], {"group": "AND", "rules": [{"path": "status", "op": "equals", "value": "ok"}]})
+            self.assertIn((wait, "out", record), edges)
+            self.assertIn((record, "out", filt), edges)
+
     def test_pr_drive_keeps_files_on_red(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "pr-drive.json"
         graph = json.loads(graph_path.read_text())
@@ -6542,6 +7323,8 @@ while True:
         self.assertEqual(edges["e18d"]["target"], "herdr_test_fail")
         fail = next(node for node in graph["spec"]["nodes"] if node["id"] == "herdr_test_fail")
         self.assertIn("files kept", fail["label"])
+        commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "fix_commit")
+        self.assertEqual(commit["config"]["writer_job_id"], "{{ CTX.receipt.job_id }}")
 
     def test_implement_slice_writer_sees_ticket_file(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "implement-slice.json"
@@ -6578,6 +7361,13 @@ while True:
         self.assertEqual(edges["e_join_e2e"]["target"], "e2e")
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "commit")
         self.assertEqual(commit["config"]["add"], "{{ CTX.INPUT.index }}")
+        writer_job = commit["config"]["writer_job_id"]
+        for alias in ("receipt_rn2", "receipt_rn1", "receipt3", "receipt2", "fallback_receipt", "receipt"):
+            self.assertIn(f"CTX.{alias}.job_id", writer_job)
+        self.assertNotIn("TASKS.", writer_job)
+        self.assertEqual(edges["e_rn1_out"]["target"], "record_rn1")
+        self.assertEqual(edges["e_rn2_out"]["target"], "record_rn2")
+        self.assertEqual(edges["e31c"]["target"], "record3")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
         self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.launcher }}")
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
@@ -8545,7 +9335,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "044c2381a9f9c400d0a682ee5fe3efdee19b39e53e597ce705389eff89d20a11")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "118562f8d3c905d15a3f57c474d86010a9718710b43c0188b02043c3c257bf9a")
 
 
 class InstallTests(unittest.TestCase):
