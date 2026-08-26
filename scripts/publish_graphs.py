@@ -197,7 +197,7 @@ def apply_workflow_output_schema(
         f"/workflows/{workflow_id}/versions/{version_id}/output-schema",
         {"outputSchema": output_schema},
     )
-    if status not in (200, 201):
+    if status not in (200, 201, 204):
         raise SystemExit(f"output schema {slug} HTTP {status}: {json.dumps(body)[:800]}")
 
 
