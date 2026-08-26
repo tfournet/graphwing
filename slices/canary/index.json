@@ -3,9 +3,9 @@
     {
       "id": "01-set-value",
       "path": "slices/canary/01-set-value.md",
-      "blocked_by": [],
       "kind": "build",
-      "status": "open"
+      "status": "done",
+      "blocked_by": []
     }
   ]
 }
