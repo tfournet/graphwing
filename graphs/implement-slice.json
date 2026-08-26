@@ -141,9 +141,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "launcher": "{{ TASKS.route.data.reviewer1_launcher }}",
-          "provider": "{{ TASKS.route.data.reviewer1_provider }}",
-          "model": "{{ TASKS.route.data.reviewer1_model }}",
+          "launcher": "{{ TASKS.fallback_route.data.reviewer1_launcher | default(TASKS.route.data.reviewer1_launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.reviewer1_provider | default(TASKS.route.data.reviewer1_provider) }}",
+          "model": "{{ TASKS.fallback_route.data.reviewer1_model | default(TASKS.route.data.reviewer1_model) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_rev1.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rev1.pending.resumeToken }}"
@@ -209,9 +209,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "launcher": "{{ TASKS.route.data.reviewer2_launcher }}",
-          "provider": "{{ TASKS.route.data.reviewer2_provider }}",
-          "model": "{{ TASKS.route.data.reviewer2_model }}",
+          "launcher": "{{ TASKS.fallback_route.data.reviewer2_launcher | default(TASKS.route.data.reviewer2_launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.reviewer2_provider | default(TASKS.route.data.reviewer2_provider) }}",
+          "model": "{{ TASKS.fallback_route.data.reviewer2_model | default(TASKS.route.data.reviewer2_model) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_rev2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rev2.pending.resumeToken }}"
@@ -251,13 +251,13 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record.session_identity }}",
-          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
-          "launcher": "{{ TASKS.route.data.launcher }}",
-          "provider": "{{ TASKS.route.data.provider }}",
-          "model": "{{ TASKS.route.data.model }}",
-          "max_turns": "{{ TASKS.route.data.max_turns }}",
-          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
+          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
+          "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
+          "max_turns": "{{ TASKS.fallback_route.data.max_turns | default(TASKS.route.data.max_turns) }}",
+          "run_budget_seconds": "{{ TASKS.fallback_route.data.run_budget_seconds | default(TASKS.route.data.run_budget_seconds) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.review1.data.compact }}\nFiles are on disk. Continue this slice. Do not start over.",
           "response_webhook_url": "{{ TASKS.wait_rn1.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rn1.pending.resumeToken }}"
@@ -306,9 +306,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "launcher": "{{ TASKS.route.data.reviewer1_launcher }}",
-          "provider": "{{ TASKS.route.data.reviewer1_provider }}",
-          "model": "{{ TASKS.route.data.reviewer1_model }}",
+          "launcher": "{{ TASKS.fallback_route.data.reviewer1_launcher | default(TASKS.route.data.reviewer1_launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.reviewer1_provider | default(TASKS.route.data.reviewer1_provider) }}",
+          "model": "{{ TASKS.fallback_route.data.reviewer1_model | default(TASKS.route.data.reviewer1_model) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_r1b.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_r1b.pending.resumeToken }}"
@@ -348,13 +348,13 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record.session_identity }}",
-          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
-          "launcher": "{{ TASKS.route.data.launcher }}",
-          "provider": "{{ TASKS.route.data.provider }}",
-          "model": "{{ TASKS.route.data.model }}",
-          "max_turns": "{{ TASKS.route.data.max_turns }}",
-          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
+          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
+          "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
+          "max_turns": "{{ TASKS.fallback_route.data.max_turns | default(TASKS.route.data.max_turns) }}",
+          "run_budget_seconds": "{{ TASKS.fallback_route.data.run_budget_seconds | default(TASKS.route.data.run_budget_seconds) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.review2.data.compact }}\nFiles are on disk. Continue this slice. Do not start over.",
           "response_webhook_url": "{{ TASKS.wait_rn2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_rn2.pending.resumeToken }}"
@@ -403,9 +403,9 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 200,
           "repo": "{{ CTX.INPUT.repo }}",
-          "launcher": "{{ TASKS.route.data.reviewer2_launcher }}",
-          "provider": "{{ TASKS.route.data.reviewer2_provider }}",
-          "model": "{{ TASKS.route.data.reviewer2_model }}",
+          "launcher": "{{ TASKS.fallback_route.data.reviewer2_launcher | default(TASKS.route.data.reviewer2_launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.reviewer2_provider | default(TASKS.route.data.reviewer2_provider) }}",
+          "model": "{{ TASKS.fallback_route.data.reviewer2_model | default(TASKS.route.data.reviewer2_model) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}",
           "response_webhook_url": "{{ TASKS.wait_r2b.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_r2b.pending.resumeToken }}"
@@ -484,7 +484,11 @@
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
             { "id": "m7", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.job_id" } },
             { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.session_identity" } },
-            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }
+            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } },
+            { "id": "m10", "output": "failure_class", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failure_class" } },
+            { "id": "m11", "output": "failure_code", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failure_code" } },
+            { "id": "m12", "output": "failover_eligible", "expression": { "kind": "getField", "path": "TASKS.wait.request.body.failover_eligible" } },
+            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "primary" } }
           ]
         }
       },
@@ -507,6 +511,83 @@
         "label": "writer receipt ok?",
         "position": { "x": 900, "y": 80 },
         "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
+      },
+      {
+        "id": "if_initial_fallback_eligible",
+        "type": "logic.filter",
+        "label": "initial availability fallback eligible?",
+        "position": { "x": 980, "y": -40 },
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "error" }, { "path": "role", "op": "equals", "value": "primary" }, { "path": "failure_class", "op": "equals", "value": "provider_availability" }, { "path": "failover_eligible", "op": "equals", "value": true }] }
+      },
+      {
+        "id": "fallback_route",
+        "type": "action.graphwing.POST:/v1/slice/route/fallback",
+        "label": "sliceRoute availability fallback",
+        "position": { "x": 1080, "y": -40 },
+        "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 15, "class": "{{ CTX.INPUT.class }}", "work_kind": "{{ CTX.INPUT.work_kind }}", "size": "{{ CTX.INPUT.size }}", "ac_count": "{{ CTX.INPUT.ac_count }}", "seams": "{{ CTX.INPUT.seams }}", "primary_route": "{{ TASKS.route.data }}", "primary_receipt": "{{ TASKS.record }}" }
+      },
+      {
+        "id": "wait_fallback",
+        "type": "action.wait.webhook",
+        "label": "Wait fallback writer receipt",
+        "position": { "x": 1180, "y": -40 },
+        "config": { "alias": "wait_fallback", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960 }
+      },
+      {
+        "id": "agent_fallback",
+        "type": "action.graphwing.POST:/v1/agent/run",
+        "label": "availability fallback agentRun",
+        "position": { "x": 1280, "y": -40 },
+        "config": { "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "prompt": "{{ TASKS.ticket_head.data.text }}", "launcher": "{{ TASKS.fallback_route.data.launcher }}", "provider": "{{ TASKS.fallback_route.data.provider }}", "model": "{{ TASKS.fallback_route.data.model }}", "max_turns": "{{ TASKS.fallback_route.data.max_turns }}", "run_budget_seconds": "{{ TASKS.fallback_route.data.run_budget_seconds }}", "response_webhook_url": "{{ TASKS.wait_fallback.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_fallback.pending.resumeToken }}" }
+      },
+      {
+        "id": "record_fallback",
+        "type": "transforms.objectBuilder",
+        "label": "Fallback receipt",
+        "position": { "x": 1380, "y": -40 },
+        "config": { "alias": "fallback_receipt", "version": 1, "mappings": [
+            { "id": "m1", "output": "summary", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.summary" } },
+            { "id": "m2", "output": "status", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.status" } },
+            { "id": "m3", "output": "job_id", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.job_id" } },
+            { "id": "m4", "output": "sha", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.sha" } },
+            { "id": "m5", "output": "repo", "expression": { "kind": "getField", "path": "TASKS.git.repo" } },
+            { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
+            { "id": "m7", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.job_id" } },
+            { "id": "m8", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.session_identity" } },
+            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } },
+            { "id": "m10", "output": "failure_class", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failure_class" } },
+            { "id": "m11", "output": "failure_code", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failure_code" } },
+            { "id": "m12", "output": "failover_eligible", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body.failover_eligible" } },
+            { "id": "m13", "output": "role", "expression": { "kind": "literal", "value": "availability_fallback" } }
+          ] }
+      },
+      {
+        "id": "if_fallback_receipt_ok",
+        "type": "logic.filter",
+        "label": "fallback writer receipt ok?",
+        "position": { "x": 1480, "y": -40 },
+        "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
+      },
+      {
+        "id": "join_writer_success",
+        "type": "logic.join.any",
+        "label": "Join successful writer",
+        "position": { "x": 1540, "y": 80 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "join_fallback_fail",
+        "type": "logic.join.any",
+        "label": "Join fallback failures",
+        "position": { "x": 1480, "y": -160 },
+        "config": { "stopOnFirst": true }
+      },
+      {
+        "id": "fallback_fail",
+        "type": "transforms.objectBuilder",
+        "label": "Fallback failed",
+        "position": { "x": 1540, "y": -160 },
+        "config": { "alias": "fallback_fail", "version": 1, "mappings": [{ "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "fallback_failed" } }, { "id": "m2", "output": "primary_receipt", "expression": { "kind": "getField", "path": "TASKS.record" } }, { "id": "m3", "output": "fallback_receipt", "expression": { "kind": "getField", "path": "TASKS.record_fallback" } }, { "id": "m4", "output": "primary_route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }, { "id": "m5", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }, { "id": "m6", "output": "fallback_route_error", "expression": { "kind": "getField", "path": "TASKS.fallback_route" } }, { "id": "m7", "output": "fallback_action_error", "expression": { "kind": "getField", "path": "TASKS.agent_fallback" } }, { "id": "m8", "output": "raw_wait_receipt", "expression": { "kind": "getField", "path": "TASKS.wait_fallback.request.body" } }] }
       },
       {
         "id": "test",
@@ -555,13 +636,13 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
           "cwd": "{{ CTX.INPUT.repo }}",
-          "session_identity": "{{ TASKS.record.session_identity }}",
-          "resume_job_id": "{{ TASKS.record.resume_job_id }}",
-          "launcher": "{{ TASKS.route.data.launcher }}",
-          "provider": "{{ TASKS.route.data.provider }}",
-          "model": "{{ TASKS.route.data.model }}",
-          "max_turns": "{{ TASKS.route.data.max_turns }}",
-          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "session_identity": "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}",
+          "resume_job_id": "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}",
+          "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
+          "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
+          "max_turns": "{{ TASKS.fallback_route.data.max_turns | default(TASKS.route.data.max_turns) }}",
+          "run_budget_seconds": "{{ TASKS.fallback_route.data.run_budget_seconds | default(TASKS.route.data.run_budget_seconds) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test.data.compact }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait2.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait2.pending.resumeToken }}"
@@ -584,7 +665,8 @@
             { "id": "m6", "output": "branch", "expression": { "kind": "getField", "path": "TASKS.git.branch" } },
             { "id": "m7", "output": "session_identity", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.session_identity" } },
             { "id": "m8", "output": "resume_job_id", "expression": { "kind": "getField", "path": "TASKS.wait2.request.body.job_id" } },
-            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } }
+            { "id": "m9", "output": "route", "expression": { "kind": "getField", "path": "TASKS.route.data" } },
+            { "id": "m10", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }
           ]
         }
       },
@@ -661,11 +743,11 @@
           "cwd": "{{ CTX.INPUT.repo }}",
           "session_identity": "{{ TASKS.record2.session_identity }}",
           "resume_job_id": "{{ TASKS.record2.resume_job_id }}",
-          "launcher": "{{ TASKS.route.data.launcher }}",
-          "provider": "{{ TASKS.route.data.provider }}",
-          "model": "{{ TASKS.route.data.model }}",
-          "max_turns": "{{ TASKS.route.data.max_turns }}",
-          "run_budget_seconds": "{{ TASKS.route.data.run_budget_seconds }}",
+          "launcher": "{{ TASKS.fallback_route.data.launcher | default(TASKS.route.data.launcher) }}",
+          "provider": "{{ TASKS.fallback_route.data.provider | default(TASKS.route.data.provider) }}",
+          "model": "{{ TASKS.fallback_route.data.model | default(TASKS.route.data.model) }}",
+          "max_turns": "{{ TASKS.fallback_route.data.max_turns | default(TASKS.route.data.max_turns) }}",
+          "run_budget_seconds": "{{ TASKS.fallback_route.data.run_budget_seconds | default(TASKS.route.data.run_budget_seconds) }}",
           "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.",
           "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"
@@ -955,7 +1037,11 @@
           "mappings": [
             { "id": "m1", "output": "status", "expression": { "kind": "literal", "value": "ok" } },
             { "id": "m2", "output": "repo", "expression": { "kind": "getField", "path": "CTX.INPUT.repo" } },
-            { "id": "m3", "output": "branch", "expression": { "kind": "getField", "path": "CTX.INPUT.branch" } }
+            { "id": "m3", "output": "branch", "expression": { "kind": "getField", "path": "CTX.INPUT.branch" } },
+            { "id": "m4", "output": "primary_receipt", "expression": { "kind": "getField", "path": "TASKS.record" } },
+            { "id": "m5", "output": "fallback_receipt", "expression": { "kind": "getField", "path": "TASKS.record_fallback" } },
+            { "id": "m6", "output": "primary_route", "expression": { "kind": "getField", "path": "TASKS.route.data" } },
+            { "id": "m7", "output": "fallback_route", "expression": { "kind": "getField", "path": "TASKS.fallback_route.data" } }
           ]
         }
       },
@@ -1046,8 +1132,15 @@
       { "id": "e12f", "source": "switch_walk", "sourceHandle": "default", "target": "done", "targetHandle": "in" },
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
       { "id": "e14", "source": "record", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
-      { "id": "e14b", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "wait_test", "targetHandle": "in" },
-      { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
+      { "id": "e14b", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" },
+      { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "if_initial_fallback_eligible", "targetHandle": "in" },
+      { "id": "e_fb_gate_ok", "source": "if_initial_fallback_eligible", "sourceHandle": "pass", "target": "fallback_route", "targetHandle": "in" }, { "id": "e_fb_gate_bad", "source": "if_initial_fallback_eligible", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
+      { "id": "e_fb_route_ok", "source": "fallback_route", "sourceHandle": "success", "target": "wait_fallback", "targetHandle": "in" }, { "id": "e_fb_route_fail", "source": "fallback_route", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" },
+      { "id": "e_fb_wait_pending", "source": "wait_fallback", "sourceHandle": "pending", "target": "agent_fallback", "targetHandle": "in" }, { "id": "e_fb_wait_out", "source": "wait_fallback", "sourceHandle": "out", "target": "record_fallback", "targetHandle": "in" },
+      { "id": "e_fb_wait_timeout", "source": "wait_fallback", "sourceHandle": "timeout", "target": "join_fallback_fail", "targetHandle": "in" }, { "id": "e_fb_wait_fail", "source": "wait_fallback", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" },
+      { "id": "e_fb_agent_fail", "source": "agent_fallback", "sourceHandle": "failure", "target": "join_fallback_fail", "targetHandle": "in" }, { "id": "e_fb_record", "source": "record_fallback", "sourceHandle": "out", "target": "if_fallback_receipt_ok", "targetHandle": "in" },
+      { "id": "e_fb_receipt_ok", "source": "if_fallback_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" }, { "id": "e_fb_receipt_bad", "source": "if_fallback_receipt_ok", "sourceHandle": "fail", "target": "join_fallback_fail", "targetHandle": "in" },
+      { "id": "e_join_fallback_fail", "source": "join_fallback_fail", "sourceHandle": "out", "target": "fallback_fail", "targetHandle": "in" }, { "id": "e_writer_success", "source": "join_writer_success", "sourceHandle": "out", "target": "wait_test", "targetHandle": "in" },
       { "id": "e15", "source": "wait_test", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },

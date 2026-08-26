@@ -818,6 +818,52 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(payload["failure_code"], "missing_binary")
         self.assertTrue(payload["failover_eligible"])
 
+    def test_webhook_agent_run_missing_binary_posts_classified_receipt(self):
+        cases = (
+            ("codex", "openai", "gpt-5.6-sol", "CODEX_BIN", "go_coding"),
+            ("claude", "anthropic", "claude-opus-5", "CLAUDE_BIN", "typescript_coding"),
+            ("grok", "xai", "grok-4.6", "GROK_BIN", "research_ops"),
+        )
+        for launcher, provider, model, bin_name, work_kind in cases:
+            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                primary_route = server.slice_route_lookup("mechanical", "M", work_kind=work_kind)
+                fallback_result = {}
+                body = json.dumps({
+                    "prompt": "x", "cwd": "scratch", "launcher": launcher,
+                    "provider": provider, "model": model,
+                    "response_webhook_url": "https://example.invalid/resume",
+                }).encode()
+
+                def receive_receipt(_url, receipt, token=None):
+                    stored = server.read_job(receipt["job_id"])
+                    self.assertEqual(stored["status"], "failed")
+                    self.assertEqual(stored["receipt"], receipt)
+                    self.assertEqual(stored["session_identity"], receipt["session_identity"])
+                    fallback_result["status"], fallback_result["payload"] = server.slice_route_fallback(json.dumps({
+                        "class": "mechanical", "size": "M", "work_kind": work_kind,
+                        "primary_route": primary_route,
+                        "primary_receipt": {**receipt, "role": "primary"},
+                    }).encode())
+                    return {"ok": True, "status": 200}
+
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, bin_name, Path(f"/nope/{launcher}")), \
+                     mock.patch.object(server, "enqueue_agent", lambda job: server.run_agent_job(job["job_id"])), \
+                     mock.patch.object(server, "spawn_writer", side_effect=AssertionError("no model process")), \
+                     mock.patch.object(server, "run_grok_acp", side_effect=AssertionError("no model process")), \
+                     mock.patch.object(server, "post_receipt", side_effect=receive_receipt) as posted:
+                    status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+                self.assertEqual(status, 202, payload)
+                self.assertEqual(fallback_result["status"], 200, fallback_result)
+                posted.assert_called_once()
+                receipt = posted.call_args.args[1]
+                self.assertEqual(receipt["status"], "error")
+                self.assertEqual(receipt["failure_class"], "provider_availability")
+                self.assertEqual(receipt["failure_code"], "missing_binary")
+                self.assertTrue(receipt["failover_eligible"])
+                self.assertIn(f"missing {launcher} binary", receipt["summary"])
+
     def test_wrap_prompt_locks_cwd(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
         self.assertIn("/home/tim/work/gw-real-slice", text)
@@ -1235,6 +1281,7 @@ while True:
         self.assertEqual(saved["receipt"]["failure_class"], "provider_availability")
         self.assertEqual(saved["receipt"]["failure_code"], "provider_rate_limit")
         self.assertTrue(saved["receipt"]["failover_eligible"])
+        self.assertEqual((saved["session_identity"]["native_session_id"], saved["receipt"]["session_identity"]["native_session_id"]), ("grok-123", "grok-123"))
 
     def test_grok_acp_bounds_stderr_log(self):
         saved, _, jdir = self._run_grok_fixture({"stderr_bytes": server.FILE_MAX_BYTES * 2})
@@ -1520,6 +1567,7 @@ while True:
         for field in ("failure_class", "failure_code", "failover_eligible"):
             self.assertIn(field, receipt)
             self.assertIn(field, spec["components"]["schemas"]["Error"]["properties"])
+        self.assertEqual(set(receipt["role"]["enum"]), {"primary", "availability_fallback"})
         expected_codes = (set(server.FAILURE_CLASS_BY_CODE) - {"success"}) | {"none", "provider_http_5xx"} | {code for code, _ in server.PROVIDER_FAILURE_GROUPS}
         self.assertEqual(set(receipt["failure_code"]["enum"]), expected_codes)
         self.assertNotIn("profile", props)
@@ -1547,6 +1595,7 @@ while True:
         self.assertEqual(spec["paths"]["/v1/slice/complete"]["post"]["operationId"], "sliceComplete")
         self.assertEqual(spec["paths"]["/v1/slice/continue"]["post"]["operationId"], "sliceContinue")
         self.assertEqual(spec["paths"]["/v1/slice/route"]["post"]["operationId"], "sliceRoute")
+        self.assertEqual(spec["paths"]["/v1/slice/route/fallback"]["post"]["operationId"], "sliceRouteFallback")
         self.assertEqual(spec["paths"]["/v1/review/run"]["post"]["operationId"], "reviewRun")
         self.assertEqual(spec["paths"]["/v1/slice/e2e"]["post"]["operationId"], "sliceE2e")
         self.assertIn("/v1/agent/run", spec["paths"])
@@ -2813,6 +2862,83 @@ while True:
             actual = sum(route[f"reviewer{i}_launcher"] != "none" for i in (1, 2))
             self.assertEqual(actual, count, f"{class_name}/{size}")
 
+    def test_availability_fallback_route_locked_matrix_and_reviewers(self):
+        expected = {
+            "go_coding": (("codex", "openai", "gpt-5.6-sol"), ("claude", "anthropic", "claude-opus-5", "default")),
+            "typescript_coding": (("claude", "anthropic", "claude-opus-5"), ("codex", "openai", "gpt-5.6-sol", "high")),
+            "research_ops": (("grok", "xai", "grok-4.6"), ("claude", "anthropic", "claude-sonnet-5", "default")),
+        }
+        for work_kind, (primary, fallback) in expected.items():
+            primary_route = server.slice_route_lookup("sensitive", "M", work_kind=work_kind)
+            self.assertEqual(tuple(primary_route[k] for k in ("launcher", "provider", "model")), primary)
+            receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": {"launcher": primary[0], "provider": primary[1], "model": primary[2]}}
+            stored_job = {
+                "launcher": primary[0], "provider": primary[1], "model": primary[2],
+                "status": "failed", "session_identity": receipt["session_identity"],
+                "receipt": {key: value for key, value in receipt.items() if key != "role"},
+            }
+            with mock.patch.object(server, "read_job", return_value=stored_job):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/slice/route/fallback", {}, True,
+                    json.dumps({"class": "sensitive", "size": "M", "work_kind": work_kind, "primary_route": primary_route, "primary_receipt": receipt}).encode(),
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["route_version"], "availability-fallback-v1")
+            self.assertEqual(tuple(payload[k] for k in ("launcher", "provider", "model", "effort")), fallback)
+            self.assertEqual((payload["role"], payload["primary_route_version"], payload["primary_reason"]), ("availability_fallback", "normal-v1", f"work_kind={work_kind}"))
+            self.assertEqual(payload["fallback_code"], "provider_rate_limit")
+            self.assertEqual(payload["selected_alternate_route"]["provider"], fallback[1])
+            for slot in ("reviewer1", "reviewer2"):
+                self.assertNotEqual(payload[f"{slot}_launcher"], "none")
+                self.assertNotEqual(payload[f"{slot}_provider"], payload["provider"])
+            self.assertNotEqual(payload["reviewer1_provider"], primary[1])
+            self.assertNotEqual(payload["reviewer1_provider"], payload["reviewer2_provider"])
+
+    def test_availability_fallback_route_fails_closed(self):
+        primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}}
+        base = {"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}
+        for patch, code in (
+            ({"primary_receipt": {**receipt, "status": "timeout"}}, "not_fallback_eligible"),
+            ({"primary_receipt": {k: v for k, v in receipt.items() if k != "role"}}, "not_fallback_eligible"),
+            ({"primary_receipt": {**receipt, "role": "availability_fallback"}}, "not_fallback_eligible"),
+            ({"primary_receipt": {**receipt, "failure_class": "timeout_budget"}}, "not_fallback_eligible"),
+            ({"primary_receipt": {**receipt, "failure_code": "unknown_failure"}}, "not_fallback_eligible"),
+            ({"primary_receipt": {**receipt, "failover_eligible": False}}, "not_fallback_eligible"),
+            ({"primary_receipt": {**receipt, "failover_eligible": "true"}}, "bad_failover_eligible"),
+            ({"primary_receipt": {**receipt, "job_id": "../bad"}}, "bad_job_id"),
+            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {"launcher": "claude", "provider": "openai", "model": "gpt-5.6-sol"}}}, "primary_provider_mismatch"),
+            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {"launcher": "codex", "provider": "anthropic", "model": "gpt-5.6-sol"}}}, "primary_provider_mismatch"),
+            ({"primary_receipt": {**receipt, "session_identity": {"launcher": "codex", "provider": "openai", "model": "claude-opus-5"}}}, "primary_provider_mismatch"),
+            ({"primary_route": {**primary_route, "provider": "anthropic"}}, "primary_provider_mismatch"),
+            ({"primary_route": {**primary_route, "reason": "forged"}}, "primary_provider_mismatch"),
+        ):
+            body = {**base, **patch}
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/slice/route/fallback", {}, True, json.dumps(body).encode()
+            )
+            self.assertEqual(status, 400, (patch, payload))
+            self.assertEqual(payload["code"], code)
+
+    def test_availability_fallback_route_requires_stored_primary_receipt(self):
+        primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}
+        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
+        body = json.dumps({"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}).encode()
+        stored_receipt = {key: value for key, value in receipt.items() if key != "role"}
+        valid_job = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "status": "failed", "session_identity": identity, "receipt": stored_receipt}
+        bad_jobs = (
+            None,
+            {**valid_job, "status": "queued"},
+            {**valid_job, "session_identity": {**identity, "provider": "anthropic"}},
+            {**valid_job, "receipt": {**stored_receipt, "failure_code": "provider_rate_limit"}},
+        )
+        for stored_job in bad_jobs:
+            with self.subTest(stored_job=stored_job), mock.patch.object(server, "read_job", return_value=stored_job):
+                status, payload, _ = server.dispatch("POST", "/v1/slice/route/fallback", {}, True, body)
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(payload["code"], "primary_receipt_mismatch")
+
     def test_route_never_returns_a_profile_named_reviewer(self):
         banned = {"terra", "sol", "sonnet", "opus", "fable"}
         for work_kind in ("go_coding", "typescript_coding", "research_ops"):
@@ -2989,14 +3115,17 @@ while True:
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        cases = {"record": ("if_receipt_ok", "wait_test"), "record2": ("if_receipt_ok2", "test2"), "wait3": ("if_receipt_ok3", "test3"), "wait_rn1": ("if_receipt_ok_rn1", "test_rn1"), "wait_rn2": ("if_receipt_ok_rn2", "test_rn2")}
+        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "test2"), "wait3": ("if_receipt_ok3", "test3"), "wait_rn1": ("if_receipt_ok_rn1", "test_rn1"), "wait_rn2": ("if_receipt_ok_rn2", "test_rn2")}
         for source, (gate, target) in cases.items():
             self.assertEqual(nodes[gate]["type"], "logic.filter")
             self.assertTrue(any(e["source"] == source and e["target"] == gate for e in edges), source)
             self.assertTrue(any(e["source"] == gate and e.get("sourceHandle") == "pass" and e["target"] == target for e in edges), gate)
-            self.assertTrue(any(e["source"] == gate and e.get("sourceHandle") == "fail" and e["target"] == "join_receipt_fail" for e in edges), gate)
+            if gate != "if_receipt_ok":
+                self.assertTrue(any(e["source"] == gate and e.get("sourceHandle") == "fail" and e["target"] == "join_receipt_fail" for e in edges), gate)
         self.assertEqual(nodes["join_receipt_fail"]["type"], "logic.join.any")
         self.assertTrue(any(e["source"] == "join_receipt_fail" and e["target"] == "receipt_fail" for e in edges))
+        self.assertEqual(nodes["join_writer_success"]["type"], "logic.join.any")
+        self.assertTrue(any(e["source"] == "join_writer_success" and e["target"] == "wait_test" for e in edges))
 
     def test_native_retry_writers_use_recorded_receipts_only(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -3009,13 +3138,115 @@ while True:
         }
         for node_id, receipt in expected.items():
             config = nodes[node_id]["config"]
-            self.assertEqual(config["session_identity"], f"{{{{ TASKS.{receipt}.session_identity }}}}")
-            self.assertEqual(config["resume_job_id"], f"{{{{ TASKS.{receipt}.resume_job_id }}}}")
-            self.assertEqual(config["provider"], "{{ TASKS.route.data.provider }}")
+            if node_id in ("agent2", "agent_rn1", "agent_rn2"):
+                self.assertIn("TASKS.record_fallback.session_identity", config["session_identity"])
+                self.assertIn(f"TASKS.{receipt}.session_identity", config["session_identity"])
+                self.assertIn("TASKS.record_fallback.resume_job_id", config["resume_job_id"])
+                self.assertIn(f"TASKS.{receipt}.resume_job_id", config["resume_job_id"])
+            else:
+                self.assertEqual(config["session_identity"], f"{{{{ TASKS.{receipt}.session_identity }}}}")
+                self.assertEqual(config["resume_job_id"], f"{{{{ TASKS.{receipt}.resume_job_id }}}}")
+            self.assertIn("TASKS.fallback_route.data.provider", config["provider"])
+            self.assertIn("TASKS.route.data.provider", config["provider"])
         for receipt in ("record", "record2"):
             outputs = {m["output"] for m in nodes[receipt]["config"]["mappings"]}
             self.assertIn("session_identity", outputs)
             self.assertIn("resume_job_id", outputs)
+
+    def test_implement_slice_initial_availability_fallback_topology(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        edge_triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
+        def reaches(start, target):
+            seen = set()
+            stack = [start]
+            while stack:
+                cur = stack.pop()
+                if cur == target:
+                    return True
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(e["target"] for e in edges if e["source"] == cur)
+            return False
+
+        self.assertEqual([n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")], ["fallback_route"])
+        self.assertEqual([n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/agent/run") and n["config"].get("launcher") == "{{ TASKS.fallback_route.data.launcher }}"], ["agent_fallback"])
+        self.assertTrue(nodes["fallback_route"]["type"].endswith("/v1/slice/route/fallback"))
+        gate = nodes["if_initial_fallback_eligible"]
+        self.assertEqual(gate["type"], "logic.filter")
+        rules = [{"path": "status", "op": "equals", "value": "error"}, {"path": "role", "op": "equals", "value": "primary"}, {"path": "failure_class", "op": "equals", "value": "provider_availability"}, {"path": "failover_eligible", "op": "equals", "value": True}]
+        self.assertEqual(gate["config"], {"group": "AND", "rules": rules})
+        self.assertIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), edge_triples)
+        self.assertIn(("if_initial_fallback_eligible", "pass", "fallback_route"), edge_triples)
+        self.assertIn(("if_initial_fallback_eligible", "fail", "join_receipt_fail"), edge_triples)
+        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"if_receipt_ok"})
+        self.assertEqual([(e["source"], e.get("sourceHandle")) for e in edges if e["target"] == "fallback_route"], [("if_initial_fallback_eligible", "pass")])
+
+        self.assertIn(("fallback_route", "success", "wait_fallback"), edge_triples)
+        self.assertIn(("wait_fallback", "pending", "agent_fallback"), edge_triples)
+        self.assertIn(("wait_fallback", "out", "record_fallback"), edge_triples)
+        self.assertIn(("record_fallback", "out", "if_fallback_receipt_ok"), edge_triples)
+        self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), edge_triples)
+
+        for source in ("if_receipt_ok2", "if_receipt_ok3", "if_receipt_ok_rn1", "if_receipt_ok_rn2", "if_review1", "if_review1b", "if_review2", "if_review2b", "if_test_ok", "if_test_ok2", "if_test_rn1", "if_test_rn2"):
+            self.assertFalse(reaches(source, "fallback_route"), source)
+            self.assertFalse(reaches(source, "agent_fallback"), source)
+
+        cfg = nodes["agent_fallback"]["config"]
+        self.assertNotIn("session_identity", cfg)
+        self.assertNotIn("resume_job_id", cfg)
+        for field in ("launcher", "provider", "model"):
+            self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{field} }}}}")
+
+    def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            cfg = nodes[node_id]["config"]
+            for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
+                self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{field} | default(TASKS.route.data.{field}) }}}}")
+        for node_id, slot in (("review1", "reviewer1"), ("review1b", "reviewer1"), ("review2", "reviewer2"), ("review2b", "reviewer2")):
+            cfg = nodes[node_id]["config"]
+            for field in ("launcher", "provider", "model"):
+                self.assertEqual(cfg[field], f"{{{{ TASKS.fallback_route.data.{slot}_{field} | default(TASKS.route.data.{slot}_{field}) }}}}")
+        for node_id in ("agent2", "agent_rn1", "agent_rn2"):
+            cfg = nodes[node_id]["config"]
+            self.assertEqual(cfg["session_identity"], "{{ TASKS.record_fallback.session_identity | default(TASKS.record.session_identity) }}")
+            self.assertEqual(cfg["resume_job_id"], "{{ TASKS.record_fallback.resume_job_id | default(TASKS.record.resume_job_id) }}")
+        self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ TASKS.record2.session_identity }}")
+        self.assertEqual(nodes["agent3"]["config"]["resume_job_id"], "{{ TASKS.record2.resume_job_id }}")
+
+    def test_implement_slice_fallback_failure_stops_with_both_receipts(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        edges = graph["spec"]["edges"]
+        self.assertEqual(nodes["fallback_fail"]["type"], "transforms.objectBuilder")
+        outputs = {m["output"]: m["expression"] for m in nodes["fallback_fail"]["config"]["mappings"]}
+        for field in ("primary_receipt", "fallback_receipt", "fallback_route_error", "fallback_action_error", "raw_wait_receipt", "primary_route", "fallback_route"):
+            self.assertIn(field, outputs)
+        self.assertEqual(outputs["fallback_receipt"], {"kind": "getField", "path": "TASKS.record_fallback"})
+        self.assertEqual(outputs["fallback_route_error"], {"kind": "getField", "path": "TASKS.fallback_route"})
+        self.assertEqual(outputs["fallback_action_error"], {"kind": "getField", "path": "TASKS.agent_fallback"})
+        self.assertEqual(outputs["raw_wait_receipt"], {"kind": "getField", "path": "TASKS.wait_fallback.request.body"})
+        self.assertEqual(nodes["join_fallback_fail"]["type"], "logic.join.any")
+        for source, handle in (("fallback_route", "failure"), ("wait_fallback", "timeout"), ("wait_fallback", "failure"), ("agent_fallback", "failure"), ("if_fallback_receipt_ok", "fail")):
+            self.assertEqual({e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle}, {"join_fallback_fail"}, (source, handle))
+        self.assertTrue(any(e["source"] == "join_fallback_fail" and e["target"] == "fallback_fail" for e in edges))
+        writer_ids = {n_id for n_id, node in nodes.items() if node["type"].endswith("/v1/agent/run")}
+        for start in ("join_fallback_fail", "fallback_fail"):
+            seen, stack = set(), [start]
+            while stack:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                stack.extend(e["target"] for e in edges if e["source"] == current)
+            self.assertTrue(writer_ids.isdisjoint(seen), (start, writer_ids & seen))
+        done = {m["output"]: m["expression"] for m in nodes["done"]["config"]["mappings"]}
+        for field, path in (("primary_receipt", "TASKS.record"), ("fallback_receipt", "TASKS.record_fallback"), ("primary_route", "TASKS.route.data"), ("fallback_route", "TASKS.fallback_route.data")):
+            self.assertEqual(done[field], {"kind": "getField", "path": path})
 
     def test_implement_slice_routes_direct_native_reviewers(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -3025,9 +3256,12 @@ while True:
             slot = "reviewer1" if suffix.startswith("1") else "reviewer2"
             config = node["config"]
             self.assertNotIn("reviewer", config)
-            self.assertEqual(config["launcher"], f"{{{{ TASKS.route.data.{slot}_launcher }}}}")
-            self.assertEqual(config["provider"], f"{{{{ TASKS.route.data.{slot}_provider }}}}")
-            self.assertEqual(config["model"], f"{{{{ TASKS.route.data.{slot}_model }}}}")
+            self.assertIn(f"TASKS.fallback_route.data.{slot}_launcher", config["launcher"])
+            self.assertIn(f"TASKS.route.data.{slot}_launcher", config["launcher"])
+            self.assertIn(f"TASKS.fallback_route.data.{slot}_provider", config["provider"])
+            self.assertIn(f"TASKS.route.data.{slot}_provider", config["provider"])
+            self.assertIn(f"TASKS.fallback_route.data.{slot}_model", config["model"])
+            self.assertIn(f"TASKS.route.data.{slot}_model", config["model"])
         second = nodes["switch_rev2"]["config"]
         self.assertEqual(second["cases"][0]["rules"], [
             {"path": "data.reviewer2_launcher", "op": "equals", "value": "none"}
@@ -3046,10 +3280,13 @@ while True:
         root = Path(server.__file__).parent / "graphs"
         implement = json.loads((root / "implement-slice.json").read_text())
         implement_nodes = {n["id"]: n for n in implement["spec"]["nodes"]}
-        for node_id in ("record", "record2"):
-            mappings = implement_nodes[node_id]["config"]["mappings"]
-            route = next(m for m in mappings if m["output"] == "route")
-            self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
+        mappings = {m["output"]: m["expression"] for m in implement_nodes["record"]["config"]["mappings"]}
+        self.assertEqual(mappings["route"], {"kind": "getField", "path": "TASKS.route.data"})
+        retry_mappings = {
+            m["output"]: m["expression"] for m in implement_nodes["record2"]["config"]["mappings"]
+        }
+        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "TASKS.route.data"})
+        self.assertEqual(retry_mappings["fallback_route"], {"kind": "getField", "path": "TASKS.fallback_route.data"})
 
         drive = json.loads((root / "pr-drive.json").read_text())
         drive_nodes = {n["id"]: n for n in drive["spec"]["nodes"]}
@@ -3820,8 +4057,10 @@ while True:
         self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
-        self.assertEqual(agent2["config"]["session_identity"], "{{ TASKS.record.session_identity }}")
-        self.assertEqual(agent2["config"]["resume_job_id"], "{{ TASKS.record.resume_job_id }}")
+        self.assertIn("TASKS.record_fallback.session_identity", agent2["config"]["session_identity"])
+        self.assertIn("TASKS.record.session_identity", agent2["config"]["session_identity"])
+        self.assertIn("TASKS.record_fallback.resume_job_id", agent2["config"]["resume_job_id"])
+        self.assertIn("TASKS.record.resume_job_id", agent2["config"]["resume_job_id"])
         self.assertIn("TASKS.test.data.compact", agent2["config"]["prompt"])
         self.assertIn("Continue this slice", agent2["config"]["prompt"])
         self.assertIn("TASKS.ticket_head.data.text", agent2["config"]["prompt"])
@@ -3871,7 +4110,8 @@ while True:
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
         self.assertEqual(agent["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
-        self.assertEqual(agent2["config"]["launcher"], "{{ TASKS.route.data.launcher }}")
+        self.assertIn("TASKS.fallback_route.data.launcher", agent2["config"]["launcher"])
+        self.assertIn("TASKS.route.data.launcher", agent2["config"]["launcher"])
         self.assertEqual(edges["e7j"]["target"], "route")
         self.assertEqual(edges["e_commit_first"]["target"], "join_switch_rev")
         self.assertEqual(edges["e_join_switch_rev"]["target"], "map_switch_rev")
@@ -3971,9 +4211,16 @@ while True:
             "reviewer1_launcher", "reviewer1_provider", "reviewer1_model",
             "reviewer1_effort", "reviewer1_reason", "reviewer2_launcher",
             "reviewer2_provider", "reviewer2_model", "reviewer2_effort",
-            "reviewer2_reason",
+            "reviewer2_reason", "role", "primary_route_version", "primary_reason",
+            "fallback_reason", "fallback_code", "selected_alternate_route",
         ):
             self.assertIn(field, route)
+        self.assertEqual(
+            set(route["route_version"]["enum"]),
+            {"normal-v1", "availability-fallback-v1"},
+        )
+        fallback_request = spec["components"]["schemas"]["SliceRouteFallbackRequest"]
+        self.assertEqual(set(fallback_request["required"]), {"work_kind", "primary_route", "primary_receipt"})
 
     def test_parse_review_verdict(self):
         self.assertEqual(server.parse_review_verdict("noise\nVERDICT: PASS\n")[0], "PASS")
