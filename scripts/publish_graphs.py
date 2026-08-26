@@ -74,7 +74,14 @@ def deployed_openapi_spec() -> dict:
 def fetch_public_openapi(url: str) -> dict:
     """Fetch the exact sourceUrl before a Rewst mutation, without caching it."""
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "graphwing-release-verifier/1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
         spec = json.loads(raw)
     except (OSError, ValueError, urllib.error.URLError) as exc:
