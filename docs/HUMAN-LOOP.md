@@ -16,10 +16,10 @@ Use your normal editor or terminal. Do not reconstruct operating rules from an o
 1. Grill the idea and record the accepted behavior on its GitHub issue.
 2. Stamp class (`mechanical`, `visual`, or `sensitive`), work kind (`go_coding`, `typescript_coding`, or `research_ops`), and size floor (`S`, `M`, or `L`).
 3. Structure the approved work into a slice map in the app worktree. Graph does not invent slices.
-4. Fire `graphwing-implement-slice` with one frontier ticket path.
+4. Start `graphwing-implement-slice` manually/form-side or through `/workflows/{slug}/run` with `{ "input": {...} }`; the current webhook input path is known broken.
 5. Run named local tests from `tests.json`. On red, files stay on disk and the run parks.
 6. After the map is empty, run the named smoke or e2e recipe before opening a PR.
-7. Open the PR, verify CI and independent review, then merge.
+7. Open the PR and verify independent review. Merge only after the final persisted named-test job and a fresh, stable, nonempty terminal-green GitHub state both pass.
 
 ## Slice map
 
@@ -48,6 +48,50 @@ Go uses Codex, TypeScript uses Claude, and research/operations uses Grok. Mechan
 Resume only the native session identity recorded in a successful Graphwing receipt. Send compact failing test names or must-fix review items, not reviewer reasoning. Never switch launchers implicitly.
 
 A timeout without a verdict, exhausted retry budget, repeated red suite, or repeated review rejection parks the slice with files intact. Discard is the only operation allowed to wipe work.
+
+## Operational boundaries
+
+- `diagnostic-v1` is a compact receipt contract, not a trace dump. `provider-recovery-v1` may reconsider a prior fallback only at a later invocation boundary from persisted evidence; active corrections remain pinned.
+- Production code-off parks before launch while Fable and Terra remain unproven. Git worktrees are not OS isolation.
+- PR status is remote-only. Merge requires the persisted final named-test job bound to repo/PR/run/head and clean start/end, then fresh open, non-draft, stable-head, merge-ready state with a nonempty terminal-green GitHub check set.
+- There is no visual proof scope in this catalog. Preserve issue-52 visual exclusions; a named recipe is not screenshot/browser evidence.
+- Local green tests do not claim Rewst import parity, publication, live readiness, or a canary.
+
+## Rollout verification checklist
+
+Run local checks from the catalog root. They neither start services nor contact Rewst/providers.
+
+**Fixture proof** — deterministic local fixtures, including issues 65-68 behavior; no tenant/runtime claim:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 test_server.py
+```
+
+**Catalog/import proof** — compile, parse OpenAPI and every graph, verify DAG/fan-in/catalog/writeback gates, then inspect the diff. This proves the source catalog is internally consistent; an actual tenant import still needs a fresh authorized readback.
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/graphwing-pyc python3 -m py_compile server.py scripts/publish_graphs.py scripts/reimport_integration.py test_server.py
+python3 - <<'PY'
+import json
+from pathlib import Path
+for path in [Path("openapi.json"), *sorted(Path("graphs").glob("*.json"))]:
+    json.loads(path.read_text())
+PY
+PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 -m unittest \
+  test_server.DispatchTests.test_graphs_fan_in_targets_are_joins \
+  test_server.DispatchTests.test_catalog_docs_inputs_and_publish_all_writeback_cover_every_graph \
+  test_server.DispatchTests.test_rollout_docs_name_proof_levels_commands_and_safety_limits \
+  test_server.DispatchTests.test_implement_slice_initial_availability_fallback_topology \
+  test_server.DispatchTests.test_implement_slice_recovery_is_only_a_later_initial_boundary \
+  test_server.DispatchTests.test_pr_drive_has_one_final_evidence_leg_and_no_merge_bypass \
+  test_server.DispatchTests.test_pr_status_reports_remote_only_states_without_side_effects \
+  test_server.CodeOffTests.test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated
+git diff --check
+```
+
+**Published proof** — only an authorized run of `python3 scripts/reimport_integration.py` followed by `python3 scripts/publish_graphs.py --only all --no-run`, plus fresh provider workflow/version/spec readback, can establish it. Saved IDs alone are insufficient.
+
+**Live canary proof** — requires a deployed source-matching API/OpenAPI, published/read-back graph, and an actual bounded nonvisual run trace. Active units alone are not proof. Code-off cannot be a launch canary while prepare parks, and no visual canary is in scope.
 
 ## Do not
 

@@ -32,13 +32,13 @@ Index JSON in the app worktree (example: [`examples/slices.example.json`](../exa
 
 Each ticket file is what the writer sees. `kind` is `build` or `decision`. `status` is `open` or `done`. Frontier is unblocked open `build` tickets. Serial: one frontier ticket at a time on the story branch.
 
-Name a `tests.json` recipe for the story suite. Visual without a recipe has no per-slice gate.
+Name a `tests.json` recipe for the story suite. Visual without a recipe has no per-slice gate, but a recipe is not browser/screenshot evidence; this catalog has no visual-proof workflow.
 
 For riftwing, use `riftwing-local-gates`. That runs `.githooks/pre-commit` (gitleaks, lockfile) with `RIFTWING_HOOK_NONINTERACTIVE=1`. It does not run pre-push fetch or Shortcut.
 
 ## Fire implement-slice
 
-Published slug: `graphwing-implement-slice`. Manual, form, or authenticated webhook.
+Published slug: `graphwing-implement-slice`. Use the manual/form trigger or an authorized `/workflows/graphwing-implement-slice/run` caller with an `input` wrapper.
 
 ```json
 {
@@ -61,15 +61,15 @@ Published slug: `graphwing-implement-slice`. Manual, form, or authenticated webh
 
 `ac_count` and `seams` feed `sliceRoute`, which may bump the size one step from countable features. Seven ACs took SC-110290 from floor `S` to `M`, which turned Sonnet spec-review on. Omitting them leaves the router blind and the floor unchanged, so send them honestly rather than to dodge a gate.
 
-Or fire from the seat without holding the webhook key:
+The legacy seat helper still exists:
 
 ```bash
 scripts/fire-slice.sh payload.json
 ```
 
-It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst trigger. The URL and `hook_secret` stay in `$GRAPHWING_HOME/rewst-install.json`. Needs `implement_slice_hook_url` recorded there; without it the endpoint answers 503 naming the key to set.
+It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do not use it as the current operator start or as rollout proof: observed webhook runs do not materialize `CTX.INPUT`, so graph inputs resolve empty. The URL and `hook_secret` stay in `$GRAPHWING_HOME/rewst-install.json`.
 
-`kick_url` is this workflow's own webhook. After a green slice, `sliceContinue` POSTs the next ticket there. Without it, this run does one slice and stops.
+`kick_url` remains generic catalog wiring, but its next-run webhook uses the known-broken input mapping. It cannot continue the slice walk today; treat one manual/API run as one slice.
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
@@ -87,7 +87,7 @@ or traces. Other `AgentReceipt` fields retain their documented artifact values a
 not covered by that claim.
 
 Provider recovery is a new invocation decision, never an active-session decision.
-After a successful one-hop fallback, a later manual/webhook payload may set
+After a successful one-hop fallback, a later manual/API invocation payload may set
 `recovery_version: provider-recovery-v1` and supply the prior primary/fallback routes
 and receipts. The recovery endpoint re-reads both terminal job files. Missing,
 malformed, mismatched, nonterminal, or out-of-order evidence stops the run. A prior
@@ -130,9 +130,10 @@ trigger with `body: {}` and fails the same silent way.
 that reaches the commit has already spent a full writer session. The graph defaults it
 too, so a caller that forgets loses nothing.
 
-`kick_url` is this workflow's own webhook. Without it the run does one fix attempt
-and stops, because Rewst forbids unbounded cycles inside a run: the loop is a chain
-of runs, not a cycle.
+`kick_url` is generic catalog wiring for a fresh-run webhook, not a working attempt
+loop. Under the recorded current mapping that webhook cannot create `CTX.INPUT`, so it
+cannot continue `pr-drive`. One `/run` invocation is one bounded fix attempt;
+`scripts/drive-pr.py` owns a multi-attempt loop by issuing fresh API runs.
 
 The writer's prompt is not yours to write. A `findings` node reads the reviewers'
 `engineering-findings-json`, dedupes by fingerprint (two reviewers raising one defect
@@ -148,7 +149,7 @@ flat result.
 
 `auto_merge` is per-run and defaults false. Initial-green and after-fix routes both checkout the freshly read PR head and run one final named test. The earlier after-fix test remains advisory.
 Only the final async job carries persisted `pr-merge-evidence-v1` repo/recipe/PR/run/head and clean start/end provenance; after-fix pins the successful writer/session job while initial-green has no writer reference.
-Merge accepts that final job ID, then freshly requires an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
+Merge accepts that final persisted job ID only when its repo/recipe/PR/run/head and clean start/end provenance match. It then freshly requires an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
 Code-off receipts remain independent issue-67 commit/push gates and cannot waive this final test. `graphwing-pr-status` reports remote readiness only; `remote_ready` means `named_test_required`, not merge-safe.
 
 ## Other graphs
@@ -156,8 +157,8 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 | Slug | When |
 |---|---|
 | `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`; success includes stack/port diagnostics and action failures terminate with compact diagnostic stage receipts. |
-| `graphwing-pr-status` | Read-only PR checks. Unauthenticated webhook. |
-| `graphwing-pr-drive` | One fix slice when CI is red. Authenticated webhook / doorbell OIDC. |
+| `graphwing-pr-status` | Remote-only PR/check classification by manual/API run; its declared webhook is known non-operational under the current input mapping. |
+| `graphwing-pr-drive` | One bounded fix slice when remote checks/findings are red; start via manual/form/API run, not webhook. |
 
 ## Run a deterministic code-off
 
@@ -165,7 +166,7 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 
 `code-off-draw-v1` uses the seed as an HMAC-SHA-256 key to rank the canonical pool and each judge's `[author-1, author-2]` order without modulo bias. The public commitment is `SHA-256("graphwing/code-off/seed-commitment/v1\\0" + seed)`; audit never returns the seed or a blind ordering before completion. There is no redraw, fallback, or cherry-picking.
 
-The immutable record holds hash-chained events and content-addressed artifacts. Candidate/final recipes run identically with bytecode disabled in disposable Git worktrees; judges receive the locked task/category but no author identity. Finalization proves the frozen hash before a Git-safe target apply; ignored candidate paths, introduced identity leakage, or terminal candidate corruption park for cleanup, while infrastructure/persistence interruptions remain retryable. Audit is read-only. Fixed Fable (and historical Terra when drawn) stays unproven/non-runnable, so production parks before launch and never redraws.
+The immutable record holds hash-chained events and content-addressed artifacts. Candidate/final recipes run identically with bytecode disabled in disposable Git worktrees; those worktrees are not OS isolation. Judges receive the locked task/category but no author identity. Finalization proves the frozen hash before a Git-safe target apply; ignored candidate paths, introduced identity leakage, or terminal candidate corruption park for cleanup, while infrastructure/persistence interruptions remain retryable. Audit is read-only. Fable and Terra remain unproven/non-runnable, so production parks before launch and never redraws.
 
 ## Publish catalog graphs
 
@@ -177,7 +178,9 @@ MCP token: `GRAPHWING_REWST_MCP_TOKEN`, or `mcp_bws_key` in that file plus `BWS_
 python3 scripts/publish_graphs.py --only all --no-run
 ```
 
-Rewst rejects fan-in that is not `logic.join.*` and rejects unbounded cycles. One Graph run per slice. `kick_url` starts the next.
+Rewst rejects fan-in that is not `logic.join.*` and rejects unbounded cycles. One Graph run handles one slice; `kick_url` is generic catalog wiring whose webhook continuation is known broken under the current input mapping.
+
+Repository checks are fixture/catalog proof only. See [HUMAN-LOOP.md](HUMAN-LOOP.md#rollout-verification-checklist) for the separate catalog/import, published, and live-canary evidence levels; this issue does not claim a publish or canary.
 
 After any `openapi.json` change, new operation or renamed field, re-import the integration **before** publishing graphs:
 
@@ -221,5 +224,5 @@ placeholders; the real ones are seat config, so deploy never touches them.
 ## Tests
 
 ```bash
-GRAPHWING_HOME=. python3 test_server.py
+PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 test_server.py
 ```

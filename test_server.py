@@ -6204,10 +6204,20 @@ while True:
         graphs = Path(__file__).resolve().parent / "graphs"
         for graph_path in sorted(graphs.glob("*.json")):
             graph = json.loads(graph_path.read_text())
-            nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+            node_rows = graph["spec"]["nodes"]
+            edge_rows = graph["spec"]["edges"]
+            node_ids = [node.get("id") for node in node_rows]
+            edge_ids = [edge.get("id") for edge in edge_rows]
+            self.assertTrue(all(isinstance(uid, str) and uid for uid in node_ids), graph_path.name)
+            self.assertTrue(all(isinstance(uid, str) and uid for uid in edge_ids), graph_path.name)
+            self.assertEqual(len(node_ids), len(set(node_ids)), f"{graph_path.name} duplicate node id")
+            self.assertEqual(len(edge_ids), len(set(edge_ids)), f"{graph_path.name} duplicate edge id")
+            nodes = {node["id"]: node for node in node_rows}
             incoming: dict[str, int] = {}
             outgoing: dict[str, list[str]] = {}
-            for edge in graph["spec"]["edges"]:
+            for edge in edge_rows:
+                self.assertIn(edge.get("source"), nodes, f"{graph_path.name} dangling source {edge}")
+                self.assertIn(edge.get("target"), nodes, f"{graph_path.name} dangling target {edge}")
                 incoming[edge["target"]] = incoming.get(edge["target"], 0) + 1
                 outgoing.setdefault(edge["source"], []).append(edge["target"])
             for nid, count in incoming.items():
@@ -6237,6 +6247,129 @@ while True:
             for nid in nodes:
                 if color[nid] == 0:
                     dfs(nid)
+
+    def test_catalog_docs_inputs_and_publish_all_writeback_cover_every_graph(self):
+        root = Path(__file__).resolve().parent
+        paths = sorted((root / "graphs").glob("*.json"))
+        graphs = {path.stem: json.loads(path.read_text()) for path in paths}
+        slugs = {graph["slug"] for graph in graphs.values()}
+        self.assertEqual(len(slugs), len(graphs), "graph slugs must be unique")
+
+        field_ref = re.compile(r"(?<![A-Za-z0-9_])CTX\.INPUT\.([a-z][a-z0-9_]*)(?![A-Za-z0-9_-])")
+        def input_fields(graph):
+            found = set()
+            def walk(value):
+                if isinstance(value, str):
+                    found.update(field_ref.findall(value))
+                elif isinstance(value, list):
+                    for item in value: walk(item)
+                elif isinstance(value, dict):
+                    for item in value.values(): walk(item)
+            for node in graph["spec"]["nodes"]:
+                walk(node.get("config", {}))
+            return found
+
+        inputs = {stem: input_fields(graph) for stem, graph in graphs.items()}
+        for stem, graph in graphs.items():
+            payload = re.search(r"\bPayload:\s*([^.]*)", graph["description"])
+            if payload:
+                enumerated = set(re.findall(r"\b[a-z][a-z0-9_]*\b", payload.group(1))) - {"optional"}
+                self.assertEqual(enumerated, inputs[stem], f"{stem} stale description payload")
+        for stem in ("implement-slice", "pr-drive"):
+            description = graphs[stem]["description"].lower()
+            self.assertNotIn("payload:", description)
+            self.assertIn("declared trigger inputs", description)
+            self.assertIn("one bounded", description)
+            self.assertIn("known-disabled", description)
+
+        def table_rows(path):
+            rows = {}
+            for line in path.read_text().splitlines():
+                cells = [cell.strip() for cell in line.split("|")[1:-1]]
+                if cells and re.fullmatch(r"`graphwing-[a-z0-9-]+`", cells[0]):
+                    rows[cells[0].strip("`")] = cells
+            return rows
+
+        catalogs = {}
+        for rel in ("README.md", "graphs/README.md"):
+            rows = catalogs[rel] = table_rows(root / rel)
+            self.assertEqual(set(rows), slugs, rel)
+
+        for rel, catalog in catalogs.items():
+            for stem, graph in graphs.items():
+                documented = set(re.findall(r"`([a-z][a-z0-9_]*)`", catalog[graph["slug"]][1]))
+                self.assertEqual(documented, inputs[stem], f"{rel} {graph['slug']} inputs")
+
+        from scripts import publish_graphs as pg
+
+        seen, saved = [], []
+        def upsert(_mcp, _name, slug, _description, _spec):
+            seen.append(slug)
+            return f"workflow-{slug}", f"version-{slug}", slug
+
+        install = {
+            "org_id": "tenant-fixture", "instance_id": "instance-fixture",
+            "pr_status_repo": "repo-fixture", "custom_integration_id": "integration-fixture",
+        }
+        with (
+            mock.patch.object(sys, "argv", ["publish_graphs.py", "--only", "all", "--no-run"]),
+            mock.patch.object(pg, "load_install", return_value=install.copy()),
+            mock.patch.object(pg, "rewst_mcp", return_value="fixture-token"),
+            mock.patch.object(pg, "public_openapi_url", return_value="https://fixture.invalid/openapi.json"),
+            mock.patch.object(pg, "upsert_workflow", side_effect=upsert),
+            mock.patch.object(pg, "save_install", side_effect=lambda value: saved.append(deepcopy(value))),
+            mock.patch("builtins.print"),
+        ):
+            pg.main()
+        self.assertEqual(len(seen), len(set(seen)), "all mode published a graph more than once")
+        self.assertEqual(set(seen), slugs)
+        self.assertEqual(len(saved), 1)
+        for stem, graph in graphs.items():
+            self.assertEqual(saved[0][stem.replace("-", "_")]["slug"], graph["slug"])
+
+    def test_rollout_docs_name_proof_levels_commands_and_safety_limits(self):
+        root = Path(__file__).resolve().parent
+        operator_source = (root / "docs" / "HUMAN-LOOP.md").read_text()
+        operator = operator_source.lower()
+        for label in ("fixture proof", "catalog/import proof", "published proof", "live canary proof"):
+            self.assertIn(label, operator)
+        for command in ("graphwing_home=. python3 test_server.py", "python3 -m py_compile", "git diff --check"):
+            self.assertIn(command, operator)
+        for truth in (
+            "fable and terra", "parks before launch", "not os isolation",
+            "persisted final named-test job", "nonempty", "no visual proof",
+        ):
+            self.assertIn(truth, operator)
+
+        focused = (
+            "test_server.DispatchTests.test_graphs_fan_in_targets_are_joins",
+            "test_server.DispatchTests.test_catalog_docs_inputs_and_publish_all_writeback_cover_every_graph",
+            "test_server.DispatchTests.test_rollout_docs_name_proof_levels_commands_and_safety_limits",
+            "test_server.DispatchTests.test_implement_slice_initial_availability_fallback_topology",
+            "test_server.DispatchTests.test_implement_slice_recovery_is_only_a_later_initial_boundary",
+            "test_server.DispatchTests.test_pr_drive_has_one_final_evidence_leg_and_no_merge_bypass",
+            "test_server.DispatchTests.test_pr_status_reports_remote_only_states_without_side_effects",
+            "test_server.CodeOffTests.test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated",
+        )
+        documented = tuple(re.findall(
+            r"(?m)^\s{2}(test_server\.(?:DispatchTests|CodeOffTests)\.test_[a-z0-9_]+)(?:\s+\\)?\s*$",
+            operator_source,
+        ))
+        self.assertEqual(documented, focused)
+        loader = unittest.TestLoader()
+        self.assertEqual(loader.loadTestsFromNames(documented).countTestCases(), len(focused))
+        self.assertFalse(loader.errors, loader.errors)
+
+        catalog = (root / "graphs" / "README.md").read_text().lower()
+        using = (root / "docs" / "USING.md").read_text().lower()
+        self.assertNotIn("`kick_url` starts the next", catalog)
+        for statement in (
+            "known broken and unusable", ".github/workflows/pr-drive-doorbell.yml",
+            "still sends `pr`", "not rollout proof", "`pr-status` webhook is known non-operational",
+        ):
+            self.assertIn(statement, catalog)
+        self.assertIn("generic catalog wiring", using)
+        self.assertIn("cannot continue", using)
 
     def test_pr_status_graph_is_read_only_and_unauthenticated(self):
         graph_path = Path(__file__).resolve().parent / "graphs" / "pr-status.json"
@@ -7719,8 +7852,9 @@ class CodeOffTests(unittest.TestCase):
         source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()
         self.assertIn('"code-off"', source)
         self.assertIn('install["code_off"]', source)
-        implement = (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_bytes()
-        self.assertEqual(hashlib.sha256(implement).hexdigest(), "7e9cfe14e4e2f9530a4c2173e8c774a1509a6b6bdb1d9b14acc0e028d2a0aa4c")
+        implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "8e4445cb6570ed9ad3cfd8a16017375c19954c89db5e71f9c5727ae0878378f7")
 
 
 class InstallTests(unittest.TestCase):

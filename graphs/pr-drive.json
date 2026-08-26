@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver: remote-ready initial and after-fix paths converge on a final head-bound named test and persisted evidence gate before optional merge; red drives one bounded fix slice, while pending, blocking, and failure paths stop safely. Doorbell is the authenticated webhook. Payload: repo, pr, test, prompt, commit_message.",
+  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: remote-ready initial and after-fix paths converge on a final head-bound named test and persisted evidence gate before optional merge; red drives one bounded fix slice, while pending, blocking, and failure paths stop safely. The webhook/doorbell and kick continuation are known-disabled operator paths because current webhook runs do not create CTX.INPUT.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
