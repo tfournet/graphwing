@@ -6761,6 +6761,14 @@ def build_step_finding(doc: dict[str, Any], step: str, change_id: str) -> str:
     """
     if step != "fix":
         return ""
+    writer = doc.get("writer_result")
+    if (
+        isinstance(writer, dict)
+        and writer.get("status") in ("error", "timeout")
+        and writer.get("completed_change_id") == change_id
+    ):
+        summary = str(writer.get("summary") or writer.get("status") or "writer failed")
+        return f"The previous writer turn ended before success.\n{summary}"[:COMPACT_MAX_CHARS]
     # Every reviewer that finished and said no, in role order. A sensitive
     # change can come back from both at once, and handing the writer one
     # finding at a time would spend a correction turn and a review round per
