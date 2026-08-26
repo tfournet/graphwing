@@ -1,5 +1,9 @@
-from sensitive_canary import NO_REAL_CREDENTIALS, TENANT_ISOLATED
+from tenant_access import can_access
 
-assert TENANT_ISOLATED is True
-assert NO_REAL_CREDENTIALS is True
+assert can_access("tenant-a", "tenant-a") is True
+assert can_access("tenant-a", "tenant-b") is False
+assert can_access("", "tenant-a") is False
+assert can_access("tenant-a", "") is False
+assert can_access(None, "tenant-a") is False
+assert can_access("tenant-a", None) is False
 print("SENSITIVE_CANARY_OK")
