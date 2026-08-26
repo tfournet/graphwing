@@ -42,7 +42,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "listener_id": "graphwing-build-completion-supervisor@{{ CTX.WORKFLOW.version }}",
+          "listener_id": "graphwing-build-completion-supervisor@{{ WORKFLOW.version }}",
           "source_workflow": {
             "id": "{{ TRIGGER.workflowCompleted.sourceWorkflow.id }}",
             "slug": "{{ TRIGGER.workflowCompleted.sourceWorkflow.slug }}",

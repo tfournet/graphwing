@@ -2662,6 +2662,12 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("/home/tim", text)
         self.assertNotIn("tim-graphwing", text)
 
+    def test_graph_templates_use_live_workflow_root(self):
+        graphs = Path(__file__).resolve().parent / "graphs"
+        for graph_path in sorted(graphs.glob("*.json")):
+            raw = graph_path.read_text()
+            self.assertNotIn("CTX.WORKFLOW", raw, graph_path.name)
+
     def test_graphs_fan_in_targets_are_joins(self):
         graphs = Path(__file__).resolve().parent / "graphs"
         for graph_path in sorted(graphs.glob("*.json")):
@@ -5613,7 +5619,7 @@ class BuildStateTests(unittest.TestCase):
         self.assertEqual(edge_targets[("register", "success")], "next")
         self.assertEqual(edge_targets[("register", "failure")], "registration_refused")
         register = nodes["register"]
-        self.assertEqual(register["config"]["source_run_id"], "{{ CTX.WORKFLOW.runId }}")
+        self.assertEqual(register["config"]["source_run_id"], "{{ WORKFLOW.runId }}")
         for field in (
             "repo", "writer_prompt", "writer_prompt_ref", "fast_recipe",
             "integration_recipe", "reviewer", "class_stamp", "route_stamp",
@@ -7761,7 +7767,7 @@ class CompletionSupervisorTests(unittest.TestCase):
             ("review", "bind_review"),
         ):
             self.assertEqual(nodes[binder]["type"], "action.graphwing.POST:/v1/supervisor/bind")
-            self.assertEqual(nodes[binder]["config"]["source_run_id"], "{{ CTX.WORKFLOW.runId }}")
+            self.assertEqual(nodes[binder]["config"]["source_run_id"], "{{ WORKFLOW.runId }}")
             self.assertEqual(nodes[binder]["config"]["job_id"], f"{{{{ TASKS.{producer}.data.job_id }}}}")
             self.assertTrue(
                 any(
@@ -7836,7 +7842,8 @@ class CompletionSupervisorTests(unittest.TestCase):
         }
         source_run.update(run_over)
         context = {
-            "CTX": {"WORKFLOW": {"version": "7"}},
+            "CTX": {},
+            "WORKFLOW": {"version": "7"},
             "TRIGGER": {
                 "workflowCompleted": {
                     "sourceWorkflow": {
