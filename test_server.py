@@ -1857,7 +1857,8 @@ while True:
             {"launcher", "provider", "model"},
         )
         self.assertIn("codeoff_workspace", props)
-        self.assertEqual(len(request_schema["oneOf"]), 2)
+        self.assertNotIn("oneOf", request_schema)
+        self.assertNotIn("allOf", request_schema)
         self.assertFalse(request_schema["additionalProperties"])
         for schema_name in ("AgentRunAccepted", "AgentJob", "AgentReceipt"):
             identity = spec["components"]["schemas"][schema_name]["properties"]["session_identity"]
@@ -1959,6 +1960,28 @@ while True:
         self.assertIn("202", spec["paths"]["/v1/script/run"]["post"]["responses"])
         self.assertIn("response_webhook_url", spec["components"]["schemas"]["ScriptRunRequest"]["properties"])
         self.assertEqual(ctype, "application/json")
+
+    def test_openapi_request_roots_are_rewst_importable(self):
+        spec = json.loads(server.openapi_bytes())
+        # Root combinators caused canary b7c619e4 to import agentRun without body fields.
+        unsupported_root_keywords = {"oneOf", "allOf", "anyOf", "not", "if"}
+        for path, operations in spec["paths"].items():
+            for method, operation in operations.items():
+                request_body = operation.get("requestBody") if isinstance(operation, dict) else None
+                if not request_body:
+                    continue
+                content = request_body["content"]
+                self.assertIn("application/json", content, (method, path))
+                self.assertIn("schema", content["application/json"], (method, path))
+                schema = content["application/json"]["schema"]
+                if "$ref" in schema:
+                    schema = spec["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
+                self.assertTrue(unsupported_root_keywords.isdisjoint(schema), (method, path))
+        agent_properties = spec["components"]["schemas"]["AgentRunRequest"]["properties"]
+        self.assertTrue(
+            {"prompt", "launcher", "provider", "model", "cwd", "codeoff_workspace"}
+            <= set(agent_properties)
+        )
 
 
 
@@ -7313,6 +7336,20 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "codeoff_identity_mismatch")
 
+    def test_agent_run_rejects_caller_prompt_or_cwd_for_codeoff_workspace(self):
+        self._prepare("opaque-exclusivity")
+        for forbidden, slot in (("prompt", "author-1"), ("cwd", "author-2")):
+            with self.subTest(forbidden=forbidden):
+                body = self._agent_body("opaque-exclusivity", slot)
+                body[forbidden] = "caller-controlled"
+                status, payload = self._post("/v1/agent/run", body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_codeoff_workspace")
+                self.assertEqual(
+                    payload["error"],
+                    "code-off jobs resolve prompt and cwd from the opaque reference",
+                )
+
     def test_claude_codeoff_provenance_accepts_one_exact_first_party_model_usage(self):
         self._prepare("claude-provenance-good")
         model = self._agent_body("claude-provenance-good", "author-2")["model"]
@@ -8331,7 +8368,7 @@ class CodeOffTests(unittest.TestCase):
         status, payload = self._post("/v1/code-off/audit", {"experiment_id": "experiment-0001"}, authed=False)
         self.assertEqual(status, 401)
 
-    def test_codeoff_openapi_identity_contract_matches_runtime_without_widening_ordinary_routes(self):
+    def test_codeoff_openapi_identity_contract_matches_runtime_manifest(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
 
@@ -8341,43 +8378,20 @@ class CodeOffTests(unittest.TestCase):
                 for variant in schemas[name]["oneOf"]
             }
 
-        ordinary = {
-            (launcher, details["provider"], model)
-            for launcher, details in server.NATIVE_LAUNCHERS.items()
-            for model in details["models"]
-        }
         codeoff = {
             (identity["launcher"], identity["provider"], identity["exact_model"])
             for identity in server.CODEOFF_MODEL_MANIFEST["models"].values()
         }
         request = schemas["AgentRunRequest"]
-        conditions = {
-            tuple(rule["if"]["required"]): rule["then"]["$ref"]
-            for rule in request["allOf"]
-        }
-        self.assertEqual(conditions, {
-            ("prompt",): "#/components/schemas/OrdinaryAgentRequestIdentity",
-            ("codeoff_workspace",): "#/components/schemas/CodeOffAgentRequestIdentity",
-        })
-        self.assertEqual(tuples("OrdinaryIdentityTuple", ("launcher", "provider", "model")), ordinary)
+        self.assertNotIn("oneOf", request)
+        self.assertNotIn("allOf", request)
         self.assertEqual(tuples("CodeOffIdentityTuple", ("launcher", "provider", "model")), codeoff)
         self.assertEqual(
             schemas["SessionIdentity"]["allOf"],
             [{"$ref": "#/components/schemas/CodeOffIdentityTuple"}],
         )
-        for name, tuple_name in (
-            ("OrdinaryAgentRequestIdentity", "OrdinaryIdentityTuple"),
-            ("CodeOffAgentRequestIdentity", "CodeOffIdentityTuple"),
-        ):
-            nested = schemas[name]["allOf"][1]["properties"]["session_identity"]["allOf"]
-            self.assertEqual(nested, [
-                {"$ref": "#/components/schemas/SessionIdentity"},
-                {"$ref": f"#/components/schemas/{tuple_name}"},
-            ])
         self.assertNotIn(("codex", "anthropic", "gpt-5.6-terra"), codeoff)
         self.assertNotIn(("claude", "openai", "claude-fable-5"), codeoff)
-        self.assertNotIn(("codex", "openai", "gpt-5.6-terra"), ordinary)
-        self.assertNotIn(("claude", "anthropic", "claude-fable-5"), ordinary)
 
         execution = schemas["CodeOffExecutionIdentity"]
         self.assertFalse(execution["additionalProperties"])

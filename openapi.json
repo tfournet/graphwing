@@ -1419,16 +1419,12 @@
           "agents": { "type": "array", "items": { "type": "object" } }
         }
       },
-      "OrdinaryIdentityTuple": {"oneOf":[{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"}}}]},
       "CodeOffIdentityTuple": {"oneOf":[{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-terra"}}},{"type":"object","required":["launcher","provider","model"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-fable-5"}}}]},
-      "OrdinaryAgentRequestIdentity": {"allOf":[{"$ref":"#/components/schemas/OrdinaryIdentityTuple"},{"properties":{"session_identity":{"allOf":[{"$ref":"#/components/schemas/SessionIdentity"},{"$ref":"#/components/schemas/OrdinaryIdentityTuple"}]}}}]},
-      "CodeOffAgentRequestIdentity": {"allOf":[{"$ref":"#/components/schemas/CodeOffIdentityTuple"},{"properties":{"session_identity":{"allOf":[{"$ref":"#/components/schemas/SessionIdentity"},{"$ref":"#/components/schemas/CodeOffIdentityTuple"}]}}}]},
       "AgentRunRequest": {
         "type": "object",
+        "description": "The root object avoids combinators unsupported by Rewst custom-integration imports. The endpoint enforces prompt/code-off workspace exclusivity and exact mode-specific identity tuples.",
         "required": ["launcher", "provider", "model"],
         "additionalProperties": false,
-        "oneOf": [{"required":["prompt"],"not":{"required":["codeoff_workspace"]}},{"required":["codeoff_workspace"],"not":{"anyOf":[{"required":["prompt"]},{"required":["cwd"]}]}}],
-        "allOf": [{"if":{"required":["prompt"]},"then":{"$ref":"#/components/schemas/OrdinaryAgentRequestIdentity"}},{"if":{"required":["codeoff_workspace"]},"then":{"$ref":"#/components/schemas/CodeOffAgentRequestIdentity"}}],
         "properties": {
           "prompt": { "type": "string", "description": "One job. Graph owns topology." },
           "launcher": { "type": "string", "enum": ["claude", "codex", "grok"] },
