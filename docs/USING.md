@@ -157,7 +157,7 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 | Slug | When |
 |---|---|
 | `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "ports" } }`; success includes stack/port diagnostics and action failures terminate with compact diagnostic stage receipts. |
-| `graphwing-pr-status` | Remote-only PR/check classification by manual/API run; its declared webhook is known non-operational under the current input mapping. |
+| `graphwing-pr-status` | No working start today: its source-parity `pr` input does not reach `CTX.INPUT` through webhook or manual/form/API until that field is renamed/fixed. |
 | `graphwing-pr-drive` | One bounded fix slice when remote checks/findings are red; start via manual/form/API run, not webhook. |
 
 ## Run a deterministic code-off

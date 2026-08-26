@@ -29,6 +29,8 @@ flowchart LR
   <img src="docs/images/architecture.svg" alt="Your computer runs Graphwing. Rewst in the cloud calls it. You start work and merge." width="100%">
 </p>
 
+*Topology-only: webhook starts are known-disabled; use the documented manual/form/API starts for `implement-slice` and `pr-drive`; `pr-status` has no working start.*
+
 Rewst cannot call `127.0.0.1`, so a Cloudflare tunnel gives Graphwing a public URL. Import that `/openapi.json` as a Rewst custom integration.
 
 ## A workflow run
@@ -56,7 +58,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 |---|---|---|
 | `graphwing-implement-slice` | `repo`, `branch`, `index`, `ticket`, `commit_message`, `test`, `iters_left`, `class`, `work_kind`, `size`, `ac_count`, `seams`, `kick_url`, `kick_token`, `e2e`, `recovery_version`, `prior_primary_route`, `prior_primary_receipt`, `prior_fallback_route`, `prior_fallback_receipt`, `fresh_primary_receipt` | One ticket: route, write, named test, opposing review, complete, commit, push. `diagnostic-v1` receipts are bounded; `provider-recovery-v1` is a later-invocation evidence check, never an active-session switch. |
 | `graphwing-verify-stack` | `stack`, `ports` | Check stack then ports and retain compact diagnostics. |
-| `graphwing-pr-status` | `pr` | Classify fresh remote PR/check state. No named test or writes; `remote_ready` is not merge-safe. |
+| `graphwing-pr-status` | `pr` | Source-parity input only; currently non-operational through webhook or manual/form/API because `pr` does not reach `CTX.INPUT` until that field is renamed/fixed. |
 | `graphwing-pr-drive` | `repo`, `pr_number`, `attempt`, `max_attempts`, `auto_merge`, `kick_url`, `kick_token`, `test`, `class`, `size`, `work_kind`, `prompt`, `commit_message` | On red, make one bounded fix. Every remote-ready path runs one final persisted, head-bound named test before optional merge. |
 | `graphwing-code-off` | `experiment_id`, `repo`, `base_sha`, `seed`, `category`, `tags`, `category_source`, `prompt`, `tests`, `toolchain`, `budgets`, `commit_message` | Deterministic bounded DAG with two frozen candidates and three blind judgments; only an exact test-green winner can reach commit/push. No redraw, fallback, cycle, or merge. |
 
