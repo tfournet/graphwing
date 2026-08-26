@@ -7695,7 +7695,7 @@ class CompletionSupervisorTests(unittest.TestCase):
         )
         self.assertEqual(
             nodes["reconcile"]["config"]["source_workflow"]["tags"],
-            "{{ TASKS.completion_payload.source_workflow.tags | tojson }}",
+            "{{ CTX.completion_payload.source_workflow.tags | tojson }}",
         )
         switch = nodes["switch_action"]
         labels = [case["label"] for case in switch["config"]["cases"]]
@@ -7860,7 +7860,7 @@ class CompletionSupervisorTests(unittest.TestCase):
                 value = value[part]
             transformed[mapping["output"]] = value
         self.assertIsInstance(transformed["source_workflow"]["tags"], list)
-        context["TASKS"] = {"completion_payload": transformed}
+        context["CTX"]["completion_payload"] = transformed
 
         def render_action(node):
             if isinstance(node, dict):
