@@ -8446,6 +8446,10 @@ def build_writer_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict
             action = "design_turn_done"
         elif status == "ok":
             action = "correction_done"
+            if frm == "writing":
+                to = build_transition_target(doc, "writer_done")
+                doc["stage"] = to
+                doc["head"] = live["head"]
         if turn is not None:
             turn["writer_result"] = {
                 k: result.get(k) for k in ("claim_id", "job_id", "status", "summary", "at")

@@ -5209,6 +5209,17 @@ class BuildStateTests(unittest.TestCase):
             self._read_doc(), "fix", writer_result["completed_change_id"]
         )
         self.assertIn("writer failed", finding)
+        claim = self._claim("writer-recovery", kind="correction")
+        self.assertEqual(claim[0], 200, claim[1])
+        with mock.patch.object(server, "enqueue_agent"):
+            correction = self._launch("writer-recovery")[1]
+        self._git("add", "partial.txt")
+        corrected_receipt = self._finish_job(correction)
+        recovered = self._complete(
+            "writer-recovery-done", correction, corrected_receipt, claim_id="writer-recovery"
+        )
+        self.assertEqual(recovered[0], 200, recovered[1])
+        self.assertEqual(self._read_doc()["stage"], "verifying")
 
     def test_correction_claim_is_stage_gated_locked_idempotent_and_single_spend(self):
         self.assertEqual(self._mechanical_create()[0], 201)
