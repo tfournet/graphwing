@@ -11421,6 +11421,8 @@ def supervisor_decide(
 
     receipt = supervisor_terminal_event_receipt(build, event_id, launch.get("job_id"))
     job_state, _job = supervisor_local_job(launch.get("job_id"))
+    if receipt is None:
+        receipt = supervisor_bound_job_receipt(build, _job)
     out["local_job_status"] = job_state
     if job_state == "active":
         # A start/claim receipt is not terminal while its bound local job is
@@ -11537,6 +11539,39 @@ def supervisor_terminal_event_receipt(
     # bind field on legacy state. Accept only when there is one unambiguous
     # non-claim candidate under this event prefix.
     return candidates[0] if len(candidates) == 1 else None
+
+
+def supervisor_bound_job_receipt(
+    build: dict[str, Any], job: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Validate a bound async job receipt against the durable build projection."""
+    if not isinstance(job, dict):
+        return None
+    status = str(job.get("status") or "")
+    if not status or status in WATCH_ACTIVE:
+        return None
+    receipt = job.get("receipt")
+    job_id = job.get("job_id")
+    if not isinstance(receipt, dict) or not isinstance(job_id, str) or receipt.get("job_id") != job_id:
+        return None
+    if job.get("kind") == "build_checks":
+        phase = receipt.get("phase")
+        check = (build.get("checks") or {}).get(phase) if phase in BUILD_CHECK_PHASES else None
+        if not isinstance(check, dict):
+            return None
+        expected = {
+            "build_id": build.get("build_id"),
+            "phase": phase,
+            "head": check.get("head"),
+            "change_id": check.get("change_id"),
+            "ok": check.get("ok") is True,
+        }
+        actual = {key: receipt.get(key) for key in expected}
+        if actual != expected:
+            return None
+        fingerprint = event_fingerprint({"job_id": job_id, "receipt": actual})
+        return {"fingerprint": fingerprint, "receipt": redact_secrets(receipt)}
+    return None
 
 
 def supervisor_reconcile(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:

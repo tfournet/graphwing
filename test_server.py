@@ -6597,6 +6597,31 @@ class CompletionSupervisorTests(unittest.TestCase):
         self.assertEqual(found["receipt"]["action"], "writer_done")
         self.assertIsNone(server.supervisor_terminal_event_receipt(build, self.EVENT, "b" * 32))
 
+    def test_bound_check_job_receipt_must_match_durable_check_projection(self):
+        job_id = "c" * 32
+        check = {
+            "phase": "fast",
+            "head": "a" * 40,
+            "change_id": "a" * 40 + ":change",
+            "ok": False,
+        }
+        build = {"build_id": self.BUILD, "checks": {"fast": check}}
+        receipt = {
+            "job_id": job_id,
+            "build_id": self.BUILD,
+            "phase": "fast",
+            "head": check["head"],
+            "change_id": check["change_id"],
+            "ok": False,
+        }
+        job = {"job_id": job_id, "kind": "build_checks", "status": "completed", "receipt": receipt}
+        found = server.supervisor_bound_job_receipt(build, job)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["receipt"]["change_id"], check["change_id"])
+        job["receipt"] = {**receipt, "change_id": "wrong"}
+        self.assertIsNone(server.supervisor_bound_job_receipt(build, job))
+
     def test_a_run_that_recorded_its_terminal_receipt_repeats_no_work(self):
         job = self._write_job("1" * 32, "running")
         self.assertEqual(self._register()[0], 201)
