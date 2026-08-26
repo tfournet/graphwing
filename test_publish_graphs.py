@@ -261,5 +261,13 @@ class PublishGraphsTests(unittest.TestCase):
         self.assertEqual(saved["custom_integration_version_id"], "v2")
 
 
+    def test_workflow_descriptions_fit_rewst_create_contract(self):
+        for path in sorted(publish_graphs.GRAPHS.glob("*.json")):
+            graph = json.loads(path.read_text())
+            description = graph.get("description")
+            if isinstance(description, str):
+                self.assertLessEqual(len(description), 2000, path.name)
+
+
 if __name__ == "__main__":
     unittest.main()
