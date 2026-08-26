@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1267,7 +1268,9 @@ while True:
         fixture.chmod(0o755)
         return fixture
 
-    def _run_grok_fixture(self, cfg=None, resume=False, api_key=True, prompt="fixture prompt"):
+    def _run_grok_fixture(
+        self, cfg=None, resume=False, api_key=True, prompt="fixture prompt", model="grok-4.6"
+    ):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -1279,14 +1282,14 @@ while True:
         capture = root / "capture.json"
         native_session_id = "grok-123" if resume else None
         identity = {
-            "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+            "launcher": "grok", "provider": "xai", "model": model,
             "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
             "native_session_id": native_session_id,
         }
         job = {
             "job_id": job_id, "status": "queued", "repo": "scratch",
             "cwd": str(root), "prompt": prompt,
-            "launcher": "grok", "provider": "xai", "model": "grok-4.6",
+            "launcher": "grok", "provider": "xai", "model": model,
             "session_identity": identity, "created_at": "t",
             "started_at": None, "finished_at": None, "max_turns": 1,
             "run_budget_seconds": (cfg or {}).get("budget", 30), "receipt": None,
@@ -1367,6 +1370,14 @@ while True:
         self.assertEqual(saved["receipt"]["failure_code"], "none")
         self.assertFalse(saved["receipt"]["failover_eligible"])
         self.assertEqual((jdir / "last-message.txt").read_text(), '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}')
+
+    def test_grok_acp_command_uses_the_requested_immutable_model(self):
+        saved, capture, _ = self._run_grok_fixture(model="grok-fixture-immutable")
+        self.assertEqual(
+            capture["argv"],
+            ["agent", "--always-approve", "--model", "grok-fixture-immutable", "stdio"],
+        )
+        self.assertEqual(saved["session_identity"]["model"], "grok-fixture-immutable")
 
     def test_grok_acp_initializer_disables_unsupported_client_methods(self):
         _, capture, _ = self._run_grok_fixture()
@@ -6337,7 +6348,7 @@ while True:
         for command in ("graphwing_home=. python3 test_server.py", "python3 -m py_compile", "git diff --check"):
             self.assertIn(command, operator)
         for truth in (
-            "fable and terra", "parks before launch", "not os isolation",
+            "fable and terra", "expiry or provenance mismatch parks", "not os isolation",
             "persisted final named-test job", "nonempty", "no visual proof",
         ):
             self.assertIn(truth, operator)
@@ -6820,13 +6831,62 @@ class CodeOffTests(unittest.TestCase):
         job = server.read_job(payload["job_id"])
         self.assertIsNotNone(job)
         identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
+        execution_identity = self._execution_identity(identity)
         job.update({
             "status": "completed", "started_at": "2026-08-26T12:00:00Z",
             "finished_at": "2026-08-26T12:00:01Z", "session_identity": identity,
-            "receipt": {"status": "ok", "job_id": job["job_id"], "session_identity": identity, "summary": "fixture"},
+            "execution_identity": execution_identity,
+            "receipt": {
+                "status": "ok", "job_id": job["job_id"], "session_identity": identity,
+                "execution_identity": execution_identity, "summary": "fixture",
+            },
         })
         server.write_job(job)
         return job["job_id"]
+
+    @staticmethod
+    def _execution_identity(session_identity):
+        source = {
+            "claude": "claude-result-v1",
+            "codex": "codex-rollout-v1",
+            "grok": "grok-acp-v1",
+        }[session_identity["launcher"]]
+        return {"version": "code-off-execution-identity-v1", "source": source, **{
+            key: session_identity[key] for key in ("launcher", "provider", "model", "native_session_id")
+        }}
+
+    @staticmethod
+    def _codex_stdout(native_session_id):
+        receipt = json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"})
+        return "".join(json.dumps(event) + "\n" for event in (
+            {"type": "thread.started", "thread_id": native_session_id},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": receipt}},
+        ))
+
+    def _run_native_terminal_fixture(
+        self, experiment_id, slot, stdout, *, native_session_id, before_run=None
+    ):
+        body = self._agent_body(experiment_id, slot)
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, launched)
+        job_id = launched["job_id"]
+        path = self.jobs / job_id
+        (path / "stdout.log").write_text(stdout)
+        if before_run is not None:
+            before_run(server.read_job(job_id))
+
+        process = mock.Mock(pid=76, returncode=0)
+        process.wait.return_value = 0
+
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "spawn_writer", return_value=(process, None)), \
+             mock.patch.object(server, "herdr_job_done"):
+            server.run_agent_job(job_id)
+        job = server.read_job(job_id)
+        self.assertEqual(job["session_identity"]["native_session_id"], native_session_id, job)
+        return job
 
     def _agent_body(self, experiment_id, slot):
         manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
@@ -6882,8 +6942,8 @@ class CodeOffTests(unittest.TestCase):
     def _target_snapshot(self):
         return server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"]
 
-    def _ready_for_judges(self, experiment_id="experiment-0001"):
-        self._prepare(experiment_id)
+    def _ready_for_judges(self, experiment_id="experiment-0001", **overrides):
+        self._prepare(experiment_id, **overrides)
         for slot in ("author-1", "author-2"):
             self._freeze_and_test(experiment_id, slot)
         status, blind = self._post("/v1/code-off/blind", {"experiment_id": experiment_id})
@@ -6929,6 +6989,52 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(draw["policy_version"], "code-off-policy-v1")
         self.assertEqual(server.CODEOFF_CATEGORIES, {"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
         self.assertEqual(server.CODEOFF_TAGS, {"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
+
+    def test_production_manifest_v2_has_exact_six_proven_current_identities(self):
+        manifest = self.production_manifest
+        expected = {
+            "grok": ("grok", "xai", "grok-4.6"), "sol": ("codex", "openai", "gpt-5.6-sol"),
+            "terra": ("codex", "openai", "gpt-5.6-terra"), "sonnet": ("claude", "anthropic", "claude-sonnet-5"),
+            "opus": ("claude", "anthropic", "claude-opus-5"), "fable": ("claude", "anthropic", "claude-fable-5"),
+        }
+        self.assertEqual(manifest["version"], "approved-model-manifest-v2")
+        self.assertEqual(set(manifest["models"]), set(expected))
+        age = (datetime.now(timezone.utc).date() - datetime.fromisoformat(manifest["as_of"]).date()).days
+        # After 30 days this intentionally fails to force policy review; it is not calendar rot.
+        self.assertTrue(0 <= age <= manifest["max_age_days"] <= 30)
+        for logical, (launcher, provider, model) in expected.items():
+            with self.subTest(logical=logical):
+                identity = manifest["models"][logical]
+                self.assertEqual((identity["launcher"], identity["provider"], identity["exact_model"]), (launcher, provider, model))
+                self.assertEqual((identity["runnable"], identity["proven"]), (True, True))
+                self.assertTrue(0 < len(identity["reason"].strip()) <= 240)
+
+    def test_prepare_snapshots_production_manifest_hash_and_check_before_selection(self):
+        # This production snapshot intentionally expires with the embedded policy so review cannot silently drift.
+        production = deepcopy(self.production_manifest)
+        expected_snapshot = deepcopy(production)
+        real_draw = server.codeoff_draw
+        def mutate_policy_source_during_draw(seed):
+            draw = real_draw(seed)
+            server.CODEOFF_MODEL_MANIFEST["limitation"] = "fixture mutation after selection began"
+            return draw
+
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", production), \
+             mock.patch.object(server, "codeoff_draw", side_effect=mutate_policy_source_during_draw):
+            status, payload = self._post(
+                "/v1/code-off/prepare", self._body("production-snapshot-0001")
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "prepared", payload)
+        manifest = json.loads((self.records / "production-snapshot-0001" / "manifest.json").read_text())
+        self.assertEqual(manifest["approved_model_manifest"], expected_snapshot)
+        self.assertEqual(
+            manifest["approved_model_manifest_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(expected_snapshot)).hexdigest(),
+        )
+        self.assertIsNotNone(datetime.fromisoformat(manifest["approved_model_manifest_checked_at"].replace("Z", "+00:00")).tzinfo)
+        self.assertEqual(manifest["selection"]["policy_version"], server.CODEOFF_POLICY_VERSION)
+        self.assertEqual(manifest["selection"]["authors"], ["sol", "sonnet"])
 
     def test_prepare_locks_category_tags_source_seed_and_exact_snapshots(self):
         payload = self._prepare()
@@ -7105,8 +7211,13 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(payload["code"], "already_blinded")
         self.assertTrue(marker.exists())
 
-    def test_current_unproven_fable_and_selected_terra_park_without_redraw_or_launch(self):
-        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", self.production_manifest), \
+    def test_current_fixture_unproven_fable_and_selected_terra_park_without_redraw_or_launch(self):
+        unproven = deepcopy(self.production_manifest)
+        for logical in ("fable", "terra"):
+            unproven["models"][logical].update({
+                "runnable": False, "proven": False, "reason": "fixture unproven identity",
+            })
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", unproven), \
              mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("launcher lookup forbidden")), \
              mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("launch forbidden")):
             status, first = self._post("/v1/code-off/prepare", self._body("park-fable-0001", seed="00" * 32))
@@ -7124,12 +7235,45 @@ class CodeOffTests(unittest.TestCase):
         stale = deepcopy(server.CODEOFF_MODEL_MANIFEST)
         stale.update({"as_of": "2020-01-01", "max_age_days": 1})
         with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", stale), \
-             mock.patch.object(server, "run_git", wraps=server.run_git) as git:
+             mock.patch.object(server, "run_git", wraps=server.run_git) as git, \
+             mock.patch.object(server, "codeoff_draw", wraps=server.codeoff_draw) as draw, \
+             mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("fallback launch forbidden")), \
+             mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("fallback launch forbidden")):
             status, payload = self._post("/v1/code-off/prepare", self._body("stale-manifest-1"))
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["status"], "parked")
-        self.assertIn("approved_model_manifest_stale", payload["reasons"])
+        self.assertEqual(payload["reasons"], ["approved_model_manifest_stale"])
+        self.assertEqual(payload["authors"], ["sol", "sonnet"])
+        draw.assert_called_once_with("00" * 32)
         self.assertFalse(any("worktree" in call.args[1] for call in git.call_args_list))
+
+    def test_newer_bounded_catalog_fable_identity_parks_before_worktree_or_launch(self):
+        current = deepcopy(self.production_manifest)
+        inventory = {
+            "version": "bounded-model-catalog-v1",
+            "models": {
+                logical: identity["exact_model"]
+                for logical, identity in current["models"].items()
+            },
+        }
+        inventory["models"]["fable"] = "claude-fable-6"
+        self.assertTrue(server._codeoff_manifest_current(current))
+        with mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", current), \
+             mock.patch.object(server, "CODEOFF_CATALOG_INVENTORY", inventory, create=True), \
+             mock.patch.object(server, "run_git", wraps=server.run_git) as git, \
+             mock.patch.object(server, "codeoff_draw", wraps=server.codeoff_draw) as draw, \
+             mock.patch.object(server, "resolve_launcher_binary_now") as launcher, \
+             mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, payload = self._post("/v1/code-off/prepare", self._body("newer-fable-0001"))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "parked")
+        self.assertEqual(payload["reasons"], ["catalog_identity_newer:fable:claude-fable-6"])
+        self.assertEqual((payload["authors"], payload["random_judges"]), (["sol", "sonnet"], ["opus", "grok"]))
+        draw.assert_called_once_with("00" * 32)
+        launcher.assert_not_called()
+        enqueue.assert_not_called()
+        self.assertFalse(any("worktree" in call.args[1] for call in git.call_args_list))
+        self.assertFalse((self.workspaces / "newer-fable-0001").exists())
 
     def test_prepare_creates_two_isolated_git_worktrees_and_agent_run_resolves_only_opaque_ref(self):
         self._prepare()
@@ -7161,6 +7305,281 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "codeoff_identity_mismatch")
 
+    def test_claude_codeoff_provenance_accepts_one_exact_first_party_model_usage(self):
+        self._prepare("claude-provenance-good")
+        model = self._agent_body("claude-provenance-good", "author-2")["model"]
+        native_session_id = "claude-codeoff-76"
+        result = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": native_session_id,
+            "result": json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"}),
+            "modelUsage": {
+                model: {"canonicalModel": model, "provider": "firstParty", "inputTokens": 1},
+            },
+            "fixtureRawMarker": "must-not-enter-compact-execution-identity",
+        }
+        job = self._run_native_terminal_fixture(
+            "claude-provenance-good", "author-2", json.dumps(result) + "\n",
+            native_session_id=native_session_id,
+        )
+        self.assertEqual(job["status"], "completed", job)
+        compact_identity = job["receipt"]["execution_identity"]
+        self.assertEqual(compact_identity, self._execution_identity(job["session_identity"]))
+        self.assertEqual(compact_identity["source"], "claude-result-v1")
+        compact = json.dumps(compact_identity, sort_keys=True)
+        self.assertNotIn("fixtureRawMarker", compact)
+        self.assertNotIn(str(Path(job["cwd"]).resolve()), compact)
+
+    def test_claude_codeoff_provenance_rejects_missing_multiple_and_mismatched_usage(self):
+        cases = (
+            "missing", "multiple_results", "canonical_model", "provider",
+            "multiple_usage", "session_model",
+        )
+        for index, case in enumerate(cases):
+            experiment_id = f"claude-bad-{index:04d}"
+            with self.subTest(case=case):
+                self._prepare(experiment_id)
+                model = self._agent_body(experiment_id, "author-2")["model"]
+                native_session_id = f"claude-bad-{index}"
+                detail = {"canonicalModel": model, "provider": "firstParty"}
+                usage = {model: detail}
+                if case == "missing": usage = None
+                if case == "canonical_model": detail["canonicalModel"] = "claude-moving-alias"
+                if case == "provider": detail["provider"] = "bedrock"
+                if case == "multiple_usage": usage["claude-other"] = detail
+                event = {"type": "result", "subtype": "success", "is_error": False,
+                         "session_id": native_session_id, "modelUsage": usage,
+                         "result": json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"})}
+                events = [event, deepcopy(event)] if case == "multiple_results" else [event]
+
+                def alter_session_model(job):
+                    if case == "session_model":
+                        job["session_identity"]["model"] = "claude-moving-alias"
+                        server.write_job(job)
+
+                job = self._run_native_terminal_fixture(
+                    experiment_id, "author-2", "".join(json.dumps(item) + "\n" for item in events),
+                    native_session_id=native_session_id, before_run=alter_session_model,
+                )
+                self.assertEqual((job["status"], job["receipt"]["failure_code"]), ("failed", "session_provenance_invalid"), job)
+                self.assertNotIn("execution_identity", job["receipt"])
+
+    def test_codex_codeoff_provenance_accepts_exact_native_rollout_metadata(self):
+        self.assertEqual(server.CODEOFF_PROVENANCE_MAX_FILES, 65536)
+        for index, model_provider in enumerate(("openai", "openai-api")):
+            experiment_id = f"codex-rollout-good-{index:02d}"
+            native_session_id = f"019c0000-0000-7000-8000-00000000000{index}"
+            codex_home = Path(self.td.name) / f"codex-home-good-{index}"
+            model = "gpt-5.6-sol"
+            self._prepare(experiment_id)
+
+            def write_rollout(job, provider=model_provider, home=codex_home):
+                rollout = home / "sessions" / "2026" / "08" / "26" / f"rollout-fixture-{native_session_id}.jsonl"
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                cwd = str(Path(job["cwd"]).resolve())
+                records = [
+                    {"type": "session_meta", "payload": {
+                        "id": native_session_id, "originator": "codex_exec", "source": "exec",
+                        "model_provider": provider, "cwd": cwd,
+                        "git": {"commit_hash": job["session_identity"]["starting_head"]},
+                    }},
+                    {"type": "turn_context", "payload": {"cwd": cwd, "model": model}},
+                    {"type": "turn_context", "payload": {"cwd": cwd, "model": model}},
+                ]
+                rollout.write_text("".join(json.dumps(item) + "\n" for item in records))
+
+            with self.subTest(model_provider=model_provider), \
+                 mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                job = self._run_native_terminal_fixture(
+                    experiment_id, "author-1", self._codex_stdout(native_session_id), native_session_id=native_session_id,
+                    before_run=write_rollout,
+                )
+                self.assertEqual(job["status"], "completed", job)
+                compact = job["receipt"]["execution_identity"]
+                self.assertEqual(compact, self._execution_identity(job["session_identity"]))
+                self.assertEqual(compact["source"], "codex-rollout-v1")
+                self.assertFalse(any(secret in json.dumps(compact) for secret in (str(codex_home), job["cwd"], "session_meta")))
+
+    def test_codex_codeoff_provenance_rejects_missing_ambiguous_drift_and_context_mismatch(self):
+        cases = (
+            "missing", "ambiguous", "native_id_mismatch", "model_drift",
+            "cwd_mismatch", "meta_cwd_mismatch", "commit_mismatch", "missing_context",
+        )
+        for index, case in enumerate(cases):
+            experiment_id = f"codex-rollout-bad-{index:02d}"
+            native_session_id = f"019c0000-0000-7000-9000-00000000000{index}"
+            codex_home = Path(self.td.name) / f"codex-home-bad-{index}"
+            self._prepare(experiment_id)
+
+            def write_rollout(job):
+                if case == "missing":
+                    return
+                cwd = str(Path(job["cwd"]).resolve())
+                meta = {"type": "session_meta", "payload": {
+                    "id": native_session_id, "originator": "codex_exec", "source": "exec",
+                    "model_provider": "openai", "cwd": cwd,
+                    "git": {"commit_hash": job["session_identity"]["starting_head"]},
+                }}
+                if case == "native_id_mismatch":
+                    meta["payload"]["id"] = "019cffff-ffff-7fff-8fff-ffffffffffff"
+                if case == "commit_mismatch":
+                    meta["payload"]["git"]["commit_hash"] = "f" * 40
+                if case == "meta_cwd_mismatch":
+                    meta["payload"]["cwd"] = str(self.repo)
+                turns = [{"type": "turn_context", "payload": {"cwd": cwd, "model": "gpt-5.6-sol"}}]
+                if case == "model_drift":
+                    turns.append({"type": "turn_context", "payload": {"cwd": cwd, "model": "gpt-5.6-terra"}})
+                if case == "cwd_mismatch":
+                    turns[0]["payload"]["cwd"] = str(self.repo)
+                if case == "missing_context":
+                    records = [meta]
+                else:
+                    records = [meta, *turns]
+                folder = codex_home / "sessions" / "2026" / "08" / "26"
+                folder.mkdir(parents=True, exist_ok=True)
+                count = 2 if case == "ambiguous" else 1
+                for duplicate in range(count):
+                    path = folder / f"rollout-{duplicate}-{native_session_id}.jsonl"
+                    path.write_text("".join(json.dumps(item) + "\n" for item in records))
+
+            with self.subTest(case=case), mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                job = self._run_native_terminal_fixture(
+                    experiment_id, "author-1", self._codex_stdout(native_session_id), native_session_id=native_session_id,
+                    before_run=write_rollout,
+                )
+                self.assertEqual((job["status"], job["receipt"]["failure_code"]), ("failed", "session_provenance_invalid"), job)
+
+    def test_codex_rollout_walk_error_discards_an_earlier_match(self):
+        codex_home = Path(self.td.name) / "codex-home-walk-error"
+        sessions = codex_home / "sessions"
+        sessions.mkdir(parents=True)
+        native_session_id = "019c0000-0000-7000-b000-000000000076"
+
+        def walk_with_late_error(root, *, onerror=None, followlinks=False):
+            self.assertEqual(Path(root), sessions)
+            self.assertFalse(followlinks)
+            yield str(sessions), [], [f"rollout-fixture-{native_session_id}.jsonl"]
+            if onerror is not None:
+                onerror(OSError("deterministic traversal failure"))
+
+        job = {"session_identity": {"native_session_id": native_session_id}}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+             mock.patch.object(server.os, "walk", side_effect=walk_with_late_error):
+            self.assertIsNone(server._codeoff_codex_rollout(job))
+
+    def test_codex_judge_provenance_is_bound_to_the_blind_workspace_starting_head(self):
+        for index, use_starting_head in enumerate((True, False)):
+            experiment_id = f"codex-judge-head-{index:02d}"
+            native_session_id = f"019c0000-0000-7000-a000-00000000000{index}"
+            codex_home = Path(self.td.name) / f"codex-judge-home-{index}"
+            self._ready_for_judges(experiment_id, seed=(2).to_bytes(32, "big").hex())
+            body = self._agent_body(experiment_id, "judge-2")
+            self.assertEqual((body["launcher"], body["model"]), ("codex", "gpt-5.6-terra"))
+
+            def write_rollout(job):
+                self.assertNotEqual(job["session_identity"]["starting_head"], self.base_sha)
+                rollout = codex_home / "sessions" / "2026" / "08" / "26" / f"rollout-judge-{native_session_id}.jsonl"
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                cwd = str(Path(job["cwd"]).resolve())
+                commit_hash = job["session_identity"]["starting_head"] if use_starting_head else self.base_sha
+                rollout.write_text("".join(json.dumps(item) + "\n" for item in (
+                    {"type": "session_meta", "payload": {
+                        "id": native_session_id, "originator": "codex_exec", "source": "exec",
+                        "model_provider": "openai", "cwd": cwd,
+                        "git": {"commit_hash": commit_hash},
+                    }},
+                    {"type": "turn_context", "payload": {"cwd": cwd, "model": body["model"]}},
+                )))
+
+            with self.subTest(use_starting_head=use_starting_head), \
+                 mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                job = self._run_native_terminal_fixture(
+                    experiment_id, "judge-2", self._codex_stdout(native_session_id),
+                    native_session_id=native_session_id, before_run=write_rollout,
+                )
+            expected = "completed" if use_starting_head else "failed"
+            self.assertEqual(job["status"], expected, job)
+            if use_starting_head:
+                self.assertEqual(
+                    job["receipt"]["execution_identity"],
+                    self._execution_identity(job["session_identity"]),
+                )
+            else:
+                self.assertEqual(job["receipt"]["failure_code"], "session_provenance_invalid")
+
+    def test_grok_codeoff_keeps_acp_session_as_compact_execution_identity(self):
+        experiment_id = "grok-execution-receipt"
+        self._prepare(experiment_id, seed=(1).to_bytes(32, "big").hex())
+        body = self._agent_body(experiment_id, "author-2")
+        self.assertEqual(body["model"], "grok-4.6")
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, launched)
+        job_id = launched["job_id"]
+        (self.jobs / job_id / "last-message.txt").write_text(
+            json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"}))
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "run_grok_acp", return_value=(0, False, "grok-codeoff-76", None)), \
+             mock.patch.object(server, "herdr_job_done"):
+            server.run_agent_job(job_id)
+        job = server.read_job(job_id)
+        expected = self._execution_identity(job["session_identity"])
+        self.assertEqual(job["receipt"]["execution_identity"], expected)
+        self.assertEqual((expected["native_session_id"], expected["source"], set(expected)), ("grok-codeoff-76", "grok-acp-v1", {"version", "source", "launcher", "provider", "model", "native_session_id"}))
+
+    def test_grok_codeoff_adapter_failure_evidence_invalidates_success(self):
+        experiment_id = "grok-adapter-evidence"
+        self._prepare(experiment_id, seed=(1).to_bytes(32, "big").hex())
+        body = self._agent_body(experiment_id, "author-2")
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, launched)
+        job_id = launched["job_id"]
+        (self.jobs / job_id / "last-message.txt").write_text(
+            json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"}))
+
+        def adapter_success_with_failure_evidence(job, *_args, **_kwargs):
+            job["_adapter_failure_code"] = "adapter_contract_invalid"
+            return 0, False, "grok-adapter-evidence-76", None
+
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "run_grok_acp", side_effect=adapter_success_with_failure_evidence), \
+             mock.patch.object(server, "herdr_job_done"):
+            server.run_agent_job(job_id)
+        job = server.read_job(job_id)
+        self.assertEqual((job["status"], job["receipt"]["failure_code"]), ("failed", "session_provenance_invalid"))
+        self.assertNotIn("execution_identity", job)
+        self.assertNotIn("execution_identity", job["receipt"])
+
+    def test_codeoff_execution_identity_rejects_unknown_launcher(self):
+        job = {
+            "launcher": "future-launcher",
+            "session_identity": {
+                "launcher": "future-launcher", "provider": "future-provider",
+                "model": "future-model", "native_session_id": "future-session",
+            },
+        }
+        self.assertIsNone(server._codeoff_execution_identity(job, None))
+
+    def test_compact_execution_identity_rejects_top_level_session_divergence(self):
+        base = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "session_identity": {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "native_session_id": "fixture-identity",
+            },
+        }
+        self.assertIsNotNone(server._codeoff_compact_execution_identity(base))
+        for field, forged in (
+            ("launcher", "claude"), ("provider", "anthropic"), ("model", "forged-model"),
+        ):
+            with self.subTest(field=field):
+                job = deepcopy(base)
+                job["session_identity"][field] = forged
+                self.assertIsNone(server._codeoff_compact_execution_identity(job))
+
     def test_ordinary_agent_run_never_acquires_the_codeoff_lock(self):
         class ForbiddenLock:
             def __enter__(self):
@@ -7179,6 +7598,56 @@ class CodeOffTests(unittest.TestCase):
             status, payload = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, payload)
         enqueue.assert_called_once()
+
+    def test_ordinary_terra_and_fable_stay_rejected_but_exact_codeoff_slots_launch(self):
+        ordinary = (
+            ("codex", "openai", "gpt-5.6-terra"),
+            ("claude", "anthropic", "claude-fable-5"),
+        )
+        for launcher, provider, model in ordinary:
+            with self.subTest(model=model):
+                status, payload = self._post("/v1/agent/run", {
+                    "prompt": "ordinary requests cannot opt into code-off-only identities",
+                    "cwd": "scratch", "launcher": launcher, "provider": provider, "model": model,
+                    "max_turns": 1, "run_budget_seconds": 30,
+                })
+                self.assertEqual((status, payload["code"]), (400, "bad_model_identity"))
+
+        self._prepare("terra-exact-launch", seed=(4).to_bytes(32, "big").hex())
+        self._ready_for_judges("fable-exact-launch")
+        for experiment_id, slot, expected in (
+            ("terra-exact-launch", "author-1", "gpt-5.6-terra"),
+            ("fable-exact-launch", "judge-fable", "claude-fable-5"),
+        ):
+            body = self._agent_body(experiment_id, slot)
+            with self.subTest(model=expected), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+                 mock.patch.object(server, "enqueue_agent") as enqueue:
+                status, payload = self._post("/v1/agent/run", body)
+            self.assertEqual((body["model"], status), (expected, 202), payload)
+            enqueue.assert_called_once()
+
+    def test_freeze_and_judge_artifacts_persist_matching_execution_identity(self):
+        experiment_id = "persist-execution-identity"
+        self._prepare(experiment_id)
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot)
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for slot in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, slot, "author-1")
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        root = self.records / experiment_id
+        receipts = [(slot, state["candidates"][slot]["freeze_receipt_hash"]) for slot in ("author-1", "author-2")]
+        receipts += [(slot, state["judges"][slot]["receipt_hash"]) for slot in ("judge-fable", "judge-1", "judge-2")]
+        for slot, receipt_hash in receipts:
+            with self.subTest(slot=slot):
+                artifact = json.loads((root / "artifacts" / receipt_hash).read_bytes())
+                job_id = artifact["job_id"]
+                job = server.read_job(job_id)
+                expected = self._execution_identity(job["session_identity"])
+                self.assertEqual(job["receipt"]["execution_identity"], expected)
+                self.assertEqual(artifact["execution_identity"], expected)
+                self.assertNotIn(str(Path(job["cwd"]).resolve()), json.dumps(artifact["execution_identity"]))
 
     def test_duplicate_budget_resume_and_terminal_receipt_mismatches_fail_closed(self):
         self._prepare()
@@ -7212,15 +7681,73 @@ class CodeOffTests(unittest.TestCase):
             status, payload = self._post("/v1/agent/run", resume_body)
         self.assertEqual((status, payload["code"]), (400, "codeoff_resume_mismatch"))
 
-        job = server.read_job(job_id)
-        job["receipt"]["job_id"] = "0" * 32
-        server.write_job(job)
-        status, payload = self._post("/v1/code-off/candidate", {
-            "experiment_id": "experiment-0001", "slot": "author-1", "action": "freeze", "job_id": job_id,
-        })
-        self.assertEqual((status, payload["code"]), (422, "agent_receipt_mismatch"))
-        self.assertTrue(json.loads((self.records / "experiment-0001" / "state.json").read_text())["finalized"])
-        self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})[0], 200)
+        for index, case in enumerate(("receipt_job_id", "execution_model", "execution_source")):
+            experiment_id = f"terminal-mismatch-{index}"
+            with self.subTest(case=case):
+                self._prepare(experiment_id)
+                mismatch_job_id = self._launch_done(experiment_id, "author-1")
+                mismatch_job = server.read_job(mismatch_job_id)
+                if case == "receipt_job_id":
+                    mismatch_job["receipt"]["job_id"] = "e" * 32
+                elif case == "execution_model":
+                    mismatch_job["receipt"]["execution_identity"]["model"] = "moving-alias"
+                else:
+                    mismatch_job["execution_identity"]["source"] = "forged-source-v1"
+                    mismatch_job["receipt"]["execution_identity"]["source"] = "forged-source-v1"
+                server.write_job(mismatch_job)
+                status, payload = self._post("/v1/code-off/candidate", {
+                    "experiment_id": experiment_id, "slot": "author-1",
+                    "action": "freeze", "job_id": mismatch_job_id,
+                })
+                self.assertEqual((status, payload["code"]), (422, "agent_receipt_mismatch"))
+                state = json.loads((self.records / experiment_id / "state.json").read_text())
+                self.assertTrue(state["finalized"])
+                self.assertEqual(self._post("/v1/code-off/cleanup", {"experiment_id": experiment_id})[0], 200)
+
+    def test_terminal_validation_rejects_identity_divergence_at_every_surface(self):
+        experiment_id = "terminal-identity-surfaces"
+        self._prepare(experiment_id)
+        job_id = self._launch_done(experiment_id, "author-1")
+        pristine = server.read_job(job_id)
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        forged = {"launcher": "claude", "provider": "anthropic", "model": "forged-model"}
+
+        surface_paths = {
+            "job": lambda job, _manifest, field, value: job.__setitem__(field, value),
+            "session": lambda job, _manifest, field, value: job["session_identity"].__setitem__(field, value),
+            "receipt_session": lambda job, _manifest, field, value: job["receipt"]["session_identity"].__setitem__(field, value),
+            "execution": lambda job, _manifest, field, value: job["execution_identity"].__setitem__(field, value),
+            "receipt_execution": lambda job, _manifest, field, value: job["receipt"]["execution_identity"].__setitem__(field, value),
+            "manifest": lambda _job, manifest, field, value: manifest["identities"]["author-1"].__setitem__(
+                "exact_model" if field == "model" else field, value
+            ),
+        }
+        for surface, mutate in surface_paths.items():
+            for field, value in forged.items():
+                with self.subTest(surface=surface, field=field):
+                    job = deepcopy(pristine)
+                    checked_manifest = deepcopy(manifest)
+                    mutate(job, checked_manifest, field, value)
+                    server.write_job(job)
+                    accepted, error = server._codeoff_validate_job(
+                        job_id, state, checked_manifest, "author-1"
+                    )
+                    self.assertIsNone(accepted)
+                    self.assertEqual(error["code"], "agent_receipt_mismatch")
+
+        for field, value in forged.items():
+            with self.subTest(surface="coherent_forged_session", field=field):
+                job = deepcopy(pristine)
+                job["session_identity"][field] = value
+                job["receipt"]["session_identity"][field] = value
+                job["execution_identity"][field] = value
+                job["receipt"]["execution_identity"][field] = value
+                server.write_job(job)
+                accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
+                self.assertIsNone(accepted)
+                self.assertEqual(error["code"], "agent_receipt_mismatch")
+        server.write_job(pristine)
 
     def test_nonterminal_agent_receipt_remains_retryable(self):
         self._prepare()
