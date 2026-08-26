@@ -6213,10 +6213,13 @@ class RolloutProofTests(unittest.TestCase):
         with mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
              mock.patch.object(server.Path, "is_file", lambda self: True), \
              mock.patch.object(server, "harness_job_env", return_value={}), \
-             mock.patch.object(server.subprocess, "run", return_value=Failed()):
+             mock.patch.object(server.subprocess, "run", return_value=Failed()) as run:
             result = server.review_result("sonnet", "ticket", Path("/tmp"), attempt_id="3" * 32)
         self.assertEqual(result["code"], "transport_exit")
         self.assertIsNone(result["verdict"])
+        prompt = run.call_args.args[0][-1]
+        self.assertIn("Answer every requested lens", prompt)
+        self.assertIn("End with exactly one trailing line", prompt)
 
 
 class CompletionSupervisorTests(unittest.TestCase):

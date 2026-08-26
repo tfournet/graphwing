@@ -2461,7 +2461,8 @@ def review_result(
     diff_text = str(diff.get("diff") or "")[:12000]
     body_prompt = (
         "Spec-review only. Do not edit files, commit, or push.\n"
-        "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
+        "Answer every requested lens with evidence. End with exactly one trailing line:\n"
+        "VERDICT: PASS\nor\nVERDICT: NACK\n"
         f"Ticket:\n{prompt[:8000]}\n\nDiff:\n{diff_text}\n"
     )
     provider = requested_provider or BUILD_REVIEWER_PROVIDER.get(reviewer)
