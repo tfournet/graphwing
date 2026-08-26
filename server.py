@@ -3842,18 +3842,19 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
                 p = p[4:].lstrip()
             if p.startswith("{"):
                 candidates.append(p)
-    start = raw.rfind("{")
-    if start >= 0:
-        depth = 0
-        for i in range(start, len(raw)):
-            ch = raw[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidates.append(raw[start : i + 1])
-                    break
+    for source in tuple(candidates):
+        start = source.rfind("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(source)):
+                ch = source[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(source[start : i + 1])
+                        break
     for candidate in reversed(candidates):
         try:
             obj = json.loads(candidate)
