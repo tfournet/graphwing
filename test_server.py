@@ -1984,6 +1984,11 @@ while True:
         send({"jsonrpc":"2.0","id":response_id(request),"error":error})
         if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
         continue
+    if cfg.get("session_update_before_method") == method:
+        params = {"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}
+        if not cfg.get("omit_early_update_session_id"):
+            params["sessionId"] = cfg.get("early_update_session_id", "grok-123")
+        send({"jsonrpc":"2.0","method":"session/update","params":params})
     if method == "initialize":
         auth_methods = cfg["auth_methods"] if "auth_methods" in cfg else [{"id":"xai.api_key"},{"id":"cached_token"}]
         result = {"protocolVersion":cfg.get("protocol_version", 1),"authMethods":auth_methods,"agentCapabilities":{"loadSession":cfg.get("load_session", True)}}
@@ -1994,7 +1999,12 @@ while True:
         if cfg.get("initialize_padding_bytes"):
             result["fixturePadding"] = "x" * cfg["initialize_padding_bytes"]
     elif method == "authenticate": result = {}
-    elif method == "session/new": result = {} if cfg.get("missing_session") else {"sessionId":cfg.get("session_id", "grok-123")}
+    elif method == "session/new":
+        for sid in cfg.get("session_new_update_ids", []):
+            update = {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}
+            if cfg.get("session_new_update_has_id"): update["id"] = 999
+            send(update)
+        result = {} if cfg.get("missing_session") else {"sessionId":cfg.get("session_id", "grok-123")}
     elif method == "session/load":
         for text in cfg.get("replay_chunks", []):
             send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":request["params"]["sessionId"],"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}})
@@ -2033,7 +2043,8 @@ while True:
         return fixture
 
     def _run_grok_fixture(
-        self, cfg=None, resume=False, api_key=True, prompt="fixture prompt", model="grok-4.6"
+        self, cfg=None, resume=False, api_key=True, prompt="fixture prompt", model="grok-4.6",
+        adapter_results=None,
     ):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -2073,7 +2084,18 @@ while True:
              mock.patch.dict(os.environ, env, clear=False):
             if not api_key:
                 os.environ.pop("XAI_API_KEY", None)
-            server.run_agent_job(job_id)
+            if adapter_results is None:
+                server.run_agent_job(job_id)
+            else:
+                run_grok_acp = server.run_grok_acp
+
+                def capture_adapter_result(*args, **kwargs):
+                    result = run_grok_acp(*args, **kwargs)
+                    adapter_results.append(result)
+                    return result
+
+                with mock.patch.object(server, "run_grok_acp", side_effect=capture_adapter_result):
+                    server.run_agent_job(job_id)
         return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
 
     def _run_grok_review_fixture(self, cfg=None):
@@ -2154,6 +2176,83 @@ while True:
                 })
                 self.assertEqual(saved["status"], "completed")
                 self.assertEqual(saved["receipt"]["summary"], "done")
+
+    def test_grok_acp_session_new_update_establishes_provisional_identity(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "session_new_update_ids": ["grok-123"],
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["session_identity"]["native_session_id"], "grok-123")
+        prompt = next(r for r in capture["requests"] if r["method"] == "session/prompt")
+        self.assertEqual(prompt["params"]["sessionId"], "grok-123")
+
+    def test_grok_acp_session_new_provisional_identity_must_not_change(self):
+        cases = {
+            "subsequent_update": {
+                "session_new_update_ids": ["grok-123", "grok-other"],
+            },
+            "session_new_result": {
+                "session_new_update_ids": ["grok-123"],
+                "session_id": "grok-other",
+            },
+        }
+        for name, cfg in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture(cfg)
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["failure_code"], "session_identity_mismatch")
+                self.assertNotIn("session/prompt", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_does_not_return_or_record_unconfirmed_provisional_identity(self):
+        adapter_results = []
+        saved, capture, _ = self._run_grok_fixture({
+            "session_new_update_ids": ["grok-provisional"],
+            "missing_session": True,
+        }, adapter_results=adapter_results)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["receipt"]["failure_code"], "session_identity_missing")
+        self.assertIsNone(adapter_results[0][2])
+        self.assertIsNone(saved["session_identity"]["native_session_id"])
+        self.assertIsNone(saved["receipt"]["session_identity"]["native_session_id"])
+        self.assertNotIn("session/prompt", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_rejects_invalid_session_new_provisional_identity(self):
+        cases = {
+            "malformed_id": {"session_new_update_ids": ["not a native id"]},
+            "null_id": {
+                "session_update_before_method": "session/new",
+                "early_update_session_id": None,
+            },
+            "absent_id": {
+                "session_update_before_method": "session/new",
+                "omit_early_update_session_id": True,
+            },
+            "response_shaped": {
+                "session_new_update_ids": ["grok-123"],
+                "session_new_update_has_id": True,
+            },
+        }
+        for name, cfg in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture(cfg)
+                self.assertEqual(saved["status"], "failed")
+                self.assertNotIn("session/prompt", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_does_not_establish_identity_before_other_responses(self):
+        cases = {
+            "valid_id": {},
+            "null_id": {"early_update_session_id": None},
+            "absent_id": {"omit_early_update_session_id": True},
+        }
+        for name, cfg in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture({
+                    "session_update_before_method": "authenticate",
+                    **cfg,
+                })
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["failure_code"], "session_identity_mismatch")
+                self.assertNotIn("session/new", [r["method"] for r in capture["requests"]])
 
     def test_grok_acp_rejects_vendor_notifications_with_response_fields(self):
         methods = (
