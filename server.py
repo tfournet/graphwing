@@ -276,6 +276,8 @@ NORMAL_REVIEWER_ROUTES = {
 }
 # Reviews need enough turns to read the ticket and diff before returning a verdict.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
+REVIEW_MIN_REQUEST_TURNS = 1
+REVIEW_MAX_REQUEST_TURNS = 30
 REVIEW_DEFAULT_BUDGET_SECONDS = 200
 REVIEW_MIN_BUDGET_SECONDS = 30
 REVIEW_MAX_BUDGET_SECONDS = 600
@@ -2530,6 +2532,7 @@ def native_review_result(
     resolved: Path,
     job_id: str | None = None,
     run_budget_seconds: int = REVIEW_DEFAULT_BUDGET_SECONDS,
+    max_turns: int = REVIEW_MAX_TURNS,
 ) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     spec = NATIVE_LAUNCHERS.get(launcher)
@@ -2595,7 +2598,7 @@ def native_review_result(
         else:
             cmd = [
                 str(binary), "-p", "--output-format", "text",
-                "--permission-mode", "plan", "--max-turns", str(REVIEW_MAX_TURNS),
+                "--permission-mode", "plan", "--max-turns", str(max_turns),
                 "--model", model, body_prompt,
             ]
             run_input = None
@@ -2670,6 +2673,7 @@ def run_review_job(job_id: str) -> None:
         job["launcher"], job["provider"], job["model"], job["prompt"],
         Path(job["cwd"]), job_id=job["job_id"],
         run_budget_seconds=job["run_budget_seconds"],
+        max_turns=job["max_turns"],
     )
     receipt = review_receipt(job, result)
     job = read_job(job_id) or job
@@ -2740,11 +2744,24 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             ),
             "code": "bad_run_budget",
         }
+    max_turns = data.get("max_turns", REVIEW_MAX_TURNS)
+    if (
+        type(max_turns) is not int
+        or not REVIEW_MIN_REQUEST_TURNS <= max_turns <= REVIEW_MAX_REQUEST_TURNS
+    ):
+        return 400, {
+            "error": (
+                "max_turns must be an integer from "
+                f"{REVIEW_MIN_REQUEST_TURNS} through {REVIEW_MAX_REQUEST_TURNS}"
+            ),
+            "code": "bad_max_turns",
+        }
 
     if not webhook_url and not async_requested:
         result = native_review_result(
             launcher, provider, model, prompt, resolved,
             run_budget_seconds=run_budget_seconds,
+            max_turns=max_turns,
         )
         if result.get("code") == "not_implemented":
             return 501, result
@@ -2767,6 +2784,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "cwd": str(resolved),
             "prompt": prompt,
             "run_budget_seconds": run_budget_seconds,
+            "max_turns": max_turns,
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
             "resume_url": webhook_url,

@@ -6480,12 +6480,13 @@ while True:
         queued = enq.call_args.args[0]
         self.assertNotIn("reviewer", queued)
         self.assertEqual(queued["run_budget_seconds"], server.REVIEW_DEFAULT_BUDGET_SECONDS)
+        self.assertEqual(queued["max_turns"], server.REVIEW_MAX_TURNS)
 
     def test_review_run_can_queue_durable_job_without_webhook(self):
         body = json.dumps({
             "repo": "scratch", "launcher": "claude", "provider": "anthropic",
             "model": "claude-sonnet-5", "prompt": "ticket", "async": True,
-            "run_budget_seconds": 600,
+            "run_budget_seconds": 600, "max_turns": 20,
         }).encode()
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
@@ -6501,6 +6502,7 @@ while True:
         self.assertEqual(status, 202, payload)
         self.assertEqual(payload["status"], "queued")
         self.assertEqual(saved["run_budget_seconds"], 600)
+        self.assertEqual(saved["max_turns"], 20)
         self.assertIsNone(saved["response_webhook_url"])
         enq.assert_called_once()
 
@@ -6513,6 +6515,9 @@ while True:
                     ("run_budget_seconds", True, "bad_run_budget"),
                     ("run_budget_seconds", 29, "bad_run_budget"),
                     ("run_budget_seconds", 601, "bad_run_budget"),
+                    ("max_turns", True, "bad_max_turns"),
+                    ("max_turns", 0, "bad_max_turns"),
+                    ("max_turns", 31, "bad_max_turns"),
                 ):
                     request = {
                         "repo": "scratch", "launcher": "claude", "provider": "anthropic",
@@ -6534,7 +6539,7 @@ while True:
                 "job_id": job_id, "kind": "review", "status": "queued",
                 "launcher": "claude", "provider": "anthropic", "model": "claude-sonnet-5",
                 "repo": "scratch", "cwd": td, "prompt": "ticket",
-                "run_budget_seconds": 600, "response_webhook_url": None,
+                "run_budget_seconds": 600, "max_turns": 20, "response_webhook_url": None,
                 "response_webhook_token": None, "resume_url": None,
                 "created_at": "t", "started_at": None, "finished_at": None,
                 "receipt": None, "log_ref": str(jobs / job_id / "stdout.log"),
@@ -6555,7 +6560,7 @@ while True:
             saved = json.loads((jobs / job_id / "job.json").read_text())
         review.assert_called_once_with(
             "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td),
-            job_id=job_id, run_budget_seconds=600,
+            job_id=job_id, run_budget_seconds=600, max_turns=20,
         )
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["receipt"]["status"], "nack")

@@ -1380,6 +1380,7 @@
           "prompt": { "type": "string" },
           "async": { "type": "boolean", "default": false, "description": "Queue a durable review job even when no response webhook is supplied." },
           "run_budget_seconds": { "type": "integer", "minimum": 30, "maximum": 600, "default": 200 },
+          "max_turns": { "type": "integer", "minimum": 1, "maximum": 30, "default": 12 },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
