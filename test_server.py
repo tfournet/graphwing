@@ -880,6 +880,46 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_job_id")
 
+    def test_agent_job_wait_blocks_until_terminal_without_relaunching(self):
+        job_id = "ab" * 16
+        queued = {"job_id": job_id, "status": "running"}
+        completed = {"job_id": job_id, "status": "completed", "receipt": {"status": "ok"}}
+        with mock.patch.object(server, "read_job", side_effect=[queued, completed]), \
+             mock.patch.object(server.time, "sleep") as sleep:
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/jobs/wait", {}, True,
+                json.dumps({"job_id": job_id, "timeout_seconds": 30}).encode(),
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "completed")
+        sleep.assert_called_once()
+
+    def test_agent_job_wait_returns_not_found_for_missing_job(self):
+        with mock.patch.object(server, "read_job", return_value=None):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/jobs/wait", {}, True,
+                json.dumps({"job_id": "ab" * 16, "timeout_seconds": 30}).encode(),
+            )
+        self.assertEqual((status, payload["code"]), (404, "not_found"))
+
+    def test_agent_job_wait_rejects_non_ascii_numeric_string(self):
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/agent/jobs/wait", {}, True,
+            json.dumps({"job_id": "ab" * 16, "timeout_seconds": "²"}).encode(),
+        )
+        self.assertEqual((status, payload["code"]), (400, "bad_timeout"))
+
+    def test_agent_job_wait_timeout_is_bounded(self):
+        job_id = "ab" * 16
+        with mock.patch.object(server, "read_job", return_value={"job_id": job_id, "status": "running"}), \
+             mock.patch.object(server.time, "monotonic", side_effect=[0, 31]):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/jobs/wait", {}, True,
+                json.dumps({"job_id": job_id, "timeout_seconds": 30}).encode(),
+            )
+        self.assertEqual(status, 408, payload)
+        self.assertEqual(payload["code"], "job_wait_timeout")
+
     def test_parse_receipt_json(self):
         parsed = server.parse_receipt_text(
             'noise\n{"status":"ok","sha":"abc","pr_url":null,"summary":"done"}\n'
@@ -1499,7 +1539,7 @@ class DispatchTests(unittest.TestCase):
             server.main()
         self.assertEqual(events, ["bind", "recover", "serve"])
 
-    def test_startup_recovery_closes_every_process_job_kind_but_not_codeoff(self):
+    def test_startup_recovery_closes_every_process_job_kind_including_codeoff(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = self._scratch_git(root)
@@ -1532,7 +1572,7 @@ class DispatchTests(unittest.TestCase):
                 persisted_before_delivery.append(json.loads((jobs / receipt["job_id"] / "job.json").read_text())["status"])
                 return {"ok": True, "status": 200}
             with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "post_receipt", side_effect=post) as posted:
-                self.assertEqual(server.recover_interrupted_agent_jobs(), 5)
+                self.assertEqual(server.recover_interrupted_agent_jobs(), 6)
             self.assertEqual(persisted_before_delivery, ["failed"] * 5)
             self.assertEqual(posted.call_count, 5)
             for job_id, extra in fixtures.items():
@@ -1549,7 +1589,9 @@ class DispatchTests(unittest.TestCase):
                 else:
                     self.assertEqual(saved["receipt"]["failure_code"], "cancelled")
                     self.assertEqual(saved["receipt"]["session_identity"], extra["session_identity"])
-            self.assertEqual(json.loads((codeoff_dir / "job.json").read_text())["status"], "running")
+            codeoff_saved = json.loads((codeoff_dir / "job.json").read_text())
+            self.assertEqual(codeoff_saved["status"], "failed")
+            self.assertEqual(codeoff_saved["receipt"]["failure_code"], "cancelled")
             codex = root / "codex"
             codex.write_text("fixture")
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
@@ -1980,7 +2022,7 @@ while True:
     else: result = {}
     send({"jsonrpc":"2.0","id":response_id(request),"result":result})
     if cfg.get("notification_after_method") == method:
-        send({"jsonrpc":"2.0","method":"_x.ai/mcp/servers_updated"})
+        send({"jsonrpc":"2.0","method":cfg.get("notification_method", "_x.ai/mcp/servers_updated"), **({"id":99} if cfg.get("notification_has_id") else {})})
     if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
     if cfg.get("hang_after_method") == method:
         while True: time.sleep(1)
@@ -2097,6 +2139,23 @@ while True:
         })
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["receipt"]["summary"], "done")
+
+    def test_grok_acp_accepts_vendor_model_update_notification(self):
+        saved, _capture, _jdir = self._run_grok_fixture({
+            "notification_after_method": "authenticate",
+            "notification_method": "_x.ai/models/update",
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["summary"], "done")
+
+    def test_grok_acp_rejects_model_update_with_response_fields(self):
+        saved, _capture, _jdir = self._run_grok_fixture({
+            "notification_after_method": "authenticate",
+            "notification_method": "_x.ai/models/update",
+            "notification_has_id": True,
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("malformed Grok vendor notification", saved["receipt"]["summary"])
 
     def test_grok_acp_command_uses_the_requested_immutable_model(self):
         saved, capture, _ = self._run_grok_fixture(model="grok-fixture-immutable")
@@ -9351,6 +9410,124 @@ class CodeOffTests(unittest.TestCase):
         self.assertFalse((self.workspaces / "experiment-0001").exists())
         self.assertTrue((self.records / "experiment-0001" / "final.json").is_file())
 
+    def test_graph_failure_terminalizes_active_experiment_and_allows_cleanup(self):
+        self._prepare("graph-failure-0001")
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": "graph-failure-0001", "outcome": "failed",
+        })
+        self.assertEqual(status, 200, terminal)
+        self.assertEqual((terminal["status"], terminal["reason"], terminal["finalized"]),
+                         ("parked", "graph_terminal_failure", True))
+        status, cleaned = self._post("/v1/code-off/cleanup", {"experiment_id": "graph-failure-0001"})
+        self.assertEqual(status, 200, cleaned)
+
+    def test_graph_failure_waits_for_launched_jobs_before_finalizing(self):
+        experiment_id = "graph-drain-0001"
+        self._prepare(experiment_id)
+        state_path = self.records / experiment_id / "state.json"
+        state = json.loads(state_path.read_text())
+        job_id = "ab" * 16
+        state["agent_jobs"]["author-1"] = [job_id]
+        server._codeoff_write_state(self.records / experiment_id, state)
+        running = {"job_id": job_id, "status": "running"}
+        completed = {"job_id": job_id, "status": "completed"}
+        with mock.patch.object(server, "read_job", side_effect=[running, completed]), \
+             mock.patch.object(server.time, "sleep") as sleep:
+            status, terminal = self._post("/v1/code-off/terminal", {
+                "experiment_id": experiment_id, "outcome": "failed",
+            })
+        self.assertEqual(status, 200, terminal)
+        self.assertTrue(terminal["finalized"])
+        sleep.assert_called_once()
+
+    def test_graph_failure_drains_every_launched_job_before_finalizing(self):
+        experiment_id = "graph-drain-all-0001"
+        self._prepare(experiment_id)
+        state_path = self.records / experiment_id / "state.json"
+        state = json.loads(state_path.read_text())
+        first, second = "aa" * 16, "bb" * 16
+        state["agent_jobs"]["author-1"] = [first]
+        state["agent_jobs"]["author-2"] = [second]
+        server._codeoff_write_state(self.records / experiment_id, state)
+        reads = [
+            {"job_id": first, "status": "completed"}, {"job_id": second, "status": "running"},
+            {"job_id": first, "status": "completed"}, {"job_id": second, "status": "failed"},
+        ]
+        with mock.patch.object(server, "read_job", side_effect=reads), \
+             mock.patch.object(server.time, "sleep") as sleep:
+            status, terminal = self._post("/v1/code-off/terminal", {
+                "experiment_id": experiment_id, "outcome": "failed",
+            })
+        self.assertEqual(status, 200, terminal)
+        self.assertTrue(terminal["finalized"])
+        sleep.assert_called_once()
+
+    def test_graph_failure_refuses_missing_or_changed_launch_evidence(self):
+        for index, failure in enumerate(("missing", "changed")):
+            experiment_id = f"graph-launch-evidence-{index}"
+            self._prepare(experiment_id)
+            state_path = self.records / experiment_id / "state.json"
+            state = json.loads(state_path.read_text())
+            state["agent_jobs"]["author-1"] = ["ef" * 16]
+            server._codeoff_write_state(self.records / experiment_id, state)
+            if failure == "missing":
+                context = mock.patch.object(server, "read_job", return_value=None)
+            else:
+                def change_launches(_state, path=state_path, root=self.records / experiment_id):
+                    changed = json.loads(path.read_text())
+                    changed["agent_jobs"]["author-2"] = ["ab" * 16]
+                    server._codeoff_write_state(root, changed)
+                    return None
+                context = mock.patch.object(server, "_codeoff_wait_for_jobs", side_effect=change_launches)
+            with context:
+                status, terminal = self._post("/v1/code-off/terminal", {
+                    "experiment_id": experiment_id, "outcome": "failed",
+                })
+            expected = "agent_job_missing" if failure == "missing" else "agent_jobs_changed"
+            self.assertEqual((status, terminal["code"]), (409, expected))
+            self.assertFalse(json.loads(state_path.read_text())["finalized"])
+
+    def test_graph_failure_refuses_to_finalize_while_launched_job_remains_active(self):
+        experiment_id = "graph-active-0001"
+        self._prepare(experiment_id)
+        state_path = self.records / experiment_id / "state.json"
+        state = json.loads(state_path.read_text())
+        job_id = "cd" * 16
+        state["agent_jobs"]["author-1"] = [job_id]
+        server._codeoff_write_state(self.records / experiment_id, state)
+        with mock.patch.object(server, "read_job", return_value={"job_id": job_id, "status": "running"}), \
+             mock.patch.object(server.time, "monotonic", side_effect=[0, server.CODEOFF_TERMINAL_DRAIN_SECONDS + 1]):
+            status, terminal = self._post("/v1/code-off/terminal", {
+                "experiment_id": experiment_id, "outcome": "failed",
+            })
+        self.assertEqual((status, terminal["code"]), (409, "agent_jobs_active"))
+        state = json.loads(state_path.read_text())
+        self.assertFalse(state["finalized"])
+
+    def test_graph_success_terminal_is_idempotent_after_durable_finalization(self):
+        self._prepare("active-success-0001")
+        state_path = self.records / "active-success-0001" / "state.json"
+        before = state_path.read_bytes()
+        status, active = self._post("/v1/code-off/terminal", {
+            "experiment_id": "active-success-0001", "outcome": "succeeded",
+        })
+        self.assertEqual((status, active["code"]), (409, "not_finalized"))
+        self.assertEqual(state_path.read_bytes(), before)
+
+        status, missing = self._post("/v1/code-off/terminal", {
+            "experiment_id": "missing-success-0001", "outcome": "succeeded",
+        })
+        self.assertEqual((status, missing["code"]), (409, "not_finalized"))
+
+        self._ready_to_finalize("graph-success-0001")
+        status, finalized = self._post("/v1/code-off/finalize", {"experiment_id": "graph-success-0001"})
+        self.assertEqual(status, 200, finalized)
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": "graph-success-0001", "outcome": "succeeded",
+        })
+        self.assertEqual(status, 200, terminal)
+        self.assertEqual((terminal["status"], terminal["finalized"]), ("completed", True))
+
     def test_cleanup_refuses_before_finalization_and_auth_is_required(self):
         self._prepare()
         status, payload = self._post("/v1/code-off/cleanup", {"experiment_id": "experiment-0001"})
@@ -9412,11 +9589,12 @@ class CodeOffTests(unittest.TestCase):
             "/v1/code-off/finalize": "codeOffFinalize",
             "/v1/code-off/audit": "codeOffAudit",
             "/v1/code-off/cleanup": "codeOffCleanup",
+            "/v1/code-off/terminal": "codeOffTerminal",
         }
         for path, operation_id in expected.items():
             method = "get" if path.endswith("audit") else "post"
             self.assertEqual(spec["paths"][path][method]["operationId"], operation_id)
-        for name in ("CodeOffPrepareRequest", "CodeOffCandidateRequest", "CodeOffJudgeRequest", "CodeOffExperimentRequest", "CodeOffWorkspaceRef", "CodeOffJudgeResult", "CodeOffPrepareResult", "CodeOffCompact"):
+        for name in ("CodeOffPrepareRequest", "CodeOffCandidateRequest", "CodeOffJudgeRequest", "CodeOffExperimentRequest", "CodeOffTerminalRequest", "CodeOffTerminalResult", "CodeOffWorkspaceRef", "CodeOffJudgeResult", "CodeOffPrepareResult", "CodeOffCompact"):
             self.assertFalse(spec["components"]["schemas"][name]["additionalProperties"], name)
         workspace = spec["components"]["schemas"]["CodeOffWorkspaceRef"]
         self.assertEqual(set(workspace["required"]), {"experiment_id", "slot"})
@@ -9442,20 +9620,83 @@ class CodeOffTests(unittest.TestCase):
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
         triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
-        for wait, agent in (("wait_author_1", "author_1"), ("wait_author_2", "author_2"), ("wait_judge_fable", "judge_fable"), ("wait_judge_1", "judge_1"), ("wait_judge_2", "judge_2")):
-            self.assertEqual(nodes[wait]["type"], "action.wait.webhook")
-            self.assertIn((wait, "pending", agent), triples)
-            self.assertIn(wait, nodes[agent]["config"]["response_webhook_url"])
-        self.assertEqual(nodes["join_candidates"]["type"], "logic.join.all")
-        self.assertEqual(nodes["join_judges"]["type"], "logic.join.all")
-        self.assertTrue(nodes["join_candidates"]["config"]["waitForAll"])
-        self.assertTrue(nodes["join_judges"]["config"]["waitForAll"])
-        self.assertEqual({e["source"] for e in edges if e["target"] == "join_candidates"}, {"test_1", "test_2"})
-        self.assertEqual({e["source"] for e in edges if e["target"] == "join_judges"}, {"receipt_fable", "receipt_1", "receipt_2"})
+
+        allowed_handles = {
+            "trigger.manual": {"out"},
+            "logic.filter": {"pass", "fail"},
+            "logic.switch": {"case-0", "default"},
+            "logic.join.any": {"out"},
+        }
+        for edge in edges:
+            self.assertEqual(edge.get("targetHandle"), "in", edge)
+            source_type = nodes[edge["source"]]["type"]
+            expected = {"success", "failure"} if source_type.startswith("action.graphwing.") else allowed_handles.get(source_type)
+            self.assertIsNotNone(expected, edge)
+            self.assertIn(edge.get("sourceHandle"), expected, edge)
+
+        self.assertIn(("trigger", "out", "prepare"), triples)
+        self.assertIn(("prepare", "success", "switch_prepare"), triples)
+        self.assertIn(("switch_prepare", "default", "author_1"), triples)
+        self.assertIn(("switch_prepare", "case-0", "join_terminal"), triples)
+        waits = {
+            "wait_author_1": "author_1", "wait_author_2": "author_2",
+            "wait_judge_fable": "judge_fable", "wait_judge_1": "judge_1", "wait_judge_2": "judge_2",
+        }
+        self.assertEqual(
+            {node_id for node_id, node in nodes.items() if node["type"] == "action.graphwing.POST:/v1/agent/jobs/wait"},
+            set(waits),
+        )
+        for wait, launch in waits.items():
+            self.assertEqual(nodes[wait]["type"], "action.graphwing.POST:/v1/agent/jobs/wait")
+            self.assertEqual(nodes[wait]["config"]["job_id"], f"{{{{ TASKS.{launch}.data.job_id }}}}")
+            self.assertNotIn("response_webhook_url", nodes[launch]["config"])
+        self.assertIn(("author_1", "success", "author_2"), triples)
+        self.assertIn(("author_2", "success", "wait_author_1"), triples)
+        self.assertIn(("judge_fable", "success", "judge_1"), triples)
+        self.assertIn(("judge_1", "success", "judge_2"), triples)
+        self.assertIn(("judge_2", "success", "wait_judge_fable"), triples)
+        for filter_id in ("author_ok_1", "author_ok_2", "judge_ok_fable", "judge_ok_1", "judge_ok_2", "eligible", "final_verified"):
+            self.assertIn((filter_id, "fail", "join_terminal"), triples, filter_id)
+        forward = {}
+        for edge in edges:
+            forward.setdefault(edge["source"], []).append(edge["target"])
+        def paths_to(target):
+            found = []
+            def walk(node, path):
+                if node == target:
+                    found.append(path + [node])
+                    return
+                for child in forward.get(node, ()):
+                    if child not in path:
+                        walk(child, path + [node])
+            walk("trigger", [])
+            return found
+        for wait in ("wait_author_1", "wait_author_2"):
+            self.assertTrue(paths_to(wait), wait)
+            self.assertTrue(all({"author_1", "author_2"} <= set(path) for path in paths_to(wait)), wait)
+        for wait in ("wait_judge_fable", "wait_judge_1", "wait_judge_2"):
+            self.assertTrue(paths_to(wait), wait)
+            self.assertTrue(all({"judge_fable", "judge_1", "judge_2"} <= set(path) for path in paths_to(wait)), wait)
+        leaves = {node_id for node_id in nodes if not forward.get(node_id)}
+        self.assertEqual(leaves, {"done", "terminal", "terminal_error", "success_confirmation_error"})
+        for leaf in leaves:
+            self.assertTrue(all({"terminalize_failed", "terminalize_success"} & set(path) for path in paths_to(leaf)), leaf)
         self.assertIn(("eligible", "pass", "finalize"), triples)
         self.assertIn(("final_verified", "pass", "commit"), triples)
-        self.assertTrue(any(e["source"] == "commit" and e["target"] == "push" for e in edges))
+        self.assertIn(("push", "success", "terminalize_success"), triples)
+        self.assertIn(("terminalize_success", "success", "done"), triples)
+        self.assertIn(("join_terminal", "out", "terminalize_failed"), triples)
+        self.assertIn(("terminalize_failed", "success", "terminal"), triples)
+        self.assertIn(("terminalize_failed", "failure", "terminal_error"), triples)
+        self.assertIn(("terminalize_success", "failure", "success_confirmation_error"), triples)
+        self.assertEqual(nodes["terminal_error"]["type"], "transforms.objectBuilder")
+        self.assertEqual(nodes["success_confirmation_error"]["type"], "transforms.objectBuilder")
+        self.assertGreater(nodes["terminalize_failed"]["config"]["timeout"], server.CODEOFF_TERMINAL_DRAIN_SECONDS)
+        for wait in waits:
+            self.assertGreater(nodes[wait]["config"]["timeout"], nodes[wait]["config"]["timeout_seconds"])
+            self.assertGreaterEqual(nodes[wait]["config"]["timeout_seconds"], server.CODEOFF_TERMINAL_DRAIN_SECONDS)
         self.assertFalse(any("merge" in node["type"].lower() for node in nodes.values()))
+
         openapi = json.loads(server.openapi_bytes())
         openapi_paths = openapi["paths"]
         graphwing_actions = {node_id: node for node_id, node in nodes.items() if node["type"].startswith("action.graphwing.")}
@@ -9484,50 +9725,40 @@ class CodeOffTests(unittest.TestCase):
                 for key, item in value.items():
                     if key in properties:
                         accepts(item, properties[key], f"{where}.{key}")
-            elif expected == "array":
-                self.assertIsInstance(value, list, where)
+            elif expected == "array": self.assertIsInstance(value, list, where)
             elif expected == "string":
                 self.assertIsInstance(value, str, where)
-                if "{{" not in value and "enum" in schema:
-                    self.assertIn(value, schema["enum"], where)
-            elif expected == "integer":
-                self.assertIs(type(value), int, where)
-            elif expected == "boolean":
-                self.assertIs(type(value), bool, where)
+                if "{{" not in value and "enum" in schema: self.assertIn(value, schema["enum"], where)
+            elif expected == "integer": self.assertIs(type(value), int, where)
+            elif expected == "boolean": self.assertIs(type(value), bool, where)
 
         for node_id, node in graphwing_actions.items():
             action, endpoint = node["type"].removeprefix("action.graphwing.").split(":", 1)
             self.assertIn(endpoint, openapi_paths, node_id)
-            self.assertIn((node_id, "failure", "join_terminal"), triples, node_id)
             request_schema = openapi_paths[endpoint][action.lower()]["requestBody"]["content"]["application/json"]["schema"]
             accepts({key: value for key, value in node["config"].items() if key not in {"integrationInstanceId", "timeout"}}, request_schema, node_id)
-        self.assertEqual(
-            {node_id for node_id, node in graphwing_actions.items() if node["type"] in {"action.graphwing.POST:/v1/git/commit", "action.graphwing.POST:/v1/git/push"}},
-            {"commit", "push"},
-        )
-        self.assertEqual(nodes["eligible"]["config"]["rules"][0]["path"], "data.promotion_eligible")
-        self.assertEqual(nodes["final_verified"]["config"]["rules"][0]["path"], "data.commit_eligible")
+            expected_target = {"terminalize_failed": "terminal_error", "terminalize_success": "success_confirmation_error"}.get(node_id, "join_terminal")
+            self.assertIn((node_id, "failure", expected_target), triples, node_id)
+
+        self.assertEqual(nodes["freeze_1"]["config"]["job_id"], "{{ TASKS.wait_author_1.data.job_id }}")
+        self.assertEqual(nodes["freeze_2"]["config"]["job_id"], "{{ TASKS.wait_author_2.data.job_id }}")
+        self.assertEqual(nodes["receipt_fable"]["config"]["job_id"], "{{ TASKS.wait_judge_fable.data.job_id }}")
+        self.assertEqual(nodes["receipt_1"]["config"]["job_id"], "{{ TASKS.wait_judge_1.data.job_id }}")
+        self.assertEqual(nodes["receipt_2"]["config"]["job_id"], "{{ TASKS.wait_judge_2.data.job_id }}")
         self.assertEqual(nodes["commit"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
         self.assertEqual(nodes["push"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
-        for suffix in ("1", "2"):
-            self.assertEqual(nodes[f"freeze_{suffix}"]["config"]["job_id"], f"{{{{ TASKS.wait_author_{suffix}.request.body.job_id }}}}")
-        for node_id, wait_id in (("receipt_fable", "wait_judge_fable"), ("receipt_1", "wait_judge_1"), ("receipt_2", "wait_judge_2")):
-            self.assertEqual(nodes[node_id]["config"]["job_id"], f"{{{{ TASKS.{wait_id}.request.body.job_id }}}}")
-        # No cycles, and every action failure is terminal rather than a redraw/retry.
+
         outgoing = {}
-        for edge in edges:
-            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        for edge in edges: outgoing.setdefault(edge["source"], []).append(edge["target"])
         color = {node: 0 for node in nodes}
         def visit(node):
             color[node] = 1
             for target in outgoing.get(node, []):
                 self.assertNotEqual(color[target], 1, f"cycle through {target}")
-                if color[target] == 0:
-                    visit(target)
+                if color[target] == 0: visit(target)
             color[node] = 2
         for node in nodes:
-            if color[node] == 0:
-                visit(node)
+            if color[node] == 0: visit(node)
         self.assertNotIn("retry", json.dumps(graph).lower())
 
     def test_publish_catalog_includes_codeoff_and_validated_implement_slice(self):

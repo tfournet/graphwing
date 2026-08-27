@@ -151,6 +151,11 @@ CODEOFF_MAX_FILE_BYTES = 32 * 1024 * 1024
 CODEOFF_MAX_TREE_BYTES = 100 * 1024 * 1024
 CODEOFF_MAX_LOG_BYTES = 256 * 1024
 CODEOFF_MAX_RATIONALE = 1200
+CODEOFF_MAX_AGENT_SECONDS = 1200
+AGENT_PROCESS_WAIT_GRACE_SECONDS = 60
+AGENT_TERM_GRACE_SECONDS = 10
+AGENT_KILL_GRACE_SECONDS = 5
+CODEOFF_TERMINAL_DRAIN_SECONDS = CODEOFF_MAX_AGENT_SECONDS + AGENT_PROCESS_WAIT_GRACE_SECONDS + AGENT_TERM_GRACE_SECONDS + AGENT_KILL_GRACE_SECONDS + 45
 CODEOFF_PROVENANCE_MAX_FILES = 65536
 CODEOFF_PROVENANCE_MAX_BYTES = 8 * 1024 * 1024
 CODEOFF_PROVENANCE_MAX_EVENTS = 10000
@@ -3323,6 +3328,35 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def agent_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"job_id", "timeout_seconds"}:
+        return 400, {"error": "job wait requires only job_id and timeout_seconds", "code": "unexpected_fields"}
+    job_id = data.get("job_id")
+    timeout = data.get("timeout_seconds")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"error": "invalid job_id", "code": "bad_job_id"}
+    if isinstance(timeout, str):
+        if not re.fullmatch(r"[0-9]{1,4}", timeout):
+            return 400, {"error": "timeout_seconds must be 1..1800", "code": "bad_timeout"}
+        timeout = int(timeout)
+    if type(timeout) is not int or not 1 <= timeout <= 1800:
+        return 400, {"error": "timeout_seconds must be 1..1800", "code": "bad_timeout"}
+    deadline = time.monotonic() + timeout
+    while True:
+        job = read_job(job_id)
+        if not job:
+            return 404, {"error": "job not found", "code": "not_found"}
+        if job.get("status") not in ("queued", "running"):
+            return 200, public_job(job)
+        if time.monotonic() >= deadline:
+            return 408, {"ok": False, "error": "job did not finish before the bounded wait", "code": "job_wait_timeout", "job_id": job_id}
+        time.sleep(0.2)
+
+
 def active_job_count() -> int:
     if not JOBS_DIR.is_dir():
         return 0
@@ -3376,7 +3410,6 @@ def recover_interrupted_agent_jobs() -> int:
                 job.get("status") not in ("queued", "running")
                 or kind not in PROCESS_JOB_KINDS
                 or (kind == "agent" and (not isinstance(launcher, str) or launcher not in NATIVE_LAUNCHERS))
-                or job.get("codeoff_workspace")
                 or not isinstance(job_id, str)
                 or not JOB_ID_RE.fullmatch(job_id)
                 or job_id != path.parent.name
@@ -4250,9 +4283,9 @@ def run_grok_acp(
                             raise ValueError("Grok assistant output exceeded limit")
                         chunks.append(text)
                 continue
-            if message.get("method") == "_x.ai/mcp/servers_updated":
+            if message.get("method") in ("_x.ai/mcp/servers_updated", "_x.ai/models/update"):
                 if any(key in message for key in ("id", "result", "error")):
-                    raise ValueError("malformed Grok MCP server notification")
+                    raise ValueError("malformed Grok vendor notification")
                 continue
             if type(message.get("id")) is not int or message["id"] != request_id:
                 raise ValueError("unexpected Grok ACP response")
@@ -4400,13 +4433,13 @@ def _kill_proc(proc: subprocess.Popen[bytes]) -> None:
     except OSError:
         proc.kill()
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=AGENT_TERM_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             proc.kill()
-        proc.wait(timeout=5)
+        proc.wait(timeout=AGENT_KILL_GRACE_SECONDS)
 
 
 def read_bounded_output(path: Path) -> str:
@@ -4613,7 +4646,7 @@ def run_agent_job(job_id: str) -> None:
         job["pid"] = proc.pid
         write_job(job)
         timed_out = False
-        wait_for = int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET) + 60
+        wait_for = int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET) + AGENT_PROCESS_WAIT_GRACE_SECONDS
         try:
             returncode = proc.wait(timeout=wait_for)
         except subprocess.TimeoutExpired:
@@ -5426,7 +5459,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
     if not isinstance(toolchain, dict) or not 1 <= len(toolchain) <= 20 or not all(isinstance(k, str) and k and isinstance(v, str) and v and len(k) <= 40 and len(v) <= 120 for k, v in toolchain.items()):
         return 400, {"error": "toolchain must be a bounded string map", "code": "bad_toolchain"}
     budgets = data.get("budgets")
-    limits = {"author_seconds": (30, 1200), "judge_seconds": (30, 1200), "test_seconds": (1, 1200), "max_turns": (1, 80)}
+    limits = {"author_seconds": (30, CODEOFF_MAX_AGENT_SECONDS), "judge_seconds": (30, CODEOFF_MAX_AGENT_SECONDS), "test_seconds": (1, 1200), "max_turns": (1, 80)}
     if not isinstance(budgets, dict) or set(budgets) != set(limits) or any(type(budgets.get(key)) is not int or not lo <= budgets[key] <= hi for key, (lo, hi) in limits.items()):
         return 400, {"error": "budgets must contain the exact versioned keys", "code": "bad_budgets"}
     commit_message = data.get("commit_message")
@@ -6075,6 +6108,62 @@ def codeoff_audit(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
     judges = {slot: ({"receipt_hash": value.get("receipt_hash"), "preference": value.get("preference"), "totals": {label: item.get("total") for label, item in value.get("candidates", {}).items()}} if state.get("finalized") is True else {"receipt_hash": value.get("receipt_hash")}) for slot, value in state.get("judges", {}).items()}
     return 200, {"ok": True, "protocol_version": manifest["protocol_version"], "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": state["finalized"], "classification": manifest["classification"], "original_classification": manifest["original_classification"], "category_source": manifest["category_source"], "selection": selection, "identities": identities, "fable_provider_overlap": manifest["fable_provider_overlap"], "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "prompt_hash": manifest["prompt_hash"], "rubric_hash": manifest["rubric_hash"], "manifest_file_hash": state["manifest_file_hash"], "event_head": state["event_head"], "event_count": state["event_count"], "candidates": candidates, "judges": judges, "aggregation": state.get("aggregation") if state.get("finalized") or not state.get("aggregation") else {key: value for key, value in state["aggregation"].items() if key != "preferences"}, "promotion": state.get("promotion"), "final_verification": state.get("final_verification"), "final_file_hash": state.get("final_file_hash")}
 
+def _codeoff_wait_for_jobs(state: dict[str, Any], timeout_seconds: int = CODEOFF_TERMINAL_DRAIN_SECONDS) -> dict[str, Any] | None:
+    job_ids = [job_id for jobs in state.get("agent_jobs", {}).values() for job_id in jobs]
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        active = []
+        for job_id in job_ids:
+            job = read_job(job_id)
+            if not job:
+                return {"error": "launched code-off job record is unavailable", "code": "agent_job_missing", "job_id": job_id}
+            if job.get("status") in ("queued", "running"):
+                active.append(job_id)
+        if not active:
+            return None
+        if time.monotonic() >= deadline:
+            return {"error": "launched code-off jobs did not finish before terminalization", "code": "agent_jobs_active", "job_ids": active}
+        time.sleep(0.2)
+
+
+def codeoff_terminal(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id", "outcome"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    outcome = data.get("outcome")
+    if outcome not in ("failed", "succeeded"):
+        return 400, {"error": "outcome must be failed or succeeded", "code": "bad_outcome"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+        if load_err:
+            if load_err.get("code") == "experiment_not_found":
+                if outcome == "succeeded":
+                    return 409, {"error": "successful graph terminal requires completed durable finalization", "code": "not_finalized"}
+                return 200, {"ok": True, "experiment_id": data["experiment_id"], "status": "absent", "reason": None, "finalized": False}
+            return 400, load_err
+        assert root and manifest and state
+        if state.get("finalized"):
+            return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+        if outcome == "succeeded":
+            return 409, {"error": "successful graph terminal requires completed durable finalization", "code": "not_finalized"}
+        launched = state.get("agent_jobs", {})
+    drain_err = _codeoff_wait_for_jobs(state)
+    if drain_err:
+        return 409, drain_err
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+        if load_err:
+            return 400, load_err
+        assert root and manifest and state
+        if state.get("finalized"):
+            return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+        if state.get("agent_jobs", {}) != launched:
+            return 409, {"error": "code-off launches changed during terminalization", "code": "agent_jobs_changed"}
+        _codeoff_finalize_record(root, manifest, state, "parked", "graph_terminal_failure")
+        return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+
+
 def codeoff_cleanup(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
     if err:
@@ -6207,7 +6296,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
-    budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, 1200)
+    budget, budget_err = parse_optional_int(data, "run_budget_seconds", 30, CODEOFF_MAX_AGENT_SECONDS)
     if budget_err:
         return 400, budget_err
     if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
@@ -6417,6 +6506,9 @@ def dispatch_inner(
     if method == "GET" and path == "/v1/code-off/audit":
         status, payload = _codeoff_boundary(codeoff_audit, qs)
         return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/terminal":
+        status, payload = _codeoff_boundary(codeoff_terminal, body)
+        return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/cleanup":
         status, payload = _codeoff_boundary(codeoff_cleanup, body, repos)
         return json_out(status, payload)
@@ -6575,6 +6667,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/agent/run":
         status, payload = agent_run(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/agent/jobs/wait":
+        status, payload = agent_job_wait(body)
         return json_out(status, payload)
     if method == "GET" and path.startswith("/v1/agent/jobs/"):
         job_id = path.removeprefix("/v1/agent/jobs/").strip("/")
