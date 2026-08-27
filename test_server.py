@@ -9896,6 +9896,8 @@ class CodeOffTests(unittest.TestCase):
             ("receipt_fable", "success"), ("receipt_1", "success"), ("receipt_2", "success"),
         })
         self.assertEqual(incoming("aggregate"), {("join_judges", "out")})
+        self.assertEqual(incoming("eligible"), {("aggregate", "success")})
+        self.assertEqual(set(nodes) - {edge["target"] for edge in edges}, {"trigger"})
         for filter_id in ("author_ok_1", "author_ok_2", "judge_ok_fable", "judge_ok_1", "judge_ok_2", "eligible", "final_verified"):
             self.assertIn((filter_id, "fail", "join_terminal"), triples, filter_id)
         forward = {}
