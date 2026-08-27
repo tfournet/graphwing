@@ -1974,6 +1974,16 @@ while True:
     seen["requests"].append(request); save()
     method = request["method"]
     if cfg.get("exit_method") == method: sys.exit(cfg.get("exit_code", 7))
+    if method == "authenticate" and cfg.get("wire_burst_record_bytes"):
+        target = cfg["wire_burst_record_bytes"]
+        notification = {"jsonrpc":"2.0","method":"_x.ai/models/update","params":{"padding":""}}
+        raw = json.dumps(notification)
+        notification["params"]["padding"] = "x" * max(0, target - len(raw))
+        raw = json.dumps(notification)
+        assert len(raw) == target
+        response = {"jsonrpc":"2.0","id":response_id(request),"result":{}}
+        sys.stdout.write(raw + "\\n" + json.dumps(response) + "\\n"); sys.stdout.flush()
+        continue
     if cfg.get("malformed_method") == method:
         print("not-json", flush=True); continue
     if cfg.get("missing_result_method") == method:
@@ -2026,6 +2036,8 @@ while True:
             send({"jsonrpc":"2.0","id":999,"method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"plan"}}})
         if cfg.get("untyped_update"):
             send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{}}})
+        for _ in range(cfg.get("thought_chunks", 0)):
+            send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"x"}}}})
         for text in cfg.get("chunks", ['{"status":"ok","sha":null,"pr_url":null,"summary":"done"}']):
             send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":cfg.get("chunk_content_type", "text"),"text":text}}}})
         result = {"stopReason":cfg.get("stop_reason", "end_turn")}
@@ -2326,6 +2338,52 @@ while True:
         self.assertGreater(len(first_line), server.FILE_MAX_BYTES)
         self.assertLess(len(first_line), server.CMD_MAX_BYTES)
         self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_accepts_valid_stream_above_cumulative_limit(self):
+        thought_chunks = server.CMD_MAX_BYTES // 100
+        saved, _, jdir = self._run_grok_fixture({
+            "thought_chunks": thought_chunks,
+        })
+        logged = (jdir / "stdout.log").read_bytes()
+        example = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "grok-123",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "x"},
+                },
+            },
+        }).encode() + b"\n"
+        self.assertGreater(len(example) * thought_chunks, server.CMD_MAX_BYTES)
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertTrue(logged.endswith(b"\n"))
+        self.assertGreater(len(logged), server.CMD_MAX_BYTES - len(example))
+        self.assertLessEqual(len(logged), server.CMD_MAX_BYTES)
+        for line in logged.splitlines():
+            self.assertIsInstance(json.loads(line), dict)
+
+    def test_grok_acp_accepts_maximum_message_followed_by_response(self):
+        saved, _, _ = self._run_grok_fixture({
+            "wire_burst_record_bytes": server.CMD_MAX_BYTES,
+        })
+        self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_rejects_message_above_wire_limit(self):
+        saved, _, _ = self._run_grok_fixture({
+            "wire_burst_record_bytes": server.CMD_MAX_BYTES + 1,
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("Grok ACP wire exceeded output limit", saved["receipt"]["summary"])
+
+    def test_grok_acp_rejects_assistant_output_above_file_limit(self):
+        saved, _, _ = self._run_grok_fixture({
+            "chunks": ["x" * server.FILE_MAX_BYTES, "x"],
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("Grok assistant output exceeded limit", saved["receipt"]["summary"])
 
     def test_grok_acp_resume_loads_only_after_capability_and_ignores_replay(self):
         saved, capture, _ = self._run_grok_fixture({
