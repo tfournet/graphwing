@@ -6479,6 +6479,88 @@ while True:
         self.assertTrue(payload["job_id"])
         queued = enq.call_args.args[0]
         self.assertNotIn("reviewer", queued)
+        self.assertEqual(queued["run_budget_seconds"], server.REVIEW_DEFAULT_BUDGET_SECONDS)
+
+    def test_review_run_can_queue_durable_job_without_webhook(self):
+        body = json.dumps({
+            "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-sonnet-5", "prompt": "ticket", "async": True,
+            "run_budget_seconds": 600,
+        }).encode()
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            jobs = Path(td) / "jobs"
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "enqueue_review") as enq:
+                response = server.dispatch("POST", "/v1/review/run", {}, True, body)
+                status, payload = response[0], response[1]
+                assert isinstance(payload, dict)
+            saved = json.loads((jobs / payload["job_id"] / "job.json").read_text())
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(saved["run_budget_seconds"], 600)
+        self.assertIsNone(saved["response_webhook_url"])
+        enq.assert_called_once()
+
+    def test_review_run_validates_async_and_bounded_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                for field, value, code in (
+                    ("async", "true", "bad_async"),
+                    ("run_budget_seconds", True, "bad_run_budget"),
+                    ("run_budget_seconds", 29, "bad_run_budget"),
+                    ("run_budget_seconds", 601, "bad_run_budget"),
+                ):
+                    request = {
+                        "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                        "model": "claude-sonnet-5", "prompt": "ticket", field: value,
+                    }
+                    response = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                    )
+                    status, payload = response[0], response[1]
+                    assert isinstance(payload, dict)
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], code)
+
+    def test_review_job_uses_persisted_budget_and_retains_timeout_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            job_id = "ab" * 16
+            job = {
+                "job_id": job_id, "kind": "review", "status": "queued",
+                "launcher": "claude", "provider": "anthropic", "model": "claude-sonnet-5",
+                "repo": "scratch", "cwd": td, "prompt": "ticket",
+                "run_budget_seconds": 600, "response_webhook_url": None,
+                "response_webhook_token": None, "resume_url": None,
+                "created_at": "t", "started_at": None, "finished_at": None,
+                "receipt": None, "log_ref": str(jobs / job_id / "stdout.log"),
+                "error": None, "webhook": None,
+            }
+            (jobs / job_id).mkdir(parents=True)
+            (jobs / job_id / "job.json").write_text(json.dumps(job))
+            timed_out = {
+                "ok": False, "verdict": "NACK", "no_verdict": True,
+                "launcher": "claude", "provider": "anthropic", "model": "claude-sonnet-5",
+                "reviewer": "claude-sonnet-5", "summary": "review timed out",
+                "compact": "timeout", "returncode": 1, "code": "timeout",
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "native_review_result", return_value=timed_out) as review, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            saved = json.loads((jobs / job_id / "job.json").read_text())
+        review.assert_called_once_with(
+            "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td),
+            job_id=job_id, run_budget_seconds=600,
+        )
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["status"], "nack")
+        self.assertTrue(saved["receipt"]["no_verdict"])
+        self.assertEqual(saved["receipt"]["summary"], "review timed out")
 
     def test_review_run_rejects_profile_named_or_mismatched_reviewers(self):
         with tempfile.TemporaryDirectory() as td:

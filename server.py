@@ -276,6 +276,9 @@ NORMAL_REVIEWER_ROUTES = {
 }
 # Reviews need enough turns to read the ticket and diff before returning a verdict.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
+REVIEW_DEFAULT_BUDGET_SECONDS = 200
+REVIEW_MIN_BUDGET_SECONDS = 30
+REVIEW_MAX_BUDGET_SECONDS = 600
 SLICE_BUDGET = {
     ("mechanical", "S"): (10, 120),
     ("mechanical", "M"): (30, 300),
@@ -2526,6 +2529,7 @@ def native_review_result(
     prompt: str,
     resolved: Path,
     job_id: str | None = None,
+    run_budget_seconds: int = REVIEW_DEFAULT_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     spec = NATIVE_LAUNCHERS.get(launcher)
@@ -2569,7 +2573,7 @@ def native_review_result(
             "launcher": launcher,
             "provider": provider,
             "model": model,
-            "run_budget_seconds": 180,
+            "run_budget_seconds": run_budget_seconds,
             "session_identity": None,
         })
         returncode, timed_out, _session_id, error = run_grok_acp(
@@ -2598,7 +2602,7 @@ def native_review_result(
         try:
             proc = subprocess.run(
                 cmd, cwd=str(resolved), env={k: v for k, v in os.environ.items()},
-                input=run_input, capture_output=True, timeout=200,
+                input=run_input, capture_output=True, timeout=run_budget_seconds,
             )
             returncode = proc.returncode
             stdout = (proc.stdout or b"").decode("utf-8", "replace")
@@ -2665,6 +2669,7 @@ def run_review_job(job_id: str) -> None:
     result = native_review_result(
         job["launcher"], job["provider"], job["model"], job["prompt"],
         Path(job["cwd"]), job_id=job["job_id"],
+        run_budget_seconds=job["run_budget_seconds"],
     )
     receipt = review_receipt(job, result)
     job = read_job(job_id) or job
@@ -2715,12 +2720,32 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     name, resolved = repo_from_body(data, repos)
     if name is None:
         return 400, resolved
+    assert isinstance(resolved, Path)
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
 
-    if not webhook_url:
-        result = native_review_result(launcher, provider, model, prompt, resolved)
+    async_requested = data.get("async", False)
+    if not isinstance(async_requested, bool):
+        return 400, {"error": "async must be a boolean", "code": "bad_async"}
+    run_budget_seconds = data.get("run_budget_seconds", REVIEW_DEFAULT_BUDGET_SECONDS)
+    if (
+        type(run_budget_seconds) is not int
+        or not REVIEW_MIN_BUDGET_SECONDS <= run_budget_seconds <= REVIEW_MAX_BUDGET_SECONDS
+    ):
+        return 400, {
+            "error": (
+                "run_budget_seconds must be an integer from "
+                f"{REVIEW_MIN_BUDGET_SECONDS} through {REVIEW_MAX_BUDGET_SECONDS}"
+            ),
+            "code": "bad_run_budget",
+        }
+
+    if not webhook_url and not async_requested:
+        result = native_review_result(
+            launcher, provider, model, prompt, resolved,
+            run_budget_seconds=run_budget_seconds,
+        )
         if result.get("code") == "not_implemented":
             return 501, result
         if result.get("code") == "timeout":
@@ -2741,6 +2766,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "repo": name,
             "cwd": str(resolved),
             "prompt": prompt,
+            "run_budget_seconds": run_budget_seconds,
             "response_webhook_url": webhook_url,
             "response_webhook_token": webhook_token,
             "resume_url": webhook_url,
