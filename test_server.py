@@ -9830,6 +9830,8 @@ class CodeOffTests(unittest.TestCase):
             "logic.filter": {"pass", "fail"},
             "logic.switch": {"case-0", "default"},
             "logic.join.any": {"out"},
+            "logic.join.all": {"out"},
+            "action.wait.webhook": {"pending", "out", "timeout", "failure"},
         }
         for edge in edges:
             self.assertEqual(edge.get("targetHandle"), "in", edge)
@@ -9840,25 +9842,60 @@ class CodeOffTests(unittest.TestCase):
 
         self.assertIn(("trigger", "out", "prepare"), triples)
         self.assertIn(("prepare", "success", "switch_prepare"), triples)
-        self.assertIn(("switch_prepare", "default", "author_1"), triples)
+        self.assertIn(("switch_prepare", "default", "wait_author_1"), triples)
         self.assertIn(("switch_prepare", "case-0", "join_terminal"), triples)
         waits = {
             "wait_author_1": "author_1", "wait_author_2": "author_2",
             "wait_judge_fable": "judge_fable", "wait_judge_1": "judge_1", "wait_judge_2": "judge_2",
         }
-        self.assertEqual(
-            {node_id for node_id, node in nodes.items() if node["type"] == "action.graphwing.POST:/v1/agent/jobs/wait"},
-            set(waits),
-        )
+        wait_filters = {
+            "wait_author_1": "author_ok_1", "wait_author_2": "author_ok_2",
+            "wait_judge_fable": "judge_ok_fable", "wait_judge_1": "judge_ok_1", "wait_judge_2": "judge_ok_2",
+        }
+        success_targets = {
+            "author_1": {"wait_author_2"}, "author_2": set(),
+            "judge_fable": {"wait_judge_1"}, "judge_1": {"wait_judge_2"}, "judge_2": set(),
+        }
+        targets = lambda source, handle: {
+            edge["target"] for edge in edges if edge["source"] == source and edge["sourceHandle"] == handle
+        }
+        self.assertFalse(any(node["type"] == "action.graphwing.POST:/v1/agent/jobs/wait" for node in nodes.values()))
         for wait, launch in waits.items():
-            self.assertEqual(nodes[wait]["type"], "action.graphwing.POST:/v1/agent/jobs/wait")
-            self.assertEqual(nodes[wait]["config"]["job_id"], f"{{{{ TASKS.{launch}.data.job_id }}}}")
-            self.assertNotIn("response_webhook_url", nodes[launch]["config"])
-        self.assertIn(("author_1", "success", "author_2"), triples)
-        self.assertIn(("author_2", "success", "wait_author_1"), triples)
-        self.assertIn(("judge_fable", "success", "judge_1"), triples)
-        self.assertIn(("judge_1", "success", "judge_2"), triples)
-        self.assertIn(("judge_2", "success", "wait_judge_fable"), triples)
+            self.assertEqual(nodes[wait]["type"], "action.wait.webhook")
+            self.assertEqual(nodes[wait]["config"], {
+                "alias": wait, "allowedMethods": ["POST"], "authMode": "token",
+                "responseStatus": 200, "timeoutSeconds": 1320,
+            })
+            self.assertEqual(nodes[launch]["config"]["response_webhook_url"], f"{{{{ TASKS.{wait}.pending.resumeUrl }}}}")
+            self.assertEqual(nodes[launch]["config"]["response_webhook_token"], f"{{{{ TASKS.{wait}.pending.resumeToken }}}}")
+            self.assertEqual(targets(wait, "pending"), {launch})
+            self.assertEqual(targets(wait, "out"), {wait_filters[wait]})
+            self.assertEqual(targets(wait, "failure"), {"join_terminal"})
+            self.assertEqual(targets(wait, "timeout"), {"join_terminal"})
+            self.assertEqual(targets(launch, "success"), success_targets[launch])
+            self.assertEqual(
+                {(edge["source"], edge["sourceHandle"]) for edge in edges if edge["target"] == wait_filters[wait]},
+                {(wait, "out")},
+            )
+            self.assertEqual(nodes[wait_filters[wait]]["config"], {
+                "group": "AND", "rules": [{"path": "request.body.status", "op": "equals", "value": "ok"}],
+            })
+            self.assertGreaterEqual(nodes[wait]["config"]["timeoutSeconds"], server.CODEOFF_TERMINAL_DRAIN_SECONDS)
+        self.assertIn(("author_1", "success", "wait_author_2"), triples)
+        self.assertIn(("blind", "success", "wait_judge_fable"), triples)
+        self.assertIn(("judge_fable", "success", "wait_judge_1"), triples)
+        self.assertIn(("judge_1", "success", "wait_judge_2"), triples)
+        self.assertEqual(nodes["join_candidates"]["type"], "logic.join.all")
+        self.assertEqual(nodes["join_judges"]["type"], "logic.join.all")
+        incoming = lambda target: {
+            (edge["source"], edge["sourceHandle"]) for edge in edges if edge["target"] == target
+        }
+        self.assertEqual(incoming("join_candidates"), {("test_1", "success"), ("test_2", "success")})
+        self.assertEqual(incoming("blind"), {("join_candidates", "out")})
+        self.assertEqual(incoming("join_judges"), {
+            ("receipt_fable", "success"), ("receipt_1", "success"), ("receipt_2", "success"),
+        })
+        self.assertEqual(incoming("aggregate"), {("join_judges", "out")})
         for filter_id in ("author_ok_1", "author_ok_2", "judge_ok_fable", "judge_ok_1", "judge_ok_2", "eligible", "final_verified"):
             self.assertIn((filter_id, "fail", "join_terminal"), triples, filter_id)
         forward = {}
@@ -9875,12 +9912,8 @@ class CodeOffTests(unittest.TestCase):
                         walk(child, path + [node])
             walk("trigger", [])
             return found
-        for wait in ("wait_author_1", "wait_author_2"):
-            self.assertTrue(paths_to(wait), wait)
-            self.assertTrue(all({"author_1", "author_2"} <= set(path) for path in paths_to(wait)), wait)
-        for wait in ("wait_judge_fable", "wait_judge_1", "wait_judge_2"):
-            self.assertTrue(paths_to(wait), wait)
-            self.assertTrue(all({"judge_fable", "judge_1", "judge_2"} <= set(path) for path in paths_to(wait)), wait)
+        self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
+        self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
         self.assertEqual(leaves, {"done", "terminal", "terminal_error", "success_confirmation_error"})
         for leaf in leaves:
@@ -9896,9 +9929,6 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(nodes["terminal_error"]["type"], "transforms.objectBuilder")
         self.assertEqual(nodes["success_confirmation_error"]["type"], "transforms.objectBuilder")
         self.assertGreater(nodes["terminalize_failed"]["config"]["timeout"], server.CODEOFF_TERMINAL_DRAIN_SECONDS)
-        for wait in waits:
-            self.assertGreater(nodes[wait]["config"]["timeout"], nodes[wait]["config"]["timeout_seconds"])
-            self.assertGreaterEqual(nodes[wait]["config"]["timeout_seconds"], server.CODEOFF_TERMINAL_DRAIN_SECONDS)
         self.assertFalse(any("merge" in node["type"].lower() for node in nodes.values()))
 
         openapi = json.loads(server.openapi_bytes())
@@ -9944,11 +9974,11 @@ class CodeOffTests(unittest.TestCase):
             expected_target = {"terminalize_failed": "terminal_error", "terminalize_success": "success_confirmation_error"}.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
-        self.assertEqual(nodes["freeze_1"]["config"]["job_id"], "{{ TASKS.wait_author_1.data.job_id }}")
-        self.assertEqual(nodes["freeze_2"]["config"]["job_id"], "{{ TASKS.wait_author_2.data.job_id }}")
-        self.assertEqual(nodes["receipt_fable"]["config"]["job_id"], "{{ TASKS.wait_judge_fable.data.job_id }}")
-        self.assertEqual(nodes["receipt_1"]["config"]["job_id"], "{{ TASKS.wait_judge_1.data.job_id }}")
-        self.assertEqual(nodes["receipt_2"]["config"]["job_id"], "{{ TASKS.wait_judge_2.data.job_id }}")
+        self.assertEqual(nodes["freeze_1"]["config"]["job_id"], "{{ TASKS.wait_author_1.request.body.job_id }}")
+        self.assertEqual(nodes["freeze_2"]["config"]["job_id"], "{{ TASKS.wait_author_2.request.body.job_id }}")
+        self.assertEqual(nodes["receipt_fable"]["config"]["job_id"], "{{ TASKS.wait_judge_fable.request.body.job_id }}")
+        self.assertEqual(nodes["receipt_1"]["config"]["job_id"], "{{ TASKS.wait_judge_1.request.body.job_id }}")
+        self.assertEqual(nodes["receipt_2"]["config"]["job_id"], "{{ TASKS.wait_judge_2.request.body.job_id }}")
         self.assertEqual(nodes["commit"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
         self.assertEqual(nodes["push"]["config"]["final_verification_hash"], "{{ TASKS.finalize.data.receipt_hash }}")
 
