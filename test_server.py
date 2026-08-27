@@ -2570,10 +2570,11 @@ while True:
         with self.assertRaises(ProcessLookupError):
             os.kill(capture["pid"], 0)
 
-    def test_grok_acp_cleanup_timeout_fails_valid_turn_and_kills_child(self):
+    def test_grok_acp_cleanup_timeout_preserves_valid_turn_and_kills_child(self):
         saved, capture, _ = self._run_grok_fixture({"hang_after_method": "session/prompt"})
-        self.assertEqual(saved["status"], "failed")
-        self.assertEqual(saved["receipt"]["status"], "timeout")
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["status"], "ok")
+        self.assertEqual(saved["receipt"]["summary"], "done")
         with self.assertRaises(ProcessLookupError):
             os.kill(capture["pid"], 0)
 
