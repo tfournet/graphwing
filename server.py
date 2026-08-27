@@ -4433,13 +4433,14 @@ def run_grok_acp(
             proc.stdin.close()
         except OSError:
             pass
+        killed_for_teardown = False
         try:
             exit_code = proc.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
-            timed_out = True
+            killed_for_teardown = True
             _kill_proc(proc)
             exit_code = proc.returncode
-        if exit_code not in (None, 0):
+        if not killed_for_teardown and exit_code not in (None, 0):
             returncode = exit_code
             if error is None:
                 error = f"Grok ACP process exited {exit_code}"
