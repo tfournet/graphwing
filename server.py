@@ -4213,7 +4213,7 @@ def run_grok_acp(
     deadline = time.monotonic() + int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET)
     request_id = 0
     wire = b""
-    wire_bytes = 0
+    logged_bytes = 0
     chunks: list[str] = []
     chunk_bytes = 0
     session_id: str | None = (job.get("session_identity") or {}).get("native_session_id")
@@ -4232,7 +4232,7 @@ def run_grok_acp(
             sent += written
 
     def read_message(log: Any) -> dict[str, Any]:
-        nonlocal wire, wire_bytes
+        nonlocal wire, logged_bytes
         while b"\n" not in wire:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
@@ -4242,12 +4242,16 @@ def run_grok_acp(
                 code = proc.poll()
                 raise RuntimeError(f"Grok ACP process exited {code if code is not None else 'early'}")
             wire += part
-            wire_bytes += len(part)
-            if len(wire) > CMD_MAX_BYTES or wire_bytes > CMD_MAX_BYTES:
+            if b"\n" not in wire and len(wire) > CMD_MAX_BYTES:
                 raise ValueError("Grok ACP wire exceeded output limit")
         raw, wire = wire.split(b"\n", 1)
-        log.write(raw + b"\n")
-        log.flush()
+        if len(raw) > CMD_MAX_BYTES:
+            raise ValueError("Grok ACP wire exceeded output limit")
+        entry = raw + b"\n"
+        if logged_bytes + len(entry) <= CMD_MAX_BYTES:
+            log.write(entry)
+            log.flush()
+            logged_bytes += len(entry)
         try:
             message = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
