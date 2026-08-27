@@ -108,6 +108,7 @@ GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/mcp_initialized",
     "_x.ai/models/update",
     "_x.ai/session_notification",
+    "_x.ai/sessions/changed",
     "_x.ai/settings/update",
 })
 CODEOFF_PROTOCOL_VERSION = "code-off-v1"
