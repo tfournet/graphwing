@@ -4284,7 +4284,8 @@ def run_grok_acp(
                         chunks.append(text)
                 continue
             if message.get("method") in (
-                "_x.ai/mcp/servers_updated", "_x.ai/models/update", "_x.ai/settings/update"
+                "_x.ai/mcp/servers_updated", "_x.ai/models/update", "_x.ai/settings/update",
+                "_x.ai/announcements/update",
             ):
                 if any(key in message for key in ("id", "result", "error")):
                     raise ValueError("malformed Grok vendor notification")
