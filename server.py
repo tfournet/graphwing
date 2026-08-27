@@ -4283,7 +4283,9 @@ def run_grok_acp(
                             raise ValueError("Grok assistant output exceeded limit")
                         chunks.append(text)
                 continue
-            if message.get("method") in ("_x.ai/mcp/servers_updated", "_x.ai/models/update"):
+            if message.get("method") in (
+                "_x.ai/mcp/servers_updated", "_x.ai/models/update", "_x.ai/settings/update"
+            ):
                 if any(key in message for key in ("id", "result", "error")):
                     raise ValueError("malformed Grok vendor notification")
                 continue

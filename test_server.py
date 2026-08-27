@@ -2022,7 +2022,9 @@ while True:
     else: result = {}
     send({"jsonrpc":"2.0","id":response_id(request),"result":result})
     if cfg.get("notification_after_method") == method:
-        send({"jsonrpc":"2.0","method":cfg.get("notification_method", "_x.ai/mcp/servers_updated"), **({"id":99} if cfg.get("notification_has_id") else {})})
+        notification = {"jsonrpc":"2.0","method":cfg.get("notification_method", "_x.ai/mcp/servers_updated"), **({"id":99} if cfg.get("notification_has_id") else {})}
+        notification.update(cfg.get("notification_fields", {}))
+        send(notification)
     if cfg.get("exit_after_method") == method: sys.exit(cfg.get("exit_code", 7))
     if cfg.get("hang_after_method") == method:
         while True: time.sleep(1)
@@ -2147,6 +2149,33 @@ while True:
         })
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["receipt"]["summary"], "done")
+
+    def test_grok_acp_accepts_vendor_settings_update_notification(self):
+        saved, _capture, _jdir = self._run_grok_fixture({
+            "notification_after_method": "authenticate",
+            "notification_method": "_x.ai/settings/update",
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertEqual(saved["receipt"]["summary"], "done")
+
+    def test_grok_acp_rejects_settings_update_with_response_fields(self):
+        for field, value in (("id", 99), ("result", {}), ("error", {"code": -1})):
+            with self.subTest(field=field):
+                saved, _capture, _jdir = self._run_grok_fixture({
+                    "notification_after_method": "authenticate",
+                    "notification_method": "_x.ai/settings/update",
+                    "notification_fields": {field: value},
+                })
+                self.assertEqual(saved["status"], "failed")
+                self.assertIn("malformed Grok vendor notification", saved["receipt"]["summary"])
+
+    def test_grok_acp_rejects_unknown_vendor_notification_method(self):
+        saved, _capture, _jdir = self._run_grok_fixture({
+            "notification_after_method": "authenticate",
+            "notification_method": "_x.ai/settings/unknown",
+        })
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
 
     def test_grok_acp_rejects_model_update_with_response_fields(self):
         saved, _capture, _jdir = self._run_grok_fixture({
