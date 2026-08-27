@@ -2167,6 +2167,7 @@ while True:
             "_x.ai/mcp/init_progress",
             "_x.ai/mcp/server_status",
             "_x.ai/session_notification",
+            "_x.ai/sessions/changed",
         )
         for method in methods:
             with self.subTest(method=method):
@@ -2264,6 +2265,7 @@ while True:
             "_x.ai/mcp/init_progress",
             "_x.ai/mcp/server_status",
             "_x.ai/session_notification",
+            "_x.ai/sessions/changed",
         )
         response_fields = (("id", 99), ("result", {}), ("error", {"code": -1}))
         for method in methods:
@@ -2281,12 +2283,14 @@ while True:
                     )
 
     def test_grok_acp_rejects_unknown_vendor_notification_method(self):
-        saved, _capture, _jdir = self._run_grok_fixture({
-            "notification_after_method": "authenticate",
-            "notification_method": "_x.ai/settings/unknown",
-        })
-        self.assertEqual(saved["status"], "failed")
-        self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
+        for method in ("_x.ai/settings/unknown", "_x.ai/sessions/changed/extra"):
+            with self.subTest(method=method):
+                saved, _capture, _jdir = self._run_grok_fixture({
+                    "notification_after_method": "authenticate",
+                    "notification_method": method,
+                })
+                self.assertEqual(saved["status"], "failed")
+                self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
 
     def test_grok_acp_command_uses_the_requested_immutable_model(self):
         saved, capture, _ = self._run_grok_fixture(model="grok-fixture-immutable")
