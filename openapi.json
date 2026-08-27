@@ -1378,6 +1378,8 @@
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"], "description": "Must belong to the selected launcher/provider; mismatches fail with bad_model_identity." },
           "prompt": { "type": "string" },
+          "async": { "type": "boolean", "default": false, "description": "Queue a durable review job even when no response webhook is supplied." },
+          "run_budget_seconds": { "type": "integer", "minimum": 30, "maximum": 600, "default": 200 },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
