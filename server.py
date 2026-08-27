@@ -100,6 +100,16 @@ NATIVE_LAUNCHERS = {
     "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
     "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
+GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
+    "_x.ai/announcements/update",
+    "_x.ai/mcp/init_progress",
+    "_x.ai/mcp/server_status",
+    "_x.ai/mcp/servers_updated",
+    "_x.ai/mcp_initialized",
+    "_x.ai/models/update",
+    "_x.ai/session_notification",
+    "_x.ai/settings/update",
+})
 CODEOFF_PROTOCOL_VERSION = "code-off-v1"
 CODEOFF_CATEGORY_VERSION = "code-category-v1"
 CODEOFF_DRAW_VERSION = "code-off-draw-v1"
@@ -4283,10 +4293,7 @@ def run_grok_acp(
                             raise ValueError("Grok assistant output exceeded limit")
                         chunks.append(text)
                 continue
-            if message.get("method") in (
-                "_x.ai/mcp/servers_updated", "_x.ai/models/update", "_x.ai/settings/update",
-                "_x.ai/announcements/update",
-            ):
+            if message.get("method") in GROK_VENDOR_NOTIFICATION_METHODS:
                 if any(key in message for key in ("id", "result", "error")):
                     raise ValueError("malformed Grok vendor notification")
                 continue
