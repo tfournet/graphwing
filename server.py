@@ -4214,6 +4214,7 @@ def run_grok_acp(
     chunks: list[str] = []
     chunk_bytes = 0
     session_id: str | None = (job.get("session_identity") or {}).get("native_session_id")
+    pending_session_id: str | None = None
 
     def write_message(message: dict[str, Any]) -> None:
         payload = (json.dumps(message) + "\n").encode()
@@ -4253,7 +4254,7 @@ def run_grok_acp(
         return message
 
     def request(log: Any, method: str, params: dict[str, Any], collect: bool = False) -> dict[str, Any]:
-        nonlocal request_id, chunk_bytes
+        nonlocal request_id, chunk_bytes, pending_session_id
         request_id += 1
         write_message({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         while True:
@@ -4278,8 +4279,23 @@ def run_grok_acp(
                 if (
                     not isinstance(update, dict)
                     or not isinstance(update.get("sessionUpdate"), str)
-                    or update_params.get("sessionId") != session_id
                 ):
+                    job["_adapter_failure_code"] = "session_identity_mismatch"
+                    raise ValueError("malformed or changed Grok session update")
+                update_session_id = update_params.get("sessionId")
+                if method == "session/new" and session_id is None:
+                    if (
+                        not isinstance(update_session_id, str)
+                        or not NATIVE_SESSION_RE.fullmatch(update_session_id)
+                    ):
+                        job["_adapter_failure_code"] = "session_identity_mismatch"
+                        raise ValueError("malformed or changed Grok session update")
+                    if pending_session_id is None:
+                        pending_session_id = update_session_id
+                    elif update_session_id != pending_session_id:
+                        job["_adapter_failure_code"] = "session_identity_mismatch"
+                        raise ValueError("malformed or changed Grok session update")
+                elif session_id is None or update_session_id != session_id:
                     job["_adapter_failure_code"] = "session_identity_mismatch"
                     raise ValueError("malformed or changed Grok session update")
                 if update.get("sessionUpdate") == "agent_message_chunk":
@@ -4360,7 +4376,12 @@ def run_grok_acp(
                 if not isinstance(candidate, str) or not NATIVE_SESSION_RE.fullmatch(candidate.strip()):
                     job["_adapter_failure_code"] = "session_identity_missing"
                     raise ValueError("missing structured Grok session identity")
-                session_id = candidate.strip()
+                candidate = candidate.strip()
+                if pending_session_id is not None and candidate != pending_session_id:
+                    job["_adapter_failure_code"] = "session_identity_mismatch"
+                    raise ValueError("Grok session identity changed during creation")
+                session_id = candidate
+                pending_session_id = None
             prompted = request(stdout_f, "session/prompt", {
                 "sessionId": session_id,
                 "prompt": [{"type": "text", "text": path.joinpath("prompt.txt").read_text()}],
