@@ -107,6 +107,8 @@ GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/mcp/servers_updated",
     "_x.ai/mcp_initialized",
     "_x.ai/models/update",
+    "_x.ai/queue/changed",
+    "_x.ai/session/prompt_complete",
     "_x.ai/session_notification",
     "_x.ai/sessions/changed",
     "_x.ai/settings/update",

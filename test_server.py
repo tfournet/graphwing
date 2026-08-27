@@ -2166,6 +2166,8 @@ while True:
             "_x.ai/mcp_initialized",
             "_x.ai/mcp/init_progress",
             "_x.ai/mcp/server_status",
+            "_x.ai/queue/changed",
+            "_x.ai/session/prompt_complete",
             "_x.ai/session_notification",
             "_x.ai/sessions/changed",
         )
@@ -2264,6 +2266,8 @@ while True:
             "_x.ai/mcp_initialized",
             "_x.ai/mcp/init_progress",
             "_x.ai/mcp/server_status",
+            "_x.ai/queue/changed",
+            "_x.ai/session/prompt_complete",
             "_x.ai/session_notification",
             "_x.ai/sessions/changed",
         )
@@ -2283,7 +2287,13 @@ while True:
                     )
 
     def test_grok_acp_rejects_unknown_vendor_notification_method(self):
-        for method in ("_x.ai/settings/unknown", "_x.ai/sessions/changed/extra"):
+        methods = (
+            "_x.ai/settings/unknown",
+            "_x.ai/sessions/changed/extra",
+            "_x.ai/queue/changed/extra",
+            "_x.ai/session/prompt_complete/extra",
+        )
+        for method in methods:
             with self.subTest(method=method):
                 saved, _capture, _jdir = self._run_grok_fixture({
                     "notification_after_method": "authenticate",
