@@ -5004,6 +5004,108 @@ while True:
             "ee0d6e700b8664c66282034a58048f9ef6435dac173382dbc4cc86f59e4c3450",
         )
 
+    def test_slice_route_current_matrix_is_frozen(self):
+        writers = {
+            "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
+            "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
+            "research_ops": ("grok", "xai", "grok-4.6", "default"),
+        }
+        reviewers = {
+            "openai": (
+                ("claude", "anthropic", "claude-sonnet-5", "default"),
+                ("grok", "xai", "grok-4.6", "default"),
+            ),
+            "anthropic": (
+                ("codex", "openai", "gpt-5.6-sol", "high"),
+                ("grok", "xai", "grok-4.6", "default"),
+            ),
+            "xai": (
+                ("codex", "openai", "gpt-5.6-sol", "high"),
+                ("claude", "anthropic", "claude-opus-5", "default"),
+            ),
+        }
+        # With seams omitted, normal-v1 treats every visual floor below L as a
+        # one-step bump. This surprising behavior is intentionally characterized.
+        matrix = {
+            ("mechanical", "S"): ("S", 10, 120, 0),
+            ("mechanical", "M"): ("M", 30, 300, 1),
+            ("mechanical", "L"): ("L", 50, 600, 1),
+            ("visual", "S"): ("M", 30, 600, 1),
+            ("visual", "M"): ("L", 50, 900, 1),
+            ("visual", "L"): ("L", 50, 900, 1),
+            ("sensitive", "S"): ("S", 10, 180, 2),
+            ("sensitive", "M"): ("M", 30, 600, 2),
+            ("sensitive", "L"): ("L", 50, 900, 2),
+        }
+        for work_kind, writer in writers.items():
+            for (class_name, size_floor), (size, turns, wall, review_count) in matrix.items():
+                with self.subTest(work_kind=work_kind, class_name=class_name, size=size_floor):
+                    route = server.slice_route_lookup(class_name, size_floor, work_kind=work_kind)
+                    self.assertEqual(route["route_version"], "normal-v1")
+                    self.assertEqual(route["work_kind"], work_kind)
+                    self.assertEqual(route["class"], class_name)
+                    self.assertEqual(route["size_floor"], size_floor)
+                    self.assertEqual(route["size"], size)
+                    self.assertEqual(
+                        tuple(route[key] for key in ("launcher", "provider", "model", "effort")),
+                        writer,
+                    )
+                    self.assertEqual(route["reason"], f"work_kind={work_kind}")
+                    self.assertEqual(route["max_turns"], turns)
+                    self.assertEqual(route["run_budget_seconds"], wall)
+                    for index in (1, 2):
+                        actual = tuple(
+                            route[f"reviewer{index}_{key}"]
+                            for key in ("launcher", "provider", "model", "effort")
+                        )
+                        expected = reviewers[writer[1]][index - 1] if index <= review_count else (
+                            "none", "none", "none", "none"
+                        )
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(route[f"reviewer{index}"], expected[2])
+                    self.assertEqual(
+                        sum(route[f"reviewer{index}_launcher"] != "none" for index in (1, 2)),
+                        review_count,
+                    )
+
+        bump_cases = (
+            ("mechanical", "S", None, None, "S"),
+            ("mechanical", "S", 5, None, "S"),
+            ("mechanical", "S", 6, None, "M"),
+            ("mechanical", "M", 6, None, "L"),
+            ("mechanical", "L", 6, None, "L"),
+            ("visual", "S", None, None, "M"),
+            ("visual", "S", None, 1, "M"),
+            ("visual", "S", None, 0, "S"),
+            ("visual", "S", None, 2, "S"),
+            ("visual", "S", 6, 0, "M"),
+        )
+        for class_name, floor, ac_count, seams, expected_size in bump_cases:
+            with self.subTest(class_name=class_name, floor=floor, ac_count=ac_count, seams=seams):
+                route = server.slice_route_lookup(
+                    class_name, floor, ac_count=ac_count, seams=seams, work_kind="go_coding"
+                )
+                self.assertEqual(route["size"], expected_size)
+
+        spec = json.loads(server.openapi_bytes())
+        agent_request = spec["components"]["schemas"]["AgentRunRequest"]
+        self.assertFalse(agent_request["additionalProperties"])
+        self.assertNotIn("effort", agent_request["properties"])
+        status, payload = server.agent_run(json.dumps({"effort": "high"}).encode(), {})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "unexpected_fields")
+        self.assertEqual(payload["fields"], ["effort"])
+
+        root = Path(server.__file__).resolve().parent
+        checked_nodes = []
+        for graph_path in sorted((root / "graphs").glob("*.json")):
+            graph = json.loads(graph_path.read_text())
+            for node in graph["spec"]["nodes"]:
+                if node["type"].endswith(("/v1/agent/run", "/v1/review/run")):
+                    checked_nodes.append((graph_path.name, node["id"]))
+                    self.assertNotIn("effort", node.get("config", {}), (graph_path.name, node["id"]))
+        self.assertTrue(checked_nodes)
+
     def test_availability_fallback_route_locked_matrix_and_reviewers(self):
         expected = {
             "go_coding": (("codex", "openai", "gpt-5.6-sol"), ("claude", "anthropic", "claude-opus-5", "default")),
