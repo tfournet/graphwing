@@ -175,6 +175,7 @@ CODEOFF_DRAW_VERSION = "code-off-draw-v1"
 CODEOFF_POLICY_VERSION = "code-off-policy-v1"
 CODEOFF_AGGREGATION_VERSION = "code-off-aggregation-v1"
 CODEOFF_RUBRIC_VERSION = "code-off-rubric-v1"
+CODEOFF_EXECUTION_MANIFEST_VERSION = "code-off-execution-manifest-v1"
 CODEOFF_AUTHOR_POOL = ["grok", "sol", "terra", "sonnet", "opus"]
 CODEOFF_CATEGORIES = frozenset({"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
 CODEOFF_TAGS = frozenset({"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
@@ -353,6 +354,8 @@ REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SESSION_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 JOB_LOCK = threading.Lock()
+JOB_RECORD_LOCKS_LOCK = threading.Lock()
+JOB_RECORD_LOCKS: dict[str, threading.RLock] = {}
 REPO_LOCKS_LOCK = threading.Lock()
 REPO_LOCKS: dict[str, threading.RLock] = {}
 RUNS_LOCK = threading.Lock()
@@ -3541,7 +3544,14 @@ def job_path(job_id: str) -> Path:
     return job_dir(job_id) / "job.json"
 
 
-def read_job(job_id: str) -> dict[str, Any] | None:
+def job_record_lock(job_id: str) -> threading.RLock:
+    """Serialize trusted daemon writers for one ephemeral job record."""
+    key = str(job_path(job_id).resolve())
+    with JOB_RECORD_LOCKS_LOCK:
+        return JOB_RECORD_LOCKS.setdefault(key, threading.RLock())
+
+
+def _read_job_unlocked(job_id: str) -> dict[str, Any] | None:
     path = job_path(job_id)
     if not path.is_file():
         return None
@@ -3552,12 +3562,26 @@ def read_job(job_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def write_job(job: dict[str, Any]) -> None:
+def read_job(job_id: str) -> dict[str, Any] | None:
+    with job_record_lock(job_id):
+        return _read_job_unlocked(job_id)
+
+
+def _write_job_unlocked(job: dict[str, Any]) -> None:
     path = job_path(job["job_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(job, indent=2) + "\n")
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(job, indent=2) + "\n")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def write_job(job: dict[str, Any]) -> None:
+    job_id = job["job_id"]
+    with job_record_lock(job_id):
+        _write_job_unlocked(job)
 
 
 AGENT_PROFILE_FIELDS = (
@@ -3680,6 +3704,7 @@ def agent_execution_snapshot(job: Any) -> dict[str, Any] | None:
         for key in (
             "job_id", "kind", "repo", "cwd", "launcher", "provider", "model",
             "requested_effort", "effective_effort", "effort_source", "launcher_version",
+            "branch", "starting_head", "launch_native_session_id",
             "max_turns", "run_budget_seconds", "codeoff_workspace", "prompt_hash",
             "git_baseline", "resume_job_id", "response_webhook_url",
             "response_webhook_token", "resume_url",
@@ -3695,6 +3720,159 @@ def agent_execution_snapshot(job: Any) -> dict[str, Any] | None:
 
 def agent_record_matches_execution_snapshot(job: Any, snapshot: dict[str, Any]) -> bool:
     return agent_execution_snapshot(job) == snapshot
+
+
+def _agent_provenance_failure_receipt(job_id: str) -> dict[str, Any]:
+    classified = classify_agent_failure("session_provenance_invalid")
+    return {
+        "status": "error", "job_id": job_id,
+        **{key: None for key in AGENT_PROFILE_FIELDS}, "session_identity": None,
+        "summary": classified["diagnostic"]["summary"], **classified,
+    }
+
+
+def agent_mark_running(
+    job_id: str, snapshot: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Atomically claim a queued agent record for this worker."""
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if (
+            current is None or current.get("status") != "queued"
+            or not agent_record_matches_execution_snapshot(current, snapshot)
+        ):
+            return None
+        current["status"] = "running"
+        current["started_at"] = utcnow()
+        _write_job_unlocked(current)
+        return current
+
+
+def agent_update_running(
+    job_id: str, snapshot: dict[str, Any], updates: dict[str, Any]
+) -> bool:
+    """Apply operational bookkeeping without accepting identity replacement."""
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if (
+            current is None or current.get("status") != "running"
+            or not agent_record_matches_execution_snapshot(current, snapshot)
+        ):
+            return False
+        current.update(updates)
+        _write_job_unlocked(current)
+        return True
+
+
+def agent_terminal_transition(
+    job_id: str,
+    snapshot: dict[str, Any],
+    receipt: dict[str, Any],
+    execution_identity: dict[str, Any] | None,
+    returncode: int,
+    timed_out: bool,
+    error: str | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Validate and install one terminal result in one per-job critical section.
+
+    A trusted daemon writer that replaced or terminalized the record wins.  An
+    alien record is never overwritten; a still-agent drift is closed with a
+    sanitized receipt while preserving the drifted immutable fields for audit.
+    """
+    codeoff_context = CODEOFF_LOCK if isinstance(snapshot.get("codeoff_workspace"), dict) else nullcontext()
+    # Match launch ordering: enclosing code-off evidence, then one job record.
+    with codeoff_context, job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if not (
+            current is not None and current.get("status") == "running"
+            and agent_record_matches_execution_snapshot(current, snapshot)
+        ):
+            if (
+                isinstance(current, dict) and current.get("job_id") == job_id
+                and current.get("kind") == "agent"
+                and current.get("status") in ("queued", "running")
+            ):
+                failure = _agent_provenance_failure_receipt(job_id)
+                current.update({
+                    "status": "failed", "finished_at": utcnow(),
+                    "receipt": failure,
+                    "error": "persisted agent execution identity changed during execution",
+                    "returncode": returncode,
+                })
+                current.pop("execution_identity", None)
+                _write_job_unlocked(current)
+                return current, False
+            return None, False
+
+        terminal_receipt = json.loads(json.dumps(receipt))
+        if isinstance(terminal_receipt.get("session_identity"), dict):
+            current["session_identity"] = dict(terminal_receipt["session_identity"])
+        if terminal_receipt["status"] == "ok" and current.get("git_baseline"):
+            try:
+                with repo_lock(Path(current["cwd"])):
+                    staging_err = stage_writer_changes(current)
+            except Exception:
+                staging_err = {
+                    "error": "Graphwing could not verify or stage writer paths",
+                    "code": "repository_mismatch",
+                }
+            if staging_err:
+                terminal_receipt["status"] = "error"
+                terminal_receipt["summary"] = staging_failure_summary(staging_err)
+                current["error"] = staging_failure_summary(staging_err)
+                terminal_receipt.update(classify_agent_failure("repository_mismatch"))
+        terminal_receipt["summary"] = terminal_receipt["diagnostic"]["summary"]
+        current["finished_at"] = utcnow()
+        current["returncode"] = returncode
+        current["receipt"] = terminal_receipt
+        if error:
+            current["error"] = error
+        if execution_identity is not None and terminal_receipt["status"] == "ok":
+            current["execution_identity"] = execution_identity
+        else:
+            current.pop("execution_identity", None)
+        if (
+            terminal_receipt["status"] == "ok" and current.get("codeoff_workspace")
+            and not _codeoff_record_terminal_manifest_locked(current, terminal_receipt)
+        ):
+            terminal_receipt = _agent_provenance_failure_receipt(job_id)
+            current["receipt"] = terminal_receipt
+            current["error"] = "code-off terminal execution manifest could not be bound"
+            current.pop("execution_identity", None)
+        current["status"] = "completed" if terminal_receipt["status"] == "ok" else "failed"
+        if timed_out:
+            current["error"] = "agent run budget exceeded"
+        elif terminal_receipt["status"] != "ok" and not current.get("error"):
+            current["error"] = terminal_receipt.get("summary") or f"agent exited {returncode}"
+        _write_job_unlocked(current)
+        return current, True
+
+
+def agent_store_webhook_result(
+    job_id: str, snapshot: dict[str, Any], receipt: dict[str, Any], hook: dict[str, Any]
+) -> bool:
+    """Store callback bookkeeping only if the guarded terminal record remains."""
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if not isinstance(current, dict) or current.get("kind") != "agent":
+            return False
+        current_snapshot = agent_execution_snapshot(current)
+        if current_snapshot is not None:
+            current_identity = current_snapshot.get("session_identity")
+            expected_identity = snapshot.get("session_identity")
+            if isinstance(current_identity, dict) and isinstance(expected_identity, dict):
+                current_identity["native_session_id"] = expected_identity.get("native_session_id")
+        immutable_matches = current_snapshot == snapshot
+        provenance_failure = receipt.get("failure_code") == "session_provenance_invalid"
+        if not (
+            (immutable_matches or provenance_failure)
+            and current.get("status") in ("completed", "failed")
+            and current.get("receipt") == receipt
+        ):
+            return False
+        current["webhook"] = hook
+        _write_job_unlocked(current)
+        return True
 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3787,8 +3965,11 @@ def recover_interrupted_agent_jobs() -> int:
     """At process startup only, close process-owned jobs no process can still own."""
     recovered: list[dict[str, Any]] = []
     with JOB_LOCK:
-        for path in JOBS_DIR.glob("*/job.json") if JOBS_DIR.is_dir() else ():
-            job = read_job(path.parent.name) or {}
+        paths = list(JOBS_DIR.glob("*/job.json")) if JOBS_DIR.is_dir() else []
+    for path in paths:
+        candidate_id = path.parent.name
+        with job_record_lock(candidate_id):
+            job = _read_job_unlocked(candidate_id) or {}
             raw_kind = job.get("kind")
             kind = raw_kind if isinstance(raw_kind, str) else None
             launcher = job.get("launcher")
@@ -3808,7 +3989,7 @@ def recover_interrupted_agent_jobs() -> int:
                 "error": receipt["summary"], "returncode": None,
             })
             job.pop("pid", None)
-            write_job(job)
+            _write_job_unlocked(job)
             recovered.append(job)
     for job in recovered:
         try:
@@ -3816,8 +3997,18 @@ def recover_interrupted_agent_jobs() -> int:
         except Exception:
             delivered = {"ok": False}
         if delivered is not None:
-            job["webhook"] = {key: delivered[key] for key in ("ok", "status") if key in delivered}
-            write_job(job)
+            with job_record_lock(job["job_id"]):
+                current = _read_job_unlocked(job["job_id"])
+                if (
+                    isinstance(current, dict)
+                    and current.get("kind") == job.get("kind")
+                    and current.get("status") == "failed"
+                    and current.get("receipt") == job.get("receipt")
+                ):
+                    current["webhook"] = {
+                        key: delivered[key] for key in ("ok", "status") if key in delivered
+                    }
+                    _write_job_unlocked(current)
     return len(recovered)
 
 
@@ -4637,7 +4828,17 @@ def run_grok_acp(
         job["_adapter_failure_code"] = "spawn_failed"
         return 1, False, None, f"spawn failed: {exc}"
     job["pid"] = proc.pid
-    write_job(job)
+    if mode == "writer":
+        snapshot = agent_execution_snapshot(job)
+        if snapshot is None or not agent_update_running(job["job_id"], snapshot, {"pid": proc.pid}):
+            job["_adapter_failure_code"] = "session_provenance_invalid"
+            _kill_proc(proc)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+            return 1, False, None, "persisted agent execution identity changed during execution"
+    else:
+        write_job(job)
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
     def drain_stderr() -> None:
@@ -5097,26 +5298,41 @@ def run_agent_job(job_id: str) -> None:
     if not isinstance(job, dict) or job.get("kind") != "agent":
         return
     if not is_agent_job_record(job):
-        job["status"] = "failed"
-        job["started_at"] = job.get("started_at") or utcnow()
-        job["finished_at"] = utcnow()
-        job["error"] = "agent job provenance is invalid"
-        job["receipt"] = normalize_receipt(
+        expected = json.loads(json.dumps(job))
+        failure = normalize_receipt(
             job, {"status": "error"}, 1, False,
             evidence_code="session_provenance_invalid",
         )
-        write_job(job)
+        with job_record_lock(job_id):
+            current = _read_job_unlocked(job_id)
+            if current != expected:
+                return
+            current.update({
+                "status": "failed", "started_at": current.get("started_at") or utcnow(),
+                "finished_at": utcnow(), "error": "agent job provenance is invalid",
+                "receipt": failure,
+            })
+            _write_job_unlocked(current)
+            job = current
         hook = deliver_webhook(job, job["receipt"])
         if hook is not None:
-            job["webhook"] = hook
-            write_job(job)
+            with job_record_lock(job_id):
+                current = _read_job_unlocked(job_id)
+                if (
+                    isinstance(current, dict) and current.get("kind") == "agent"
+                    and current.get("status") == "failed"
+                    and current.get("receipt") == job.get("receipt")
+                ):
+                    current["webhook"] = hook
+                    _write_job_unlocked(current)
         herdr_job_done(job)
         return
     execution_snapshot = agent_execution_snapshot(job)
     assert execution_snapshot is not None
-    job["status"] = "running"
-    job["started_at"] = utcnow()
-    write_job(job)
+    claimed = agent_mark_running(job_id, execution_snapshot)
+    if claimed is None:
+        return
+    job = claimed
     binary = resolve_launcher_binary_now(str(job["launcher"]))
     try:
         with pinned_launcher(binary) as pinned:
@@ -5137,23 +5353,27 @@ def run_agent_job(job_id: str) -> None:
     except OSError:
         proc, err = None, {"error": "launcher artifact could not be pinned", "code": "launcher_version_mismatch"}
     if err:
-        job["status"] = "failed"
-        job["finished_at"] = utcnow()
-        job["error"] = err.get("error")
-        job["receipt"] = normalize_receipt(
+        receipt = normalize_receipt(
             job, {"status": "error", "summary": err.get("error")}, 1, False,
             evidence_code=str(err.get("code") or "unknown_failure"),
         )
-        write_job(job)
-        hook = deliver_webhook(job, job["receipt"])
-        if hook is not None:
-            job["webhook"] = hook
-        write_job(job)
-        herdr_job_done(job)
+        stored, transitioned = agent_terminal_transition(
+            job_id, execution_snapshot, receipt, None, 1, False,
+            str(err.get("error") or "agent launch failed"),
+        )
+        if isinstance(stored, dict) and stored.get("kind") == "agent":
+            terminal_receipt = stored.get("receipt")
+            if isinstance(terminal_receipt, dict):
+                hook = deliver_webhook(stored, terminal_receipt)
+                if hook is not None:
+                    agent_store_webhook_result(job_id, execution_snapshot, terminal_receipt, hook)
+            herdr_job_done(stored)
         return
     if proc is not None:
         job["pid"] = proc.pid
-        write_job(job)
+        if not agent_update_running(job_id, execution_snapshot, {"pid": proc.pid}):
+            _kill_proc(proc)
+            return
         timed_out = False
         wait_for = int(job.get("run_budget_seconds") or AGENT_RUN_BUDGET) + AGENT_PROCESS_WAIT_GRACE_SECONDS
         try:
@@ -5207,39 +5427,26 @@ def run_agent_job(job_id: str) -> None:
         receipt.update(classify_agent_failure("session_provenance_invalid"))
         receipt["summary"] = receipt["diagnostic"]["summary"]
         job["error"] = "persisted agent execution identity changed during execution"
-    assert isinstance(job, dict)
-    if isinstance(receipt.get("session_identity"), dict):
-        job["session_identity"] = dict(receipt["session_identity"])
-    if receipt["status"] == "ok" and job.get("git_baseline"):
-        try:
-            with repo_lock(Path(job["cwd"])):
-                staging_err = stage_writer_changes(job)
-        except Exception:
-            staging_err = {"error": "Graphwing could not verify or stage writer paths", "code": "repository_mismatch"}
-        if staging_err:
-            receipt["status"] = "error"
-            receipt["summary"] = staging_failure_summary(staging_err)
-            job["error"] = staging_failure_summary(staging_err)
-            receipt.update(classify_agent_failure("repository_mismatch"))
-    receipt["summary"] = receipt["diagnostic"]["summary"]
-    job["finished_at"] = utcnow()
-    job["returncode"] = returncode
-    job["receipt"] = receipt
-    if execution_identity is not None:
-        job["execution_identity"] = execution_identity
-    else:
-        job.pop("execution_identity", None)
-    job["status"] = "completed" if receipt["status"] == "ok" else "failed"
-    if timed_out:
-        job["error"] = "agent run budget exceeded"
-    elif receipt["status"] != "ok" and not job.get("error"):
-        job["error"] = receipt.get("summary") or f"agent exited {returncode}"
-    write_job(job)
-    hook = deliver_webhook(job, receipt)
+    stored, transitioned = agent_terminal_transition(
+        job_id, execution_snapshot, receipt, execution_identity, returncode, timed_out,
+        str(job["error"]) if job.get("error") else None,
+    )
+    if not transitioned:
+        if isinstance(stored, dict) and stored.get("kind") == "agent":
+            failure = stored.get("receipt")
+            if isinstance(failure, dict):
+                hook = deliver_webhook(job, failure)
+                if hook is not None:
+                    agent_store_webhook_result(job_id, execution_snapshot, failure, hook)
+            herdr_job_done(stored)
+        return
+    assert isinstance(stored, dict)
+    terminal_receipt = stored["receipt"]
+    hook = deliver_webhook(stored, terminal_receipt)
     if hook is not None:
-        job["webhook"] = hook
-    write_job(job)
-    herdr_job_done(job)
+        agent_store_webhook_result(job_id, execution_snapshot, terminal_receipt, hook)
+        stored = read_job(job_id) or stored
+    herdr_job_done(stored)
 
 
 def enqueue_agent(job: dict[str, Any]) -> None:
@@ -5545,6 +5752,142 @@ def _codeoff_read_artifact(root: Path, digest: str) -> bytes:
     if hashlib.sha256(data).hexdigest() != digest:
         raise CodeOffArtifactError("artifact hash mismatch")
     return data
+
+def _codeoff_launch_execution_manifest(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the complete server-validated launch authority for one slot."""
+    workspace = job.get("codeoff_workspace")
+    identity = job.get("session_identity")
+    required_job_fields = {
+        "job_id", "kind", "repo", "branch", "starting_head", "launcher", "provider",
+        "model", *AGENT_PROFILE_FIELDS, "launch_native_session_id", "codeoff_workspace",
+        "prompt_hash", "max_turns", "run_budget_seconds", "session_identity",
+    }
+    if not (
+        is_agent_job_record(job) and required_job_fields <= job.keys()
+        and isinstance(workspace, dict) and isinstance(identity, dict)
+        and all(job.get(key) == identity.get(key) for key in ("repo", "branch", "starting_head"))
+    ):
+        return None
+    slot = workspace.get("slot")
+    return {
+        "version": CODEOFF_EXECUTION_MANIFEST_VERSION,
+        "kind": "agent",
+        "work_role": "author" if isinstance(slot, str) and slot.startswith("author-") else "judge",
+        "experiment_id": workspace.get("experiment_id"),
+        "slot": slot,
+        "job_id": job.get("job_id"),
+        **{key: job.get(key) for key in AGENT_PROFILE_FIELDS},
+        "repo": identity.get("repo"),
+        "branch": identity.get("branch"),
+        "starting_head": identity.get("starting_head"),
+        "launch_native_session_id": job.get("launch_native_session_id"),
+        "codeoff_workspace": workspace,
+        "prompt_hash": job.get("prompt_hash"),
+        "max_turns": job.get("max_turns"),
+        "run_budget_seconds": job.get("run_budget_seconds"),
+    }
+
+def _codeoff_terminal_execution_manifest(
+    job: dict[str, Any], receipt: dict[str, Any]
+) -> dict[str, Any] | None:
+    launch = _codeoff_launch_execution_manifest(job)
+    session = job.get("session_identity")
+    execution = job.get("execution_identity")
+    if not (
+        launch is not None and receipt_profile_matches_job(job, receipt)
+        and isinstance(session, dict)
+        and isinstance(session.get("native_session_id"), str)
+        and NATIVE_SESSION_RE.fullmatch(session["native_session_id"])
+        and receipt.get("session_identity") == session
+        and isinstance(execution, dict)
+        and receipt.get("execution_identity") == execution
+    ):
+        return None
+    return {**launch, "native_session_id": session["native_session_id"], "execution_identity": execution}
+
+def _codeoff_execution_manifest_hashes(
+    root: Path, state: dict[str, Any], slot: str, job_id: str
+) -> tuple[str, str] | None:
+    """Resolve hashes from immutable events and corroborate mutable state."""
+    try:
+        events = _codeoff_events(root, state)
+    except (OSError, RuntimeError, json.JSONDecodeError):
+        return None
+    launches = [
+        event["data"].get("execution_manifest_hash")
+        for event in events
+        if event.get("kind") == "agent_launched"
+        and event.get("data", {}).get("slot") == slot
+        and event.get("data", {}).get("job_id") == job_id
+    ]
+    terminals = [
+        event["data"].get("execution_manifest_hash")
+        for event in events
+        if event.get("kind") == "agent_terminal_manifest"
+        and event.get("data", {}).get("slot") == slot
+        and event.get("data", {}).get("job_id") == job_id
+    ]
+    entry = state.get("execution_manifests", {}).get(slot, {}).get(job_id)
+    if not (
+        len(launches) == len(terminals) == 1
+        and isinstance(entry, dict)
+        and set(entry) == {"launch_manifest_hash", "terminal_manifest_hash"}
+        and entry.get("launch_manifest_hash") == launches[0]
+        and entry.get("terminal_manifest_hash") == terminals[0]
+        and all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in (*launches, *terminals)
+        )
+    ):
+        return None
+    return launches[0], terminals[0]
+
+def _codeoff_record_terminal_manifest_locked(
+    job: dict[str, Any], receipt: dict[str, Any]
+) -> bool:
+    """Bind provider-issued session attribution into immutable code-off evidence."""
+    workspace = job.get("codeoff_workspace")
+    if not isinstance(workspace, dict):
+        return True
+    root, manifest, state, err = _codeoff_load(workspace.get("experiment_id"), active=True)
+    if err or root is None or manifest is None or state is None:
+        return False
+    slot, job_id = workspace.get("slot"), job.get("job_id")
+    entry = state.get("execution_manifests", {}).get(slot, {}).get(job_id)
+    launch = _codeoff_launch_execution_manifest(job)
+    terminal = _codeoff_terminal_execution_manifest(job, receipt)
+    if not (
+        isinstance(slot, str) and isinstance(job_id, str)
+        and isinstance(entry, dict) and launch is not None and terminal is not None
+    ):
+        return False
+    try:
+        launch_hash = hashlib.sha256(codeoff_canonical_json(launch)).hexdigest()
+        if entry.get("launch_manifest_hash") != launch_hash:
+            return False
+        terminal_hash = _codeoff_artifact(root, codeoff_canonical_json(terminal))
+        prior = entry.get("terminal_manifest_hash")
+        if prior not in (None, terminal_hash):
+            return False
+        if prior == terminal_hash:
+            return True
+        entry["terminal_manifest_hash"] = terminal_hash
+        _codeoff_commit_event(root, state, "agent_terminal_manifest", {
+            "slot": slot, "job_id": job_id,
+            "execution_manifest_hash": terminal_hash,
+            "launch_manifest_hash": launch_hash,
+        })
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+def _codeoff_record_terminal_manifest(job: dict[str, Any]) -> bool:
+    """Fixture/recovery seam for an already persisted successful terminal job."""
+    receipt = job.get("receipt")
+    if not isinstance(receipt, dict):
+        return False
+    with CODEOFF_LOCK:
+        return _codeoff_record_terminal_manifest_locked(job, receipt)
 
 def _codeoff_manifest_current(manifest: dict[str, Any], now: datetime | None = None) -> bool:
     try:
@@ -5926,6 +6269,7 @@ def _codeoff_replay_prepared(record_root: Path, locked: dict[str, Any]) -> tuple
         and state.get("event_count") == 2 and state.get("aggregation") is None
         and state.get("judges") == {} and state.get("candidates") == {"author-1": {}, "author-2": {}}
         and state.get("agent_jobs") == {slot: [] for slot in locked["identities"]}
+        and state.get("execution_manifests") == {slot: {} for slot in locked["identities"]}
     )
     exact = manifest is not None and all(manifest.get(key) == value for key, value in locked.items())
     workspaces_exact = untouched and exact and all(
@@ -6086,7 +6430,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             }
             _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
             manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
-            state = {"status": "preparing", "reason": None, "finalized": False, "manifest_file_hash": manifest_file_hash, "event_count": 0, "event_head": "0" * 64, "agent_jobs": {slot: [] for slot in slot_logical}, "candidates": {"author-1": {}, "author-2": {}}, "judges": {}, "aggregation": None}
+            state = {"status": "preparing", "reason": None, "finalized": False, "manifest_file_hash": manifest_file_hash, "event_count": 0, "event_head": "0" * 64, "agent_jobs": {slot: [] for slot in slot_logical}, "execution_manifests": {slot: {} for slot in slot_logical}, "candidates": {"author-1": {}, "author-2": {}}, "judges": {}, "aggregation": None}
             _codeoff_commit_event(record_build, state, "prepared_manifest", {"manifest_file_hash": manifest_file_hash, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash})
             reasons = ([] if current else ["approved_model_manifest_stale"]) + catalog_reasons + [f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}" for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]]
             if reasons:
@@ -6143,7 +6487,20 @@ def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str
     if job.get("status") in ("queued", "running"): return None, {"error": "slot agent has not reached a terminal receipt", "code": "agent_not_terminal"}
     identity = manifest["identities"][slot]
     receipt = job.get("receipt")
-    if not (job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and _codeoff_terminal_identity_matches(job, receipt, identity) and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot}):
+    root = _codeoff_root(manifest["experiment_id"])
+    hashes = _codeoff_execution_manifest_hashes(root, state, slot, job_id)
+    manifests_match = False
+    if hashes is not None and isinstance(receipt, dict):
+        try:
+            launch_manifest = json.loads(_codeoff_read_artifact(root, hashes[0]))
+            terminal_manifest = json.loads(_codeoff_read_artifact(root, hashes[1]))
+            manifests_match = (
+                launch_manifest == _codeoff_launch_execution_manifest(job)
+                and terminal_manifest == _codeoff_terminal_execution_manifest(job, receipt)
+            )
+        except (CodeOffArtifactError, OSError, json.JSONDecodeError):
+            manifests_match = False
+    if not (job.get("job_id") == job_id and manifests_match and job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and _codeoff_terminal_identity_matches(job, receipt, identity) and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot}):
         return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
     return job, None
 
@@ -6947,6 +7304,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "kind": "agent",
             "status": "queued",
             "repo": repo_name,
+            "branch": branch,
+            "starting_head": head,
             "cwd": str(resolved),
             "prompt": prompt if codeoff is None else f"[code-off prompt {codeoff['prompt_hash']}]",
             "launcher": launcher,
@@ -6955,6 +7314,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             **effort,
             "launcher_version": launcher_version,
             "session_identity": session_identity,
+            "launch_native_session_id": session_identity.get("native_session_id"),
             "max_turns": turns or AGENT_MAX_TURNS,
             "run_budget_seconds": budget or AGENT_RUN_BUDGET,
             "response_webhook_url": webhook_url,
@@ -6987,9 +7347,19 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         if codeoff is not None:
             try:
                 state = codeoff["state"]
+                execution_manifest = _codeoff_launch_execution_manifest(job)
+                if execution_manifest is None:
+                    raise RuntimeError("code-off launch manifest was incomplete")
+                execution_manifest_hash = _codeoff_artifact(
+                    codeoff["root"], codeoff_canonical_json(execution_manifest)
+                )
                 state["agent_jobs"][codeoff["slot"]].append(job_id)
+                state["execution_manifests"][codeoff["slot"]][job_id] = {
+                    "launch_manifest_hash": execution_manifest_hash,
+                    "terminal_manifest_hash": None,
+                }
                 state["status"] = "authors_running" if codeoff["slot"].startswith("author-") else "judging"
-                _codeoff_commit_event(codeoff["root"], state, "agent_launched", {"slot": codeoff["slot"], "job_id": job_id, "identity_snapshot_hash": hashlib.sha256(codeoff_canonical_json(codeoff["identity"])).hexdigest(), "prompt_hash": codeoff["prompt_hash"]})
+                _codeoff_commit_event(codeoff["root"], state, "agent_launched", {"slot": codeoff["slot"], "job_id": job_id, "identity_snapshot_hash": hashlib.sha256(codeoff_canonical_json(codeoff["identity"])).hexdigest(), "execution_manifest_hash": execution_manifest_hash, "prompt_hash": codeoff["prompt_hash"]})
             except (OSError, RuntimeError):
                 shutil.rmtree(job_dir(job_id), ignore_errors=True)
                 return 500, {"ok": False, "error": "code-off launch persistence was interrupted; retry the same slot", "code": "codeoff_runtime_failure", "retryable": True}
