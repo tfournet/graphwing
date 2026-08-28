@@ -59,6 +59,29 @@ def _stamp_fixture_execution_profile(job, binary=None, requested="default", sour
     return profile
 
 
+def _stamp_complete_writer_evidence(job):
+    """Complete intentionally minimal writer fixtures with trusted profile evidence."""
+    job.setdefault("launcher", "codex")
+    job.setdefault("provider", "openai")
+    job.setdefault("model", "gpt-5.6-sol")
+    profile = _fixture_execution_profile(job["launcher"], job["provider"], job["model"])
+    job.update(profile)
+    identity = job.setdefault("session_identity", {})
+    identity.update({
+        "launcher": job["launcher"], "provider": job["provider"], "model": job["model"],
+        **_fixture_identity_profile(profile), "repo": job["repo"],
+        "branch": identity["branch"], "starting_head": identity["starting_head"],
+        "native_session_id": identity.get("native_session_id") or "fixture-session",
+    })
+    job.setdefault("receipt", {}).update({
+        "status": "ok", "job_id": job["job_id"],
+        "launcher": job["launcher"], "provider": job["provider"], "model": job["model"],
+        **profile, "session_identity": identity,
+        "failure_class": "none", "failure_code": "none", "failover_eligible": False,
+    })
+    return job
+
+
 class DispatchTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -531,7 +554,9 @@ class DispatchTests(unittest.TestCase):
                 )
             self.assertEqual(gstatus, 200, gp)
             self.assertEqual(gp["status"], "queued")
-            self.assertEqual(gp["prompt"], "ping")
+            self.assertNotIn("prompt", gp)
+            self.assertNotIn("cwd", gp)
+            self.assertNotIn("log_ref", gp)
             self.assertNotIn("response_webhook_token", gp)
             self.assertNotIn("resume_url", gp)
 
@@ -609,7 +634,7 @@ class DispatchTests(unittest.TestCase):
                 server.run_agent_job(job_id)
         resolve_now.assert_called_once_with("codex")
         spawn.assert_called_once()
-        self.assertEqual(spawn.call_args.args[1], current)
+        self.assertRegex(str(spawn.call_args.args[1]), r"^/proc/self/fd/[0-9]+$")
 
     def test_request_time_launcher_resolver_delegates_to_shared_current_resolver(self):
         cases = {
@@ -1046,6 +1071,90 @@ class DispatchTests(unittest.TestCase):
         self.assertLessEqual(len(compact), server.COMPACT_MAX_CHARS)
         self.assertEqual(server.compact_cmd_signal({"ok": True, "stdout": "lots"}), "ok")
 
+    def test_agent_job_public_projection_is_exact_and_sanitized_for_every_state(self):
+        schemas = json.loads(server.openapi_bytes())["components"]["schemas"]
+        job_schema = schemas["AgentJob"]
+        receipt_schema = schemas["AgentReceipt"]
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": None,
+        }
+        expected = {
+            "ok", "job_id", "status", "repo", "launcher", "provider", "model",
+            "requested_effort", "effective_effort", "effort_source", "launcher_version",
+            "session_identity", "created_at", "started_at", "finished_at", "receipt",
+        }
+        hostile = "PROMPT_FRAGMENT /home/private TOKEN_SECRET https://private.example provider-output"
+        for state in ("queued", "running", "completed", "failed"):
+            with self.subTest(state=state):
+                state_identity = dict(identity)
+                if state == "completed":
+                    state_identity["native_session_id"] = "codex-fixture"
+                job = {
+                    "job_id": "ab" * 16, "status": state, "repo": "scratch", "cwd": "/home/private",
+                    "prompt": hostile, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    **profile, "session_identity": state_identity, "created_at": "created",
+                    "started_at": None, "finished_at": None, "receipt": None,
+                    "log_ref": "/home/private/stdout.log", "error": hostile,
+                    "webhook": {"error": hostile}, "response_webhook_url": "https://private.example",
+                    "response_webhook_token": "TOKEN_SECRET",
+                }
+                if state == "completed":
+                    job["receipt"] = server.normalize_receipt(
+                        job, {"status": "ok", "summary": hostile}, 0, False,
+                    )
+                elif state == "failed":
+                    job["receipt"] = server.normalize_receipt(
+                        job, {"status": "error", "summary": hostile}, 1, False,
+                    )
+                public = server.public_job(job)
+                self.assertEqual(set(public), expected)
+                self.assertEqual(set(public), set(job_schema["required"]))
+                self.assertEqual(set(public), set(job_schema["properties"]))
+                if public["receipt"] is not None:
+                    self.assertEqual(set(public["receipt"]), set(receipt_schema["required"]))
+                    self.assertEqual(set(public["receipt"]), set(receipt_schema["properties"]) - {"role", "execution_identity"})
+                dumped = json.dumps(public, sort_keys=True)
+                for fragment in ("PROMPT_FRAGMENT", "/home/private", "TOKEN_SECRET", "private.example", "provider-output"):
+                    self.assertNotIn(fragment, dumped)
+                self.assertEqual(
+                    {key: public[key] for key in ("requested_effort", "effective_effort", "effort_source", "launcher_version")},
+                    profile,
+                )
+        incomplete = deepcopy(job)
+        incomplete["receipt"].pop("launcher_version")
+        fail_closed = server.public_job(incomplete)["receipt"]
+        self.assertEqual(fail_closed["failure_code"], "session_provenance_invalid")
+        self.assertTrue(all(fail_closed[key] is None for key in server.AGENT_PROFILE_FIELDS))
+
+    def test_interrupted_agent_receipt_is_sanitized_and_fails_closed_without_profile(self):
+        hostile = "PROMPT_FRAGMENT /home/private TOKEN_SECRET https://private.example provider-output"
+        legacy = {
+            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "session_identity": {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "scratch", "branch": "main", "starting_head": "b" * 40,
+                "native_session_id": "native-old",
+            },
+            "log_ref": "/home/private/stdout.log", "error": hostile,
+        }
+        receipt = server.interrupted_job_receipt(legacy, "agent")
+        receipt_schema = json.loads(server.openapi_bytes())["components"]["schemas"]["AgentReceipt"]
+        self.assertEqual(set(receipt), set(receipt_schema["required"]))
+        self.assertEqual(receipt["failure_code"], "session_provenance_invalid")
+        self.assertIsNone(receipt["session_identity"])
+        for key in ("launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "launcher_version"):
+            self.assertIn(key, receipt)
+            self.assertIsNone(receipt[key])
+        dumped = json.dumps(receipt, sort_keys=True)
+        for fragment in ("PROMPT_FRAGMENT", "/home/private", "TOKEN_SECRET", "private.example", "provider-output"):
+            self.assertNotIn(fragment, dumped)
+        self.assertNotIn("log_ref", receipt)
+        self.assertNotIn("sha", receipt)
+        self.assertNotIn("pr_url", receipt)
+
     def test_agent_job_not_found(self):
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
@@ -1104,6 +1213,69 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 408, payload)
         self.assertEqual(payload["code"], "job_wait_timeout")
 
+    def test_pinned_launcher_executes_exact_hashed_bytes_after_path_and_inode_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            marker = root / "marker"
+            original = root / "original"
+            configured = root / "codex"
+            replacement = root / "replacement"
+            original.write_text(f"#!/bin/sh\nprintf original > {marker}\ncat >/dev/null\n")
+            replacement.write_text(f"#!/bin/sh\nprintf replacement > {marker}\ncat >/dev/null\n")
+            original.chmod(0o755)
+            replacement.chmod(0o755)
+            configured.symlink_to(original)
+            job_id = "ad" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            (jdir / "prompt.txt").write_text("bounded")
+            job = {
+                "job_id": job_id, "cwd": str(self.scratch), "model": "gpt-5.6-sol",
+                "max_turns": 1, "session_identity": {"native_session_id": None},
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                with server.pinned_launcher(configured) as pinned:
+                    expected = pinned.fingerprint
+                    configured.unlink()
+                    configured.symlink_to(replacement)
+                    original.write_text(replacement.read_text())
+                    original.chmod(0o755)
+                    proc, err = server.spawn_codex(job, pinned.path)
+                    self.assertIsNone(err)
+                    self.assertEqual(proc.wait(timeout=5), 0)
+            self.assertEqual(marker.read_text(), "original")
+            self.assertEqual(expected, "sha256:" + hashlib.sha256(
+                f"#!/bin/sh\nprintf original > {marker}\ncat >/dev/null\n".encode()
+            ).hexdigest())
+
+    def test_pinned_launcher_rejects_missing_and_nonregular_and_closes_descriptors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            regular = root / "launcher"
+            regular.write_text("#!/bin/sh\nexit 0\n")
+            regular.chmod(0o755)
+            unreadable = root / "unreadable"
+            unreadable.write_text("#!/bin/sh\nexit 0\n")
+            unreadable.chmod(0)
+            before = len(list(Path("/proc/self/fd").iterdir()))
+            for _ in range(100):
+                with server.pinned_launcher(regular) as pinned:
+                    self.assertTrue(pinned.path.exists())
+            with self.assertRaises(RuntimeError):
+                with server.pinned_launcher(regular):
+                    raise RuntimeError("fixture context failure")
+            for bad in (root / "missing", root):
+                with self.subTest(path=bad):
+                    with self.assertRaises(OSError):
+                        with server.pinned_launcher(bad):
+                            pass
+            with self.assertRaises(PermissionError):
+                with server.pinned_launcher(unreadable):
+                    pass
+            after = len(list(Path("/proc/self/fd").iterdir()))
+            self.assertEqual(after, before)
+
     def test_agent_worker_rejects_launcher_version_mismatch_before_spawn(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
@@ -1138,6 +1310,73 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(saved["receipt"]["failure_code"], "launcher_version_mismatch")
         self.assertEqual(saved["receipt"]["diagnostic"]["code"], "launcher_version_mismatch")
 
+    def test_public_agent_receipt_is_allowlisted_and_cannot_copy_launcher_text(self):
+        hostile = (
+            "PROMPT_FRAGMENT /home/private/provider TOKEN_SECRET "
+            "https://private.example/callback model-provider-output"
+        )
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": "codex-fixture",
+        }
+        job = {
+            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "session_identity": identity, **profile,
+        }
+        for status in ("ok", "error", "timeout"):
+            with self.subTest(status=status):
+                receipt = server.normalize_receipt(
+                    job,
+                    {"status": status, "summary": hostile, "sha": hostile, "pr_url": hostile},
+                    0,
+                    False,
+                )
+                dumped = json.dumps(receipt, sort_keys=True)
+                self.assertNotIn(hostile, dumped)
+                for fragment in ("PROMPT_FRAGMENT", "/home/private", "TOKEN_SECRET", "private.example", "model-provider-output"):
+                    self.assertNotIn(fragment, dumped)
+                self.assertNotIn("sha", receipt)
+                self.assertNotIn("pr_url", receipt)
+                self.assertEqual(receipt["summary"], receipt["diagnostic"]["summary"])
+
+    def test_worker_callback_cans_raw_spawn_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            binary = Path(td) / "codex"
+            binary.write_text("fixture")
+            hostile = "spawn failed /home/private/codex TOKEN_SECRET https://private.example provider text"
+            job_id = "ac" * 16
+            profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", binary)
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+                "starting_head": "b" * 40, "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(self.scratch),
+                "prompt": "PROMPT_FRAGMENT", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", **profile, "session_identity": identity,
+                "max_turns": 1, "run_budget_seconds": 30, "created_at": "fixture",
+                "started_at": None, "finished_at": None, "receipt": None,
+                "response_webhook_url": "https://example.invalid/resume",
+                "response_webhook_token": "TOKEN_SECRET", "resume_url": None,
+                "log_ref": str(jobs / job_id / "stdout.log"), "error": None, "webhook": None,
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.write_job(job)
+                with mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+                     mock.patch.object(server, "spawn_writer", return_value=(None, {"error": hostile, "code": "spawn_failed"})), \
+                     mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted, \
+                     mock.patch.object(server, "herdr_job_done"):
+                    server.run_agent_job(job_id)
+            callback = posted.call_args.args[1]
+            dumped = json.dumps(callback, sort_keys=True)
+            for fragment in ("PROMPT_FRAGMENT", "/home/private", "TOKEN_SECRET", "private.example", "provider text"):
+                self.assertNotIn(fragment, dumped)
+            self.assertEqual(callback["summary"], callback["diagnostic"]["summary"])
+
     def test_agent_receipt_binds_effective_effort(self):
         identity = {
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
@@ -1146,7 +1385,7 @@ class DispatchTests(unittest.TestCase):
             "native_session_id": "codex-fixture",
         }
         job = {
-            "job_id": "ab" * 16, "launcher": "codex", "session_identity": identity,
+            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity,
             "requested_effort": "high", "effective_effort": "high",
             "effort_source": "explicit", "launcher_version": identity["launcher_version"],
             "log_ref": "/private/runtime/stdout.log",
@@ -1165,6 +1404,26 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertNotIn("log_ref", receipt)
         self.assertNotIn("/private", json.dumps(receipt, sort_keys=True))
+
+    def test_session_identity_rejects_unknown_fields_in_parser_and_endpoint(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": "native-123",
+            "native_token": "TOKEN_SECRET",
+        }
+        parsed, error = server.parse_session_identity(identity)
+        self.assertIsNone(parsed)
+        self.assertEqual(error["code"], "bad_session_identity")
+        body = json.dumps({
+            "prompt": "bounded", "cwd": "scratch", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity,
+            "resume_job_id": "ab" * 16,
+        }).encode()
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)):
+            status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+        self.assertEqual((status, payload["code"]), (400, "bad_session_identity"))
 
     def test_parse_receipt_json(self):
         parsed = server.parse_receipt_text(
@@ -1365,7 +1624,8 @@ class DispatchTests(unittest.TestCase):
         )
         for receipt, failure_class, failure_code in receipts:
             self.assertEqual((receipt["failure_class"], receipt["failure_code"]), (failure_class, failure_code))
-        self.assertEqual(receipts[-2][0]["summary"], "specific")
+        self.assertEqual(receipts[-2][0]["summary"], receipts[-2][0]["diagnostic"]["summary"])
+        self.assertNotIn("specific", json.dumps(receipts[-2][0]))
 
     def test_agent_run_missing_binary_codes_match_for_all_launchers(self):
         cases = (
@@ -1439,7 +1699,8 @@ class DispatchTests(unittest.TestCase):
                 self.assertTrue(receipt["failover_eligible"])
                 self.assertEqual(receipt["diagnostic"]["category"], "provider_availability")
                 self.assertEqual(receipt["diagnostic"]["component"], "binary")
-                self.assertIn(f"missing {launcher} binary", receipt["summary"])
+                self.assertEqual(receipt["summary"], "writer binary unavailable")
+                self.assertNotIn(launcher, receipt["summary"])
 
     def test_wrap_prompt_locks_cwd_and_leaves_staging_to_graph(self):
         text = server.wrap_prompt("ab" * 16, "ping", "/home/tim/work/gw-real-slice")
@@ -1449,6 +1710,66 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("Graphwing stages", text)
         self.assertIn("Do not git commit, git push", text)
         self.assertIn("Do not `git checkout`", text)
+
+    def test_writer_execution_profile_mismatch_blocks_commit_and_merge_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            binary = root / "codex"
+            binary.write_text("fixture")
+            profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", binary)
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "branch", "--show-current"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                **_fixture_identity_profile(profile), "repo": "scratch", "branch": branch,
+                "starting_head": head, "native_session_id": "native-writer",
+            }
+            baseline = server.capture_writer_baseline(repo)[0]
+            (repo / "writer.txt").write_text("writer\n")
+            job_id = "ae" * 16
+            pristine = {
+                "job_id": job_id, "status": "completed", "repo": "scratch", "cwd": str(repo),
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile,
+                "session_identity": identity, "git_baseline": baseline,
+                "writer_parent_paths": [],
+                "receipt": {
+                    "status": "ok", "job_id": job_id, "launcher": "codex", "provider": "openai",
+                    "model": "gpt-5.6-sol", **profile, "session_identity": identity,
+                    "failure_class": "none", "failure_code": "none", "failover_eligible": False,
+                    "diagnostic": server.compact_diagnostic("none"), "summary": "ok",
+                },
+            }
+            self.assertIsNone(server.stage_writer_changes(pristine))
+            mutations = {
+                "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+                "effective_effort": "default", "launcher_version": "sha256:" + "f" * 64,
+                "requested_effort": "high", "effort_source": "explicit",
+            }
+            surfaces = ("job", "session_identity", "receipt")
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                for surface in surfaces:
+                    for field, value in mutations.items():
+                        if surface == "session_identity" and field in ("requested_effort", "effort_source"):
+                            continue
+                        with self.subTest(surface=surface, field=field):
+                            job = deepcopy(pristine)
+                            target = job if surface == "job" else job[surface]
+                            target[field] = value
+                            server.write_job(job)
+                            error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
+                            self.assertEqual(error["code"], "writer_evidence_mismatch")
+                            status, payload = server.git_commit(json.dumps({
+                                "repo": "scratch", "message": "must not commit", "writer_job_id": job_id,
+                            }).encode(), {"scratch": str(repo)})
+                            self.assertEqual((status, payload["code"]), (409, "writer_job_mismatch"))
 
     def test_writer_staging_and_commit_preserve_dirty_operator_state_in_linked_worktree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1479,6 +1800,7 @@ class DispatchTests(unittest.TestCase):
                 ).stdout.strip()},
                 "receipt": {"status": "ok"},
             }
+            _stamp_complete_writer_evidence(job)
             staged_err = server.stage_writer_changes(job)
             self.assertIsNone(staged_err)
             self.assertEqual(job["writer_paths"], ["deleted.txt", "modified.txt", "new.txt", "note[1].md"])
@@ -1520,6 +1842,7 @@ class DispatchTests(unittest.TestCase):
                 "git_baseline": baseline, "writer_parent_paths": [], "receipt": {"status": "ok"},
                 "session_identity": {"branch": branch, "starting_head": head},
             }
+            _stamp_complete_writer_evidence(job)
             self.assertIsNone(server.stage_writer_changes(job))
             original = server.run_cmd
             commit_attempted = False
@@ -1646,7 +1969,7 @@ class DispatchTests(unittest.TestCase):
                 server.run_agent_job(job_id)
                 saved = server.read_job(job_id)
             self.assertEqual(saved["status"], "failed")
-            self.assertEqual(saved["receipt"]["summary"], "writer changed pre-existing dirty paths: dirty.txt")
+            self.assertEqual(saved["error"], "writer changed pre-existing dirty paths: dirty.txt")
             self.assertNotIn("payload", json.dumps(saved["receipt"]))
             self.assertNotIn("operator private", json.dumps(saved["receipt"]))
 
@@ -1770,15 +2093,15 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(recovered, 2)
             self.assertEqual(saved["status"], "failed")
             self.assertEqual(saved["receipt"]["status"], "error")
-            self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]), ("cancelled", "cancelled"))
-            self.assertEqual(saved["receipt"]["summary"], "agent job interrupted by Graphwing restart")
+            self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]), ("session_provenance", "session_provenance_invalid"))
+            self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
             self.assertNotIn("secret", json.dumps(saved["receipt"]))
             posted.assert_called_once()
             self.assertEqual(posted.call_args.args[1], saved["receipt"])
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 queued_saved = server.read_job(queued_id)
             self.assertEqual(queued_saved["status"], "failed")
-            self.assertEqual(queued_saved["receipt"]["failure_code"], "cancelled")
+            self.assertEqual(queued_saved["receipt"]["failure_code"], "session_provenance_invalid")
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
@@ -1842,7 +2165,7 @@ class DispatchTests(unittest.TestCase):
             for job_id, extra in fixtures.items():
                 saved = json.loads((jobs / job_id / "job.json").read_text())
                 self.assertEqual(saved["status"], "failed", extra)
-                self.assertLessEqual(len(saved["receipt"]["summary"]), 500)
+                self.assertLessEqual(len(saved["error"]), 500)
                 self.assertNotIn("secret", json.dumps(saved["receipt"]))
                 if extra.get("kind") == "review":
                     self.assertEqual(saved["receipt"]["status"], "nack")
@@ -1851,11 +2174,11 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(saved["receipt"]["status"], "error")
                     self.assertEqual(saved["receipt"]["log_ref"], saved["log_ref"])
                 else:
-                    self.assertEqual(saved["receipt"]["failure_code"], "cancelled")
-                    self.assertEqual(saved["receipt"]["session_identity"], extra["session_identity"])
+                    self.assertEqual(saved["receipt"]["failure_code"], "session_provenance_invalid")
+                    self.assertIsNone(saved["receipt"]["session_identity"])
             codeoff_saved = json.loads((codeoff_dir / "job.json").read_text())
             self.assertEqual(codeoff_saved["status"], "failed")
-            self.assertEqual(codeoff_saved["receipt"]["failure_code"], "cancelled")
+            self.assertEqual(codeoff_saved["receipt"]["failure_code"], "session_provenance_invalid")
             codex = root / "codex"
             codex.write_text("fixture")
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
@@ -1986,6 +2309,7 @@ class DispatchTests(unittest.TestCase):
             job_id = "92" * 16
             head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             job = {"job_id": job_id, "repo": "scratch", "cwd": str(repo), "status": "completed", "git_baseline": baseline, "writer_parent_paths": [], "receipt": {"status": "ok"}, "session_identity": {"branch": "main", "starting_head": head}}
+            _stamp_complete_writer_evidence(job)
             self.assertIsNone(server.stage_writer_changes(job))
             operator_index = subprocess.run(["git", "-C", str(repo), "show", ":operator.txt"], check=True, capture_output=True).stdout
             jobs = root / "jobs"
@@ -2112,6 +2436,7 @@ class DispatchTests(unittest.TestCase):
                     "receipt": {"status": "ok"},
                     "session_identity": {"branch": branch, "starting_head": head},
                 })
+                _stamp_complete_writer_evidence(job)
             second["writer_parent_job_id"] = first["job_id"]
             jobs = Path(td) / "jobs"
             with mock.patch.object(server, "JOBS_DIR", jobs):
@@ -2432,7 +2757,7 @@ while True:
         })
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["session_identity"]["native_session_id"], "grok-123")
-        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         self.assertEqual(saved["receipt"]["failure_class"], "none")
         self.assertEqual(saved["receipt"]["failure_code"], "none")
         self.assertFalse(saved["receipt"]["failover_eligible"])
@@ -2459,7 +2784,7 @@ while True:
                     "notification_method": method,
                 })
                 self.assertEqual(saved["status"], "completed")
-                self.assertEqual(saved["receipt"]["summary"], "done")
+                self.assertEqual(saved["receipt"]["summary"], "ok")
 
     def test_grok_acp_session_new_update_establishes_provisional_identity(self):
         saved, capture, _ = self._run_grok_fixture({
@@ -2562,10 +2887,8 @@ while True:
                         "notification_fields": {field: value},
                     })
                     self.assertEqual(saved["status"], "failed")
-                    self.assertIn(
-                        "malformed Grok vendor notification",
-                        saved["receipt"]["summary"],
-                    )
+                    self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
+                    self.assertNotIn("malformed Grok vendor notification", json.dumps(saved["receipt"]))
 
     def test_grok_acp_rejects_unknown_vendor_notification_method(self):
         methods = (
@@ -2581,7 +2904,7 @@ while True:
                     "notification_method": method,
                 })
                 self.assertEqual(saved["status"], "failed")
-                self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
+                self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_command_uses_the_requested_immutable_model(self):
         saved, capture, _ = self._run_grok_fixture(model="grok-fixture-immutable")
@@ -2627,7 +2950,7 @@ while True:
         }).encode() + b"\n"
         self.assertGreater(len(example) * thought_chunks, server.CMD_MAX_BYTES)
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         self.assertTrue(logged.endswith(b"\n"))
         self.assertGreater(len(logged), server.CMD_MAX_BYTES - len(example))
         self.assertLessEqual(len(logged), server.CMD_MAX_BYTES)
@@ -2645,14 +2968,14 @@ while True:
             "wire_burst_record_bytes": server.CMD_MAX_BYTES + 1,
         })
         self.assertEqual(saved["status"], "failed")
-        self.assertIn("Grok ACP wire exceeded output limit", saved["receipt"]["summary"])
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_rejects_assistant_output_above_file_limit(self):
         saved, _, _ = self._run_grok_fixture({
             "chunks": ["x" * server.FILE_MAX_BYTES, "x"],
         })
         self.assertEqual(saved["status"], "failed")
-        self.assertIn("Grok assistant output exceeded limit", saved["receipt"]["summary"])
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_resume_loads_only_after_capability_and_ignores_replay(self):
         saved, capture, _ = self._run_grok_fixture({
@@ -2666,12 +2989,13 @@ while True:
         self.assertEqual(requests[2]["params"], {
             "sessionId": "grok-123", "cwd": str(Path(saved["cwd"]).resolve()), "mcpServers": [],
         })
-        self.assertEqual(saved["receipt"]["summary"], "current")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         changed, _, _ = self._run_grok_fixture({
             "load_result": {"sessionId": "grok-other"},
         }, resume=True)
         self.assertEqual(changed["status"], "failed")
-        self.assertIn("changed during load", changed["receipt"]["summary"])
+        self.assertEqual(changed["receipt"]["summary"], changed["receipt"]["diagnostic"]["summary"])
+        self.assertNotIn("changed during load", json.dumps(changed["receipt"]))
 
     def test_grok_acp_uses_cached_auth_without_api_key(self):
         saved, capture, _ = self._run_grok_fixture(api_key=False)
@@ -2700,10 +3024,7 @@ while True:
             with self.subTest(auth_methods=auth_methods):
                 saved, capture, _ = self._run_grok_fixture({"auth_methods": auth_methods})
                 self.assertEqual(saved["status"], "failed")
-                self.assertEqual(
-                    saved["receipt"]["summary"],
-                    "malformed Grok ACP authentication methods",
-                )
+                self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
                 self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
 
     def test_grok_acp_rejects_selected_terminal_or_unknown_authentication(self):
@@ -2713,10 +3034,7 @@ while True:
                     "auth_methods": [{"id": "xai.api_key", "type": method_type}],
                 })
                 self.assertEqual(saved["status"], "failed")
-                self.assertEqual(
-                    saved["receipt"]["summary"],
-                    "unsupported Grok ACP authentication",
-                )
+                self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
                 self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
 
     def test_grok_acp_rejects_boolean_response_id_for_integer_request(self):
@@ -2724,12 +3042,12 @@ while True:
             "response_id_method": "initialize", "response_id": True,
         })
         self.assertEqual(saved["status"], "failed")
-        self.assertIn("unexpected Grok ACP response", saved["receipt"]["summary"])
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_rejects_non_text_agent_message_chunk(self):
         saved, _, _ = self._run_grok_fixture({"chunk_content_type": "image"})
         self.assertEqual(saved["status"], "failed")
-        self.assertIn("malformed Grok agent message chunk", saved["receipt"]["summary"])
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_fail_closed_fixtures(self):
         cases = {
@@ -2761,7 +3079,8 @@ while True:
                 saved, capture, _ = self._run_grok_fixture(fixture)
                 self.assertEqual(saved["status"], "failed")
                 self.assertEqual(saved["receipt"]["status"], "error")
-                self.assertIn(summary, saved["receipt"]["summary"])
+                self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
+                self.assertNotIn(summary, json.dumps(saved["receipt"]))
                 if name in {
                     "malformed_wire", "missing_result", "missing_protocol_version",
                     "unsupported_protocol_version", "boolean_protocol_version", "unsupported_auth",
@@ -2794,7 +3113,7 @@ while True:
         saved, _, _ = self._run_grok_fixture({"exit_after_method": "session/prompt", "exit_code": 7})
         self.assertEqual(saved["status"], "failed")
         self.assertEqual(saved["returncode"], 7)
-        self.assertIn("exited 7", saved["receipt"]["summary"])
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_acp_protocol_error_preserves_summary_and_child_exit(self):
         saved, _, _ = self._run_grok_fixture({
@@ -2804,7 +3123,7 @@ while True:
         })
         self.assertEqual(saved["status"], "failed")
         self.assertEqual(saved["returncode"], 7)
-        self.assertEqual(saved["receipt"]["summary"], "Grok ACP session/prompt error")
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
 
     def test_grok_structured_provider_error_is_failover_eligible(self):
         saved, _, _ = self._run_grok_fixture({
@@ -2828,7 +3147,7 @@ while True:
         })
         stderr = (jdir / "stderr.log").read_bytes()
         self.assertEqual(saved["status"], "failed")
-        self.assertEqual(saved["receipt"]["summary"], "Grok ACP session/prompt error")
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
         self.assertEqual(len(stderr), server.FILE_MAX_BYTES)
         self.assertTrue(stderr.endswith(b"Grok ACP session/prompt error\n"))
 
@@ -2843,7 +3162,7 @@ while True:
         saved, capture, _ = self._run_grok_fixture({"hang_after_method": "session/prompt"})
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["receipt"]["status"], "ok")
-        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         with self.assertRaises(ProcessLookupError):
             os.kill(capture["pid"], 0)
 
@@ -2890,7 +3209,7 @@ while True:
                 "job_id": job_id, "status": "queued", "repo": "scratch",
                 "cwd": str(td), "prompt": "ping",
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-                "session_identity": {"native_session_id": None},
+                "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": "0" * 40, "native_session_id": None},
                 "response_webhook_url": "https://example.invalid/resume",
                 "response_webhook_token": "tok_secret", "created_at": "t",
                 "started_at": None, "finished_at": None, "max_turns": 1,
@@ -2906,9 +3225,10 @@ while True:
                  mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted:
                 server.run_agent_job(job_id)
             saved = json.loads((jdir / "job.json").read_text())
-            self.assertEqual(saved["receipt"]["summary"], specific)
+            self.assertEqual(saved["receipt"]["summary"], saved["receipt"]["diagnostic"]["summary"])
+            self.assertEqual(saved["error"], specific)
             posted.assert_called_once()
-            self.assertEqual(posted.call_args.args[1]["summary"], specific)
+            self.assertEqual(posted.call_args.args[1]["summary"], saved["receipt"]["diagnostic"]["summary"])
             self.assertEqual(posted.call_args.args[1], saved["receipt"])
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 public = server.public_job(server.read_job(job_id))
@@ -2948,7 +3268,7 @@ while True:
                 server.run_agent_job(job_id)
             saved = json.loads((jdir / "job.json").read_text())
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         self.assertEqual(saved["session_identity"]["native_session_id"], "codex-123")
         self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "codex-123")
 
@@ -3045,7 +3365,7 @@ while True:
                 server.run_agent_job(job_id)
             saved = json.loads((jdir / "job.json").read_text())
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(saved["receipt"]["summary"], "done")
+        self.assertEqual(saved["receipt"]["summary"], "ok")
         self.assertEqual(saved["session_identity"]["native_session_id"], "claude-123")
         self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "claude-123")
 
@@ -3171,9 +3491,13 @@ while True:
         self.assertNotIn("oneOf", request_schema)
         self.assertNotIn("allOf", request_schema)
         self.assertFalse(request_schema["additionalProperties"])
-        for schema_name in ("AgentRunAccepted", "AgentJob", "AgentReceipt"):
+        accepted_identity = spec["components"]["schemas"]["AgentRunAccepted"]["properties"]["session_identity"]
+        self.assertEqual(accepted_identity["$ref"], "#/components/schemas/SessionIdentity")
+        for schema_name in ("AgentJob", "AgentReceipt"):
             identity = spec["components"]["schemas"][schema_name]["properties"]["session_identity"]
-            self.assertEqual(identity["$ref"], "#/components/schemas/SessionIdentity")
+            self.assertEqual(identity["oneOf"], [
+                {"$ref": "#/components/schemas/SessionIdentity"}, {"type": "null"},
+            ])
         receipt = spec["components"]["schemas"]["AgentReceipt"]["properties"]
         self.assertEqual(
             set(receipt["failure_class"]["enum"]),
@@ -4859,7 +5183,7 @@ while True:
                 "job_id": writer_id, "status": "completed", "repo": "r", "cwd": str(repo.resolve()),
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile,
                 "session_identity": identity,
-                "receipt": {"status": "ok", "job_id": writer_id, "session_identity": identity, **profile, "failure_class": "none", "failure_code": "none", "failover_eligible": False},
+                "receipt": {"status": "ok", "job_id": writer_id, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity, **profile, "failure_class": "none", "failure_code": "none", "failover_eligible": False},
             }
             wp = jobs / writer_id / "job.json"
             wp.parent.mkdir(parents=True)
@@ -5441,7 +5765,7 @@ while True:
             self.assertIn(field, receipt["properties"])
         self.assertEqual(
             receipt["properties"]["effort_source"]["enum"],
-            ["route", "explicit", "launcher_default"],
+            ["route", "explicit", "launcher_default", None],
         )
         for forbidden in ("prompt", "log", "log_ref", "path", "cwd", "token", "provider_output"):
             self.assertNotIn(forbidden, receipt["properties"])
