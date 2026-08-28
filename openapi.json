@@ -943,7 +943,7 @@
           "diagnostic_version": { "type": "string", "enum": ["diagnostic-v1"] },
           "category": { "type": "string", "enum": ["none", "provider_availability", "local_infrastructure", "workflow_failure"] },
           "component": { "type": "string", "enum": ["none", "provider", "binary", "config", "auth", "network", "health", "stack", "port", "command", "request", "execution"] },
-          "code": { "type": "string", "enum": ["adapter_contract_invalid", "bad_health_config", "bad_port", "branch_mismatch", "cancelled", "cmd_failed", "head_mismatch", "health_bad_status", "health_unreachable", "invalid_receipt", "local_binary_missing", "missing_binary", "missing_port", "missing_prompt", "model_reported_error", "model_stopped", "none", "not_configured", "port_not_listening", "process_exit", "provider_authentication", "provider_http_5xx", "provider_network", "provider_overloaded", "provider_quota", "provider_rate_limit", "reported_timeout", "repository_mismatch", "run_budget_exceeded", "session_identity_mismatch", "session_identity_missing", "session_provenance_invalid", "spawn_failed", "stack_unhealthy", "timeout", "unknown_failure", "unknown_port", "unknown_stack"] },
+          "code": { "type": "string", "enum": ["adapter_contract_invalid", "bad_health_config", "bad_port", "branch_mismatch", "cancelled", "cmd_failed", "head_mismatch", "health_bad_status", "health_unreachable", "invalid_receipt", "launcher_version_mismatch", "local_binary_missing", "missing_binary", "missing_port", "missing_prompt", "model_reported_error", "model_stopped", "none", "not_configured", "port_not_listening", "primary_execution_profile_mismatch", "process_exit", "provider_authentication", "provider_http_5xx", "provider_network", "provider_overloaded", "provider_quota", "provider_rate_limit", "reported_timeout", "repository_mismatch", "run_budget_exceeded", "session_identity_mismatch", "session_identity_missing", "session_provenance_invalid", "spawn_failed", "stack_unhealthy", "timeout", "unknown_failure", "unknown_port", "unknown_stack"] },
           "evidence": { "type": "string" },
           "summary": { "type": "string", "maxLength": 80 }
         }
@@ -1279,7 +1279,7 @@
           "fresh_primary_receipt": { "$ref": "#/components/schemas/AgentReceipt", "description": "For remote provider failures only: a distinct successful normal-primary job created no earlier than the prior fallback finished." }
         }
       },
-      "RecoveryRouteIdentity": { "type": "object", "required": ["job_id", "route_version", "launcher", "provider", "model"], "additionalProperties": false, "properties": { "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "route_version": { "type": "string", "enum": ["normal-v1", "availability-fallback-v1"] }, "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] }, "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] }, "model": { "type": "string" } } },
+      "RecoveryRouteIdentity": { "type": "object", "required": ["job_id", "route_version", "launcher", "provider", "model", "effective_effort", "launcher_version"], "additionalProperties": false, "properties": { "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }, "route_version": { "type": "string", "enum": ["normal-v1", "availability-fallback-v1"] }, "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] }, "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] }, "model": { "type": "string" }, "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] }, "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$" } } },
       "ProviderRecoveryEvidence": { "type": "object", "required": ["recovery_version", "basis", "failure_code", "primary", "fallback"], "additionalProperties": false, "description": "Compact route/job identities only. No paths, callbacks, secrets, raw provider output, or traces.", "properties": { "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"] }, "basis": { "type": "string", "enum": ["configured_binary_available", "configured_binary_unavailable", "fresh_primary_success_required", "fresh_primary_success"] }, "failure_code": { "type": "string", "enum": ["missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx"] }, "primary": { "$ref": "#/components/schemas/RecoveryRouteIdentity" }, "fallback": { "$ref": "#/components/schemas/RecoveryRouteIdentity" }, "fresh_primary": { "$ref": "#/components/schemas/RecoveryRouteIdentity" } } },
       "SliceRouteRecovery": { "type": "object", "required": ["ok", "recovery_version", "decision", "role", "selected_route", "evidence"], "additionalProperties": false, "properties": { "ok": { "type": "boolean" }, "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"] }, "decision": { "type": "string", "enum": ["primary_recovered", "fallback_retained"] }, "role": { "type": "string", "enum": ["primary", "availability_fallback"] }, "selected_route": { "$ref": "#/components/schemas/SliceRoute" }, "evidence": { "$ref": "#/components/schemas/ProviderRecoveryEvidence" } } },
       "SliceRoute": {
@@ -1463,6 +1463,7 @@
           "launcher": { "type": "string", "enum": ["claude", "codex", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string" },
+          "effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"], "description": "Launcher-neutral requested effort. Phase 1 accepts only values proven by the selected current launcher/model contract; other known values return unsupported_effort." },
           "max_turns": { "oneOf": [{"type":"integer","minimum":1,"maximum":80},{"type":"string","pattern":"^[0-9]{1,2}$","description":"Whole-value numeric Graph interpolation."}] },
           "run_budget_seconds": { "oneOf": [{"type":"integer","minimum":30,"maximum":1200},{"type":"string","pattern":"^[0-9]{2,4}$","description":"Whole-value numeric Graph interpolation."}] },
           "codeoff_workspace": { "$ref": "#/components/schemas/CodeOffWorkspaceRef", "description": "Opaque server-resolved workspace; caller paths and prompt overrides are rejected." },
@@ -1499,6 +1500,9 @@
           "launcher": { "type": "string" },
           "provider": { "type": "string" },
           "model": { "type": "string" },
+          "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "codeoff_workspace": { "$ref": "#/components/schemas/CodeOffWorkspaceRef" },
           "poll": { "type": "string" }
@@ -1507,12 +1511,14 @@
       "SessionIdentity": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"],
+        "required": ["launcher", "provider", "model", "effective_effort", "launcher_version", "repo", "branch", "starting_head", "native_session_id"],
         "allOf": [{"$ref":"#/components/schemas/CodeOffIdentityTuple"}],
         "properties": {
           "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string", "enum": ["gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "grok-4.6"] },
+          "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$", "description": "Path-free SHA-256 fingerprint of the resolved launcher executable, or missing for an availability-failure job." },
           "repo": { "type": "string" },
           "branch": { "type": "string" },
           "starting_head": { "type": "string" },
@@ -1522,22 +1528,27 @@
       "CodeOffExecutionIdentity": {"type":"object","additionalProperties":false,"required":["version","source","launcher","provider","model","native_session_id"],"properties":{"version":{"type":"string","enum":["code-off-execution-identity-v1"]},"source":{"type":"string","enum":["claude-result-v1","codex-rollout-v1","grok-acp-v1"]},"launcher":{"type":"string","enum":["codex","claude","grok"]},"provider":{"type":"string","enum":["openai","anthropic","xai"]},"model":{"type":"string","enum":["gpt-5.6-sol","claude-opus-5","claude-sonnet-5","grok-4.6","gpt-5.6-terra","claude-fable-5"],"description":"Exact requested model retained after launcher-native execution provenance checks; Codex and Claude prove the executed model."},"native_session_id":{"type":"string","minLength":1}},"oneOf":[{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-sol"},"source":{"const":"codex-rollout-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-opus-5"},"source":{"const":"claude-result-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-sonnet-5"},"source":{"const":"claude-result-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"grok"},"provider":{"const":"xai"},"model":{"const":"grok-4.6"},"source":{"const":"grok-acp-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"codex"},"provider":{"const":"openai"},"model":{"const":"gpt-5.6-terra"},"source":{"const":"codex-rollout-v1"}}},{"type":"object","required":["launcher","provider","model","source"],"properties":{"launcher":{"const":"claude"},"provider":{"const":"anthropic"},"model":{"const":"claude-fable-5"},"source":{"const":"claude-result-v1"}}}]},
       "AgentReceipt": {
         "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "job_id", "session_identity", "requested_effort", "effective_effort", "effort_source", "launcher_version", "failure_class", "failure_code", "failover_eligible", "diagnostic"],
         "properties": {
           "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
           "job_id": { "type": "string" },
           "role": { "type": "string", "enum": ["primary", "availability_fallback"] },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "execution_identity": { "$ref": "#/components/schemas/CodeOffExecutionIdentity" },
+          "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
+          "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$" },
           "sha": { "type": ["string", "null"] },
           "pr_url": { "type": ["string", "null"] },
-          "log_ref": { "type": "string" },
           "summary": { "type": ["string", "null"] },
           "failure_class": {
             "type": "string",
             "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"],
             "description": "Closed launcher outcome class. Only provider_availability may be failover eligible."
           },
-          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"], "description": "Stable machine code within failure_class; none on success." },
+          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "launcher_version_mismatch", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"], "description": "Stable machine code within failure_class; none on success." },
           "failover_eligible": { "type": "boolean", "description": "True only for structured or deterministic provider availability failures." },
           "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
         }
@@ -1554,6 +1565,10 @@
           "launcher": { "type": "string" },
           "provider": { "type": "string" },
           "model": { "type": "string" },
+          "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
+          "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$" },
           "session_identity": { "$ref": "#/components/schemas/SessionIdentity" },
           "created_at": { "type": "string" },
           "started_at": { "type": ["string", "null"] },
@@ -1573,7 +1588,7 @@
             "type": "string",
             "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"]
           },
-          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"] },
+          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "launcher_version_mismatch", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"] },
           "failover_eligible": { "type": "boolean" },
           "blocker_kind": { "type": "string", "enum": ["agent", "codeoff", "script", "test", "rr", "review"] },
           "blocker_job_id": { "type": "string", "pattern": "^([0-9a-f]{32}|unknown)$" }

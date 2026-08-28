@@ -95,11 +95,48 @@ AGENT_MAX_CONCURRENT = 3
 SCRIPT_SYNC_TIMEOUT = 25
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 NATIVE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+LAUNCHER_VERSION_RE = re.compile(r"^(?:sha256:[0-9a-f]{64}|missing)$")
 NATIVE_LAUNCHERS = {
     "codex": {"provider": "openai", "models": ("gpt-5.6-sol",)},
     "claude": {"provider": "anthropic", "models": ("claude-opus-5", "claude-sonnet-5")},
     "grok": {"provider": "xai", "models": ("grok-4.6",)},
 }
+EFFORT_VALUES = ("default", "low", "medium", "high", "max")
+EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
+# Phase 1 describes only behavior established by today's adapters: Codex is
+# pinned to high and Claude/Grok pass no effort option. Phase 2 may widen this
+# table only when it also wires and verifies the corresponding native option.
+EFFORT_PROFILES = {
+    ("codex", "openai", "gpt-5.6-sol"): {"default": "high", "high": "high"},
+    ("codex", "openai", "gpt-5.6-terra"): {"default": "high", "high": "high"},
+    ("claude", "anthropic", "claude-opus-5"): {"default": "default"},
+    ("claude", "anthropic", "claude-sonnet-5"): {"default": "default"},
+    ("claude", "anthropic", "claude-fable-5"): {"default": "default"},
+    ("grok", "xai", "grok-4.6"): {"default": "default"},
+}
+
+
+def normalize_effort(
+    launcher: str,
+    provider: str,
+    model: str,
+    requested: Any,
+    source: str,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Validate one launcher-neutral effort and return its explicit profile."""
+    if source not in EFFORT_SOURCES:
+        raise ValueError("invalid internal effort source")
+    if not isinstance(requested, str) or requested not in EFFORT_VALUES:
+        return None, {"error": "effort must be default, low, medium, high, or max", "code": "bad_effort"}
+    supported = EFFORT_PROFILES.get((launcher, provider, model), {})
+    effective = supported.get(requested)
+    if effective is None:
+        return None, {"error": "effort is unsupported for the selected launcher/provider/model", "code": "unsupported_effort"}
+    return {
+        "requested_effort": requested,
+        "effective_effort": effective,
+        "effort_source": source,
+    }, None
 GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/announcements/update",
     "_x.ai/mcp/init_progress",
@@ -180,7 +217,7 @@ FAILURE_CLASS_CODES = {
     "timeout_budget": {"run_budget_exceeded", "reported_timeout"},
     "model_execution": {"process_exit", "spawn_failed", "model_stopped", "model_reported_error"},
     "malformed_contract": {"invalid_receipt", "adapter_contract_invalid", "missing_prompt"},
-    "session_provenance": {"session_identity_missing", "session_identity_mismatch", "session_provenance_invalid"},
+    "session_provenance": {"session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "launcher_version_mismatch"},
     "repository_state": {"repository_mismatch", "branch_mismatch", "head_mismatch"},
     "cancelled": {"cancelled"},
     "unknown": {"unknown_failure"},
@@ -224,6 +261,7 @@ DIAGNOSTIC_METADATA = {
     "bad_port": ("workflow_failure", "request", "validated_input", "port input is invalid"),
     "unknown_port": ("workflow_failure", "request", "validated_input", "port is not allowlisted"),
     "unknown_stack": ("workflow_failure", "request", "validated_input", "stack is not configured"),
+    "primary_execution_profile_mismatch": ("workflow_failure", "execution", "closed_failure_code", "bounded workflow operation failed"),
 }
 
 
@@ -2021,17 +2059,44 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
     ):
         return 400, {"error": "receipt session_identity does not match normal route", "code": "primary_provider_mismatch"}
-
     failure_code = str(receipt.get("failure_code") or "unknown_failure").strip() or "unknown_failure"
     if failure_code not in PROVIDER_AVAILABILITY_CODES:
         return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
+    expected_effort, expected_effort_err = normalize_effort(
+        normal_launcher, normal_provider, normal_model, primary_route.get("effort"), "route"
+    )
+    receipt_source = receipt.get("effort_source")
+    receipt_effort, receipt_effort_err = normalize_effort(
+        normal_launcher, normal_provider, normal_model,
+        receipt.get("requested_effort"),
+        receipt_source if isinstance(receipt_source, str) and receipt_source in EFFORT_SOURCES else "route",
+    )
+    assert expected_effort_err is None and expected_effort is not None
+    launcher_version = session_identity.get("launcher_version")
+    if (
+        receipt_effort_err is not None or receipt_effort is None
+        or receipt_source not in EFFORT_SOURCES
+        or receipt_effort["effective_effort"] != expected_effort["effective_effort"]
+        or session_identity.get("effective_effort") != expected_effort["effective_effort"]
+        or not isinstance(launcher_version, str)
+        or not LAUNCHER_VERSION_RE.fullmatch(launcher_version)
+        or receipt.get("effective_effort") != session_identity.get("effective_effort")
+        or receipt.get("launcher_version") != launcher_version
+    ):
+        code = "primary_execution_profile_mismatch"
+        return 400, {
+            "error": "primary receipt execution profile does not match normal route",
+            "code": code,
+            "diagnostic": compact_diagnostic(code),
+        }
     job_id = receipt.get("job_id")
     if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
         return 400, {"error": "invalid primary receipt job_id", "code": "bad_job_id"}
     stored_job = read_job(job_id)
     stored_receipt = stored_job.get("receipt") if isinstance(stored_job, dict) else None
     receipt_fields = (
-        "status", "job_id", "session_identity", "failure_class", "failure_code", "failover_eligible",
+        "status", "job_id", "session_identity", "requested_effort", "effective_effort",
+        "effort_source", "launcher_version", "failure_class", "failure_code", "failover_eligible",
     )
     if (
         not isinstance(stored_receipt, dict)
@@ -2040,7 +2105,11 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         or any(receipt.get(key) != stored_receipt.get(key) for key in receipt_fields)
         or any(
             stored_job.get(key) != value
-            for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
+            for key, value in (
+                ("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model),
+                ("effective_effort", session_identity["effective_effort"]),
+                ("launcher_version", launcher_version),
+            )
         )
     ):
         return 400, {"error": "primary receipt does not match its stored job", "code": "primary_receipt_mismatch"}
@@ -2096,7 +2165,24 @@ def resolve_launcher_binary_now(launcher: str) -> Path:
     )
 
 
-RECOVERY_RECEIPT_FIELDS = ("status", "job_id", "session_identity", "failure_class", "failure_code", "failover_eligible")
+def launcher_version_fingerprint(binary: Path) -> str | None:
+    """Return a path-free immutable launcher artifact identity without executing it."""
+    if not binary.is_file():
+        return "missing"
+    digest = hashlib.sha256()
+    try:
+        with binary.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return f"sha256:{digest.hexdigest()}"
+
+
+RECOVERY_RECEIPT_FIELDS = (
+    "status", "job_id", "session_identity", "requested_effort", "effective_effort",
+    "effort_source", "launcher_version", "failure_class", "failure_code", "failover_eligible",
+)
 
 
 def recovery_job_evidence(
@@ -2116,6 +2202,23 @@ def recovery_job_evidence(
         return None, {"error": "recovery session identity is malformed", "code": "malformed_recovery_evidence"}
     if any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model")):
         return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
+    source = receipt.get("effort_source")
+    route_profile, route_profile_err = normalize_effort(
+        route["launcher"], route["provider"], route["model"], route.get("effort"), "route"
+    )
+    receipt_profile, receipt_profile_err = normalize_effort(
+        route["launcher"], route["provider"], route["model"], receipt.get("requested_effort"),
+        source if isinstance(source, str) and source in EFFORT_SOURCES else "route",
+    )
+    if (
+        route_profile_err or receipt_profile_err or route_profile is None or receipt_profile is None
+        or receipt_profile["effective_effort"] != route_profile["effective_effort"]
+        or identity.get("effective_effort") != route_profile["effective_effort"]
+        or receipt.get("effective_effort") != identity.get("effective_effort")
+        or receipt.get("launcher_version") != identity.get("launcher_version")
+        or source not in EFFORT_SOURCES
+    ):
+        return None, {"error": "recovery execution profile mismatches", "code": "recovery_evidence_mismatch"}
     if receipt_status == "ok" and (
         receipt.get("failure_class") != "none" or receipt.get("failure_code") != "none"
         or receipt.get("failover_eligible") is not False
@@ -2131,6 +2234,7 @@ def recovery_job_evidence(
         job.get("status") != job_status or not isinstance(stored, dict)
         or job.get("session_identity") != identity
         or any(job.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
+        or any(job.get(key) != receipt.get(key) for key in ("requested_effort", "effective_effort", "effort_source", "launcher_version"))
         or any(receipt.get(key) != stored.get(key) for key in RECOVERY_RECEIPT_FIELDS)
     ):
         return None, {"error": "recovery receipt does not match its durable job", "code": "recovery_evidence_mismatch"}
@@ -2150,7 +2254,12 @@ def recovery_job_precedes(first: dict[str, Any], second: dict[str, Any]) -> bool
 
 
 def recovery_route_identity(route: dict[str, Any], receipt: dict[str, Any]) -> dict[str, str]:
-    return {"job_id": receipt["job_id"], **{key: route[key] for key in ("route_version", "launcher", "provider", "model")}}
+    return {
+        "job_id": receipt["job_id"],
+        **{key: route[key] for key in ("route_version", "launcher", "provider", "model")},
+        "effective_effort": receipt["effective_effort"],
+        "launcher_version": receipt["launcher_version"],
+    }
 
 
 def derive_slice_recovery_route(data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -3793,7 +3902,10 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     if not isinstance(raw, dict):
         return None, {"error": "session_identity must be an object", "code": "bad_session_identity"}
     out: dict[str, Any] = {}
-    for key in ("launcher", "provider", "model", "repo", "branch", "starting_head", "native_session_id"):
+    for key in (
+        "launcher", "provider", "model", "effective_effort", "launcher_version",
+        "repo", "branch", "starting_head", "native_session_id",
+    ):
         value = raw.get(key)
         if value is None and key == "native_session_id":
             out[key] = None
@@ -3804,6 +3916,8 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     session_id = out["native_session_id"]
     if session_id is not None and not NATIVE_SESSION_RE.fullmatch(session_id):
         return None, {"error": "session_identity.native_session_id is invalid", "code": "bad_session_identity"}
+    if out["effective_effort"] not in EFFORT_VALUES or not LAUNCHER_VERSION_RE.fullmatch(out["launcher_version"]):
+        return None, {"error": "session_identity execution profile is invalid", "code": "bad_session_identity"}
     return out, None
 
 
@@ -3817,14 +3931,18 @@ def validate_native_resume_provenance(
         return {"error": "resume_job_id must be 32 lowercase hex characters", "code": "bad_resume_job_id"}
     prior = read_job(resume_job_id)
     receipt = prior.get("receipt") if isinstance(prior, dict) else None
+    profile_fields = ("requested_effort", "effective_effort", "effort_source", "launcher_version")
     if not (
         isinstance(prior, dict)
         and prior.get("launcher") == launcher
         and prior.get("status") == "completed"
         and prior.get("session_identity") == requested_identity
+        and prior.get("effective_effort") == requested_identity.get("effective_effort")
+        and prior.get("launcher_version") == requested_identity.get("launcher_version")
         and isinstance(receipt, dict)
         and receipt.get("status") == "ok"
         and receipt.get("session_identity") == requested_identity
+        and all(receipt.get(key) == prior.get(key) for key in profile_fields)
     ):
         return {"error": f"resume session_identity is not traceable to a successful {launcher} job", "code": "untraceable_resume_session"}
     return None
@@ -4025,6 +4143,33 @@ def normalize_receipt(
     evidence_code: str | None = None,
     structured_output: str = "",
 ) -> dict[str, Any]:
+    raw_requested = job.get("requested_effort")
+    raw_source = job.get("effort_source")
+    requested_effort = raw_requested if raw_requested in EFFORT_VALUES else "default"
+    effort_source = raw_source if raw_source in EFFORT_SOURCES else "launcher_default"
+    profile, profile_err = normalize_effort(
+        str(job.get("launcher") or ""), str(job.get("provider") or ""),
+        str(job.get("model") or ""), requested_effort, effort_source,
+    )
+    identity = job.get("session_identity")
+    effective_effort = job.get("effective_effort") or (
+        identity.get("effective_effort") if isinstance(identity, dict) else None
+    ) or (profile or {}).get("effective_effort") or "default"
+    launcher_version = job.get("launcher_version") or (
+        identity.get("launcher_version") if isinstance(identity, dict) else None
+    ) or "missing"
+    parsed_identity, identity_err = parse_session_identity(identity)
+    profile_complete = bool(
+        raw_requested in EFFORT_VALUES and raw_source in EFFORT_SOURCES
+        and profile_err is None and profile is not None
+        and job.get("effective_effort") == profile["effective_effort"]
+        and isinstance(job.get("launcher_version"), str)
+        and LAUNCHER_VERSION_RE.fullmatch(job["launcher_version"])
+        and identity_err is None and parsed_identity == identity
+        and isinstance(identity, dict)
+        and identity.get("effective_effort") == job.get("effective_effort")
+        and identity.get("launcher_version") == job.get("launcher_version")
+    )
     failure: str | None = None
     if timed_out:
         status, failure, evidence = "timeout", "agent run budget exceeded", "run_budget_exceeded"
@@ -4037,7 +4182,10 @@ def normalize_receipt(
         evidence = "success" if status == "ok" else (
             "reported_timeout" if status == "timeout" else "model_reported_error"
         )
-    identity = job.get("session_identity")
+    if not profile_complete:
+        status, failure, evidence = (
+            "error", "execution profile provenance is incomplete", "session_provenance_invalid",
+        )
     if status == "ok" and job.get("launcher") in NATIVE_LAUNCHERS and (
         not isinstance(identity, dict) or not identity.get("native_session_id")
     ):
@@ -4049,9 +4197,12 @@ def normalize_receipt(
         "status": status,
         "job_id": job["job_id"],
         "session_identity": identity,
+        "requested_effort": requested_effort,
+        "effective_effort": effective_effort,
+        "effort_source": effort_source,
+        "launcher_version": launcher_version,
         "sha": None,
         "pr_url": None,
-        "log_ref": job["log_ref"],
         "summary": failure,
     }
     if parsed:
@@ -4700,7 +4851,13 @@ def run_agent_job(job_id: str) -> None:
     job["started_at"] = utcnow()
     write_job(job)
     binary = resolve_launcher_binary_now(str(job["launcher"]))
-    if not binary.is_file():
+    current_launcher_version = launcher_version_fingerprint(binary)
+    if current_launcher_version != job.get("launcher_version"):
+        proc, err = None, {
+            "error": "launcher version changed after request validation",
+            "code": "launcher_version_mismatch",
+        }
+    elif not binary.is_file():
         proc, err = None, {"error": f"missing {job['launcher']} binary: {binary}", "code": "missing_binary"}
     elif job.get("launcher") == "grok":
         returncode, timed_out, session_id, protocol_error = run_grok_acp(
@@ -6321,7 +6478,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     allowed = {
         "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
         "session_identity", "resume_job_id", "cwd", "response_webhook_url",
-        "response_webhook_token", "resume_url", "codeoff_workspace",
+        "response_webhook_token", "resume_url", "codeoff_workspace", "effort",
     }
     unexpected = sorted(set(data) - allowed)
     if unexpected:
@@ -6376,6 +6533,16 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             return 400, {"error": "code-off identity differs from the immutable snapshot; fallback/substitution is forbidden", "code": "codeoff_identity_mismatch"}
     elif provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
+    effort, effort_err = normalize_effort(
+        launcher,
+        provider,
+        model,
+        data.get("effort", "default"),
+        "explicit" if "effort" in data else "launcher_default",
+    )
+    if effort_err:
+        return 400, effort_err
+    assert effort is not None
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
@@ -6385,6 +6552,14 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
         return 400, {"error": "code-off job must use the immutable turn and time budgets", "code": "codeoff_budget_mismatch"}
     binary = resolve_launcher_binary_now(launcher)
+    launcher_version = launcher_version_fingerprint(binary)
+    if launcher_version is None:
+        classified = classify_agent_failure("launcher_version_mismatch")
+        return 501, {
+            "error": "launcher version is unavailable",
+            "code": "launcher_version_mismatch",
+            **classified,
+        }
     if not binary.is_file() and not webhook_url:
         classified = classify_agent_failure("missing_binary")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": "missing_binary", **classified}
@@ -6400,6 +6575,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, identity_err
     session_identity = {
         "launcher": launcher, "provider": provider, "model": model,
+        "effective_effort": effort["effective_effort"],
+        "launcher_version": launcher_version,
         "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
     }
     resume_parent: dict[str, Any] | None = None
@@ -6477,6 +6654,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "launcher": launcher,
             "provider": provider,
             "model": model,
+            **effort,
+            "launcher_version": launcher_version,
             "session_identity": session_identity,
             "max_turns": turns or AGENT_MAX_TURNS,
             "run_budget_seconds": budget or AGENT_RUN_BUDGET,
@@ -6525,6 +6704,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "launcher": launcher,
         "provider": provider,
         "model": model,
+        **effort,
         "session_identity": session_identity,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
