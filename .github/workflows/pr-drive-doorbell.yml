@@ -2,6 +2,7 @@ name: pr-drive-doorbell
 
 on:
   workflow_run:
+    workflows: [catalog-ci]
     types: [completed]
   pull_request_review:
     types: [submitted]
