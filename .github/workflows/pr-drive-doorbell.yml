@@ -13,6 +13,7 @@ permissions:
 jobs:
   ring:
     if: >-
+      vars.GRAPHWING_PR_DRIVE_ENABLED == 'true' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.name != 'pr-drive-doorbell') &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure') &&
       (github.event.pull_request.user.login == 'tfournet' || github.event.workflow_run.actor.login == 'tfournet' || github.actor == 'tfournet')
