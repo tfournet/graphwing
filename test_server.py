@@ -45,7 +45,9 @@ def _fixture_execution_profile(
 
 def _fixture_identity_profile(profile):
     return {
+        "requested_effort": profile["requested_effort"],
         "effective_effort": profile["effective_effort"],
+        "effort_source": profile["effort_source"],
         "launcher_version": profile["launcher_version"],
     }
 
@@ -433,7 +435,8 @@ class DispatchTests(unittest.TestCase):
             ).stdout.strip()
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-                "effective_effort": "default", "launcher_version": version,
+                "requested_effort": "default", "effective_effort": "high",
+                "effort_source": "launcher_default", "launcher_version": version,
                 "repo": "scratch", "branch": branch, "starting_head": head,
                 "native_session_id": "codex-fixture",
             }
@@ -441,8 +444,9 @@ class DispatchTests(unittest.TestCase):
             self.assertIsNone(parse_error)
             self.assertEqual(parsed, identity)
             identities = (
-                {**identity, "effective_effort": "default"},
-                {**identity, "effective_effort": "high", "launcher_version": "sha256:" + "f" * 64},
+                identity,
+                {**identity, "requested_effort": "high", "effort_source": "explicit",
+                 "launcher_version": "sha256:" + "f" * 64},
             )
             with mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
                  mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("provider execution forbidden")):
@@ -841,8 +845,11 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "grok",
+                "provider": "xai", "model": "grok-4.6",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
-                "receipt": {"status": "ok", "session_identity": identity, **profile, "summary": "done"},
+                "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "grok",
+                            "provider": "xai", "model": "grok-4.6",
+                            "session_identity": identity, **profile, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
             replacements = {
@@ -861,7 +868,11 @@ class DispatchTests(unittest.TestCase):
                     body = json.dumps({**base, "session_identity": dict(identity, **{key: value})}).encode()
                     status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
                     self.assertEqual(status, 400, key)
-                    self.assertEqual(payload["code"], "session_identity_mismatch", key)
+                    self.assertEqual(
+                        payload["code"],
+                        "bad_session_identity" if key in {"launcher", "provider", "model"} else "session_identity_mismatch",
+                        key,
+                    )
                 valid = json.dumps({**base, "session_identity": identity}).encode()
                 status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid)
                 self.assertEqual(status, 202, payload)
@@ -923,8 +934,11 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
-                "receipt": {"status": "ok", "session_identity": identity, **profile, "summary": "done"},
+                "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "codex",
+                            "provider": "openai", "model": "gpt-5.6-sol",
+                            "session_identity": identity, **profile, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
             bad_identity_job = dict(prior, job_id="cd" * 16, receipt={"status": "ok", "session_identity": dict(identity, native_session_id="codex-999")})
@@ -994,8 +1008,11 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "claude",
+                "provider": "anthropic", "model": "claude-opus-5",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
-                "receipt": {"status": "ok", "session_identity": identity, **profile, "summary": "done"},
+                "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "claude",
+                            "provider": "anthropic", "model": "claude-opus-5",
+                            "session_identity": identity, **profile, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
             body = json.dumps({
@@ -1039,8 +1056,11 @@ class DispatchTests(unittest.TestCase):
             prior_dir.mkdir(parents=True)
             prior = {
                 "job_id": prior_job_id, "status": "completed", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
-                "receipt": {"status": "ok", "session_identity": identity, **profile, "summary": "done"},
+                "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "codex",
+                            "provider": "openai", "model": "gpt-5.6-sol",
+                            "session_identity": identity, **profile, "summary": "done"},
             }
             (prior_dir / "job.json").write_text(json.dumps(prior))
             (repo / "CHANGE").write_text("new head\n")
@@ -1173,10 +1193,71 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "bad_job_id")
 
+    def test_agent_job_endpoint_rejects_adversarial_non_agent_records(self):
+        hostile = {
+            "log_ref": "/home/private/log", "path": "/home/private/credential",
+            "token": "TOKEN_SECRET", "callback": "https://private.example/callback",
+            "error": "raw provider error",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            for index, kind in enumerate(("test", "script", "rr", "review"), start=1):
+                job_id = f"{index:02x}" * 16
+                record = {
+                    "job_id": job_id, "kind": kind, "status": "completed",
+                    "repo": "scratch", "receipt": {"status": "ok", **hostile}, **hostile,
+                }
+                path = jobs / job_id / "job.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(record))
+                with self.subTest(kind=kind), mock.patch.object(server, "JOBS_DIR", jobs):
+                    status, payload, _ = server.dispatch(
+                        "GET", f"/v1/agent/jobs/{job_id}", {}, True, b""
+                    )
+                self.assertEqual((status, payload["code"]), (404, "not_found"), payload)
+                self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+                self.assertNotIn("private.example", json.dumps(payload))
+
+            allowed = (
+                (5, "codex", "openai", "gpt-5.6-sol", {}),
+                (6, "codex", "openai", "gpt-5.6-terra", {
+                    "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
+                }),
+            )
+            for index, launcher, provider, model, extra in allowed:
+                profile = _fixture_execution_profile(launcher, provider, model)
+                identity = {
+                    "launcher": launcher, "provider": provider, "model": model,
+                    **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+                    "starting_head": "b" * 40, "native_session_id": None,
+                }
+                job_id = f"{index:02x}" * 16
+                record = {
+                    "job_id": job_id, "status": "queued", "repo": "scratch",
+                    "launcher": launcher, "provider": provider, "model": model,
+                    **profile, "session_identity": identity, **extra,
+                }
+                path = jobs / job_id / "job.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(record))
+                with self.subTest(agent_extra=extra), mock.patch.object(server, "JOBS_DIR", jobs):
+                    status, payload, _ = server.dispatch(
+                        "GET", f"/v1/agent/jobs/{job_id}", {}, True, b""
+                    )
+                self.assertEqual(status, 200, payload)
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                self.assertEqual(payload["job_id"], job_id)
+                self.assertNotIn("codeoff_workspace", payload)
+
     def test_agent_job_wait_blocks_until_terminal_without_relaunching(self):
         job_id = "ab" * 16
-        queued = {"job_id": job_id, "status": "running"}
-        completed = {"job_id": job_id, "status": "completed", "receipt": {"status": "ok"}}
+        agent_shape = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "session_identity": {},
+        }
+        queued = {"job_id": job_id, "status": "running", **agent_shape}
+        completed = {"job_id": job_id, "status": "completed", "receipt": {"status": "ok"}, **agent_shape}
         with mock.patch.object(server, "read_job", side_effect=[queued, completed]), \
              mock.patch.object(server.time, "sleep") as sleep:
             status, payload, _ = server.dispatch(
@@ -1204,7 +1285,11 @@ class DispatchTests(unittest.TestCase):
 
     def test_agent_job_wait_timeout_is_bounded(self):
         job_id = "ab" * 16
-        with mock.patch.object(server, "read_job", return_value={"job_id": job_id, "status": "running"}), \
+        running = {
+            "job_id": job_id, "status": "running", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol", "session_identity": {},
+        }
+        with mock.patch.object(server, "read_job", return_value=running), \
              mock.patch.object(server.time, "monotonic", side_effect=[0, 31]):
             status, payload, _ = server.dispatch(
                 "POST", "/v1/agent/jobs/wait", {}, True,
@@ -1339,7 +1424,12 @@ class DispatchTests(unittest.TestCase):
                     self.assertNotIn(fragment, dumped)
                 self.assertNotIn("sha", receipt)
                 self.assertNotIn("pr_url", receipt)
+                self.assertEqual(receipt["session_identity"]["starting_head"], "b" * 40)
                 self.assertEqual(receipt["summary"], receipt["diagnostic"]["summary"])
+        for doc_path in (Path("docs/HUMAN-LOOP.md"), Path("docs/USING.md")):
+            text = doc_path.read_text()
+            self.assertIn("validated `starting_head`", text)
+            self.assertIn("launcher/model-supplied SHA/PR URL", text)
 
     def test_worker_callback_cans_raw_spawn_failure(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1404,6 +1494,43 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertNotIn("log_ref", receipt)
         self.assertNotIn("/private", json.dumps(receipt, sort_keys=True))
+
+    def test_session_identity_binds_requested_effective_source_and_version(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": "native-123",
+        }
+        parsed, error = server.parse_session_identity(identity)
+        self.assertIsNone(error)
+        self.assertEqual(parsed, identity)
+        schema = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]
+        self.assertEqual(set(schema["required"]), set(identity))
+        self.assertEqual(set(schema["properties"]), set(identity))
+
+    def test_resume_rejects_top_level_profile_drift_from_identity(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": "native-123",
+        }
+        prior = {
+            "job_id": "ab" * 16, "status": "completed",
+            "launcher": "codex", "provider": "anthropic", "model": "claude-opus-5",
+            **profile, "session_identity": identity,
+            "receipt": {
+                "status": "ok", "job_id": "ab" * 16,
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                **profile, "session_identity": identity,
+            },
+        }
+        with mock.patch.object(server, "read_job", return_value=prior):
+            error = server.validate_native_resume_provenance(
+                {"resume_job_id": "ab" * 16}, identity, "codex"
+            )
+        self.assertEqual(error["code"], "untraceable_resume_session")
 
     def test_session_identity_rejects_unknown_fields_in_parser_and_endpoint(self):
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
@@ -1757,8 +1884,6 @@ class DispatchTests(unittest.TestCase):
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 for surface in surfaces:
                     for field, value in mutations.items():
-                        if surface == "session_identity" and field in ("requested_effort", "effort_source"):
-                            continue
                         with self.subTest(surface=surface, field=field):
                             job = deepcopy(pristine)
                             target = job if surface == "job" else job[surface]
@@ -1770,6 +1895,14 @@ class DispatchTests(unittest.TestCase):
                                 "repo": "scratch", "message": "must not commit", "writer_job_id": job_id,
                             }).encode(), {"scratch": str(repo)})
                             self.assertEqual((status, payload["code"]), (409, "writer_job_mismatch"))
+                coordinated = deepcopy(pristine)
+                coordinated["requested_effort"] = "high"
+                coordinated["effort_source"] = "explicit"
+                coordinated["receipt"]["requested_effort"] = "high"
+                coordinated["receipt"]["effort_source"] = "explicit"
+                server.write_job(coordinated)
+                error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
+                self.assertEqual(error["code"], "writer_evidence_mismatch")
 
     def test_writer_staging_and_commit_preserve_dirty_operator_state_in_linked_worktree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2224,18 +2357,26 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(status, 400, payload)
             self.assertEqual(payload["code"], "repo_not_toplevel")
 
-    def test_empty_writer_job_id_uses_legacy_staged_commit(self):
-        with tempfile.TemporaryDirectory() as td:
-            repo = self._scratch_git(Path(td))
-            (repo / "staged.txt").write_text("staged\n")
-            subprocess.run(["git", "-C", str(repo), "add", "--", "staged.txt"], check=True)
-            status, payload = server.git_commit(json.dumps({
-                "repo": "scratch", "message": "staged", "writer_job_id": "",
-            }).encode(), {"scratch": str(repo)})
-            self.assertEqual(status, 200, payload)
-            self.assertIn("staged.txt", subprocess.run(
-                ["git", "-C", str(repo), "show", "--format=", "--name-only", "HEAD"], check=True, capture_output=True, text=True,
-            ).stdout.splitlines())
+    def test_ordinary_commit_requires_nonempty_writer_job_id(self):
+        for writer_value in (None, ""):
+            with self.subTest(writer_value=writer_value), tempfile.TemporaryDirectory() as td:
+                repo = self._scratch_git(Path(td))
+                (repo / "staged.txt").write_text("staged\n")
+                subprocess.run(["git", "-C", str(repo), "add", "--", "staged.txt"], check=True)
+                body = {"repo": "scratch", "message": "staged"}
+                if writer_value is not None:
+                    body["writer_job_id"] = writer_value
+                status, payload = server.git_commit(
+                    json.dumps(body).encode(), {"scratch": str(repo)}
+                )
+                self.assertEqual((status, payload["code"]), (400, "writer_job_required"), payload)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "1",
+                )
 
     def test_writer_commit_rejects_cyclic_resume_descendants(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3472,9 +3613,10 @@ while True:
         commit_op = spec["paths"]["/v1/git/commit"]["post"]
         commit_request = spec["components"]["schemas"]["GitCommitRequest"]["properties"]
         self.assertEqual(commit_request["writer_job_id"]["pattern"], "^[0-9a-f]{32}$")
-        self.assertIn("real staged index", commit_op["summary"])
+        self.assertIn("validated writer evidence", commit_op["summary"])
+        self.assertIn("code-off", commit_op["summary"])
         self.assertIn("isolated index", commit_op["summary"])
-        self.assertIn("real staged index", commit_request["add"]["description"])
+        self.assertIn("code-off commits use the verified staged index", commit_request["add"]["description"])
         self.assertIn("isolated index", commit_request["add"]["description"])
         self.assertIn("409", commit_op["responses"])
         self.assertIn("409", spec["paths"]["/v1/agent/run"]["post"]["responses"])
@@ -4124,8 +4266,8 @@ while True:
                         {"repo": "scratch", "message": "add extra", "add": "extra.txt"}
                     ).encode(),
                 )
-            self.assertEqual(status, 200, payload)
-            self.assertTrue(payload["ok"])
+            self.assertEqual((status, payload["code"]), (400, "writer_job_required"), payload)
+            self.assertTrue((repo / "extra.txt").is_file())
 
     def test_file_head_nested_relative_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4809,6 +4951,9 @@ while True:
             "final": {"branch": "feature", "sha": head, "clean": True},
         }
         evidence.update(overrides.pop("evidence", {}))
+        evidence.setdefault(
+            "writer_evidence_mode", "writer" if "writer_job_id" in evidence else "initial_green"
+        )
         job = {
             "job_id": job_id,
             "kind": "test",
@@ -4950,6 +5095,8 @@ while True:
             self.assertEqual(status, 202, payload)
             job = json.loads((jobs / payload["job_id"] / "job.json").read_text())
             evidence = job["merge_evidence"]
+            self.assertEqual(evidence["writer_evidence_mode"], "initial_green")
+            self.assertNotIn("writer_job_id", evidence)
             self.assertEqual(evidence["repo"], "r")
             self.assertEqual(job["repo"], "r")
             self.assertEqual(evidence["cwd"], str(repo.resolve()))
@@ -4959,6 +5106,55 @@ while True:
             self.assertEqual((evidence["expected_head"], evidence["live_head"], evidence["head_ref"]), (head, head, "feature"))
             self.assertEqual(evidence["start"], {"branch": "feature", "sha": head, "clean": True})
             self.assertIsNone(evidence["final"])
+            enqueue.assert_called_once()
+
+    def test_merge_evidence_creation_requires_valid_writer_before_stamping_writer_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"], check=True, capture_output=True)
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            jobs = root / "jobs"
+            writer_id = "c" * 32
+            spec = {"catalog-compile": {
+                "name": "catalog-compile", "argv": [sys.executable, "-c", "pass"],
+                "cwd": repo.resolve(), "timeout_seconds": 120, "async": True,
+            }}
+            request = {
+                "name": "catalog-compile", "evidence_mode": "pr_merge", "repo": "r",
+                "pr": "7", "run_id": "run-7", "expected_head": head,
+                "writer_job_id": writer_id,
+            }
+            patches = (
+                mock.patch.object(server, "JOBS_DIR", jobs),
+                mock.patch.object(server, "load_tests", return_value=spec),
+                mock.patch.object(server, "gh_json", return_value=self._strict_pr_view(head)),
+                mock.patch.object(server, "enqueue_script"),
+            )
+            with patches[0], patches[1], patches[2], patches[3] as enqueue:
+                status, payload = server.test_run(json.dumps(request).encode(), {"r": str(repo)})
+            self.assertEqual(status, 409, payload)
+            enqueue.assert_not_called()
+
+            writer = _stamp_complete_writer_evidence({
+                "job_id": writer_id, "status": "completed", "repo": "r", "cwd": str(repo.resolve()),
+                "session_identity": {"branch": "feature", "starting_head": head}, "receipt": {"status": "ok"},
+            })
+            writer_path = jobs / writer_id / "job.json"
+            writer_path.parent.mkdir(parents=True)
+            writer_path.write_text(json.dumps(writer) + "\n")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_tests", return_value=spec), \
+                 mock.patch.object(server, "gh_json", return_value=self._strict_pr_view(head)), \
+                 mock.patch.object(server, "enqueue_script") as enqueue:
+                status, payload = server.test_run(json.dumps(request).encode(), {"r": str(repo)})
+            self.assertEqual(status, 202, payload)
+            created = json.loads((jobs / payload["job_id"] / "job.json").read_text())
+            self.assertEqual(created["merge_evidence"]["writer_evidence_mode"], "writer")
+            self.assertEqual(created["merge_evidence"]["writer_job_id"], writer_id)
             enqueue.assert_called_once()
 
     def test_merge_evidence_creation_rejects_stale_branch_dirty_and_wrong_recipe_cwd(self):
@@ -5049,6 +5245,10 @@ while True:
                 ("branch_mismatch", {**base, "merge_evidence": {**base["merge_evidence"], "final": {"branch": "other", "sha": head, "clean": True}}}),
                 ("dirty_start", {**base, "merge_evidence": {**base["merge_evidence"], "start": {"branch": "feature", "sha": head, "clean": False}}}),
                 ("dirty_end", {**base, "merge_evidence": {**base["merge_evidence"], "final": {"branch": "feature", "sha": head, "clean": False}}}),
+                ("missing_writer_mode", {**base, "merge_evidence": {key: value for key, value in base["merge_evidence"].items() if key != "writer_evidence_mode"}}),
+                ("unknown_writer_mode", {**base, "merge_evidence": {**base["merge_evidence"], "writer_evidence_mode": "legacy"}}),
+                ("writer_mode_without_id", {**base, "merge_evidence": {**base["merge_evidence"], "writer_evidence_mode": "writer"}}),
+                ("initial_mode_with_id", {**base, "merge_evidence": {**base["merge_evidence"], "writer_evidence_mode": "initial_green", "writer_job_id": "c" * 32}}),
             ])
             for label, job in cases:
                 with self.subTest(label=label):
@@ -5407,7 +5607,7 @@ while True:
                 {"r": str(Path(server.__file__).parent)},
             )
         self.assertFalse(payload.get("ok"))
-        self.assertEqual(payload.get("code"), "nothing_staged", payload)
+        self.assertEqual(payload.get("code"), "writer_job_required", payload)
 
     def test_pr_findings_extracts_the_machine_verdict_not_the_prose(self):
         # pr-drive took its fix instructions from CTX.INPUT.prompt, so a human
@@ -5833,25 +6033,31 @@ while True:
         route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         base_identity = {
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-            "effective_effort": "high", "launcher_version": "sha256:" + "a" * 64,
+            "requested_effort": "high", "effective_effort": "high", "effort_source": "route",
+            "launcher_version": "sha256:" + "a" * 64,
         }
         cases = (
-            ({"effective_effort": "default"}, "sha256:" + "a" * 64),
-            ({}, "missing"),
+            ({"effective_effort": "default"}, {}, "sha256:" + "a" * 64),
+            ({}, {}, "missing"),
+            ({}, {"requested_effort": "default", "effort_source": "launcher_default"}, "sha256:" + "a" * 64),
+            ({}, {"provider": "anthropic"}, "sha256:" + "a" * 64),
         )
-        for identity_change, receipt_version in cases:
+        for identity_change, receipt_change, receipt_version in cases:
             identity = {**base_identity, **identity_change}
             receipt = {
                 "status": "error", "job_id": "a" * 32, "role": "primary",
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "requested_effort": "high", "effective_effort": identity["effective_effort"],
                 "effort_source": "route", "launcher_version": receipt_version,
                 "failure_class": "provider_availability", "failure_code": "provider_rate_limit",
-                "failover_eligible": True, "session_identity": identity,
+                "failover_eligible": True, "session_identity": identity, **receipt_change,
             }
             stored_receipt = {key: value for key, value in receipt.items() if key != "role"}
             stored_job = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "requested_effort": receipt["requested_effort"],
                 "effective_effort": identity["effective_effort"],
+                "effort_source": receipt["effort_source"],
                 "launcher_version": base_identity["launcher_version"], "status": "failed",
                 "session_identity": identity, "receipt": stored_receipt,
             }
@@ -5878,7 +6084,7 @@ while True:
             self.assertEqual(tuple(primary_route[k] for k in ("launcher", "provider", "model")), primary)
             profile = _fixture_execution_profile(*primary, requested=primary_route["effort"], source="route")
             identity = {"launcher": primary[0], "provider": primary[1], "model": primary[2], **_fixture_identity_profile(profile)}
-            receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", **profile, "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": identity}
+            receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": primary[0], "provider": primary[1], "model": primary[2], **profile, "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": identity}
             stored_job = {
                 "launcher": primary[0], "provider": primary[1], "model": primary[2],
                 **profile,
@@ -5906,7 +6112,7 @@ while True:
         primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", requested="high", source="route")
         identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **_fixture_identity_profile(profile)}
-        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
+        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         base = {"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}
         for patch, code in (
             ({"primary_receipt": {**receipt, "status": "timeout"}}, "not_fallback_eligible"),
@@ -5934,7 +6140,7 @@ while True:
         primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", requested="high", source="route")
         identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **_fixture_identity_profile(profile)}
-        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
+        receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         body = json.dumps({"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}).encode()
         stored_receipt = {key: value for key, value in receipt.items() if key != "role"}
         valid_job = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "status": "failed", "session_identity": identity, "receipt": stored_receipt}
@@ -6031,6 +6237,9 @@ while True:
             "status": "error",
             "job_id": primary_job_id,
             "role": "primary",
+            "launcher": primary_route["launcher"],
+            "provider": primary_route["provider"],
+            "model": primary_route["model"],
             "session_identity": primary_identity,
             **primary_profile,
             "failure_class": "provider_availability",
@@ -6042,6 +6251,9 @@ while True:
             "status": "ok",
             "job_id": fallback_job_id,
             "role": "availability_fallback",
+            "launcher": fallback_route["launcher"],
+            "provider": fallback_route["provider"],
+            "model": fallback_route["model"],
             "session_identity": fallback_identity,
             **fallback_profile,
             "failure_class": "none",
@@ -6098,6 +6310,9 @@ while True:
                 "status": "ok",
                 "job_id": "3" * 32,
                 "role": "primary",
+                "launcher": primary_route["launcher"],
+                "provider": primary_route["provider"],
+                "model": primary_route["model"],
                 "session_identity": fresh_identity,
                 **primary_profile,
                 "failure_class": "none",
@@ -6197,6 +6412,22 @@ while True:
                     status, payload = server.derive_slice_recovery_route(body)
                 self.assertEqual(status, 400, payload)
                 self.assertEqual(payload["code"], "recovery_evidence_mismatch")
+
+    def test_provider_recovery_rejects_coordinated_job_receipt_profile_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            body = self._provider_recovery_fixture(jobs, "provider_network")
+            receipt = body["fallback_receipt"]
+            receipt["effort_source"] = "explicit"
+            stored_path = jobs / receipt["job_id"] / "job.json"
+            stored = json.loads(stored_path.read_text())
+            stored["effort_source"] = "explicit"
+            stored["receipt"]["effort_source"] = "explicit"
+            stored_path.write_text(json.dumps(stored) + "\n")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
+                status, payload = server.derive_slice_recovery_route(body)
+            self.assertEqual((status, payload["code"]), (400, "recovery_evidence_mismatch"), payload)
 
     def test_provider_recovery_rejects_own_job_head_mismatch_and_out_of_order_fallback(self):
         cases = ("own_job_head_mismatch", "out_of_order")
@@ -7757,47 +7988,29 @@ while True:
                 self.assertEqual(status, 400, payload)
                 self.assertEqual(payload["code"], "extra_field")
 
-    def test_git_commit_add_and_staged_only(self):
+    def test_git_commit_add_and_staged_only_require_evidence(self):
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             (repo / "tracked.txt").write_text("a\n")
             (repo / "left.txt").write_text("leave me\n")
+            subprocess.run(["git", "-C", str(repo), "add", "left.txt"], check=True, capture_output=True)
+            requests = (
+                {"repo": "scratch", "message": "add tracked", "add": ["tracked.txt"]},
+                {"repo": "scratch", "message": "staged only"},
+            )
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
-                status, payload, _ = server.dispatch(
-                    "POST",
-                    "/v1/git/commit",
-                    {},
-                    True,
-                    json.dumps({"repo": "scratch", "message": "add tracked", "add": ["tracked.txt"]}).encode(),
-                )
-                self.assertEqual(status, 200, payload)
-                self.assertTrue(payload["ok"])
-                listed = subprocess.run(
-                    ["git", "-C", str(repo), "ls-files"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertIn("tracked.txt", listed.stdout)
-                self.assertNotIn("left.txt", listed.stdout)
-                subprocess.run(["git", "-C", str(repo), "add", "left.txt"], check=True, capture_output=True)
-                (repo / "untracked.txt").write_text("nope\n")
-                status, payload, _ = server.dispatch(
-                    "POST",
-                    "/v1/git/commit",
-                    {},
-                    True,
-                    json.dumps({"repo": "scratch", "message": "staged only"}).encode(),
-                )
-                self.assertEqual(status, 200, payload)
-                listed = subprocess.run(
-                    ["git", "-C", str(repo), "ls-files"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertIn("left.txt", listed.stdout)
-                self.assertNotIn("untracked.txt", listed.stdout)
+                for request in requests:
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/git/commit", {}, True, json.dumps(request).encode()
+                    )
+                    self.assertEqual((status, payload["code"]), (400, "writer_job_required"), payload)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
+                "1",
+            )
 
     def test_git_commit_rejects(self):
         with tempfile.TemporaryDirectory() as td:
@@ -9952,9 +10165,13 @@ class CodeOffTests(unittest.TestCase):
             "native_session_id": "fixture-resume",
         }
         server.write_job({
-            "job_id": resume_id, "status": "completed", "launcher": resume_body["launcher"],
-            **profile, "session_identity": resume_identity,
-            "receipt": {"status": "ok", "job_id": resume_id, **profile, "session_identity": resume_identity},
+            "job_id": resume_id, "status": "completed",
+            "launcher": resume_body["launcher"], "provider": resume_body["provider"],
+            "model": resume_body["model"], **profile, "session_identity": resume_identity,
+            "receipt": {"status": "ok", "job_id": resume_id,
+                        "launcher": resume_body["launcher"], "provider": resume_body["provider"],
+                        "model": resume_body["model"], **profile,
+                        "session_identity": resume_identity},
         })
         resume_body.update({"resume_job_id": resume_id, "session_identity": resume_identity})
         with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)):

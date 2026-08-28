@@ -1368,6 +1368,15 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     writer_id = data.get("writer_job_id")
     if writer_id == "":
         writer_id = None
+    codeoff_commit = (
+        data.get("codeoff_experiment_id") not in (None, "")
+        and data.get("final_verification_hash") not in (None, "")
+    )
+    if writer_id is None and not codeoff_commit:
+        return 400, {
+            "error": "ordinary commits require writer_job_id",
+            "code": "writer_job_required",
+        }
     writer_paths: list[str] = []
     if writer_id is not None:
         writer = read_job(writer_id) if isinstance(writer_id, str) and JOB_ID_RE.fullmatch(writer_id) else None
@@ -2080,7 +2089,8 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         receipt_effort_err is not None or receipt_effort is None
         or receipt_source not in EFFORT_SOURCES
         or receipt_effort["effective_effort"] != expected_effort["effective_effort"]
-        or session_identity.get("effective_effort") != expected_effort["effective_effort"]
+        or any(session_identity.get(key) != value for key, value in receipt_effort.items())
+        or any(receipt.get(key) != session_identity.get(key) for key in AGENT_PROFILE_FIELDS)
         or not isinstance(launcher_version, str)
         or not LAUNCHER_VERSION_RE.fullmatch(launcher_version)
         or receipt.get("effective_effort") != session_identity.get("effective_effort")
@@ -2098,22 +2108,16 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
     stored_job = read_job(job_id)
     stored_receipt = stored_job.get("receipt") if isinstance(stored_job, dict) else None
     receipt_fields = (
-        "status", "job_id", "session_identity", "requested_effort", "effective_effort",
-        "effort_source", "launcher_version", "failure_class", "failure_code", "failover_eligible",
+        "status", "job_id", "session_identity", "launcher", "provider", "model",
+        "requested_effort", "effective_effort", "effort_source", "launcher_version",
+        "failure_class", "failure_code", "failover_eligible",
     )
     if (
         not isinstance(stored_receipt, dict)
         or stored_job.get("status") != "failed"
         or stored_job.get("session_identity") != session_identity
         or any(receipt.get(key) != stored_receipt.get(key) for key in receipt_fields)
-        or any(
-            stored_job.get(key) != value
-            for key, value in (
-                ("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model),
-                ("effective_effort", session_identity["effective_effort"]),
-                ("launcher_version", launcher_version),
-            )
-        )
+        or any(stored_job.get(key) != session_identity.get(key) for key in AGENT_PROFILE_FIELDS)
     ):
         return 400, {"error": "primary receipt does not match its stored job", "code": "primary_receipt_mismatch"}
     fallback = build_slice_route(
@@ -2222,8 +2226,9 @@ def launcher_version_fingerprint(binary: Path) -> str | None:
 
 
 RECOVERY_RECEIPT_FIELDS = (
-    "status", "job_id", "session_identity", "requested_effort", "effective_effort",
-    "effort_source", "launcher_version", "failure_class", "failure_code", "failover_eligible",
+    "status", "job_id", "session_identity", "launcher", "provider", "model",
+    "requested_effort", "effective_effort", "effort_source", "launcher_version",
+    "failure_class", "failure_code", "failover_eligible",
 )
 
 
@@ -2255,9 +2260,8 @@ def recovery_job_evidence(
     if (
         route_profile_err or receipt_profile_err or route_profile is None or receipt_profile is None
         or receipt_profile["effective_effort"] != route_profile["effective_effort"]
-        or identity.get("effective_effort") != route_profile["effective_effort"]
-        or receipt.get("effective_effort") != identity.get("effective_effort")
-        or receipt.get("launcher_version") != identity.get("launcher_version")
+        or any(identity.get(key) != value for key, value in receipt_profile.items())
+        or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
         or source not in EFFORT_SOURCES
     ):
         return None, {"error": "recovery execution profile mismatches", "code": "recovery_evidence_mismatch"}
@@ -2275,8 +2279,7 @@ def recovery_job_evidence(
     if (
         job.get("status") != job_status or not isinstance(stored, dict)
         or job.get("session_identity") != identity
-        or any(job.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
-        or any(job.get(key) != receipt.get(key) for key in ("requested_effort", "effective_effort", "effort_source", "launcher_version"))
+        or any(job.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
         or any(receipt.get(key) != stored.get(key) for key in RECOVERY_RECEIPT_FIELDS)
     ):
         return None, {"error": "recovery receipt does not match its durable job", "code": "recovery_evidence_mismatch"}
@@ -2434,7 +2437,13 @@ def validate_merge_test(data: dict[str, Any], repo_name: str, repo: Path, number
     ):
         code = "head_moved" if head not in {evidence.get("expected_head"), evidence.get("live_head")} else "test_evidence_mismatch"
         return {"error": "final test evidence does not match this PR/run/head", "code": code}
-    if "writer_job_id" in evidence:
+    mode = evidence.get("writer_evidence_mode")
+    if mode not in {"initial_green", "writer"}:
+        return {"error": "merge evidence has no valid writer evidence mode", "code": "writer_evidence_mode_invalid"}
+    has_writer = "writer_job_id" in evidence
+    if (mode == "writer") != has_writer:
+        return {"error": "merge evidence writer mode and ID disagree", "code": "writer_evidence_mode_invalid"}
+    if mode == "writer":
         return validate_writer_evidence(evidence.get("writer_job_id"), repo_name, repo, branch)
     return None
 
@@ -3536,7 +3545,7 @@ def trusted_agent_profile(job: dict[str, Any]) -> dict[str, Any] | None:
         or job.get("effective_effort") != normalized["effective_effort"]
         or not isinstance(launcher_version, str) or not LAUNCHER_VERSION_RE.fullmatch(launcher_version)
         or identity_err or parsed != identity or not isinstance(identity, dict)
-        or any(identity.get(key) != job.get(key) for key in ("launcher", "provider", "model", "effective_effort", "launcher_version"))
+        or any(identity.get(key) != job.get(key) for key in AGENT_PROFILE_FIELDS)
     ):
         return None
     return {key: job.get(key) for key in AGENT_PROFILE_FIELDS} | {"session_identity": identity}
@@ -3575,10 +3584,34 @@ def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def is_agent_job_record(job: Any) -> bool:
+    """Recognize only records created by the native agent job path."""
+    if not isinstance(job, dict) or job.get("kind") not in (None, "agent"):
+        return False
+    launcher, provider, model = (job.get(key) for key in ("launcher", "provider", "model"))
+    identity = job.get("session_identity")
+    native_spec = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
+    ordinary = bool(
+        native_spec and provider == native_spec["provider"] and model in native_spec["models"]
+    )
+    workspace = job.get("codeoff_workspace")
+    codeoff = bool(
+        isinstance(workspace, dict)
+        and set(workspace) == {"experiment_id", "slot"}
+        and isinstance(workspace.get("experiment_id"), str)
+        and CODEOFF_EXPERIMENT_RE.fullmatch(workspace["experiment_id"])
+        and workspace.get("slot") in {"author-1", "author-2", "judge-fable", "judge-1", "judge-2"}
+        and isinstance(provider, str) and isinstance(model, str)
+        and (launcher, provider, model) in EFFORT_PROFILES
+    )
+    return bool(
+        isinstance(job.get("job_id"), str) and JOB_ID_RE.fullmatch(job["job_id"])
+        and (ordinary or codeoff)
+        and isinstance(identity, dict)
+    )
+
+
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
-    if job.get("kind") not in (None, "agent") and not job.get("codeoff_workspace"):
-        keys = ("job_id", "status", "repo", "created_at", "started_at", "finished_at", "receipt")
-        return {"ok": True, **{key: job.get(key) for key in keys}}
     profile = trusted_agent_profile(job)
     return {
         "ok": True,
@@ -3610,8 +3643,9 @@ def agent_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
     deadline = time.monotonic() + timeout
     while True:
         job = read_job(job_id)
-        if not job:
+        if not is_agent_job_record(job):
             return 404, {"error": "job not found", "code": "not_found"}
+        assert isinstance(job, dict)
         if job.get("status") not in ("queued", "running"):
             return 200, public_job(job)
         if time.monotonic() >= deadline:
@@ -4000,15 +4034,17 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     if not isinstance(raw, dict):
         return None, {"error": "session_identity must be an object", "code": "bad_session_identity"}
     allowed = {
-        "launcher", "provider", "model", "effective_effort", "launcher_version",
-        "repo", "branch", "starting_head", "native_session_id",
+        "launcher", "provider", "model", "requested_effort", "effective_effort",
+        "effort_source", "launcher_version", "repo", "branch", "starting_head",
+        "native_session_id",
     }
     if set(raw) != allowed:
         return None, {"error": "session_identity has missing or unsupported fields", "code": "bad_session_identity"}
     out: dict[str, Any] = {}
     for key in (
-        "launcher", "provider", "model", "effective_effort", "launcher_version",
-        "repo", "branch", "starting_head", "native_session_id",
+        "launcher", "provider", "model", "requested_effort", "effective_effort",
+        "effort_source", "launcher_version", "repo", "branch", "starting_head",
+        "native_session_id",
     ):
         value = raw.get(key)
         if value is None and key == "native_session_id":
@@ -4020,7 +4056,15 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     session_id = out["native_session_id"]
     if session_id is not None and not NATIVE_SESSION_RE.fullmatch(session_id):
         return None, {"error": "session_identity.native_session_id is invalid", "code": "bad_session_identity"}
-    if out["effective_effort"] not in EFFORT_VALUES or not LAUNCHER_VERSION_RE.fullmatch(out["launcher_version"]):
+    normalized, effort_err = normalize_effort(
+        out["launcher"], out["provider"], out["model"],
+        out["requested_effort"], out["effort_source"],
+    )
+    if (
+        effort_err or normalized is None
+        or out["effective_effort"] != normalized["effective_effort"]
+        or not LAUNCHER_VERSION_RE.fullmatch(out["launcher_version"])
+    ):
         return None, {"error": "session_identity execution profile is invalid", "code": "bad_session_identity"}
     return out, None
 
@@ -4035,18 +4079,18 @@ def validate_native_resume_provenance(
         return {"error": "resume_job_id must be 32 lowercase hex characters", "code": "bad_resume_job_id"}
     prior = read_job(resume_job_id)
     receipt = prior.get("receipt") if isinstance(prior, dict) else None
-    profile_fields = ("requested_effort", "effective_effort", "effort_source", "launcher_version")
+    profile = trusted_agent_profile(prior) if isinstance(prior, dict) else None
     if not (
         isinstance(prior, dict)
-        and prior.get("launcher") == launcher
         and prior.get("status") == "completed"
         and prior.get("session_identity") == requested_identity
-        and prior.get("effective_effort") == requested_identity.get("effective_effort")
-        and prior.get("launcher_version") == requested_identity.get("launcher_version")
+        and profile is not None
+        and all(prior.get(key) == requested_identity.get(key) for key in AGENT_PROFILE_FIELDS)
         and isinstance(receipt, dict)
         and receipt.get("status") == "ok"
+        and receipt.get("job_id") == resume_job_id
         and receipt.get("session_identity") == requested_identity
-        and all(receipt.get(key) == prior.get(key) for key in profile_fields)
+        and all(receipt.get(key) == prior.get(key) for key in AGENT_PROFILE_FIELDS)
     ):
         return {"error": f"resume session_identity is not traceable to a successful {launcher} job", "code": "untraceable_resume_session"}
     return None
@@ -5125,7 +5169,15 @@ def prepare_merge_evidence(data: dict[str, Any], spec: dict[str, Any], repos: di
         return None, {"error": "PR is not remotely ready for final evidence", "code": str(view.get("remote_state") or "pr_state_invalid"), "status": 409}
     if vd.get("headRefOid") != expected:
         return None, {"error": "declared PR head is stale", "code": "head_moved", "status": 409}
-    evidence = {"version": PR_EVIDENCE_VERSION, "repo": repo_name, "cwd": str(resolved.resolve()), "pr": number,
+    if writer not in (None, ""):
+        writer_err = validate_writer_evidence(
+            writer, repo_name, resolved, str(vd.get("headRefName") or "")
+        )
+        if writer_err:
+            return None, {**writer_err, "status": 409}
+    evidence = {"version": PR_EVIDENCE_VERSION,
+                "writer_evidence_mode": "writer" if writer not in (None, "") else "initial_green",
+                "repo": repo_name, "cwd": str(resolved.resolve()), "pr": number,
                 "run_id": run_id, "recipe": str(spec["name"]), "expected_head": expected, "live_head": vd["headRefOid"],
                 "head_ref": vd["headRefName"], "start": None, "final": None}
     if writer not in (None, ""):
@@ -6684,7 +6736,9 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, identity_err
     session_identity = {
         "launcher": launcher, "provider": provider, "model": model,
+        "requested_effort": effort["requested_effort"],
         "effective_effort": effort["effective_effort"],
+        "effort_source": effort["effort_source"],
         "launcher_version": launcher_version,
         "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
     }
@@ -7048,8 +7102,9 @@ def dispatch_inner(
         if not JOB_ID_RE.fullmatch(job_id):
             return json_out(400, {"error": "invalid job_id", "code": "bad_job_id"})
         job = read_job(job_id)
-        if not job:
+        if not is_agent_job_record(job):
             return json_out(404, {"error": "job not found", "code": "not_found"})
+        assert isinstance(job, dict)
         return json_out(200, public_job(job))
 
     return json_out(404, {"error": "not found", "code": "not_found"})
