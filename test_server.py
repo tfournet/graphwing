@@ -77,6 +77,13 @@ def _minimal_agent_record(job_id, status="completed", repo="scratch"):
     }
 
 
+def _replace_persisted_job_fixture(job_id, job):
+    """Model an out-of-protocol same-user file mutation in corruption tests."""
+    path = server.job_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(job))
+
+
 def _stamp_complete_writer_evidence(job):
     """Complete intentionally minimal writer fixtures with trusted profile evidence."""
     job.setdefault("launcher", "codex")
@@ -3839,6 +3846,162 @@ while True:
             self.assertEqual(saved["status"], "failed", saved)
             self.assertEqual(saved["receipt"]["status"], "error", saved)
             posted.assert_not_called()
+
+    def test_agent_terminal_transition_does_not_overwrite_reentrant_staging_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            job_id = "7c" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            binary = root / "codex"
+            binary.write_text("fixture")
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "branch", "--show-current"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "scratch", "branch": branch, "starting_head": head,
+                "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
+                "cwd": str(repo), "prompt": "x", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t",
+                "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": "https://example.invalid/callback",
+                "response_webhook_token": None,
+                "git_baseline": server.capture_writer_baseline(repo)[0],
+                "writer_parent_paths": [],
+            }
+            _stamp_fixture_execution_profile(job, binary)
+            (jdir / "job.json").write_text(json.dumps(job))
+            process = mock.Mock(pid=42, returncode=0)
+            process.wait.return_value = 0
+            (jdir / "stdout.log").write_text(
+                '{"type":"thread.started","thread_id":"codex-stage-race"}\n'
+                + json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message",
+                    "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                }})
+            )
+            alien = {
+                "job_id": job_id, "kind": "script", "status": "failed",
+                "receipt": {"status": "error", "job_id": job_id},
+                "error": "trusted staging replacement",
+            }
+            stage_entered = False
+
+            def replace_during_staging(_candidate):
+                nonlocal stage_entered
+                stage_entered = True
+                self.assertTrue(server.write_job(alien))
+                return None
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(binary)}), \
+                 mock.patch.object(server, "spawn_writer", return_value=(process, None)), \
+                 mock.patch.object(server, "stage_writer_changes", side_effect=replace_during_staging), \
+                 mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+
+            self.assertTrue(stage_entered)
+            self.assertEqual(saved, alien)
+            posted.assert_not_called()
+
+    def test_agent_success_is_immutable_before_callback_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_id = "7d" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            binary = root / "codex"
+            binary.write_text("fixture")
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+                "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
+                "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t",
+                "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": "https://example.invalid/callback",
+                "response_webhook_token": None,
+            }
+            _stamp_fixture_execution_profile(job, binary)
+            (jdir / "job.json").write_text(json.dumps(job))
+            process = mock.Mock(pid=42, returncode=0)
+            process.wait.return_value = 0
+            (jdir / "stdout.log").write_text(
+                '{"type":"thread.started","thread_id":"codex-callback-race"}\n'
+                + json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message",
+                    "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                }})
+            )
+            alien = {
+                "job_id": job_id, "kind": "script", "status": "failed",
+                "receipt": {"status": "error", "job_id": job_id},
+                "error": "queued trusted replacement",
+            }
+            attempted = threading.Event()
+            writer_done = threading.Event()
+            writer_results = []
+            callbacks = []
+            writer_thread = None
+            original_write = server._write_job_unlocked
+
+            def queued_writer():
+                attempted.set()
+                writer_results.append(server.write_job(alien))
+                writer_done.set()
+
+            def queue_behind_terminal_commit(candidate):
+                nonlocal writer_thread
+                if candidate.get("kind") == "agent" and candidate.get("status") == "completed" and writer_thread is None:
+                    writer_thread = threading.Thread(target=queued_writer, daemon=True)
+                    writer_thread.start()
+                    self.assertTrue(attempted.wait(0.5), "trusted writer did not reach the terminal lock")
+                original_write(candidate)
+
+            def deliver_after_queued_writer(_url, receipt, token=None):
+                self.assertTrue(writer_done.wait(1.0), "queued writer did not finish before callback")
+                callbacks.append(deepcopy(receipt))
+                return {"ok": True, "status": 200}
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(binary)}), \
+                 mock.patch.object(server, "spawn_writer", return_value=(process, None)), \
+                 mock.patch.object(server, "_write_job_unlocked", side_effect=queue_behind_terminal_commit), \
+                 mock.patch.object(server, "post_receipt", side_effect=deliver_after_queued_writer), \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+
+            self.assertIsNotNone(writer_thread)
+            writer_thread.join(timeout=1.0)
+            self.assertFalse(writer_thread.is_alive(), "trusted writer deadlocked behind terminal CAS")
+            self.assertEqual(writer_results, [False])
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(callbacks[0]["status"], "ok")
+            self.assertEqual((saved["kind"], saved["status"]), ("agent", "completed"), saved)
+            self.assertEqual(saved["receipt"], callbacks[0])
+            self.assertEqual(saved["webhook"], {"ok": True, "status": 200})
 
     def test_native_writer_job_stages_server_attributed_paths_after_valid_receipt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11071,7 +11234,7 @@ class CodeOffTests(unittest.TestCase):
                 else:
                     mismatch_job["execution_identity"]["source"] = "forged-source-v1"
                     mismatch_job["receipt"]["execution_identity"]["source"] = "forged-source-v1"
-                server.write_job(mismatch_job)
+                _replace_persisted_job_fixture(mismatch_job_id, mismatch_job)
                 status, payload = self._post("/v1/code-off/candidate", {
                     "experiment_id": experiment_id, "slot": "author-1",
                     "action": "freeze", "job_id": mismatch_job_id,
@@ -11106,7 +11269,7 @@ class CodeOffTests(unittest.TestCase):
                     job = deepcopy(pristine)
                     checked_manifest = deepcopy(manifest)
                     mutate(job, checked_manifest, field, value)
-                    server.write_job(job)
+                    _replace_persisted_job_fixture(job_id, job)
                     accepted, error = server._codeoff_validate_job(
                         job_id, state, checked_manifest, "author-1"
                     )
@@ -11120,11 +11283,11 @@ class CodeOffTests(unittest.TestCase):
                 job["receipt"]["session_identity"][field] = value
                 job["execution_identity"][field] = value
                 job["receipt"]["execution_identity"][field] = value
-                server.write_job(job)
+                _replace_persisted_job_fixture(job_id, job)
                 accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
                 self.assertIsNone(accepted)
                 self.assertEqual(error["code"], "agent_receipt_mismatch")
-        server.write_job(pristine)
+        _replace_persisted_job_fixture(job_id, pristine)
 
     def test_codeoff_terminal_validation_binds_complete_job_receipt_profile(self):
         experiment_id = "terminal-complete-profile"
@@ -11149,7 +11312,7 @@ class CodeOffTests(unittest.TestCase):
             with self.subTest(field=field):
                 job = deepcopy(pristine)
                 job["receipt"][field] = value
-                server.write_job(job)
+                _replace_persisted_job_fixture(job_id, job)
                 accepted, error = server._codeoff_validate_job(
                     job_id, state, manifest, "author-1"
                 )
@@ -11159,7 +11322,7 @@ class CodeOffTests(unittest.TestCase):
             with self.subTest(missing_field=field):
                 job = deepcopy(pristine)
                 job["receipt"].pop(field)
-                server.write_job(job)
+                _replace_persisted_job_fixture(job_id, job)
                 accepted, error = server._codeoff_validate_job(
                     job_id, state, manifest, "author-1"
                 )
@@ -11174,11 +11337,11 @@ class CodeOffTests(unittest.TestCase):
             "requested_effort": "high", "effective_effort": "high",
             "effort_source": "explicit",
         })
-        server.write_job(coordinated)
+        _replace_persisted_job_fixture(job_id, coordinated)
         accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
         self.assertIsNone(accepted)
         self.assertEqual(error["code"], "agent_receipt_mismatch")
-        server.write_job(pristine)
+        _replace_persisted_job_fixture(job_id, pristine)
 
     def test_codeoff_terminal_validation_rejects_coordinated_complete_manifest_drift(self):
         experiment_id = "terminal-manifest-drift"
