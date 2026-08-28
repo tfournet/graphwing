@@ -4,12 +4,13 @@
 
 - Catalog base: `9f7a178c8491f1ea7ac7dab14f5e6856254c45a8` (`origin/main` at characterization time).
 - Route contract: `normal-v1`.
-- Evidence level: local source, fixtures, and sanitized numeric aggregates only. This is not provider, Rewst publication, tenant-import, or live-canary proof.
-- No launcher or provider was invoked to produce this note.
+- Evidence level: local source, provider-free fixtures, and one immutable committed snapshot of sanitized categorical/numeric observations. This is not provider, Rewst publication, tenant-import, or live-canary proof.
+- No launcher or provider was invoked to produce this note or its fixtures.
+- Paths use `$WORKTREE` for the isolated catalog checkout and `$GRAPHWING_HOME` for the replaceable local Graphwing seat. They are placeholders, not host paths.
 
 ## Frozen route behavior
 
-The characterization fixture enumerates all 27 `work_kind` / class / size-floor combinations and asserts the complete writer and reviewer identities, declared effort, effective size, turn limit, and wall budget.
+The characterization fixture sends JSON through authenticated `POST /v1/slice/route` dispatch. It enumerates all 27 `work_kind` / class / size-floor combinations and compares each complete response, including writer and reviewer identities, declared efforts, effective size, turn limit, and wall budget.
 
 | Work kind | Writer launcher | Provider | Model | Declared effort |
 |---|---|---|---|---|
@@ -37,67 +38,102 @@ Reviewer order is provider-dependent and opposing-provider:
 | sensitive / M | M | 30 | 600 | 2 |
 | sensitive / L | L | 50 | 900 | 2 |
 
-Current size-bump behavior is also frozen:
+Current size-bump behavior is also frozen through the public dispatch surface, with complete response assertions for every case:
 
 - `ac_count >= 6` bumps one size step, capped at L; `ac_count <= 5` does not.
 - Visual work bumps one step when `seams` is omitted or equals `1`.
 - Visual work does not receive the seam bump when `seams` is `0` or `2`; an AC-count bump still applies.
-- Concurrent AC and seam conditions still produce only one step.
+- Explicit concurrent cases use visual S plus `ac_count = 6` with `seams` both omitted and equal to `1`. Both conditions are true, but the result is M, proving current one-step-only behavior rather than two accumulated steps.
 
 ## Declared effort is dead metadata
 
 At this base:
 
 - `sliceRoute` emits writer and reviewer effort strings.
-- `AgentRunRequest` has `additionalProperties: false` and no `effort` property.
-- `/v1/agent/run` returns `400 unexpected_fields` for an `effort` field.
+- `AgentRunRequest` has `additionalProperties: false` and no `effort` property. `/v1/agent/run` therefore returns `400 unexpected_fields` for `effort`.
+- `ReviewRunRequest` has no `effort` property and does not close additional properties. The request parser also has no unknown-field rejection.
+- A bounded provider-free `POST /v1/review/run` fixture supplies a unique effort sentinel. The endpoint accepts the request, silently drops the sentinel, and calls a mocked native-review boundary without effort. The fixture forbids queued review execution and fails if the schema closes, the request is rejected, the sentinel is persisted/returned, or effort is passed into the review boundary.
 - No `/v1/agent/run` or `/v1/review/run` graph-node config contains an `effort` payload field.
 
-The fixture asserts all four facts without changing production behavior, OpenAPI, or graphs.
+These are characterization facts, not desired behavior. Any intentional wiring or contract change requires a new baseline version.
 
-## Sanitized local aggregate evidence
+## Immutable sanitized point-in-time observation
 
-The aggregation read only `job.json`, selected an explicit allowlist of categorical and numeric fields, and emitted counts and min/P50/P90/max values. It did not emit prompts, job/session IDs, logs, paths, URLs, receipt text, tokens used for authentication, or provider responses.
+This section records an **ephemeral local diagnostic observation**, not an authoritative metrics store. The Graphwing daemon/seat is replaceable; its jobs, logs, usage, and caches may disappear normally. Their disappearance is expected and does not invalidate the immutable table committed here. Permanent normalized metrics, workflow outcomes, and audit records belong only in Rewst data storage in later phases; Phase 0 makes no production change toward that design.
 
-Latest 30 native-model job records by `created_at`:
+Snapshot selection was fixed before aggregation:
 
-- Window: `2026-08-27T04:32:12+00:00` through `2026-08-27T21:59:54+00:00`.
-- Launcher counts: Claude 16, Codex 6, Grok 8.
-- Provider counts: Anthropic 16, OpenAI 6, xAI 8.
-- Model counts: Claude Fable 5: 4; Claude Opus 5: 4; Claude Sonnet 5: 8; GPT-5.6 Sol: 3; GPT-5.6 Terra: 3; Grok 4.6: 8. Fable and Terra records are code-off evidence, not ordinary-route choices.
-- Terminal status counts: completed 28, failed 2.
-- Declared max turns (min/P50/P90/max): 10 / 30 / 30 / 50.
-- Declared wall budget seconds: 300 / 300 / 600 / 900.
-- Observed wall seconds: 15 / 131 / 358 / 778.
-- Persisted normalized usage coverage: 0 of 30. Missing usage is unknown, not zero.
+- Observation date: 2026-08-28.
+- Inclusion window: `created_at >= 2026-08-26T00:00:00Z` and `created_at < 2026-08-28T00:00:00Z`.
+- Included records: launcher exactly `codex`, `claude`, or `grok`, with parseable `created_at` in that fixed window.
+- Source read once: replaceable local `job.json` diagnostics below `$GRAPHWING_HOME/jobs`.
+- Sanitization allowlist: launcher, provider, model, terminal status, and numeric provider-native usage fields only.
+- Excluded: individual timestamps, job/session identifiers, paths, URLs, prompts, receipts other than numeric usage values, logs, provider response text, and credentials.
 
-The local store contained 18 earlier records with numeric native usage (`2026-08-26T04:04:50+00:00` through `2026-08-26T05:51:13+00:00`):
+The committed values below—not the mutable/non-versioned local source—are the Phase 0 snapshot baseline.
 
-| Launcher (records) | Numeric field | Min | P50 | P90 | Max |
+### Categorical snapshot (103 records)
+
+| Category | Immutable counts |
+|---|---|
+| Launcher | Claude 53; Codex 23; Grok 27 |
+| Provider | Anthropic 44; OpenAI 23; xAI 17; unrecorded 19 |
+| Model | Claude Fable 5: 12; Claude Opus 5: 21; Claude Sonnet 5: 20; GPT-5.6 Sol: 8; GPT-5.6 Terra: 15; Grok 4.6: 27 |
+| Terminal status | completed 85; failed 18 |
+| Provider-native usage present | 18 |
+| Provider-native usage missing | 85 |
+
+Fable and Terra observations are not ordinary `normal-v1` route choices. Missing provider or usage values are unknown, never inferred as a named provider or zero usage.
+
+### Provider-native usage snapshot (18 records)
+
+This is **provider-native usage**, not normalized usage. Field names preserve the native receipt categories and are not asserted to have cross-provider-equivalent semantics. There are nine Claude records and nine Grok records with numeric usage; there are no Codex records with persisted provider-native usage in this snapshot. That absence is a coverage gap, not evidence of zero Codex consumption.
+
+Estimator for the summary table: sort the values ascending, use the first and last values for min/max, and select zero-based index `round((n - 1) * p)` for P50 and P90 (`p = 0.5` or `0.9`, Python 3 ties-to-even rounding). Each populated field has `n = 9`.
+
+| Launcher | Native numeric field | Min | P50 | P90 | Max |
 |---|---|---:|---:|---:|---:|
-| Claude (9) | fresh input tokens | 4 | 10 | 12 | 20 |
-| Claude (9) | cache creation input tokens | 17,045 | 23,750 | 29,321 | 30,649 |
-| Claude (9) | cache read input tokens | 52,112 | 162,869 | 228,624 | 360,465 |
-| Claude (9) | output tokens | 414 | 1,627 | 3,001 | 3,069 |
-| Grok (9) | fresh input tokens | 1,663 | 18,625 | 24,383 | 36,177 |
-| Grok (9) | cache creation input tokens | 0 | 0 | 0 | 0 |
-| Grok (9) | cache read input tokens | 52,736 | 86,528 | 118,912 | 124,032 |
-| Grok (9) | output tokens | 484 | 950 | 1,291 | 1,947 |
-| Grok (9) | reasoning tokens | 343 | 741 | 869 | 1,523 |
-| Grok (9) | total tokens | 85,032 | 96,483 | 122,948 | 127,235 |
+| Claude | input tokens | 4 | 10 | 12 | 20 |
+| Claude | cache creation input tokens | 17,045 | 23,750 | 29,321 | 30,649 |
+| Claude | cache read input tokens | 52,112 | 162,869 | 228,624 | 360,465 |
+| Claude | output tokens | 414 | 1,627 | 3,001 | 3,069 |
+| Grok | input tokens | 1,663 | 18,625 | 24,383 | 36,177 |
+| Grok | cache creation input tokens | 0 | 0 | 0 | 0 |
+| Grok | cache read input tokens | 52,736 | 86,528 | 118,912 | 124,032 |
+| Grok | output tokens | 484 | 950 | 1,291 | 1,947 |
+| Grok | reasoning tokens | 343 | 741 | 869 | 1,523 |
+| Grok | total tokens | 85,032 | 96,483 | 122,948 | 127,235 |
 
-The 18-record numeric sample has no Codex usage records and the latest-30 sample has no persisted normalized usage. These are baseline coverage gaps, not evidence of zero Codex consumption.
+The following sanitized sorted vectors are the committed aggregate representation from which the table can be recomputed. They cannot be joined back to individual records because row relationships, identifiers, and timestamps were intentionally removed.
 
-## Commands used
+```text
+claude.input_tokens = [4, 4, 8, 8, 10, 10, 10, 12, 20]
+claude.cache_creation_input_tokens = [17045, 20199, 21483, 22517, 23750, 24704, 29019, 29321, 30649]
+claude.cache_read_input_tokens = [52112, 62602, 126686, 131205, 162869, 170100, 191400, 228624, 360465]
+claude.output_tokens = [414, 433, 1161, 1333, 1627, 2467, 2577, 3001, 3069]
+grok.input_tokens = [1663, 2423, 3134, 17408, 18625, 19005, 22829, 24383, 36177]
+grok.cache_creation_input_tokens = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+grok.cache_read_input_tokens = [52736, 62592, 65152, 71552, 86528, 90368, 94336, 118912, 124032]
+grok.output_tokens = [484, 780, 875, 902, 950, 1087, 1193, 1291, 1947]
+grok.reasoning_tokens = [343, 587, 628, 640, 741, 807, 846, 869, 1523]
+grok.total_tokens = [85032, 86712, 90860, 91264, 96483, 108726, 112104, 122948, 127235]
+```
+
+Full raw-source reproducibility is intentionally not claimed: retaining raw local diagnostics would conflict with sanitization and replaceable-seat architecture. The fixed selection rules and estimator explain the snapshot; the committed categorical table and sorted numeric vectors are its immutable evidence.
+
+## Verification commands
+
+Run from `$WORKTREE`:
 
 ```bash
-git -C /home/tim/work/gw-routing-v2 status --short --branch
-git -C /home/tim/work/gw-routing-v2 rev-parse HEAD
-git -C /home/tim/work/gw-routing-v2 rev-parse origin/main
-git -C /home/tim/work/gw-routing-v2 merge-base HEAD origin/main
+git status --short --branch
+git rev-parse HEAD
+git rev-parse origin/main
+git merge-base HEAD origin/main
 
 PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 -m unittest \
-  test_server.DispatchTests.test_slice_route_current_matrix_is_frozen
+  test_server.DispatchTests.test_slice_route_current_matrix_is_frozen \
+  test_server.DispatchTests.test_declared_effort_is_dead_for_agent_and_review_requests
 PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 test_server.py
 
 PYTHONPYCACHEPREFIX=/tmp/graphwing-pyc python3 -m py_compile \
@@ -118,37 +154,4 @@ PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 -m unittest \
   test_server.DispatchTests.test_pr_status_reports_remote_only_states_without_side_effects \
   test_server.CodeOffTests.test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated
 git diff --check
-```
-
-Aggregate-only runtime command (the tuple indexes are the explicit allowlist described above):
-
-```bash
-GRAPHWING_HOME=/home/tim/.graphwing python3 - <<'PY'
-import json, os
-from collections import Counter
-from datetime import datetime
-from pathlib import Path
-T=lambda v: datetime.fromisoformat(str(v).replace('Z','+00:00')) if v else None
-def Q(v):
- v=sorted(v); return None if not v else (v[0],v[round((len(v)-1)*.5)],v[round((len(v)-1)*.9)],v[-1])
-r=[]
-for p in Path(os.environ['GRAPHWING_HOME'],'jobs').glob('*/job.json'):
- try: d=json.loads(p.read_text()); c=T(d.get('created_at'))
- except (OSError,json.JSONDecodeError,ValueError): continue
- if not c or d.get('launcher') not in {'codex','claude','grok'}: continue
- try: s,f=T(d.get('started_at')),T(d.get('finished_at'))
- except ValueError: s=f=None
- n=((d.get('transport_provenance') or {}).get('native_receipt') or {})
- r.append((c,d['launcher'],d.get('provider') or 'unrecorded',d.get('model') or 'unrecorded',d.get('status') or 'unrecorded',d.get('max_turns'),d.get('run_budget_seconds'),(f-s).total_seconds() if s and f else None,n.get('usage') if isinstance(n,dict) else None))
-a=sorted(r)[-30:]
-print('recent',len(a),a[0][0].isoformat(),a[-1][0].isoformat())
-for i,k in ((1,'launcher'),(2,'provider'),(3,'model'),(4,'status')): print(k,dict(sorted(Counter(x[i] for x in a).items())))
-for i,k in ((5,'turns'),(6,'budget'),(7,'wall')): print(k,Q([x[i] for x in a if isinstance(x[i],(int,float))]))
-print('recent_usage_coverage',sum(isinstance(x[8],dict) for x in a),len(a))
-u=[x for x in r if isinstance(x[8],dict)]
-print('usage_records',len(u),min(x[0] for x in u).isoformat(),max(x[0] for x in u).isoformat())
-for launcher in sorted({x[1] for x in u}):
- lane=[x for x in u if x[1]==launcher]; print('usage_lane',launcher,len(lane))
- for k in ('input_tokens','cache_creation_input_tokens','cache_read_input_tokens','output_tokens','reasoning_tokens','total_tokens'): print(k,Q([x[8][k] for x in lane if isinstance(x[8].get(k),(int,float))]))
-PY
 ```

@@ -5024,77 +5024,185 @@ while True:
                 ("claude", "anthropic", "claude-opus-5", "default"),
             ),
         }
-        # With seams omitted, normal-v1 treats every visual floor below L as a
-        # one-step bump. This surprising behavior is intentionally characterized.
-        matrix = {
-            ("mechanical", "S"): ("S", 10, 120, 0),
-            ("mechanical", "M"): ("M", 30, 300, 1),
-            ("mechanical", "L"): ("L", 50, 600, 1),
-            ("visual", "S"): ("M", 30, 600, 1),
-            ("visual", "M"): ("L", 50, 900, 1),
-            ("visual", "L"): ("L", 50, 900, 1),
-            ("sensitive", "S"): ("S", 10, 180, 2),
-            ("sensitive", "M"): ("M", 30, 600, 2),
-            ("sensitive", "L"): ("L", 50, 900, 2),
+        budgets = {
+            ("mechanical", "S"): (10, 120),
+            ("mechanical", "M"): (30, 300),
+            ("mechanical", "L"): (50, 600),
+            ("visual", "S"): (10, 180),
+            ("visual", "M"): (30, 600),
+            ("visual", "L"): (50, 900),
+            ("sensitive", "S"): (10, 180),
+            ("sensitive", "M"): (30, 600),
+            ("sensitive", "L"): (50, 900),
         }
-        for work_kind, writer in writers.items():
-            for (class_name, size_floor), (size, turns, wall, review_count) in matrix.items():
-                with self.subTest(work_kind=work_kind, class_name=class_name, size=size_floor):
-                    route = server.slice_route_lookup(class_name, size_floor, work_kind=work_kind)
-                    self.assertEqual(route["route_version"], "normal-v1")
-                    self.assertEqual(route["work_kind"], work_kind)
-                    self.assertEqual(route["class"], class_name)
-                    self.assertEqual(route["size_floor"], size_floor)
-                    self.assertEqual(route["size"], size)
-                    self.assertEqual(
-                        tuple(route[key] for key in ("launcher", "provider", "model", "effort")),
-                        writer,
+        omitted = object()
+
+        def dispatch_route(class_name, size_floor, work_kind, ac_count=omitted, seams=omitted):
+            request = {"class": class_name, "size": size_floor, "work_kind": work_kind}
+            if ac_count is not omitted:
+                request["ac_count"] = ac_count
+            if seams is not omitted:
+                request["seams"] = seams
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/slice/route", {}, True, json.dumps(request).encode()
+            )
+            self.assertEqual(status, 200, payload)
+            return payload
+
+        def expected_route(class_name, size_floor, effective_size, work_kind):
+            writer = writers[work_kind]
+            if class_name == "sensitive":
+                review_count = 2
+            elif class_name == "mechanical" and effective_size == "S":
+                review_count = 0
+            else:
+                review_count = 1
+            selected = list(reviewers[writer[1]][:review_count])
+            selected.extend([("none", "none", "none", "none")] * (2 - len(selected)))
+            reviewer1, reviewer2 = selected
+            turns, wall = budgets[(class_name, effective_size)]
+            return {
+                "ok": True,
+                "route_version": "normal-v1",
+                "class": class_name,
+                "work_kind": work_kind,
+                "size_floor": size_floor,
+                "size": effective_size,
+                "launcher": writer[0],
+                "provider": writer[1],
+                "model": writer[2],
+                "effort": writer[3],
+                "reason": f"work_kind={work_kind}",
+                "max_turns": turns,
+                "run_budget_seconds": wall,
+                "reviewer1": reviewer1[2],
+                "reviewer1_launcher": reviewer1[0],
+                "reviewer1_provider": reviewer1[1],
+                "reviewer1_model": reviewer1[2],
+                "reviewer1_effort": reviewer1[3],
+                "reviewer1_reason": (
+                    "different_provider_from_writer"
+                    if reviewer1[0] != "none"
+                    else "not_required_by_review_policy"
+                ),
+                "reviewer2": reviewer2[2],
+                "reviewer2_launcher": reviewer2[0],
+                "reviewer2_provider": reviewer2[1],
+                "reviewer2_model": reviewer2[2],
+                "reviewer2_effort": reviewer2[3],
+                "reviewer2_reason": (
+                    "different_provider_from_writer_and_reviewer1"
+                    if reviewer2[0] != "none"
+                    else "not_required_by_review_policy"
+                ),
+                "review": (
+                    "none"
+                    if reviewer1[0] == "none"
+                    else (
+                        f"{reviewer1[2]}_{reviewer2[2]}"
+                        if reviewer2[0] != "none"
+                        else reviewer1[2]
                     )
-                    self.assertEqual(route["reason"], f"work_kind={work_kind}")
-                    self.assertEqual(route["max_turns"], turns)
-                    self.assertEqual(route["run_budget_seconds"], wall)
-                    for index in (1, 2):
-                        actual = tuple(
-                            route[f"reviewer{index}_{key}"]
-                            for key in ("launcher", "provider", "model", "effort")
-                        )
-                        expected = reviewers[writer[1]][index - 1] if index <= review_count else (
-                            "none", "none", "none", "none"
-                        )
-                        self.assertEqual(actual, expected)
-                        self.assertEqual(route[f"reviewer{index}"], expected[2])
+                ),
+            }
+
+        # With seams omitted, normal-v1 treats every visual floor below L as a
+        # one-step bump. All 27 cases cross the public parsing/dispatch boundary.
+        matrix = {
+            ("mechanical", "S"): "S",
+            ("mechanical", "M"): "M",
+            ("mechanical", "L"): "L",
+            ("visual", "S"): "M",
+            ("visual", "M"): "L",
+            ("visual", "L"): "L",
+            ("sensitive", "S"): "S",
+            ("sensitive", "M"): "M",
+            ("sensitive", "L"): "L",
+        }
+        for work_kind in writers:
+            for (class_name, size_floor), effective_size in matrix.items():
+                with self.subTest(work_kind=work_kind, class_name=class_name, size=size_floor):
                     self.assertEqual(
-                        sum(route[f"reviewer{index}_launcher"] != "none" for index in (1, 2)),
-                        review_count,
+                        dispatch_route(class_name, size_floor, work_kind),
+                        expected_route(class_name, size_floor, effective_size, work_kind),
                     )
 
         bump_cases = (
-            ("mechanical", "S", None, None, "S"),
-            ("mechanical", "S", 5, None, "S"),
-            ("mechanical", "S", 6, None, "M"),
-            ("mechanical", "M", 6, None, "L"),
-            ("mechanical", "L", 6, None, "L"),
-            ("visual", "S", None, None, "M"),
-            ("visual", "S", None, 1, "M"),
-            ("visual", "S", None, 0, "S"),
-            ("visual", "S", None, 2, "S"),
+            ("mechanical", "S", omitted, omitted, "S"),
+            ("mechanical", "S", 5, omitted, "S"),
+            ("mechanical", "S", 6, omitted, "M"),
+            ("mechanical", "M", 6, omitted, "L"),
+            ("mechanical", "L", 6, omitted, "L"),
+            ("visual", "S", omitted, omitted, "M"),
+            ("visual", "S", omitted, 1, "M"),
+            ("visual", "S", omitted, 0, "S"),
+            ("visual", "S", omitted, 2, "S"),
             ("visual", "S", 6, 0, "M"),
+            # Both bump conditions are true, but normal-v1 applies one step only.
+            ("visual", "S", 6, omitted, "M"),
+            ("visual", "S", 6, 1, "M"),
         )
-        for class_name, floor, ac_count, seams, expected_size in bump_cases:
-            with self.subTest(class_name=class_name, floor=floor, ac_count=ac_count, seams=seams):
-                route = server.slice_route_lookup(
-                    class_name, floor, ac_count=ac_count, seams=seams, work_kind="go_coding"
+        for class_name, floor, ac_count, seams, effective_size in bump_cases:
+            with self.subTest(
+                class_name=class_name,
+                floor=floor,
+                ac_count="omitted" if ac_count is omitted else ac_count,
+                seams="omitted" if seams is omitted else seams,
+            ):
+                self.assertEqual(
+                    dispatch_route(class_name, floor, "go_coding", ac_count, seams),
+                    expected_route(class_name, floor, effective_size, "go_coding"),
                 )
-                self.assertEqual(route["size"], expected_size)
 
+    def test_declared_effort_is_dead_for_agent_and_review_requests(self):
         spec = json.loads(server.openapi_bytes())
-        agent_request = spec["components"]["schemas"]["AgentRunRequest"]
+        schemas = spec["components"]["schemas"]
+        agent_request = schemas["AgentRunRequest"]
         self.assertFalse(agent_request["additionalProperties"])
         self.assertNotIn("effort", agent_request["properties"])
         status, payload = server.agent_run(json.dumps({"effort": "high"}).encode(), {})
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "unexpected_fields")
         self.assertEqual(payload["fields"], ["effort"])
+
+        review_request = schemas["ReviewRunRequest"]
+        self.assertNotIn("additionalProperties", review_request)
+        self.assertNotIn("effort", review_request["properties"])
+        expected = {
+            "ok": True,
+            "verdict": "PASS",
+            "launcher": "claude",
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "summary": "fixture",
+        }
+        body = json.dumps({
+            "repo": "scratch",
+            "launcher": "claude",
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "prompt": "bounded fixture",
+            "effort": "phase0-review-effort-sentinel",
+        }).encode()
+        with mock.patch.object(server, "native_review_result", return_value=expected) as review, \
+             mock.patch.object(
+                 server, "enqueue_review", side_effect=AssertionError("review process forbidden")
+             ):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/review/run", {}, True, body
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload, expected)
+        review.assert_called_once_with(
+            "claude",
+            "anthropic",
+            "claude-sonnet-5",
+            "bounded fixture",
+            self.scratch,
+            run_budget_seconds=server.REVIEW_DEFAULT_BUDGET_SECONDS,
+            max_turns=server.REVIEW_MAX_TURNS,
+        )
+        self.assertNotIn("phase0-review-effort-sentinel", json.dumps(payload, sort_keys=True))
 
         root = Path(server.__file__).resolve().parent
         checked_nodes = []
