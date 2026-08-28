@@ -104,16 +104,30 @@ NATIVE_LAUNCHERS = {
 }
 EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
-# Phase 1 describes only behavior established by today's adapters: Codex is
-# pinned to high and Claude/Grok pass no effort option. Phase 2 may widen this
-# table only when it also wires and verifies the corresponding native option.
+# Native support proven against the installed launcher contracts. Graphwing's
+# closed vocabulary deliberately excludes launcher-only aliases such as xhigh.
 EFFORT_PROFILES = {
-    ("codex", "openai", "gpt-5.6-sol"): {"default": "high", "high": "high"},
-    ("codex", "openai", "gpt-5.6-terra"): {"default": "high", "high": "high"},
-    ("claude", "anthropic", "claude-opus-5"): {"default": "default"},
-    ("claude", "anthropic", "claude-sonnet-5"): {"default": "default"},
-    ("claude", "anthropic", "claude-fable-5"): {"default": "default"},
+    ("codex", "openai", "gpt-5.6-sol"): {
+        "default": "high", "low": "low", "medium": "medium", "high": "high", "max": "max",
+    },
+    ("codex", "openai", "gpt-5.6-terra"): {
+        "default": "high", "low": "low", "medium": "medium", "high": "high", "max": "max",
+    },
+    ("claude", "anthropic", "claude-opus-5"): {
+        "default": "default", "low": "low", "medium": "medium", "high": "high", "max": "max",
+    },
+    ("claude", "anthropic", "claude-sonnet-5"): {
+        "default": "default", "low": "low", "medium": "medium", "high": "high", "max": "max",
+    },
+    ("claude", "anthropic", "claude-fable-5"): {
+        "default": "default", "low": "low", "medium": "medium", "high": "high", "max": "max",
+    },
     ("grok", "xai", "grok-4.6"): {"default": "default"},
+}
+NATIVE_EFFORT_VALUES = {
+    "codex": {"low": "low", "medium": "medium", "high": "high", "max": "max"},
+    "claude": {"default": None, "low": "low", "medium": "medium", "high": "high", "max": "max"},
+    "grok": {"default": "default"},
 }
 
 
@@ -138,6 +152,26 @@ def normalize_effort(
         "effective_effort": effective,
         "effort_source": source,
     }, None
+
+
+def native_effort_value(job: dict[str, Any]) -> tuple[bool, str | None]:
+    """Revalidate persisted profile evidence at the command boundary."""
+    profile, error = normalize_effort(
+        str(job.get("launcher") or ""),
+        str(job.get("provider") or ""),
+        str(job.get("model") or ""),
+        job.get("requested_effort"),
+        str(job.get("effort_source") or ""),
+    )
+    if error is not None or profile is None:
+        return False, None
+    if any(job.get(key) != value for key, value in profile.items()):
+        return False, None
+    native = NATIVE_EFFORT_VALUES.get(str(job.get("launcher") or ""), {})
+    effective = str(profile["effective_effort"])
+    if effective not in native:
+        return False, None
+    return True, native[effective]
 
 
 def authoritative_route_effort_profiles(
@@ -2741,6 +2775,8 @@ def native_review_result(
     job_id: str | None = None,
     run_budget_seconds: int = REVIEW_DEFAULT_BUDGET_SECONDS,
     max_turns: int = REVIEW_MAX_TURNS,
+    requested_effort: str = "default",
+    effort_source: str = "launcher_default",
 ) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     spec = NATIVE_LAUNCHERS.get(launcher)
@@ -2750,6 +2786,14 @@ def native_review_result(
     if provider != spec["provider"] or model not in spec["models"]:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
+    effort_profile, effort_error = normalize_effort(
+        launcher, provider, model, requested_effort, effort_source
+    )
+    if effort_error is not None or effort_profile is None:
+        return {
+            "ok": False, "verdict": "NACK", "no_verdict": True,
+            **(effort_error or {"error": "unsupported effort profile", "code": "unsupported_effort"}),
+        }
     binary = resolve_launcher_binary_now(launcher)
     if not binary.is_file():
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
@@ -2771,6 +2815,10 @@ def native_review_result(
     text = ""
     ephemeral = job_id is None
     error: str | None = None
+    adapter_job = {
+        "launcher": launcher, "provider": provider, "model": model,
+        **effort_profile, "max_turns": max_turns, "session_identity": None,
+    }
     if launcher == "grok":
         run_id = job_id or uuid.uuid4().hex
         path = job_dir(run_id)
@@ -2784,6 +2832,7 @@ def native_review_result(
             "launcher": launcher,
             "provider": provider,
             "model": model,
+            **effort_profile,
             "run_budget_seconds": run_budget_seconds,
             "session_identity": None,
         })
@@ -2796,19 +2845,15 @@ def native_review_result(
         path = job_dir(run_id)
         path.mkdir(parents=True, exist_ok=True)
         if launcher == "codex":
-            cmd = [
-                str(binary), "exec", "--json", "--model", model,
-                "-c", "model_reasoning_effort=high", "-C", str(resolved),
-                "--sandbox", "read-only",
-                "--output-last-message", str(path / "last-message.txt"), "-",
-            ]
+            cmd = codex_command(
+                adapter_job, path / "prompt.txt", str(resolved), binary, sandbox="read-only"
+            )
             run_input = receipt_prompt.encode()
         else:
-            cmd = [
-                str(binary), "-p", "--output-format", "text",
-                "--permission-mode", "plan", "--max-turns", str(max_turns),
-                "--model", model, body_prompt,
-            ]
+            cmd = claude_command(
+                adapter_job, body_prompt, str(resolved), binary,
+                permission_mode="plan", output_format="text",
+            )
             run_input = None
         try:
             proc = subprocess.run(
@@ -2843,6 +2888,7 @@ def native_review_result(
         "launcher": launcher,
         "provider": provider,
         "model": model,
+        **effort_profile,
         "reviewer": model,
         "summary": error or summary,
         "compact": compact_cmd_signal({"ok": verdict == "PASS", "stdout": text, "stderr": error or ""}),
@@ -2865,6 +2911,9 @@ def review_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any
         "launcher": job.get("launcher"),
         "provider": job.get("provider"),
         "model": job.get("model"),
+        "requested_effort": job.get("requested_effort"),
+        "effective_effort": job.get("effective_effort"),
+        "effort_source": job.get("effort_source"),
         "summary": str(result.get("summary") or result.get("error") or "")[:500],
         "compact": result.get("compact") or "",
     }
@@ -2882,6 +2931,8 @@ def run_review_job(job_id: str) -> None:
         Path(job["cwd"]), job_id=job["job_id"],
         run_budget_seconds=job["run_budget_seconds"],
         max_turns=job["max_turns"],
+        requested_effort=job["requested_effort"],
+        effort_source=job["effort_source"],
     )
     receipt = review_receipt(job, result)
     job = read_job(job_id) or job
@@ -2925,6 +2976,15 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     model = str(data.get("model") or "").strip()
     if provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
+    requested_effort = data.get("effort", "default")
+    effort_source = "explicit" if "effort" in data else "launcher_default"
+    effort_profile, effort_error = normalize_effort(
+        launcher, provider, model, requested_effort, effort_source
+    )
+    if effort_error is not None or effort_profile is None:
+        return 400, effort_error or {
+            "error": "unsupported effort profile", "code": "unsupported_effort"
+        }
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return 400, {"error": "prompt is required", "code": "missing_prompt"}
@@ -2970,6 +3030,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             launcher, provider, model, prompt, resolved,
             run_budget_seconds=run_budget_seconds,
             max_turns=max_turns,
+            requested_effort=effort_profile["requested_effort"],
+            effort_source=effort_profile["effort_source"],
         )
         if result.get("code") == "not_implemented":
             return 501, result
@@ -2988,6 +3050,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             "launcher": launcher,
             "provider": provider,
             "model": model,
+            **effort_profile,
             "repo": name,
             "cwd": str(resolved),
             "prompt": prompt,
@@ -3015,6 +3078,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         "launcher": launcher,
         "provider": provider,
         "model": model,
+        **effort_profile,
         "repo": name,
         "poll": f"/v1/agent/jobs/{job_id}",
     }
@@ -4746,6 +4810,36 @@ def launcher_pass_fds(binary: Path) -> tuple[int, ...]:
     return (int(match.group(1)),) if match else ()
 
 
+def claude_command(
+    job: dict[str, Any], prompt: str, cwd: str, binary: Path | None = None, *,
+    permission_mode: Literal["acceptEdits", "plan"] = "acceptEdits",
+    output_format: Literal["json", "text"] = "json",
+) -> list[str]:
+    binary = binary or CLAUDE_BIN
+    valid, effort = native_effort_value(job)
+    if not valid:
+        raise ValueError("unsupported effort profile")
+    command = [
+        str(binary),
+        "-p",
+        "--output-format",
+        output_format,
+        "--permission-mode",
+        permission_mode,
+        "--max-turns",
+        str(job["max_turns"]),
+        "--add-dir", cwd,
+        "--model", str(job["model"]),
+    ]
+    if effort is not None:
+        command.extend(["--effort", effort])
+    session_id = (job.get("session_identity") or {}).get("native_session_id")
+    if session_id:
+        command.extend(["--resume", str(session_id)])
+    command.append(prompt)
+    return command
+
+
 def spawn_claude(
     job: dict[str, Any], binary: Path | None = None
 ) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
@@ -4766,24 +4860,12 @@ def spawn_claude(
     env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "PWD": cwd})
     if job.get("codeoff_workspace"):
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-    cmd = [
-        str(binary),
-        "-p",
-        "--output-format",
-        "json",
-        "--permission-mode",
-        "acceptEdits",
-        "--max-turns",
-        str(job["max_turns"]),
-        "--add-dir",
-        cwd,
-        "--model",
-        str(job.get("model") or "claude-opus-5"),
-    ]
-    session_id = (job.get("session_identity") or {}).get("native_session_id")
-    if session_id:
-        cmd.extend(["--resume", str(session_id)])
-    cmd.append(prompt)
+    try:
+        cmd = claude_command(job, prompt, cwd, binary)
+    except ValueError:
+        stdout_f.close()
+        stderr_f.close()
+        return None, {"error": "unsupported effort profile", "code": "unsupported_effort"}
     try:
         proc = subprocess.Popen(
             cmd,
@@ -4804,13 +4886,17 @@ def spawn_claude(
 
 
 def codex_command(
-    job: dict[str, Any], prompt_path: Path, cwd: str, binary: Path | None = None
+    job: dict[str, Any], prompt_path: Path, cwd: str, binary: Path | None = None, *,
+    sandbox: Literal["workspace-write", "read-only"] = "workspace-write",
 ) -> list[str]:
     binary = binary or CODEX_BIN
+    valid, effort = native_effort_value(job)
+    if not valid or effort is None:
+        raise ValueError("unsupported effort profile")
     command = [
         str(binary), "exec", "--json", "--model", str(job["model"]),
-        "-c", "model_reasoning_effort=high",
-        "-C", cwd, "--sandbox", "workspace-write",
+        "-c", f"model_reasoning_effort={effort}",
+        "-C", cwd, "--sandbox", sandbox,
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
     ]
     session_id = (job.get("session_identity") or {}).get("native_session_id")
@@ -4834,8 +4920,15 @@ def spawn_codex(
     stdout_f = stdout_path.open("wb")
     stderr_f = stderr_path.open("wb")
     try:
+        command = codex_command(job, prompt_path, cwd, binary)
+    except ValueError:
+        stdin_f.close()
+        stdout_f.close()
+        stderr_f.close()
+        return None, {"error": "unsupported effort profile", "code": "unsupported_effort"}
+    try:
         proc = subprocess.Popen(
-            codex_command(job, prompt_path, cwd, binary), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
+            command, stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
             cwd=cwd, env=native_job_env(job), start_new_session=True,
             pass_fds=launcher_pass_fds(binary),
         )
@@ -4848,6 +4941,25 @@ def spawn_codex(
     stdout_f.close()
     stderr_f.close()
     return proc, None
+
+
+def grok_acp_command(
+    job: dict[str, Any], binary: Path | None = None, *,
+    mode: Literal["writer", "review"],
+) -> list[str]:
+    if mode not in ("writer", "review"):
+        raise ValueError("invalid Grok ACP mode")
+    binary = binary or GROK_BIN
+    valid, effort = native_effort_value(job)
+    if not valid or effort is None:
+        raise ValueError("unsupported effort profile")
+    command = [str(binary), "agent"]
+    if mode == "writer":
+        command.append("--always-approve")
+    command.extend([
+        "--model", str(job["model"]), "--reasoning-effort", effort, "stdio",
+    ])
+    return command
 
 
 def run_grok_acp(
@@ -4865,10 +4977,13 @@ def run_grok_acp(
     cwd = str(Path(job["cwd"]).resolve())
     env = native_job_env(job)
     env["GROK_DISABLE_AUTOUPDATER"] = "1"
-    command = [str(binary), "agent"]
-    if mode == "writer":
-        command.append("--always-approve")
-    command.extend(["--model", str(job["model"]), "stdio"])
+    try:
+        command = grok_acp_command(job, binary, mode=mode)
+    except ValueError as exc:
+        job["_adapter_failure_code"] = (
+            "adapter_contract_invalid" if str(exc) == "invalid Grok ACP mode" else "unsupported_effort"
+        )
+        return 1, False, None, str(exc)
     try:
         proc = subprocess.Popen(
             command,
