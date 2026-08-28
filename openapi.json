@@ -521,7 +521,19 @@
           "202": { "description": "queued review", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "409": { "$ref": "#/components/responses/Error" },
+          "409": {
+            "description": "busy or synchronous execution identity mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/Error" },
+                    { "$ref": "#/components/schemas/ReviewReceipt" }
+                  ]
+                }
+              }
+            }
+          },
           "501": { "description": "launcher unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } },
           "504": { "description": "synchronous review timed out", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } }
         }
@@ -539,7 +551,8 @@
           "200": { "description": "review job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -554,7 +567,8 @@
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "$ref": "#/components/responses/Error" },
-          "408": { "$ref": "#/components/responses/Error" }
+          "408": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
         }
       }
     },

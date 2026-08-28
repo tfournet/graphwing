@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import hashlib
 import io
 import json
@@ -2534,16 +2535,18 @@ class DispatchTests(unittest.TestCase):
                 return {"ok": True, "status": 200}
             with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(server, "post_receipt", side_effect=post) as posted:
                 self.assertEqual(server.recover_interrupted_agent_jobs(), 6)
-            self.assertEqual(persisted_before_delivery, ["failed"] * 5)
-            self.assertEqual(posted.call_count, 5)
+            self.assertEqual(persisted_before_delivery, ["failed"] * 4)
+            self.assertEqual(posted.call_count, 4)
             for job_id, extra in fixtures.items():
                 saved = json.loads((jobs / job_id / "job.json").read_text())
                 self.assertEqual(saved["status"], "failed", extra)
                 self.assertLessEqual(len(saved["error"]), 500)
                 self.assertNotIn("secret", json.dumps(saved["receipt"]))
                 if extra.get("kind") == "review":
-                    self.assertEqual(saved["receipt"]["status"], "nack")
-                    self.assertTrue(saved["receipt"]["no_verdict"])
+                    self.assertIsNone(saved["receipt"])
+                    self.assertEqual(
+                        saved["review_recovery_code"], "review_authority_unavailable"
+                    )
                 elif extra.get("kind") in {"script", "test", "rr"}:
                     self.assertEqual(saved["receipt"]["status"], "error")
                     self.assertEqual(saved["receipt"]["log_ref"], saved["log_ref"])
@@ -6882,9 +6885,9 @@ while True:
             "#/components/schemas/ReviewJob",
         )
         poll = spec["paths"]["/v1/review/jobs/{job_id}"]["get"]
-        self.assertEqual(set(poll["responses"]), {"200", "400", "401", "404"})
+        self.assertEqual(set(poll["responses"]), {"200", "400", "401", "404", "409"})
         wait = spec["paths"]["/v1/review/jobs/wait"]["post"]
-        self.assertEqual(set(wait["responses"]), {"200", "400", "401", "404", "408"})
+        self.assertEqual(set(wait["responses"]), {"200", "400", "401", "404", "408", "409"})
 
     def test_agent_and_review_effort_are_real_while_graph_effort_remains_unwired(self):
         spec = json.loads(server.openapi_bytes())
@@ -8610,7 +8613,7 @@ while True:
         route = next(m for m in mappings if m["output"] == "route")
         self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
 
-    def _queue_closed_review(self, root, *, effort=None, extra=None):
+    def _queue_closed_review(self, root, *, effort=None, extra=None, active_count=0):
         repo = self._scratch_git(root)
         jobs = root / "jobs"
         launcher = root / "claude-review-wrapper"
@@ -8627,7 +8630,7 @@ while True:
         patches = (
             mock.patch.object(server, "JOBS_DIR", jobs),
             mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}),
-            mock.patch.object(server, "active_job_count", return_value=0),
+            mock.patch.object(server, "active_job_count", return_value=active_count),
             mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher),
             mock.patch.object(server, "enqueue_review"),
         )
@@ -8636,6 +8639,8 @@ while True:
         status, payload, _ = server.dispatch(
             "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
         )
+        if status == 202 and isinstance(payload, dict):
+            self.addCleanup(server.release_review_authority, payload["job_id"])
         return status, payload, jobs, repo, launcher, entered[-1]
 
     def test_review_run_rejects_hostile_extras_before_review_boundary(self):
@@ -8824,7 +8829,7 @@ while True:
                 self.assertNotIn("prompt", saved["receipt"])
                 self.assertNotIn("cwd", saved["receipt"])
 
-    def test_review_worker_pins_wrapper_and_rejects_path_mutation_before_spawn(self):
+    def test_review_worker_executes_accepted_pin_after_launcher_path_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             status, accepted, jobs, _repo, launcher, _ = self._queue_closed_review(root)
@@ -8834,17 +8839,26 @@ while True:
             self.assertNotEqual(
                 server.launcher_version_fingerprint(launcher), accepted_fingerprint
             )
+            captured_fingerprints = []
+
+            def pass_with_pinned_launcher(*_args, **kwargs):
+                captured_fingerprints.append(
+                    server.launcher_version_fingerprint(kwargs["binary"])
+                )
+                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
                  mock.patch.object(
-                     server, "native_review_result",
-                     side_effect=AssertionError("mutated wrapper must not spawn"),
-                 ) as spawn, mock.patch.object(server, "herdr_job_done"):
+                     server, "native_review_result", side_effect=pass_with_pinned_launcher
+                 ) as spawn, mock.patch.object(server, "herdr_job_done"), \
+                 mock.patch.object(server, "deliver_webhook", return_value=None):
                 server.run_review_job(accepted["job_id"])
-            spawn.assert_not_called()
+            spawn.assert_called_once()
+            self.assertEqual(captured_fingerprints, [accepted_fingerprint])
             saved = json.loads((jobs / accepted["job_id"] / "job.json").read_text())
-            self.assertEqual(saved["status"], "failed")
-            self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
+            self.assertEqual(saved["status"], "completed")
+            self.assertEqual(saved["receipt"]["status"], "ok")
 
     def test_review_terminal_transition_rejects_source_only_drift_after_spawn(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8902,6 +8916,309 @@ while True:
                     )
                     self.assertEqual(status, 400 if bad_id == "bad" else 404, payload)
 
+    def test_review_coordinated_job_and_disk_snapshot_rewrite_cannot_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            job_path = jobs / job_id / "job.json"
+            snapshot_path = jobs / job_id / "review-snapshot.json"
+            stored = json.loads(job_path.read_text())
+            snapshot = json.loads(snapshot_path.read_text())
+            hostile_prompt = "coordinated replacement TOKEN_SECRET /private/review"
+            hostile_hash = hashlib.sha256(hostile_prompt.encode()).hexdigest()
+            for record in (stored, snapshot):
+                record["prompt"] = hostile_prompt
+                record["prompt_sha256"] = hostile_hash
+                record["execution_identity"]["prompt_sha256"] = hostile_hash
+            snapshot_raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+            snapshot_path.write_bytes(snapshot_raw)
+            stored["review_snapshot_sha256"] = hashlib.sha256(snapshot_raw).hexdigest()
+            job_path.write_text(json.dumps(stored))
+
+            with mock.patch.object(
+                server, "native_review_result",
+                side_effect=AssertionError("coordinated mutable rewrite must not spawn"),
+            ) as spawn, mock.patch.object(server, "deliver_webhook") as callback, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            spawn.assert_not_called()
+            callback.assert_not_called()
+            saved = json.loads(job_path.read_text())
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
+            self.assertNotIn("TOKEN_SECRET", json.dumps(server.public_review_job(saved)))
+            self.assertNotIn(job_id, server.REVIEW_AUTHORITIES)
+
+    def test_review_missing_process_authority_fails_closed_without_spawn_or_callback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(
+                root, extra={"response_webhook_url": "https://example.invalid/review"}
+            )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            server.release_review_authority(job_id)
+            with mock.patch.object(server, "native_review_result") as spawn, \
+                 mock.patch.object(server, "deliver_webhook") as callback, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            spawn.assert_not_called()
+            callback.assert_not_called()
+            saved = json.loads((jobs / job_id / "job.json").read_text())
+            self.assertEqual(saved["status"], "failed")
+            self.assertIsNone(saved["receipt"])
+            poll_status, poll, _ = server.dispatch(
+                "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+            )
+            self.assertEqual((poll_status, poll["code"]), (409, "review_authority_unavailable"))
+            self.assertNotIn("prompt", json.dumps(poll))
+
+    def test_review_terminal_is_sealed_and_guarded_bookkeeping_still_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            with mock.patch.object(
+                server, "native_review_result",
+                return_value={"ok": True, "verdict": "PASS", "no_verdict": False},
+            ), mock.patch.object(server, "deliver_webhook", return_value=None), \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            terminal = json.loads((jobs / job_id / "job.json").read_text())
+            receipt = deepcopy(terminal["receipt"])
+            hostile = deepcopy(terminal)
+            hostile.update({
+                "prompt": "TOKEN_SECRET", "cwd": "/private/path", "status": "failed",
+                "receipt": {"provider_output": "hostile"},
+            })
+            self.assertFalse(server.write_job(hostile))
+            self.assertTrue(server.review_set_webhook_result(
+                job_id, accepted["execution_identity"], receipt, {"ok": True, "status": 204}
+            ))
+            saved = json.loads((jobs / job_id / "job.json").read_text())
+            self.assertEqual(saved["receipt"], receipt)
+            self.assertEqual(saved["status"], "completed")
+            self.assertEqual(saved["webhook"], {"ok": True, "status": 204})
+
+    def test_review_terminal_cas_rejects_reentrant_and_queued_replacements(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(
+                root, extra={"response_webhook_url": "https://example.invalid/review"}
+            )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            alien = {
+                "job_id": job_id, "kind": "script", "status": "failed",
+                "receipt": {"status": "error", "job_id": job_id},
+                "prompt": "TOKEN_SECRET", "cwd": "/private/path",
+            }
+            original_write = server._write_job_unlocked
+            reentrant_results = []
+            queued_results = []
+            attempted = threading.Event()
+            done = threading.Event()
+            writer_thread = None
+
+            def queued_writer():
+                attempted.set()
+                queued_results.append(server.write_job(alien))
+                done.set()
+
+            def guarded_write(candidate):
+                nonlocal writer_thread
+                if candidate.get("kind") == "review" and candidate.get("status") == "completed":
+                    reentrant_results.append(server.write_job(alien))
+                    if writer_thread is None:
+                        writer_thread = threading.Thread(target=queued_writer, daemon=True)
+                        writer_thread.start()
+                        self.assertTrue(attempted.wait(0.5))
+                original_write(candidate)
+
+            callbacks = []
+            with mock.patch.object(
+                server, "native_review_result",
+                return_value={"ok": True, "verdict": "PASS", "no_verdict": False},
+            ), mock.patch.object(server, "_write_job_unlocked", side_effect=guarded_write), \
+                 mock.patch.object(
+                     server, "deliver_webhook",
+                     side_effect=lambda _job, receipt: callbacks.append(deepcopy(receipt)) or None,
+                 ), mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            self.assertIsNotNone(writer_thread)
+            writer_thread.join(timeout=1)
+            self.assertTrue(done.is_set())
+            self.assertEqual(reentrant_results, [False])
+            self.assertEqual(queued_results, [False])
+            self.assertEqual(len(callbacks), 1)
+            saved = json.loads((jobs / job_id / "job.json").read_text())
+            self.assertEqual((saved["kind"], saved["status"]), ("review", "completed"))
+            self.assertEqual(saved["receipt"], callbacks[0])
+
+    def test_review_hostile_stored_receipt_is_not_polled_or_leaked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            path = jobs / job_id / "job.json"
+            stored = json.loads(path.read_text())
+            stored.update({"status": "completed", "finished_at": "2026-08-28T00:00:00Z"})
+            stored["receipt"] = {
+                "ok": True, "status": "ok", "job_id": job_id, "kind": "review",
+                "verdict": "PASS", "no_verdict": False,
+                "execution_identity": accepted["execution_identity"],
+                "summary": "review passed", "code": None,
+                "prompt": "TOKEN_SECRET", "path": "/private/review", "provider_output": "raw",
+            }
+            path.write_text(json.dumps(stored))
+            poll_status, payload, _ = server.dispatch(
+                "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+            )
+            self.assertEqual((poll_status, payload["code"]), (409, "review_record_invalid"))
+            public = json.dumps(payload)
+            for secret in ("TOKEN_SECRET", "/private/review", "raw"):
+                self.assertNotIn(secret, public)
+            server.release_review_authority(job_id)
+
+    def test_review_startup_recovery_never_callbacks_mutable_review_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            cases = {
+                "a1" * 16: {"kind": "review", "status": "queued"},
+                "a2" * 16: {"kind": "review", "status": "running", "review_snapshot_sha256": "0" * 64},
+                "a3" * 16: {"kind": "script", "status": "running"},
+                "a4" * 16: {"status": "running"},
+            }
+            for job_id, extra in cases.items():
+                path = jobs / job_id
+                path.mkdir(parents=True)
+                (path / "job.json").write_text(json.dumps({
+                    "job_id": job_id, "response_webhook_url": "https://example.invalid/stale",
+                    "response_webhook_token": "TOKEN_SECRET", "prompt": "/private/review", **extra,
+                }))
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "deliver_webhook") as callback:
+                recovered = server.recover_interrupted_agent_jobs()
+            self.assertEqual(callback.call_count, 1)
+            self.assertEqual(callback.call_args.args[0]["kind"], "script")
+            self.assertEqual(recovered, 3)
+            for job_id in ("a1" * 16, "a2" * 16):
+                saved = json.loads((jobs / job_id / "job.json").read_text())
+                self.assertEqual(saved["status"], "failed")
+                self.assertIsNone(saved["receipt"])
+                self.assertEqual(saved["review_recovery_code"], "review_authority_unavailable")
+            self.assertEqual(
+                json.loads((jobs / ("a4" * 16) / "job.json").read_text())["status"], "running"
+            )
+
+    def test_review_run_409_openapi_allows_error_or_receipt(self):
+        spec = json.loads(server.openapi_bytes())
+        schema = spec["paths"]["/v1/review/run"]["post"]["responses"]["409"]
+        refs = {
+            item["$ref"] for item in schema["content"]["application/json"]["schema"]["oneOf"]
+        }
+        self.assertEqual(refs, {
+            "#/components/schemas/Error", "#/components/schemas/ReviewReceipt",
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, busy, *_ = self._queue_closed_review(
+                root, active_count=server.AGENT_MAX_CONCURRENT
+            )
+            self.assertEqual((status, set(busy)), (409, {"error", "code"}))
+
+            sync_root = root / "sync"
+            sync_root.mkdir()
+            repo = self._scratch_git(sync_root)
+            launcher = root / "sync-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            body = json.dumps({
+                "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                "model": "claude-sonnet-5", "prompt": "bounded ticket",
+            }).encode()
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(
+                     server, "launcher_version_fingerprint",
+                     return_value="sha256:" + "f" * 64,
+                 ), mock.patch.object(server, "native_review_result") as spawn:
+                mismatch_status, mismatch, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, body
+                )
+            spawn.assert_not_called()
+            self.assertEqual(mismatch_status, 409)
+            self.assertEqual(set(mismatch), set(server.REVIEW_RECEIPT_FIELDS))
+            self.assertEqual(mismatch["code"], "review_execution_identity_mismatch")
+
+    def test_review_alien_replacement_at_terminal_cas_is_preserved_without_callback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(
+                root, extra={"response_webhook_url": "https://example.invalid/review"}
+            )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            alien = {
+                "job_id": job_id, "kind": "script", "status": "failed",
+                "receipt": {"status": "error", "job_id": job_id},
+                "error": "trusted replacement",
+            }
+
+            def replace_then_pass(*_args, **_kwargs):
+                self.assertTrue(server.write_job(alien))
+                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+            with mock.patch.object(
+                server, "native_review_result", side_effect=replace_then_pass
+            ), mock.patch.object(server, "deliver_webhook") as callback, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            callback.assert_not_called()
+            self.assertEqual(json.loads((jobs / job_id / "job.json").read_text()), alien)
+            self.assertNotIn(job_id, server.REVIEW_AUTHORITIES)
+
+    def test_review_authority_memfds_are_sealed_and_async_cleanup_has_no_fd_leak(self):
+        baseline = len(list(Path("/proc/self/fd").iterdir()))
+        job_ids = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for index in range(12):
+                case_root = root / f"case-{index}"
+                case_root.mkdir()
+                status, accepted, _jobs, _repo, _launcher, _ = self._queue_closed_review(
+                    case_root
+                )
+                self.assertEqual(status, 202, accepted)
+                job_id = accepted["job_id"]
+                job_ids.append(job_id)
+                authority = server.review_authority(job_id)
+                self.assertIsNotNone(authority)
+                seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+                self.assertEqual(
+                    fcntl.fcntl(authority.snapshot_fd, fcntl.F_GET_SEALS) & seals, seals
+                )
+                self.assertEqual(
+                    fcntl.fcntl(authority.launcher.fd, fcntl.F_GET_SEALS) & seals, seals
+                )
+                with self.assertRaises(OSError):
+                    os.pwrite(authority.snapshot_fd, b"x", 0)
+                with self.assertRaises(OSError):
+                    os.pwrite(authority.launcher.fd, b"x", 0)
+                with mock.patch.object(server, "native_review_result", return_value={
+                    "ok": True, "verdict": "PASS", "no_verdict": False,
+                }), mock.patch.object(server, "deliver_webhook", return_value=None), \
+                     mock.patch.object(server, "herdr_job_done"):
+                    server.run_review_job(job_id)
+                self.assertNotIn(job_id, server.REVIEW_AUTHORITIES)
+        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), baseline)
+        self.assertFalse(set(job_ids) & set(server.REVIEW_AUTHORITIES))
+
     def test_review_run_is_async_when_given_a_webhook(self):
         body = json.dumps({
             "repo": "scratch", "launcher": "claude", "provider": "anthropic",
@@ -8916,6 +9233,8 @@ while True:
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
                 status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+                if status == 202 and isinstance(payload, dict):
+                    self.addCleanup(server.release_review_authority, payload["job_id"])
         assert isinstance(payload, dict)
         self.assertEqual(status, 202, payload)
         self.assertEqual(payload["status"], "queued")
@@ -8950,6 +9269,8 @@ while True:
                 response = server.dispatch("POST", "/v1/review/run", {}, True, body)
                 status, payload = response[0], response[1]
                 assert isinstance(payload, dict)
+                if status == 202:
+                    self.addCleanup(server.release_review_authority, payload["job_id"])
             saved = json.loads((jobs / payload["job_id"] / "job.json").read_text())
         self.assertEqual(status, 202, payload)
         self.assertEqual(payload["status"], "queued")
