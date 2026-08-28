@@ -1252,9 +1252,15 @@ class DispatchTests(unittest.TestCase):
 
     def test_agent_job_wait_blocks_until_terminal_without_relaunching(self):
         job_id = "ab" * 16
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": None,
+        }
         agent_shape = {
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-            "session_identity": {},
+            **profile, "session_identity": identity,
         }
         queued = {"job_id": job_id, "status": "running", **agent_shape}
         completed = {"job_id": job_id, "status": "completed", "receipt": {"status": "ok"}, **agent_shape}
@@ -1285,9 +1291,16 @@ class DispatchTests(unittest.TestCase):
 
     def test_agent_job_wait_timeout_is_bounded(self):
         job_id = "ab" * 16
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": None,
+        }
         running = {
             "job_id": job_id, "status": "running", "launcher": "codex",
-            "provider": "openai", "model": "gpt-5.6-sol", "session_identity": {},
+            "provider": "openai", "model": "gpt-5.6-sol", **profile,
+            "session_identity": identity,
         }
         with mock.patch.object(server, "read_job", return_value=running), \
              mock.patch.object(server.time, "monotonic", side_effect=[0, 31]):
@@ -1431,6 +1444,16 @@ class DispatchTests(unittest.TestCase):
             self.assertIn("validated `starting_head`", text)
             self.assertIn("launcher/model-supplied SHA/PR URL", text)
 
+    def test_launcher_fingerprint_docs_bound_downstream_package_resolution(self):
+        for doc_path in (Path("docs/HUMAN-LOOP.md"), Path("docs/USING.md")):
+            with self.subTest(doc=doc_path.name):
+                text = doc_path.read_text()
+                self.assertIn("exact selected wrapper artifact bytes", text)
+                self.assertIn("does not attest", text)
+                self.assertIn("interpreter", text)
+                self.assertIn("PATH-resolved mise/shim", text)
+                self.assertIn("provider package/tool bytes", text)
+
     def test_worker_callback_cans_raw_spawn_failure(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
@@ -1508,6 +1531,87 @@ class DispatchTests(unittest.TestCase):
         schema = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]
         self.assertEqual(set(schema["required"]), set(identity))
         self.assertEqual(set(schema["properties"]), set(identity))
+
+    def test_session_identity_provenance_has_closed_bounded_formats(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        base = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "Graphwing_catalog-1",
+            "branch": "feature/model-routing_hardening.v1",
+            "starting_head": "b" * 40, "native_session_id": "native-123",
+        }
+        for head in ("b" * 40, "c" * 64):
+            with self.subTest(valid_head_length=len(head)):
+                parsed, error = server.parse_session_identity({**base, "starting_head": head})
+                self.assertIsNone(error)
+                self.assertEqual(parsed["starting_head"], head)
+        codeoff_repo = "codeoff:experiment-0001:author-1"
+        parsed, error = server.parse_session_identity({**base, "repo": codeoff_repo})
+        self.assertIsNone(error)
+        self.assertEqual(parsed["repo"], codeoff_repo)
+        hostile = (
+            ("repo", "../private"),
+            ("repo", "https://private.example/repo"),
+            ("repo", "bad\nrepo"),
+            ("repo", "r" * 129),
+            ("branch", "/private/branch"),
+            ("branch", "../private"),
+            ("branch", "https://private.example/branch"),
+            ("branch", "bad\x00branch"),
+            ("branch", "b" * 256),
+            ("starting_head", "/home/tim/private"),
+            ("starting_head", "TOKEN_SECRET"),
+            ("starting_head", "https://private.example/token"),
+            ("starting_head", "a" * 39),
+            ("starting_head", "A" * 40),
+            ("starting_head", "a" * 65),
+        )
+        for field, value in hostile:
+            with self.subTest(field=field, value=value[:30]):
+                parsed, error = server.parse_session_identity({**base, field: value})
+                self.assertIsNone(parsed)
+                self.assertEqual(error["code"], "bad_session_identity")
+        props = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]["properties"]
+        self.assertEqual((props["repo"]["minLength"], props["repo"]["maxLength"]), (1, 128))
+        self.assertEqual((props["branch"]["minLength"], props["branch"]["maxLength"]), (1, 255))
+        self.assertEqual(props["starting_head"]["pattern"], "^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+    def test_invalid_session_provenance_is_not_public_or_callback_data(self):
+        hostile = "https://private.example/callback?token=TOKEN_SECRET"
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            job_id = "bc" * 16
+            job = _stamp_complete_writer_evidence({
+                "job_id": job_id, "status": "completed", "repo": "scratch",
+                "cwd": str(self.scratch.resolve()), "session_identity": {
+                    "branch": "main", "starting_head": "b" * 40,
+                },
+                "receipt": {"status": "ok"},
+            })
+            job["session_identity"]["starting_head"] = hostile
+            job["response_webhook_url"] = "https://example.invalid/resume"
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                server.write_job(job)
+                get_status, get_payload, _ = server.dispatch(
+                    "GET", f"/v1/agent/jobs/{job_id}", {}, True, b""
+                )
+                wait_status, wait_payload, _ = server.dispatch(
+                    "POST", "/v1/agent/jobs/wait", {}, True,
+                    json.dumps({"job_id": job_id, "timeout_seconds": 1}).encode(),
+                )
+            normalized = server.normalize_receipt(
+                job, {"status": "ok", "summary": "done"}, 0, False
+            )
+            with mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted:
+                server.deliver_webhook(job, normalized)
+            rendered = json.dumps({
+                "get": get_payload, "wait": wait_payload,
+                "callback": posted.call_args.args[1],
+            })
+            self.assertEqual((get_status, wait_status), (404, 404))
+            self.assertIsNone(normalized["session_identity"])
+            self.assertNotIn(hostile, rendered)
+            self.assertNotIn("TOKEN_SECRET", rendered)
 
     def test_resume_rejects_top_level_profile_drift_from_identity(self):
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
@@ -1903,6 +2007,57 @@ class DispatchTests(unittest.TestCase):
                 server.write_job(coordinated)
                 error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
                 self.assertEqual(error["code"], "writer_evidence_mismatch")
+
+    def test_unknown_non_agent_job_cannot_authorize_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            branch = subprocess.run(
+                ["git", "-C", str(repo), "branch", "--show-current"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            baseline = server.capture_writer_baseline(repo)[0]
+            (repo / "alien.txt").write_text("not an agent writer\n")
+            job_id = "ad" * 16
+            job = _stamp_complete_writer_evidence({
+                "job_id": job_id, "kind": "alien-non-agent", "status": "completed",
+                "repo": "scratch", "cwd": str(repo.resolve()), "git_baseline": baseline,
+                "writer_parent_paths": [], "session_identity": {
+                    "branch": branch, "starting_head": head,
+                },
+                "receipt": {"status": "ok"},
+            })
+            self.assertIsNone(server.stage_writer_changes(job))
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                server.write_job(job)
+                evidence_error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/git/commit", {}, True,
+                    json.dumps({
+                        "repo": "scratch", "message": "must not commit",
+                        "writer_job_id": job_id,
+                    }).encode(),
+                )
+            after = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(
+                evidence_error.get("code") if isinstance(evidence_error, dict) else None,
+                "writer_evidence_mismatch",
+            )
+            self.assertEqual(
+                (status, payload.get("code") if isinstance(payload, dict) else None),
+                (409, "writer_job_mismatch"),
+                payload,
+            )
+            self.assertEqual(after, head)
 
     def test_writer_staging_and_commit_preserve_dirty_operator_state_in_linked_worktree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -6035,6 +6190,8 @@ while True:
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
             "requested_effort": "high", "effective_effort": "high", "effort_source": "route",
             "launcher_version": "sha256:" + "a" * 64,
+            "repo": "scratch", "branch": "main", "starting_head": "a" * 40,
+            "native_session_id": None,
         }
         cases = (
             ({"effective_effort": "default"}, {}, "sha256:" + "a" * 64),
@@ -6073,6 +6230,82 @@ while True:
             self.assertEqual(payload["code"], "primary_execution_profile_mismatch")
             self.assertEqual(payload["diagnostic"]["code"], "primary_execution_profile_mismatch")
 
+    def test_fallback_rejects_route_profile_drift_even_when_all_evidence_agrees(self):
+        route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        route_profile = _fixture_execution_profile(
+            "codex", "openai", "gpt-5.6-sol", requested=route["effort"], source="route"
+        )
+        base_identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(route_profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": None,
+        }
+        mutations = (
+            {"requested_effort": "default"},
+            {"effective_effort": "default"},
+            {"effort_source": "explicit"},
+            {"requested_effort": "default", "effective_effort": "high", "effort_source": "explicit"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                identity = {**base_identity, **mutation}
+                profile = {**route_profile, **mutation}
+                receipt = {
+                    "status": "error", "job_id": "a" * 32, "role": "primary",
+                    "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    **profile, "failure_class": "provider_availability",
+                    "failure_code": "provider_rate_limit", "failover_eligible": True,
+                    "session_identity": identity,
+                }
+                stored_job = {
+                    "job_id": receipt["job_id"], "status": "failed", "launcher": "codex",
+                    "provider": "openai", "model": "gpt-5.6-sol", **profile,
+                    "session_identity": identity,
+                    "receipt": {key: value for key, value in receipt.items() if key != "role"},
+                }
+                body = json.dumps({
+                    "class": "mechanical", "size": "M", "work_kind": "go_coding",
+                    "primary_route": route, "primary_receipt": receipt,
+                }).encode()
+                with mock.patch.object(server, "read_job", return_value=stored_job):
+                    status, payload = server.slice_route_fallback(body)
+                self.assertEqual(
+                    (status, payload.get("code")),
+                    (400, "primary_execution_profile_mismatch"),
+                    payload,
+                )
+
+    def test_fallback_rejects_unvalidated_session_provenance(self):
+        route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        profile = _fixture_execution_profile(
+            "codex", "openai", "gpt-5.6-sol", requested=route["effort"], source="route"
+        )
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "TOKEN_SECRET", "native_session_id": None,
+        }
+        receipt = {
+            "status": "error", "job_id": "a" * 32, "role": "primary",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **profile, "failure_class": "provider_availability",
+            "failure_code": "provider_rate_limit", "failover_eligible": True,
+            "session_identity": identity,
+        }
+        stored_job = {
+            "job_id": receipt["job_id"], "status": "failed", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol", **profile,
+            "session_identity": identity,
+            "receipt": {key: value for key, value in receipt.items() if key != "role"},
+        }
+        with mock.patch.object(server, "read_job", return_value=stored_job):
+            status, payload = server.slice_route_fallback(json.dumps({
+                "class": "mechanical", "size": "M", "work_kind": "go_coding",
+                "primary_route": route, "primary_receipt": receipt,
+            }).encode())
+        self.assertEqual((status, payload.get("code")), (400, "primary_execution_profile_mismatch"), payload)
+        self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+
     def test_availability_fallback_route_locked_matrix_and_reviewers(self):
         expected = {
             "go_coding": (("codex", "openai", "gpt-5.6-sol"), ("claude", "anthropic", "claude-opus-5", "default")),
@@ -6083,7 +6316,11 @@ while True:
             primary_route = server.slice_route_lookup("sensitive", "M", work_kind=work_kind)
             self.assertEqual(tuple(primary_route[k] for k in ("launcher", "provider", "model")), primary)
             profile = _fixture_execution_profile(*primary, requested=primary_route["effort"], source="route")
-            identity = {"launcher": primary[0], "provider": primary[1], "model": primary[2], **_fixture_identity_profile(profile)}
+            identity = {
+                "launcher": primary[0], "provider": primary[1], "model": primary[2],
+                **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+                "starting_head": "a" * 40, "native_session_id": None,
+            }
             receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": primary[0], "provider": primary[1], "model": primary[2], **profile, "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": identity}
             stored_job = {
                 "launcher": primary[0], "provider": primary[1], "model": primary[2],
@@ -6111,7 +6348,11 @@ while True:
     def test_availability_fallback_route_fails_closed(self):
         primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", requested="high", source="route")
-        identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **_fixture_identity_profile(profile)}
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": None,
+        }
         receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         base = {"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}
         for patch, code in (
@@ -6123,9 +6364,9 @@ while True:
             ({"primary_receipt": {**receipt, "failover_eligible": False}}, "not_fallback_eligible"),
             ({"primary_receipt": {**receipt, "failover_eligible": "true"}}, "bad_failover_eligible"),
             ({"primary_receipt": {**receipt, "job_id": "../bad"}}, "bad_job_id"),
-            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {"launcher": "claude", "provider": "openai", "model": "gpt-5.6-sol"}}}, "primary_provider_mismatch"),
-            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {"launcher": "codex", "provider": "anthropic", "model": "gpt-5.6-sol"}}}, "primary_provider_mismatch"),
-            ({"primary_receipt": {**receipt, "session_identity": {"launcher": "codex", "provider": "openai", "model": "claude-opus-5"}}}, "primary_provider_mismatch"),
+            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {**identity, "launcher": "claude"}}}, "primary_provider_mismatch"),
+            ({"primary_receipt": {**receipt, "provider": "openai", "session_identity": {**identity, "provider": "anthropic"}}}, "primary_provider_mismatch"),
+            ({"primary_receipt": {**receipt, "session_identity": {**identity, "model": "claude-opus-5"}}}, "primary_provider_mismatch"),
             ({"primary_route": {**primary_route, "provider": "anthropic"}}, "primary_provider_mismatch"),
             ({"primary_route": {**primary_route, "reason": "forged"}}, "primary_provider_mismatch"),
         ):
@@ -6139,7 +6380,11 @@ while True:
     def test_availability_fallback_route_requires_stored_primary_receipt(self):
         primary_route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", requested="high", source="route")
-        identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **_fixture_identity_profile(profile)}
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": None,
+        }
         receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         body = json.dumps({"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}).encode()
         stored_receipt = {key: value for key, value in receipt.items() if key != "role"}
@@ -6414,20 +6659,36 @@ while True:
                 self.assertEqual(payload["code"], "recovery_evidence_mismatch")
 
     def test_provider_recovery_rejects_coordinated_job_receipt_profile_drift(self):
-        with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs"
-            body = self._provider_recovery_fixture(jobs, "provider_network")
-            receipt = body["fallback_receipt"]
-            receipt["effort_source"] = "explicit"
-            stored_path = jobs / receipt["job_id"] / "job.json"
-            stored = json.loads(stored_path.read_text())
-            stored["effort_source"] = "explicit"
-            stored["receipt"]["effort_source"] = "explicit"
-            stored_path.write_text(json.dumps(stored) + "\n")
-            with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
-                status, payload = server.derive_slice_recovery_route(body)
-            self.assertEqual((status, payload["code"]), (400, "recovery_evidence_mismatch"), payload)
+        mutations = (
+            {"requested_effort": "high"},
+            {"effective_effort": "high"},
+            {"effort_source": "explicit"},
+            {"requested_effort": "high", "effective_effort": "high", "effort_source": "explicit"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(jobs, "provider_network")
+                receipt = body["fallback_receipt"]
+                receipt.update(mutation)
+                receipt["session_identity"].update(mutation)
+                stored_path = jobs / receipt["job_id"] / "job.json"
+                stored = json.loads(stored_path.read_text())
+                stored.update(mutation)
+                stored["session_identity"].update(mutation)
+                stored["receipt"].update(mutation)
+                stored["receipt"]["session_identity"].update(mutation)
+                stored_path.write_text(json.dumps(stored) + "\n")
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
+                    status, payload = server.derive_slice_recovery_route(body)
+                self.assertEqual(status, 400, payload)
+                expected_code = (
+                    "recovery_evidence_mismatch"
+                    if mutation in ({"effort_source": "explicit"},)
+                    else "malformed_recovery_evidence"
+                )
+                self.assertEqual(payload["code"], expected_code, payload)
 
     def test_provider_recovery_rejects_own_job_head_mismatch_and_out_of_order_fallback(self):
         cases = ("own_job_head_mismatch", "out_of_order")
@@ -9220,7 +9481,8 @@ class CodeOffTests(unittest.TestCase):
         ))
 
     def _run_native_terminal_fixture(
-        self, experiment_id, slot, stdout, *, native_session_id, before_run=None
+        self, experiment_id, slot, stdout, *, native_session_id, before_run=None,
+        expect_native_session=True,
     ):
         body = self._agent_body(experiment_id, slot)
         with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
@@ -9241,7 +9503,8 @@ class CodeOffTests(unittest.TestCase):
              mock.patch.object(server, "herdr_job_done"):
             server.run_agent_job(job_id)
         job = server.read_job(job_id)
-        self.assertEqual(job["session_identity"]["native_session_id"], native_session_id, job)
+        expected_session = native_session_id if expect_native_session else None
+        self.assertEqual(job["session_identity"]["native_session_id"], expected_session, job)
         return job
 
     def _agent_body(self, experiment_id, slot):
@@ -9846,6 +10109,7 @@ class CodeOffTests(unittest.TestCase):
                 job = self._run_native_terminal_fixture(
                     experiment_id, "author-2", "".join(json.dumps(item) + "\n" for item in events),
                     native_session_id=native_session_id, before_run=alter_session_model,
+                    expect_native_session=case != "session_model",
                 )
                 self.assertEqual((job["status"], job["receipt"]["failure_code"]), ("failed", "session_provenance_invalid"), job)
                 self.assertNotIn("execution_identity", job["receipt"])
