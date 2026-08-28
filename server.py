@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import io
@@ -21,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1343,6 +1344,7 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     name, resolved = repo_from_body(data, repos)
     if name is None:
         return 400, resolved
+    assert isinstance(resolved, Path)
     message = data.get("message")
     if not isinstance(message, str) or not message.strip():
         return 400, {"error": "message is required", "code": "empty_message"}
@@ -1396,6 +1398,7 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             or Path(str(writer.get("cwd") or "")).resolve() != resolved.resolve()
             or not isinstance(identity, dict) or branch != identity.get("branch")
             or head != identity.get("starting_head") or state_err
+            or validate_writer_evidence(writer.get("job_id"), name, resolved, str(branch or "")) is not None
         ):
             return 409, {"error": "writer job is not valid for this commit", "code": "writer_job_mismatch"}
         writer_paths = writer.get("writer_paths") if isinstance(writer.get("writer_paths"), list) else []
@@ -2165,18 +2168,57 @@ def resolve_launcher_binary_now(launcher: str) -> Path:
     )
 
 
+class PinnedLauncher:
+    def __init__(self, fd: int, fingerprint: str):
+        self.fd = fd
+        self.path = Path(f"/proc/self/fd/{fd}")
+        self.fingerprint = fingerprint
+
+
+@contextmanager
+def pinned_launcher(binary: Path):
+    """Copy one opened launcher into a sealed Linux memfd for exact execution."""
+    source_fd = -1
+    sealed_fd = -1
+    try:
+        source_fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("launcher is not a regular file")
+        sealed_fd = os.memfd_create("graphwing-launcher", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(sealed_fd, view)
+                if written <= 0:
+                    raise OSError("could not pin launcher artifact")
+                view = view[written:]
+        os.fchmod(sealed_fd, stat.S_IMODE(info.st_mode))
+        os.lseek(sealed_fd, 0, os.SEEK_SET)
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        fcntl.fcntl(sealed_fd, fcntl.F_ADD_SEALS, seals)
+        yield PinnedLauncher(sealed_fd, f"sha256:{digest.hexdigest()}")
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if sealed_fd >= 0:
+            os.close(sealed_fd)
+
+
 def launcher_version_fingerprint(binary: Path) -> str | None:
     """Return a path-free immutable launcher artifact identity without executing it."""
-    if not binary.is_file():
-        return "missing"
-    digest = hashlib.sha256()
     try:
-        with binary.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
+        with pinned_launcher(binary) as pinned:
+            return pinned.fingerprint
+    except FileNotFoundError:
+        return "missing"
     except OSError:
         return None
-    return f"sha256:{digest.hexdigest()}"
 
 
 RECOVERY_RECEIPT_FIELDS = (
@@ -2347,6 +2389,7 @@ def validate_writer_evidence(job_id: Any, repo_name: str, repo: Path, branch: st
     receipt = job.get("receipt") if isinstance(job, dict) else None
     identity = job.get("session_identity") if isinstance(job, dict) else None
     parsed, identity_err = parse_session_identity(identity)
+    profile = trusted_agent_profile(job) if isinstance(job, dict) else None
     if not (
         isinstance(job, dict) and job.get("status") == "completed" and job.get("kind") not in {"test", "script", "rr", "review"}
         and job.get("repo") == repo_name and job.get("cwd") == str(repo.resolve())
@@ -2354,7 +2397,8 @@ def validate_writer_evidence(job_id: Any, repo_name: str, repo: Path, branch: st
         and receipt.get("failure_class") == "none" and receipt.get("failure_code") == "none" and receipt.get("failover_eligible") is False
         and isinstance(identity, dict) and not identity_err and parsed == identity and identity.get("native_session_id") and identity.get("repo") == repo_name
         and identity.get("branch") == branch and receipt.get("session_identity") == identity
-        and all(job.get(key) == identity.get(key) for key in ("launcher", "provider", "model"))
+        and profile is not None
+        and all(receipt.get(key) == job.get(key) for key in AGENT_PROFILE_FIELDS)
     ):
         return {"error": "writer/session job is incomplete or mismatched", "code": "writer_evidence_mismatch"}
     return None
@@ -3464,34 +3508,86 @@ def write_job(job: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def public_job(job: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "job_id",
-        "status",
-        "repo",
-        "cwd",
-        "prompt",
-        "launcher",
-        "provider",
-        "model",
-        "session_identity",
-        "created_at",
-        "started_at",
-        "finished_at",
-        "receipt",
-        "log_ref",
-        "error",
-        "webhook",
+AGENT_PROFILE_FIELDS = (
+    "launcher", "provider", "model", "requested_effort", "effective_effort",
+    "effort_source", "launcher_version",
+)
+
+
+def trusted_agent_profile(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a complete corroborated profile, never a best-effort projection."""
+    launcher, provider, model = (job.get(key) for key in ("launcher", "provider", "model"))
+    source = job.get("effort_source")
+    requested = job.get("requested_effort")
+    if not (
+        isinstance(launcher, str) and launcher in NATIVE_LAUNCHERS
+        and isinstance(provider, str) and isinstance(model, str)
+        and source in EFFORT_SOURCES and requested in EFFORT_VALUES
+    ):
+        return None
+    if (launcher, provider, model) not in EFFORT_PROFILES:
+        return None
+    normalized, effort_err = normalize_effort(launcher, provider, model, requested, source)
+    identity = job.get("session_identity")
+    parsed, identity_err = parse_session_identity(identity)
+    launcher_version = job.get("launcher_version")
+    if (
+        effort_err or normalized is None
+        or job.get("effective_effort") != normalized["effective_effort"]
+        or not isinstance(launcher_version, str) or not LAUNCHER_VERSION_RE.fullmatch(launcher_version)
+        or identity_err or parsed != identity or not isinstance(identity, dict)
+        or any(identity.get(key) != job.get(key) for key in ("launcher", "provider", "model", "effective_effort", "launcher_version"))
+    ):
+        return None
+    return {key: job.get(key) for key in AGENT_PROFILE_FIELDS} | {"session_identity": identity}
+
+
+def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
+    stored = job.get("receipt")
+    if not isinstance(stored, dict):
+        return None
+    profile = trusted_agent_profile(job)
+    receipt_profile_valid = bool(
+        profile is not None
+        and all(stored.get(key) == profile[key] for key in AGENT_PROFILE_FIELDS)
+        and stored.get("session_identity") == profile["session_identity"]
     )
-    out = {k: job.get(k) for k in keys}
-    if job.get("codeoff_workspace"):
-        out.pop("cwd", None)
-        out.pop("prompt", None)
-        out.pop("log_ref", None)
-        out["codeoff_workspace"] = job["codeoff_workspace"]
-        out["prompt_hash"] = job.get("prompt_hash")
-    out["ok"] = True
-    return out
+    if not receipt_profile_valid:
+        classified = classify_agent_failure("session_provenance_invalid")
+        return {
+            "status": "error", "job_id": job.get("job_id"),
+            **{key: None for key in AGENT_PROFILE_FIELDS}, "session_identity": None,
+            "summary": classified["diagnostic"]["summary"], **classified,
+        }
+    assert profile is not None
+    status = stored.get("status") if stored.get("status") in ("ok", "error", "timeout") else "error"
+    code = stored.get("failure_code")
+    if status == "ok" and code == "none" and profile["session_identity"].get("native_session_id"):
+        classified = classify_agent_failure("success")
+    elif isinstance(code, str) and code in FAILURE_CLASS_BY_CODE and code != "success":
+        classified = classify_agent_failure(code)
+    else:
+        status = "error"
+        classified = classify_agent_failure("invalid_receipt")
+    return {
+        "status": status, "job_id": job.get("job_id"), **profile,
+        "summary": classified["diagnostic"]["summary"], **classified,
+    }
+
+
+def public_job(job: dict[str, Any]) -> dict[str, Any]:
+    if job.get("kind") not in (None, "agent") and not job.get("codeoff_workspace"):
+        keys = ("job_id", "status", "repo", "created_at", "started_at", "finished_at", "receipt")
+        return {"ok": True, **{key: job.get(key) for key in keys}}
+    profile = trusted_agent_profile(job)
+    return {
+        "ok": True,
+        **{key: job.get(key) for key in ("job_id", "status", "repo")},
+        **({key: profile[key] for key in AGENT_PROFILE_FIELDS} if profile else {key: None for key in AGENT_PROFILE_FIELDS}),
+        "session_identity": profile["session_identity"] if profile else None,
+        **{key: job.get(key) for key in ("created_at", "started_at", "finished_at")},
+        "receipt": sanitized_agent_receipt(job),
+    }
 
 
 def agent_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
@@ -3543,11 +3639,13 @@ PROCESS_JOB_KINDS = frozenset({"agent", "script", "test", "review", "rr"})
 def interrupted_job_receipt(job: dict[str, Any], kind: str) -> dict[str, Any]:
     summary = f"{kind} job interrupted by Graphwing restart"[:500]
     if kind == "agent":
+        profile = trusted_agent_profile(job)
+        classified = classify_agent_failure("cancelled" if profile else "session_provenance_invalid")
         return {
             "status": "error", "job_id": job["job_id"],
-            "session_identity": job.get("session_identity"), "sha": None, "pr_url": None,
-            "log_ref": job.get("log_ref"), "summary": summary,
-            **classify_agent_failure("cancelled"),
+            **({key: profile[key] for key in AGENT_PROFILE_FIELDS} if profile else {key: None for key in AGENT_PROFILE_FIELDS}),
+            "session_identity": profile["session_identity"] if profile else None,
+            "summary": classified["diagnostic"]["summary"], **classified,
         }
     if kind == "review":
         return {
@@ -3901,6 +3999,12 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
         return None, None
     if not isinstance(raw, dict):
         return None, {"error": "session_identity must be an object", "code": "bad_session_identity"}
+    allowed = {
+        "launcher", "provider", "model", "effective_effort", "launcher_version",
+        "repo", "branch", "starting_head", "native_session_id",
+    }
+    if set(raw) != allowed:
+        return None, {"error": "session_identity has missing or unsupported fields", "code": "bad_session_identity"}
     out: dict[str, Any] = {}
     for key in (
         "launcher", "provider", "model", "effective_effort", "launcher_version",
@@ -4167,6 +4271,7 @@ def normalize_receipt(
         and LAUNCHER_VERSION_RE.fullmatch(job["launcher_version"])
         and identity_err is None and parsed_identity == identity
         and isinstance(identity, dict)
+        and all(identity.get(key) == job.get(key) for key in ("launcher", "provider", "model"))
         and identity.get("effective_effort") == job.get("effective_effort")
         and identity.get("launcher_version") == job.get("launcher_version")
     )
@@ -4196,26 +4301,17 @@ def normalize_receipt(
     rec = {
         "status": status,
         "job_id": job["job_id"],
+        "launcher": job.get("launcher"),
+        "provider": job.get("provider"),
+        "model": job.get("model"),
         "session_identity": identity,
         "requested_effort": requested_effort,
         "effective_effort": effective_effort,
         "effort_source": effort_source,
         "launcher_version": launcher_version,
-        "sha": None,
-        "pr_url": None,
-        "summary": failure,
     }
-    if parsed:
-        sha = parsed.get("sha")
-        pr_url = parsed.get("pr_url")
-        summary = parsed.get("summary")
-        if sha not in (None, ""):
-            rec["sha"] = str(sha)[:64]
-        if pr_url not in (None, ""):
-            rec["pr_url"] = str(pr_url)[:500]
-        if failure is None and summary not in (None, ""):
-            rec["summary"] = str(summary)[:500]
     rec.update(classify_agent_failure(evidence_code or evidence, structured_output))
+    rec["summary"] = rec["diagnostic"]["summary"]
     return rec
 
 
@@ -4255,6 +4351,11 @@ def native_job_env(job: dict[str, Any]) -> dict[str, str]:
     if job.get("codeoff_workspace"):
         env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+def launcher_pass_fds(binary: Path) -> tuple[int, ...]:
+    match = re.fullmatch(r"/proc/self/fd/([0-9]+)", str(binary))
+    return (int(match.group(1)),) if match else ()
 
 
 def spawn_claude(
@@ -4303,6 +4404,7 @@ def spawn_claude(
             cwd=cwd,
             env=env,
             start_new_session=True,
+            pass_fds=launcher_pass_fds(binary),
         )
     except OSError as exc:
         stdout_f.close()
@@ -4347,6 +4449,7 @@ def spawn_codex(
         proc = subprocess.Popen(
             codex_command(job, prompt_path, cwd, binary), stdin=stdin_f, stdout=stdout_f, stderr=stderr_f,
             cwd=cwd, env=native_job_env(job), start_new_session=True,
+            pass_fds=launcher_pass_fds(binary),
         )
     except OSError as exc:
         stdin_f.close()
@@ -4383,6 +4486,7 @@ def run_grok_acp(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, env=env, start_new_session=True, bufsize=0,
+            pass_fds=launcher_pass_fds(binary),
         )
     except OSError as exc:
         job["_adapter_failure_code"] = "spawn_failed"
@@ -4851,21 +4955,24 @@ def run_agent_job(job_id: str) -> None:
     job["started_at"] = utcnow()
     write_job(job)
     binary = resolve_launcher_binary_now(str(job["launcher"]))
-    current_launcher_version = launcher_version_fingerprint(binary)
-    if current_launcher_version != job.get("launcher_version"):
-        proc, err = None, {
-            "error": "launcher version changed after request validation",
-            "code": "launcher_version_mismatch",
-        }
-    elif not binary.is_file():
-        proc, err = None, {"error": f"missing {job['launcher']} binary: {binary}", "code": "missing_binary"}
-    elif job.get("launcher") == "grok":
-        returncode, timed_out, session_id, protocol_error = run_grok_acp(
-            job, binary, mode="writer"
-        )
-        proc, err = None, None
-    else:
-        proc, err = spawn_writer(job, binary)
+    try:
+        with pinned_launcher(binary) as pinned:
+            if pinned.fingerprint != job.get("launcher_version"):
+                proc, err = None, {
+                    "error": "launcher version changed after request validation",
+                    "code": "launcher_version_mismatch",
+                }
+            elif job.get("launcher") == "grok":
+                returncode, timed_out, session_id, protocol_error = run_grok_acp(
+                    job, pinned.path, mode="writer"
+                )
+                proc, err = None, None
+            else:
+                proc, err = spawn_writer(job, pinned.path)
+    except FileNotFoundError:
+        proc, err = None, {"error": "configured launcher is missing", "code": "missing_binary"}
+    except OSError:
+        proc, err = None, {"error": "launcher artifact could not be pinned", "code": "launcher_version_mismatch"}
     if err:
         job["status"] = "failed"
         job["finished_at"] = utcnow()
@@ -4874,7 +4981,6 @@ def run_agent_job(job_id: str) -> None:
             job, {"status": "error", "summary": err.get("error")}, 1, False,
             evidence_code=str(err.get("code") or "unknown_failure"),
         )
-        job["receipt"]["summary"] = err.get("error")
         write_job(job)
         hook = deliver_webhook(job, job["receipt"])
         if hook is not None:
@@ -4918,6 +5024,7 @@ def run_agent_job(job_id: str) -> None:
     if failure_summary:
         receipt["status"] = "error"
         receipt["summary"] = failure_summary
+        job["error"] = failure_summary
     execution_identity = None
     if receipt["status"] == "ok" and job.get("codeoff_workspace"):
         execution_identity = _codeoff_execution_identity(job, adapter_evidence)
@@ -4939,7 +5046,9 @@ def run_agent_job(job_id: str) -> None:
         if staging_err:
             receipt["status"] = "error"
             receipt["summary"] = staging_failure_summary(staging_err)
+            job["error"] = staging_failure_summary(staging_err)
             receipt.update(classify_agent_failure("repository_mismatch"))
+    receipt["summary"] = receipt["diagnostic"]["summary"]
     job["finished_at"] = utcnow()
     job["returncode"] = returncode
     job["receipt"] = receipt
