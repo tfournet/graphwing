@@ -511,15 +511,50 @@
       "post": {
         "operationId": "reviewRun",
         "tags": ["review"],
-        "summary": "Read-only opposing-vendor review of git diff HEAD through an explicit direct Codex, Claude, or Grok launcher. Does not edit, commit, or push.",
+        "summary": "Run or queue one read-only native review bound to an immutable execution identity.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunRequest" } } }
         },
         "responses": {
-          "200": { "description": "verdict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewRunResult" } } } },
+          "200": { "description": "terminal synchronous review", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } },
+          "202": { "description": "queued review", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
           "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "501": { "description": "launcher unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } },
+          "504": { "description": "synchronous review timed out", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } }
+        }
+      }
+    },
+    "/v1/review/jobs/{job_id}": {
+      "get": {
+        "operationId": "reviewJob",
+        "tags": ["review"],
+        "summary": "Poll one canonical review job without exposing prompts, paths, logs, or provider output.",
+        "parameters": [
+          { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" } }
+        ],
+        "responses": {
+          "200": { "description": "review job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/review/jobs/wait": {
+      "post": {
+        "operationId": "reviewJobWait",
+        "tags": ["review"],
+        "summary": "Wait boundedly for one canonical review job; never launch or retry a model process.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJobWaitRequest" } } } },
+        "responses": {
+          "200": { "description": "terminal review job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "408": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -1372,34 +1407,85 @@
       "ReviewRunRequest": {
         "type": "object",
         "required": ["repo", "launcher", "provider", "model", "prompt"],
+        "additionalProperties": false,
         "properties": {
-          "repo": { "type": "string" },
+          "repo": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
           "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
-          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"], "description": "Must belong to the selected launcher/provider; mismatches fail with bad_model_identity." },
-          "effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"], "description": "Launcher-neutral reviewer effort; unsupported launcher/model combinations fail closed." },
-          "prompt": { "type": "string" },
-          "async": { "type": "boolean", "default": false, "description": "Queue a durable review job even when no response webhook is supplied." },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
+          "prompt": { "type": "string", "minLength": 1 },
+          "effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"], "description": "Closed launcher-neutral request. Grok 4.6 supports default→high plus low, medium, and high; max fails closed." },
+          "async": { "type": "boolean", "default": false },
           "run_budget_seconds": { "type": "integer", "minimum": 30, "maximum": 600, "default": 200 },
           "max_turns": { "type": "integer", "minimum": 1, "maximum": 30, "default": 12 },
           "response_webhook_url": { "type": "string" },
           "response_webhook_token": { "type": "string" }
         }
       },
-      "ReviewRunResult": {
+      "ReviewExecutionIdentity": {
         "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "kind", "launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "launcher_version", "repo", "branch", "starting_head", "prompt_sha256", "diff_sha256", "run_budget_seconds", "max_turns", "permission_profile"],
         "properties": {
-          "ok": { "type": "boolean" },
-          "verdict": { "type": "string" },
-          "reviewer": { "type": "string" },
-          "launcher": { "type": "string" },
-          "provider": { "type": "string" },
-          "model": { "type": "string" },
+          "version": { "type": "string", "const": "review-execution-v1" },
+          "kind": { "type": "string", "const": "review" },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
           "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
           "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
           "effort_source": { "type": "string", "enum": ["explicit", "launcher_default"] },
-          "summary": { "type": "string" },
-          "compact": { "type": "string" }
+          "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$" },
+          "repo": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+          "branch": { "type": "string" },
+          "starting_head": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+          "prompt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "diff_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "run_budget_seconds": { "type": "integer", "minimum": 30, "maximum": 600 },
+          "max_turns": { "type": "integer", "minimum": 1, "maximum": 30 },
+          "permission_profile": { "type": "string", "enum": ["codex-read-only", "claude-plan", "grok-read-only-acp"] }
+        }
+      },
+      "ReviewReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "status", "job_id", "kind", "verdict", "no_verdict", "execution_identity", "summary", "code"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["ok", "nack", "error"] },
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "kind": { "type": "string", "const": "review" },
+          "verdict": { "type": ["string", "null"], "enum": ["PASS", "NACK", null] },
+          "no_verdict": { "type": "boolean" },
+          "execution_identity": { "$ref": "#/components/schemas/ReviewExecutionIdentity" },
+          "summary": { "type": "string", "enum": ["review passed", "review requested changes", "review timed out", "review launcher unavailable", "review execution failed", "review returned no verdict", "review execution identity mismatch"] },
+          "code": { "type": ["string", "null"], "enum": ["timeout", "not_implemented", "review_failed", "review_execution_identity_mismatch", null] }
+        }
+      },
+      "ReviewJob": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "job_id", "kind", "status", "execution_identity", "created_at", "started_at", "finished_at", "receipt", "poll"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "kind": { "type": "string", "const": "review" },
+          "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
+          "execution_identity": { "$ref": "#/components/schemas/ReviewExecutionIdentity" },
+          "created_at": { "type": "string" },
+          "started_at": { "type": ["string", "null"] },
+          "finished_at": { "type": ["string", "null"] },
+          "receipt": { "anyOf": [{ "$ref": "#/components/schemas/ReviewReceipt" }, { "type": "null" }] },
+          "poll": { "type": "string", "pattern": "^/v1/review/jobs/[0-9a-f]{32}$" }
+        }
+      },
+      "ReviewJobWaitRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "timeout_seconds"],
+        "properties": {
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "timeout_seconds": { "oneOf": [{ "type": "integer", "minimum": 1, "maximum": 1800 }, { "type": "string", "pattern": "^[0-9]{1,4}$" }] }
         }
       },
       "SliceContinue": {
