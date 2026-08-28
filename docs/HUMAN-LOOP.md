@@ -41,6 +41,10 @@ Use your normal editor or terminal. Do not reconstruct operating rules from an o
 
 Go uses Codex, TypeScript uses Claude, and research/operations uses Grok. Mechanical S skips model review. Other work gets one opposing-provider review; sensitive work gets two. Missing launchers, model mismatches, untraceable resumes, missing session identity, and invalid receipts fail closed.
 
+`agentRun` accepts the closed launcher-neutral effort vocabulary `default | low | medium | high | max`. In Phase 1 the conservative capability table advertises only behavior established by the current adapters: Codex Sol (and code-off-only Terra) accepts `default` or `high`, both with effective `high`; Claude Opus/Sonnet (and code-off-only Fable) and Grok 4.6 accept only `default`. Other known values fail with `unsupported_effort`; unknown values fail with `bad_effort`. A supplied value has source `explicit`; omission records requested `default` with source `launcher_default`. `route` is reserved for internally attributable route wiring and is not emitted by direct `agentRun` in this phase.
+
+Terminal jobs and receipts carry requested/effective effort, source, and a path-free launcher executable fingerprint. Effective effort and launcher version are part of session identity, so resume, recovery, and fallback evidence fail closed on launcher, provider, model, effective-effort, or launcher-version drift. Public receipts do not include prompts, logs, paths, secrets, raw provider output, or launcher-native effort tokens.
+
 `gitCommit` does not run `git add -A`. An empty commit is a failed slice. Keep files and do not push.
 
 ## Retry and park
@@ -52,6 +56,8 @@ A timeout without a verdict, exhausted retry budget, repeated red suite, or repe
 ## Operational boundaries
 
 - `diagnostic-v1` is a compact receipt contract, not a trace dump. `provider-recovery-v1` may reconsider a prior fallback only at a later invocation boundary from persisted evidence; active corrections remain pinned.
+- Daemon jobs, logs, caches, session files, and local receipts are replaceable runtime corroboration, never durable authority. Rewst data storage is the future permanent receipt store; Phase 1 adds no Rewst persistence.
+- Phase 1 makes direct agent effort validation and execution identity real, but does not add Phase 2 launcher command propagation. Review effort and graph-node effort remain unwired until later phases.
 - Code-off is eligible only while its at-most-30-day embedded approval is current and every exact immutable slot identity is proven; Fable and Terra are code-off-only, not ordinary launcher choices. Expiry or provenance mismatch parks rather than discovering, aliasing, substituting, falling back, or redrawing. Git worktrees are not OS isolation.
 - PR status is remote-only. Merge requires the persisted final named-test job bound to repo/PR/run/head and clean start/end, then fresh open, non-draft, stable-head, merge-ready state with a nonempty terminal-green GitHub check set.
 - There is no visual proof scope in this catalog. Preserve issue-52 visual exclusions; a named recipe is not screenshot/browser evidence.

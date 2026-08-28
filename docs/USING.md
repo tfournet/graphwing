@@ -73,6 +73,20 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
+### Agent effort contract (Phase 1)
+
+Direct `POST /v1/agent/run` accepts optional `effort` with the closed values `default`, `low`, `medium`, `high`, and `max`. A supplied value records `effort_source: explicit`; omission records `requested_effort: default` and `effort_source: launcher_default`. Direct calls do not claim `route` provenance. Unknown text returns `400 bad_effort`; a known value outside the selected profile's conservative Phase 1 support returns `400 unsupported_effort`.
+
+| launcher/model | accepted request values | effective effort |
+| --- | --- | --- |
+| Codex `gpt-5.6-sol` (and code-off-only `gpt-5.6-terra`) | `default`, `high` | `high` |
+| Claude `claude-opus-5`, `claude-sonnet-5` (and code-off-only `claude-fable-5`) | `default` | `default` |
+| Grok `grok-4.6` | `default` | `default` |
+
+This table deliberately does not advertise `low`, `medium`, or `max` support before Phase 2 proves and propagates launcher-native command options. Phase 1 validates and records agent effort but does not add those command arguments. Review requests and graph-node configs remain unwired until their later phases.
+
+Terminal jobs and receipts expose `requested_effort`, `effective_effort`, `effort_source`, and a path-free `launcher_version` fingerprint. Session identity binds effective effort and launcher version in addition to launcher/provider/model; resume, fallback, and recovery evidence rejects any drift. Public receipts exclude prompts, logs, paths, secrets, raw provider output, and launcher-native effort tokens. Local daemon jobs, logs, caches, session files, and receipts remain replaceable corroboration; they are not durable authority. Rewst data storage is the future permanent store, and Phase 1 writes nothing to it.
+
 Completed writer callbacks carry a `diagnostic-v1` object with a stable code, evidence
 kind, and canned summary; pre-callback action/wait failures use compact diagnostic stage
 receipts.
@@ -81,10 +95,8 @@ Every failover-eligible writer outcome remains
 authentication or network evidence. `local_infrastructure` describes stack, port,
 health, command, and configuration checks only; a missing non-writer executable is
 `local_binary_missing`, not provider availability. The closed launcher failure taxonomy
-and one-hop fallback gate are unchanged. Only compact diagnostics and provider-recovery
-evidence are claimed sanitized: they never copy callback data, paths, provider output,
-or traces. Other `AgentReceipt` fields retain their documented artifact values and are
-not covered by that claim.
+and one-hop fallback gate are unchanged. Compact diagnostics and provider-recovery
+evidence never copy callback data, paths, provider output, or traces.
 
 Provider recovery is a new invocation decision, never an active-session decision.
 After a successful one-hop fallback, a later manual/API invocation payload may set
