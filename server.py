@@ -3578,10 +3578,37 @@ def _write_job_unlocked(job: dict[str, Any]) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def write_job(job: dict[str, Any]) -> None:
+JOB_TERMINAL_TRANSITION_LOCAL = threading.local()
+
+
+def _job_terminal_transition_keys() -> set[str]:
+    keys = getattr(JOB_TERMINAL_TRANSITION_LOCAL, "keys", None)
+    if keys is None:
+        keys = set()
+        JOB_TERMINAL_TRANSITION_LOCAL.keys = keys
+    return keys
+
+
+def write_job(job: dict[str, Any]) -> bool:
+    """Write an ordinary trusted record unless terminal agent authority is sealed.
+
+    Terminal agent bookkeeping has narrow guarded APIs below.  Returning False
+    makes both queued and same-thread reentrant replacement attempts explicit.
+    """
     job_id = job["job_id"]
+    key = str(job_path(job_id).resolve())
+    if key in _job_terminal_transition_keys():
+        return False
     with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if (
+            current != job and isinstance(current, dict)
+            and current.get("kind") == "agent"
+            and current.get("status") in ("completed", "failed")
+        ):
+            return False
         _write_job_unlocked(job)
+        return True
 
 
 AGENT_PROFILE_FIELDS = (
@@ -3779,31 +3806,40 @@ def agent_terminal_transition(
     alien record is never overwritten; a still-agent drift is closed with a
     sanitized receipt while preserving the drifted immutable fields for audit.
     """
+    def reject_or_sanitize(current: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool]:
+        if (
+            isinstance(current, dict) and current.get("job_id") == job_id
+            and current.get("kind") == "agent"
+            and current.get("status") in ("queued", "running")
+            and not agent_record_matches_execution_snapshot(current, snapshot)
+        ):
+            failure = _agent_provenance_failure_receipt(job_id)
+            current.update({
+                "status": "failed", "finished_at": utcnow(),
+                "receipt": failure,
+                "error": "persisted agent execution identity changed during execution",
+                "returncode": returncode,
+            })
+            current.pop("execution_identity", None)
+            _write_job_unlocked(current)
+            return current, False
+        return None, False
+
     codeoff_context = CODEOFF_LOCK if isinstance(snapshot.get("codeoff_workspace"), dict) else nullcontext()
     # Match launch ordering: enclosing code-off evidence, then one job record.
-    with codeoff_context, job_record_lock(job_id):
-        current = _read_job_unlocked(job_id)
-        if not (
-            current is not None and current.get("status") == "running"
-            and agent_record_matches_execution_snapshot(current, snapshot)
-        ):
-            if (
-                isinstance(current, dict) and current.get("job_id") == job_id
-                and current.get("kind") == "agent"
-                and current.get("status") in ("queued", "running")
+    # Side-effectful collaborators run before the final guarded CAS.  Any
+    # trusted write they perform is therefore visible to the exact final reread.
+    with codeoff_context:
+        with job_record_lock(job_id):
+            prepared_from = _read_job_unlocked(job_id)
+            if not (
+                prepared_from is not None and prepared_from.get("status") == "running"
+                and agent_record_matches_execution_snapshot(prepared_from, snapshot)
             ):
-                failure = _agent_provenance_failure_receipt(job_id)
-                current.update({
-                    "status": "failed", "finished_at": utcnow(),
-                    "receipt": failure,
-                    "error": "persisted agent execution identity changed during execution",
-                    "returncode": returncode,
-                })
-                current.pop("execution_identity", None)
-                _write_job_unlocked(current)
-                return current, False
-            return None, False
+                return reject_or_sanitize(prepared_from)
+            prepared_from = json.loads(json.dumps(prepared_from))
 
+        current = json.loads(json.dumps(prepared_from))
         terminal_receipt = json.loads(json.dumps(receipt))
         if isinstance(terminal_receipt.get("session_identity"), dict):
             current["session_identity"] = dict(terminal_receipt["session_identity"])
@@ -3844,8 +3880,24 @@ def agent_terminal_transition(
             current["error"] = "agent run budget exceeded"
         elif terminal_receipt["status"] != "ok" and not current.get("error"):
             current["error"] = terminal_receipt.get("summary") or f"agent exited {returncode}"
-        _write_job_unlocked(current)
-        return current, True
+
+        with job_record_lock(job_id):
+            key = str(job_path(job_id).resolve())
+            transition_keys = _job_terminal_transition_keys()
+            transition_keys.add(key)
+            try:
+                persisted = _read_job_unlocked(job_id)
+                if persisted != prepared_from:
+                    return reject_or_sanitize(persisted)
+                if not (
+                    persisted.get("status") == "running"
+                    and agent_record_matches_execution_snapshot(persisted, snapshot)
+                ):
+                    return reject_or_sanitize(persisted)
+                _write_job_unlocked(current)
+                return current, True
+            finally:
+                transition_keys.discard(key)
 
 
 def agent_store_webhook_result(
