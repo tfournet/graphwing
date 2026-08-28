@@ -1597,9 +1597,11 @@ class DispatchTests(unittest.TestCase):
                 parsed, error = server.parse_session_identity({**base, field: value})
                 self.assertIsNone(parsed)
                 self.assertEqual(error["code"], "bad_session_identity")
-        props = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]["properties"]
+        schemas = json.loads(server.openapi_bytes())["components"]["schemas"]
+        props = schemas["SessionIdentity"]["properties"]
         self.assertEqual((props["repo"]["minLength"], props["repo"]["maxLength"]), (1, 128))
-        self.assertEqual((props["branch"]["minLength"], props["branch"]["maxLength"]), (1, 255))
+        self.assertEqual(props["branch"], {"$ref": "#/components/schemas/BranchName"})
+        self.assertEqual((schemas["BranchName"]["minLength"], schemas["BranchName"]["maxLength"]), (1, 255))
         self.assertEqual(props["starting_head"]["pattern"], "^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
     def test_invalid_session_provenance_is_not_public_or_callback_data(self):
@@ -3648,6 +3650,124 @@ while True:
         self.assertEqual(saved["receipt"]["summary"], "ok")
         self.assertEqual(saved["session_identity"]["native_session_id"], "codex-123")
         self.assertEqual(saved["receipt"]["session_identity"]["native_session_id"], "codex-123")
+
+    def test_agent_worker_fails_closed_when_persisted_execution_identity_drifts(self):
+        cases = {
+            "coordinated_profile": lambda saved: (
+                saved.update({"requested_effort": "high", "effort_source": "explicit"}),
+                saved["session_identity"].update({"requested_effort": "high", "effort_source": "explicit"}),
+            ),
+            "single_profile_field": lambda saved: saved.__setitem__("requested_effort", "high"),
+            "missing_kind": lambda saved: saved.pop("kind"),
+            "alien_kind": lambda saved: saved.__setitem__("kind", "script"),
+        }
+        for index, (case, mutate) in enumerate(cases.items()):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                jobs = root / "jobs"
+                job_id = f"{index + 1:02x}" * 16
+                jdir = jobs / job_id
+                jdir.mkdir(parents=True)
+                binary = root / "codex"
+                binary.write_text("fixture")
+                identity = {
+                    "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+                    "native_session_id": None,
+                }
+                job = {
+                    "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
+                    "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai",
+                    "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t",
+                    "started_at": None, "finished_at": None, "max_turns": 1,
+                    "run_budget_seconds": 30, "receipt": None,
+                    "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                    "response_webhook_url": "https://example.invalid/callback",
+                    "response_webhook_token": None,
+                }
+                _stamp_fixture_execution_profile(job, binary)
+                (jdir / "job.json").write_text(json.dumps(job))
+
+                class DriftProc:
+                    pid = 42
+                    returncode = 0
+                    def wait(self, timeout=None):
+                        saved = json.loads((jdir / "job.json").read_text())
+                        mutate(saved)
+                        (jdir / "job.json").write_text(json.dumps(saved))
+                        (jdir / "stdout.log").write_text(
+                            '{"type":"thread.started","thread_id":"codex-race"}\n'
+                            + json.dumps({"type": "item.completed", "item": {
+                                "type": "agent_message",
+                                "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                            }})
+                        )
+                        return 0
+
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(binary)}), \
+                     mock.patch.object(server, "spawn_writer", return_value=(DriftProc(), None)), \
+                     mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted, \
+                     mock.patch.object(server, "herdr_job_done"):
+                    server.run_agent_job(job_id)
+                    saved = server.read_job(job_id)
+                self.assertEqual((saved["status"], saved["receipt"]["status"]), ("failed", "error"), saved)
+                self.assertEqual(saved["receipt"]["failure_code"], "session_provenance_invalid")
+                self.assertEqual(posted.call_args.args[1], saved["receipt"])
+
+    def test_agent_worker_preserves_safe_operational_refresh_without_identity_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_id = "9a" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            binary = root / "codex"
+            binary.write_text("fixture")
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+                "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
+                "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t",
+                "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": "https://example.invalid/callback",
+                "response_webhook_token": None,
+            }
+            _stamp_fixture_execution_profile(job, binary)
+            (jdir / "job.json").write_text(json.dumps(job))
+
+            class OperationalProc:
+                pid = 42
+                returncode = 0
+                def wait(self, timeout=None):
+                    saved = json.loads((jdir / "job.json").read_text())
+                    saved["webhook_attempts"] = 2
+                    (jdir / "job.json").write_text(json.dumps(saved))
+                    (jdir / "stdout.log").write_text(
+                        '{"type":"thread.started","thread_id":"codex-safe"}\n'
+                        + json.dumps({"type": "item.completed", "item": {
+                            "type": "agent_message",
+                            "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                        }})
+                    )
+                    return 0
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(binary)}), \
+                 mock.patch.object(server, "spawn_writer", return_value=(OperationalProc(), None)), \
+                 mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+            self.assertEqual((saved["status"], saved["receipt"]["status"]), ("completed", "ok"), saved)
+            self.assertEqual(saved["webhook_attempts"], 2)
+            self.assertEqual(posted.call_args.args[1], saved["receipt"])
 
     def test_native_writer_job_stages_server_attributed_paths_after_valid_receipt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -9706,30 +9826,70 @@ while True:
                 self.assertIsNone(callback["session_identity"])
                 self.assertNotIn("TOKEN_SECRET", json.dumps(callback))
 
-    def test_branch_validator_matches_git_for_phase1_reference_rules(self):
-        valid = (
-            "main", "feature/model-routing", "release/2026.08", "user_name/topic-1",
-        )
-        git_invalid = (
-            "feature.lock/child", "FEATURE.LOCK/child", "feature/child.lock", "a..b",
-            "a@{b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b",
-            "a\\b", "/a", "a/", "a//b", ".a", "a/.b", "a.", "@", "-branch",
-            "bad\x7fbranch", "b" * 256,
-        )
-        conservative_only = {"@", "FEATURE.LOCK/child", "b" * 256}
-        for name in valid + tuple(name for name in git_invalid if name not in conservative_only):
+    def test_branch_runtime_and_openapi_share_the_documented_safe_subset(self):
+        corpus = {
+            "main": True,
+            "feature/model-routing": True,
+            "release/2026.08": True,
+            "user_name/topic-1": True,
+            "feature/a+b": False,
+            "#123": False,
+            "a!b": False,
+            "a=b": False,
+            "a,b": False,
+            "a;b": False,
+            "a(b)": False,
+            "éclair": False,
+            "feature.lock/child": False,
+            "FEATURE.LOCK/child": False,
+            "feature/child.lock": False,
+            "a..b": False,
+            "a@{b": False,
+            "a b": False,
+            "a~b": False,
+            "a^b": False,
+            "a:b": False,
+            "a?b": False,
+            "a*b": False,
+            "a[b": False,
+            "a\\b": False,
+            "/a": False,
+            "a/": False,
+            "a//b": False,
+            ".a": False,
+            "a/.b": False,
+            "a.": False,
+            "@": False,
+            "-branch": False,
+            "bad\x1fbranch": False,
+            "bad\x7fbranch": False,
+            "b" * 255: True,
+            "b" * 256: False,
+        }
+        spec = json.loads(server.openapi_bytes())
+        branch_schema = spec["components"]["schemas"]["BranchName"]
+        pattern = re.compile(branch_schema["pattern"])
+        self.assertEqual((branch_schema["minLength"], branch_schema["maxLength"]), (1, 255))
+        for name, expected in corpus.items():
             with self.subTest(name=name):
-                git_ok = subprocess.run(
-                    ["git", "check-ref-format", "--branch", name],
-                    check=False, capture_output=True, text=True,
-                ).returncode == 0
-                self.assertEqual(server.valid_branch(name), git_ok, name)
-        self.assertTrue(all(server.valid_branch(name) for name in valid))
-        self.assertTrue(all(not server.valid_branch(name) for name in git_invalid))
-        pattern = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]["properties"]["branch"]["pattern"]
-        self.assertIsNone(re.fullmatch(pattern, "feature.lock/child"))
-        for name in valid:
-            self.assertIsNotNone(re.fullmatch(pattern, name), name)
+                schema_accepts = (
+                    branch_schema["minLength"] <= len(name) <= branch_schema["maxLength"]
+                    and pattern.fullmatch(name) is not None
+                )
+                self.assertEqual(server.valid_branch(name), expected)
+                self.assertEqual(schema_accepts, expected)
+        self.assertEqual(
+            spec["components"]["schemas"]["SessionIdentity"]["properties"]["branch"],
+            {"$ref": "#/components/schemas/BranchName"},
+        )
+        self.assertEqual(
+            spec["components"]["schemas"]["GitCheckoutRequest"]["properties"]["branch"],
+            {"$ref": "#/components/schemas/BranchName"},
+        )
+        self.assertEqual(
+            spec["components"]["schemas"]["SliceContinueRequest"]["properties"]["branch"],
+            {"$ref": "#/components/schemas/BranchName"},
+        )
 
 
 class CodeOffTests(unittest.TestCase):
@@ -9834,6 +9994,9 @@ class CodeOffTests(unittest.TestCase):
             "execution_identity": execution_identity,
             "receipt": {
                 "status": "ok", "job_id": job["job_id"], "session_identity": identity,
+                "launcher": job["launcher"], "provider": job["provider"],
+                "model": job["model"],
+                **{key: job[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
                 "execution_identity": execution_identity, "summary": "fixture",
             },
         })
@@ -10889,6 +11052,60 @@ class CodeOffTests(unittest.TestCase):
                 accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
                 self.assertIsNone(accepted)
                 self.assertEqual(error["code"], "agent_receipt_mismatch")
+        server.write_job(pristine)
+
+    def test_codeoff_terminal_validation_binds_complete_job_receipt_profile(self):
+        experiment_id = "terminal-complete-profile"
+        self._prepare(experiment_id)
+        job_id = self._launch_done(experiment_id, "author-1")
+        pristine = server.read_job(job_id)
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
+        self.assertIsNone(error)
+        self.assertEqual(accepted, pristine)
+        contradictions = {
+            "launcher": "claude",
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "requested_effort": "high",
+            "effective_effort": "default",
+            "effort_source": "explicit",
+            "launcher_version": "sha256:" + "f" * 64,
+        }
+        for field, value in contradictions.items():
+            with self.subTest(field=field):
+                job = deepcopy(pristine)
+                job["receipt"][field] = value
+                server.write_job(job)
+                accepted, error = server._codeoff_validate_job(
+                    job_id, state, manifest, "author-1"
+                )
+                self.assertIsNone(accepted)
+                self.assertEqual(error["code"], "agent_receipt_mismatch")
+        for field in server.AGENT_PROFILE_FIELDS:
+            with self.subTest(missing_field=field):
+                job = deepcopy(pristine)
+                job["receipt"].pop(field)
+                server.write_job(job)
+                accepted, error = server._codeoff_validate_job(
+                    job_id, state, manifest, "author-1"
+                )
+                self.assertIsNone(accepted)
+                self.assertEqual(error["code"], "agent_receipt_mismatch")
+        coordinated = deepcopy(pristine)
+        coordinated["receipt"].update({
+            "requested_effort": "high", "effective_effort": "high",
+            "effort_source": "explicit",
+        })
+        coordinated["receipt"]["session_identity"].update({
+            "requested_effort": "high", "effective_effort": "high",
+            "effort_source": "explicit",
+        })
+        server.write_job(coordinated)
+        accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
+        self.assertIsNone(accepted)
+        self.assertEqual(error["code"], "agent_receipt_mismatch")
         server.write_job(pristine)
 
     def test_nonterminal_agent_receipt_remains_retryable(self):

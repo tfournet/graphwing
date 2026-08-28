@@ -1069,7 +1069,7 @@
         "required": ["repo", "branch"],
         "properties": {
           "repo": { "type": "string", "description": "Allowlisted short name, not a filesystem path." },
-          "branch": { "type": "string", "description": "Branch name. Rejected if it looks like a path." },
+          "branch": { "$ref": "#/components/schemas/BranchName" },
           "create": { "type": "boolean", "default": false, "description": "If true, git checkout -b. Not git checkout -B." }
         }
       },
@@ -1212,7 +1212,7 @@
         "properties": {
           "repo": { "type": "string" },
           "index": { "type": "string" },
-          "branch": { "type": "string" },
+          "branch": { "$ref": "#/components/schemas/BranchName" },
           "test": { "type": "string" },
           "commit_message": { "type": "string" },
           "iters_left": { "type": "string" },
@@ -1509,6 +1509,13 @@
           "poll": { "type": "string" }
         }
       },
+      "BranchName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "pattern": "^(?![./~-])(?!.*(?:\\.\\.|//|\\\\|@\\{))(?!.*(?:^|/)\\.)(?![^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*\/[^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*(?:\\.|/)$)[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$",
+        "description": "Graphwing Phase 1 safe ASCII branch subset, not every Git-valid ref. Slash-separated names are allowed; unsupported punctuation and Unicode, Git-forbidden forms, dot components, and case-insensitive .lock components are rejected."
+      },
       "SessionIdentity": {
         "type": "object",
         "additionalProperties": false,
@@ -1523,7 +1530,7 @@
           "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
           "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$", "description": "Path-free SHA-256 fingerprint of the resolved launcher executable, or missing for an availability-failure job." },
           "repo": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "description": "Validated path-free allowlist short name, including internal code-off identities." },
-          "branch": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^(?![./~-])(?!.*(?:\\.\\.|//|\\\\|@\\{))(?!.*(?:^|/)\\.)(?![^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*\/[^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*(?:\\.|/)$)[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$", "description": "Conservative validated Git branch subset; slash-separated names are allowed, while Git-forbidden controls, punctuation, dot components, and case-insensitive .lock components are rejected." },
+          "branch": { "$ref": "#/components/schemas/BranchName" },
           "starting_head": { "type": "string", "minLength": 40, "maxLength": 64, "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$", "description": "Validated full lowercase Git object ID (SHA-1 or SHA-256 object format)." },
           "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id, Claude result.session_id, or Grok ACP session/new result.sessionId. Required non-null for success and resume." }
         }
