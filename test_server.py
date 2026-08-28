@@ -53,6 +53,8 @@ def _fixture_identity_profile(profile):
 
 
 def _stamp_fixture_execution_profile(job, binary=None, requested="default", source="launcher_default"):
+    job.setdefault("kind", "agent")
+    job.setdefault("repo", job["session_identity"]["repo"])
     profile = _fixture_execution_profile(
         job["launcher"], job["provider"], job["model"], binary, requested, source
     )
@@ -61,9 +63,24 @@ def _stamp_fixture_execution_profile(job, binary=None, requested="default", sour
     return profile
 
 
+def _minimal_agent_record(job_id, status="completed", repo="scratch"):
+    profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+    identity = {
+        "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+        **_fixture_identity_profile(profile), "repo": repo, "branch": "main",
+        "starting_head": "a" * 40, "native_session_id": "fixture-session",
+    }
+    return {
+        "job_id": job_id, "kind": "agent", "status": status, "repo": repo,
+        "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+        **profile, "session_identity": identity, "receipt": {"status": "ok"},
+    }
+
+
 def _stamp_complete_writer_evidence(job):
     """Complete intentionally minimal writer fixtures with trusted profile evidence."""
     job.setdefault("launcher", "codex")
+    job.setdefault("kind", "agent")
     job.setdefault("provider", "openai")
     job.setdefault("model", "gpt-5.6-sol")
     profile = _fixture_execution_profile(job["launcher"], job["provider"], job["model"])
@@ -844,7 +861,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir = jobs / prior_job_id
             prior_dir.mkdir(parents=True)
             prior = {
-                "job_id": prior_job_id, "status": "completed", "launcher": "grok",
+                "job_id": prior_job_id, "kind": "agent", "status": "completed", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
                 "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "grok",
@@ -933,7 +950,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir = jobs / prior_job_id
             prior_dir.mkdir(parents=True)
             prior = {
-                "job_id": prior_job_id, "status": "completed", "launcher": "codex",
+                "job_id": prior_job_id, "kind": "agent", "status": "completed", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
                 "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "codex",
@@ -975,7 +992,11 @@ class DispatchTests(unittest.TestCase):
                     (prior_dir / "job.json").write_text(json.dumps({**prior, **mismatch}))
                     status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid_resume)
                     self.assertEqual(status, 400, mismatch)
-                    self.assertEqual(payload["code"], "resume_repository_mismatch", mismatch)
+                    self.assertEqual(
+                        payload["code"],
+                        "untraceable_resume_session" if "repo" in mismatch else "resume_repository_mismatch",
+                        mismatch,
+                    )
                 (prior_dir / "job.json").write_text(json.dumps(prior))
                 status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, valid_resume)
             self.assertEqual(status, 202, payload)
@@ -1007,7 +1028,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir = jobs / prior_job_id
             prior_dir.mkdir(parents=True)
             prior = {
-                "job_id": prior_job_id, "status": "completed", "launcher": "claude",
+                "job_id": prior_job_id, "kind": "agent", "status": "completed", "launcher": "claude",
                 "provider": "anthropic", "model": "claude-opus-5",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
                 "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "claude",
@@ -1055,7 +1076,7 @@ class DispatchTests(unittest.TestCase):
             prior_dir = jobs / prior_job_id
             prior_dir.mkdir(parents=True)
             prior = {
-                "job_id": prior_job_id, "status": "completed", "launcher": "codex",
+                "job_id": prior_job_id, "kind": "agent", "status": "completed", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "cwd": str(repo), **profile, "session_identity": identity,
                 "receipt": {"status": "ok", "job_id": prior_job_id, "launcher": "codex",
@@ -1102,7 +1123,7 @@ class DispatchTests(unittest.TestCase):
             "starting_head": "b" * 40, "native_session_id": None,
         }
         expected = {
-            "ok", "job_id", "status", "repo", "launcher", "provider", "model",
+            "ok", "kind", "job_id", "status", "repo", "launcher", "provider", "model",
             "requested_effort", "effective_effort", "effort_source", "launcher_version",
             "session_identity", "created_at", "started_at", "finished_at", "receipt",
         }
@@ -1113,7 +1134,7 @@ class DispatchTests(unittest.TestCase):
                 if state == "completed":
                     state_identity["native_session_id"] = "codex-fixture"
                 job = {
-                    "job_id": "ab" * 16, "status": state, "repo": "scratch", "cwd": "/home/private",
+                    "job_id": "ab" * 16, "kind": "agent", "status": state, "repo": "scratch", "cwd": "/home/private",
                     "prompt": hostile, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                     **profile, "session_identity": state_identity, "created_at": "created",
                     "started_at": None, "finished_at": None, "receipt": None,
@@ -1233,7 +1254,7 @@ class DispatchTests(unittest.TestCase):
                 }
                 job_id = f"{index:02x}" * 16
                 record = {
-                    "job_id": job_id, "status": "queued", "repo": "scratch",
+                    "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
                     "launcher": launcher, "provider": provider, "model": model,
                     **profile, "session_identity": identity, **extra,
                 }
@@ -1259,7 +1280,8 @@ class DispatchTests(unittest.TestCase):
             "starting_head": "b" * 40, "native_session_id": None,
         }
         agent_shape = {
-            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "kind": "agent", "repo": "scratch", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol",
             **profile, "session_identity": identity,
         }
         queued = {"job_id": job_id, "status": "running", **agent_shape}
@@ -1298,7 +1320,7 @@ class DispatchTests(unittest.TestCase):
             "starting_head": "b" * 40, "native_session_id": None,
         }
         running = {
-            "job_id": job_id, "status": "running", "launcher": "codex",
+            "job_id": job_id, "kind": "agent", "repo": "scratch", "status": "running", "launcher": "codex",
             "provider": "openai", "model": "gpt-5.6-sol", **profile,
             "session_identity": identity,
         }
@@ -1382,12 +1404,13 @@ class DispatchTests(unittest.TestCase):
             binary.write_text("changed launcher fixture")
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-                "effective_effort": "high", "launcher_version": "sha256:" + "a" * 64,
+                "requested_effort": "high", "effective_effort": "high", "effort_source": "explicit",
+                "launcher_version": "sha256:" + "a" * 64,
                 "repo": "scratch", "branch": "main", "starting_head": "b" * 40,
                 "native_session_id": None,
             }
             job = {
-                "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(self.scratch),
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch", "cwd": str(self.scratch),
                 "prompt": "bounded", "launcher": "codex", "provider": "openai",
                 "model": "gpt-5.6-sol", "requested_effort": "high",
                 "effective_effort": "high", "effort_source": "explicit",
@@ -1420,7 +1443,8 @@ class DispatchTests(unittest.TestCase):
             "starting_head": "b" * 40, "native_session_id": "codex-fixture",
         }
         job = {
-            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai",
+            "job_id": "ab" * 16, "kind": "agent", "repo": "scratch",
+            "launcher": "codex", "provider": "openai",
             "model": "gpt-5.6-sol", "session_identity": identity, **profile,
         }
         for status in ("ok", "error", "timeout"):
@@ -1468,7 +1492,7 @@ class DispatchTests(unittest.TestCase):
                 "starting_head": "b" * 40, "native_session_id": None,
             }
             job = {
-                "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(self.scratch),
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch", "cwd": str(self.scratch),
                 "prompt": "PROMPT_FRAGMENT", "launcher": "codex", "provider": "openai",
                 "model": "gpt-5.6-sol", **profile, "session_identity": identity,
                 "max_turns": 1, "run_budget_seconds": 30, "created_at": "fixture",
@@ -1493,12 +1517,14 @@ class DispatchTests(unittest.TestCase):
     def test_agent_receipt_binds_effective_effort(self):
         identity = {
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
-            "effective_effort": "high", "launcher_version": "sha256:" + "a" * 64,
+            "requested_effort": "high", "effective_effort": "high",
+            "effort_source": "explicit", "launcher_version": "sha256:" + "a" * 64,
             "repo": "scratch", "branch": "main", "starting_head": "b" * 40,
             "native_session_id": "codex-fixture",
         }
         job = {
-            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity,
+            "job_id": "ab" * 16, "kind": "agent", "repo": "scratch",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity,
             "requested_effort": "high", "effective_effort": "high",
             "effort_source": "explicit", "launcher_version": identity["launcher_version"],
             "log_ref": "/private/runtime/stdout.log",
@@ -1843,7 +1869,8 @@ class DispatchTests(unittest.TestCase):
             "starting_head": "0" * 40, "native_session_id": "native-123",
         }
         job = {
-            "job_id": "ab" * 16, "launcher": "codex", "provider": "openai",
+            "job_id": "ab" * 16, "kind": "agent", "repo": "scratch",
+            "launcher": "codex", "provider": "openai",
             "model": "gpt-5.6-sol", **profile, "log_ref": "/tmp/log",
             "session_identity": identity,
         }
@@ -1967,7 +1994,7 @@ class DispatchTests(unittest.TestCase):
             (repo / "writer.txt").write_text("writer\n")
             job_id = "ae" * 16
             pristine = {
-                "job_id": job_id, "status": "completed", "repo": "scratch", "cwd": str(repo),
+                "job_id": job_id, "kind": "agent", "status": "completed", "repo": "scratch", "cwd": str(repo),
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile,
                 "session_identity": identity, "git_baseline": baseline,
                 "writer_parent_paths": [],
@@ -2007,6 +2034,27 @@ class DispatchTests(unittest.TestCase):
                 server.write_job(coordinated)
                 error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
                 self.assertEqual(error["code"], "writer_evidence_mismatch")
+                for field, value in (
+                    ("repo", "other"), ("branch", "other"), ("starting_head", "f" * 40),
+                ):
+                    with self.subTest(surface="top_level_provenance", field=field):
+                        hostile = deepcopy(pristine)
+                        hostile[field] = value
+                        server.write_job(hostile)
+                        error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
+                        self.assertEqual(error["code"], "writer_evidence_mismatch")
+                        status, payload = server.git_commit(json.dumps({
+                            "repo": "scratch", "message": "must not commit",
+                            "writer_job_id": job_id,
+                        }).encode(), {"scratch": str(repo)})
+                        self.assertEqual((status, payload["code"]), (409, "writer_job_mismatch"))
+                        self.assertEqual(
+                            subprocess.run(
+                                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                capture_output=True, text=True,
+                            ).stdout.strip(),
+                            head,
+                        )
 
     def test_unknown_non_agent_job_cannot_authorize_commit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2025,7 +2073,7 @@ class DispatchTests(unittest.TestCase):
             (repo / "alien.txt").write_text("not an agent writer\n")
             job_id = "ad" * 16
             job = _stamp_complete_writer_evidence({
-                "job_id": job_id, "kind": "alien-non-agent", "status": "completed",
+                "job_id": job_id, "kind": "agent", "status": "completed",
                 "repo": "scratch", "cwd": str(repo.resolve()), "git_baseline": baseline,
                 "writer_parent_paths": [], "session_identity": {
                     "branch": branch, "starting_head": head,
@@ -2035,28 +2083,35 @@ class DispatchTests(unittest.TestCase):
             self.assertIsNone(server.stage_writer_changes(job))
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
-                server.write_job(job)
-                evidence_error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
-                status, payload, _ = server.dispatch(
-                    "POST", "/v1/git/commit", {}, True,
-                    json.dumps({
-                        "repo": "scratch", "message": "must not commit",
-                        "writer_job_id": job_id,
-                    }).encode(),
-                )
+                for kind in ("alien-non-agent", "test", "script", "rr", "review", None, 7):
+                    candidate = deepcopy(job)
+                    if kind is None:
+                        candidate.pop("kind")
+                    else:
+                        candidate["kind"] = kind
+                    server.write_job(candidate)
+                    evidence_error = server.validate_writer_evidence(job_id, "scratch", repo, branch)
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/git/commit", {}, True,
+                        json.dumps({
+                            "repo": "scratch", "message": "must not commit",
+                            "writer_job_id": job_id,
+                        }).encode(),
+                    )
+                    with self.subTest(kind=kind):
+                        self.assertEqual(
+                            evidence_error.get("code") if isinstance(evidence_error, dict) else None,
+                            "writer_evidence_mismatch",
+                        )
+                        self.assertEqual(
+                            (status, payload.get("code") if isinstance(payload, dict) else None),
+                            (409, "writer_job_mismatch"),
+                            payload,
+                        )
             after = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
                 capture_output=True, text=True,
             ).stdout.strip()
-            self.assertEqual(
-                evidence_error.get("code") if isinstance(evidence_error, dict) else None,
-                "writer_evidence_mismatch",
-            )
-            self.assertEqual(
-                (status, payload.get("code") if isinstance(payload, dict) else None),
-                (409, "writer_job_mismatch"),
-                payload,
-            )
             self.assertEqual(after, head)
 
     def test_writer_staging_and_commit_preserve_dirty_operator_state_in_linked_worktree(self):
@@ -2356,13 +2411,14 @@ class DispatchTests(unittest.TestCase):
             jdir = jobs / interrupted_id
             jdir.mkdir(parents=True)
             job = {
-                "job_id": interrupted_id, "status": "running", "repo": "scratch", "cwd": str(repo),
+                "job_id": interrupted_id, "kind": "agent", "status": "running", "repo": "scratch", "cwd": str(repo),
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "session_identity": {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "repo": "scratch", "branch": "main", "starting_head": "0" * 40, "native_session_id": "codex-old"},
                 "created_at": "t", "started_at": "t", "finished_at": None, "receipt": None,
                 "log_ref": str(jdir / "stdout.log"), "error": "raw secret must disappear",
                 "response_webhook_url": "https://example.invalid/resume", "response_webhook_token": "tok_secret", "webhook": None,
             }
+            _stamp_fixture_execution_profile(job)
             (jdir / "job.json").write_text(json.dumps(job))
             queued_id = "90" * 16
             queued_dir = jobs / queued_id
@@ -2381,7 +2437,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(recovered, 2)
             self.assertEqual(saved["status"], "failed")
             self.assertEqual(saved["receipt"]["status"], "error")
-            self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]), ("session_provenance", "session_provenance_invalid"))
+            self.assertEqual((saved["receipt"]["failure_class"], saved["receipt"]["failure_code"]), ("cancelled", "cancelled"))
             self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
             self.assertNotIn("secret", json.dumps(saved["receipt"]))
             posted.assert_called_once()
@@ -2389,7 +2445,7 @@ class DispatchTests(unittest.TestCase):
             with mock.patch.object(server, "JOBS_DIR", jobs):
                 queued_saved = server.read_job(queued_id)
             self.assertEqual(queued_saved["status"], "failed")
-            self.assertEqual(queued_saved["receipt"]["failure_code"], "session_provenance_invalid")
+            self.assertEqual(queued_saved["receipt"]["failure_code"], "cancelled")
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
@@ -2419,8 +2475,16 @@ class DispatchTests(unittest.TestCase):
             root = Path(td)
             repo = self._scratch_git(root)
             jobs = root / "jobs"
+            agent_profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+            agent_identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                **_fixture_identity_profile(agent_profile), "repo": "scratch", "branch": "main",
+                "starting_head": "0" * 40, "native_session_id": "codex-old",
+            }
             fixtures = {
-                "95" * 16: {"launcher": "codex", "session_identity": {"native_session_id": "codex-old"}},
+                "95" * 16: {"kind": "agent", "launcher": "codex", "provider": "openai",
+                              "model": "gpt-5.6-sol", **agent_profile,
+                              "session_identity": agent_identity},
                 "96" * 16: {"kind": "script", "script": "lint"},
                 "97" * 16: {"kind": "test", "script": "unit"},
                 "98" * 16: {"kind": "review", "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5"},
@@ -2438,9 +2502,19 @@ class DispatchTests(unittest.TestCase):
             codeoff_id = "9a" * 16
             codeoff_dir = jobs / codeoff_id
             codeoff_dir.mkdir(parents=True)
+            codeoff_profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-terra")
+            codeoff_identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-terra",
+                **_fixture_identity_profile(codeoff_profile),
+                "repo": "codeoff:experiment-0001:author-1", "branch": "main",
+                "starting_head": "0" * 40, "native_session_id": "codex-codeoff",
+            }
             (codeoff_dir / "job.json").write_text(json.dumps({
-                "job_id": codeoff_id, "status": "running", "cwd": str(root / "codeoff"),
-                "launcher": "codex", "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
+                "job_id": codeoff_id, "kind": "agent", "status": "running",
+                "repo": codeoff_identity["repo"], "cwd": str(root / "codeoff"),
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-terra",
+                **codeoff_profile, "session_identity": codeoff_identity,
+                "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
             }))
             persisted_before_delivery = []
             def post(_url, receipt, token=None):
@@ -2462,11 +2536,11 @@ class DispatchTests(unittest.TestCase):
                     self.assertEqual(saved["receipt"]["status"], "error")
                     self.assertEqual(saved["receipt"]["log_ref"], saved["log_ref"])
                 else:
-                    self.assertEqual(saved["receipt"]["failure_code"], "session_provenance_invalid")
-                    self.assertIsNone(saved["receipt"]["session_identity"])
+                    self.assertEqual(saved["receipt"]["failure_code"], "cancelled")
+                    self.assertIsNotNone(saved["receipt"]["session_identity"])
             codeoff_saved = json.loads((codeoff_dir / "job.json").read_text())
             self.assertEqual(codeoff_saved["status"], "failed")
-            self.assertEqual(codeoff_saved["receipt"]["failure_code"], "session_provenance_invalid")
+            self.assertEqual(codeoff_saved["receipt"]["failure_code"], "cancelled")
             codex = root / "codex"
             codex.write_text("fixture")
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
@@ -2569,9 +2643,9 @@ class DispatchTests(unittest.TestCase):
                 ["git", "-C", str(repo), "write-tree"], check=True,
                 capture_output=True, text=True,
             ).stdout.strip()
-            parent = {"job_id": parent_id, "status": "completed", "receipt": {"status": "ok"}}
+            parent = _minimal_agent_record(parent_id)
             children = [
-                {"job_id": job_id, "writer_parent_job_id": parent_id, "status": "completed", "receipt": {"status": "ok"}}
+                {**_minimal_agent_record(job_id), "writer_parent_job_id": parent_id}
                 for job_id in (child1_id, child2_id)
             ]
             with mock.patch.object(server, "JOBS_DIR", jobs):
@@ -2963,7 +3037,7 @@ while True:
             "native_session_id": native_session_id,
         }
         job = {
-            "job_id": job_id, "status": "queued", "repo": "scratch",
+            "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
             "cwd": str(root), "prompt": prompt,
             "launcher": "grok", "provider": "xai", "model": model,
             **profile,
@@ -2982,7 +3056,14 @@ while True:
         if api_key:
             env["XAI_API_KEY"] = "fixture-key"
         env["GRAPHWING_GROK_BIN"] = str(fixture)
+        native_launchers = deepcopy(server.NATIVE_LAUNCHERS)
+        native_launchers["grok"]["models"] = tuple(dict.fromkeys(
+            (*native_launchers["grok"]["models"], model)
+        ))
+        effort_profiles = {**server.EFFORT_PROFILES, ("grok", "xai", model): {"default": "default"}}
         with mock.patch.object(server, "JOBS_DIR", jobs), \
+             mock.patch.object(server, "NATIVE_LAUNCHERS", native_launchers), \
+             mock.patch.object(server, "EFFORT_PROFILES", effort_profiles), \
              mock.patch.dict(os.environ, env, clear=False):
             if not api_key:
                 os.environ.pop("XAI_API_KEY", None)
@@ -5535,7 +5616,7 @@ while True:
                 "native_session_id": "session-7",
             }
             writer = {
-                "job_id": writer_id, "status": "completed", "repo": "r", "cwd": str(repo.resolve()),
+                "job_id": writer_id, "kind": "agent", "status": "completed", "repo": "r", "cwd": str(repo.resolve()),
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile,
                 "session_identity": identity,
                 "receipt": {"status": "ok", "job_id": writer_id, "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "session_identity": identity, **profile, "failure_class": "none", "failure_code": "none", "failover_eligible": False},
@@ -6323,6 +6404,7 @@ while True:
             }
             receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": primary[0], "provider": primary[1], "model": primary[2], **profile, "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": identity}
             stored_job = {
+                "job_id": receipt["job_id"], "kind": "agent", "repo": "scratch",
                 "launcher": primary[0], "provider": primary[1], "model": primary[2],
                 **profile,
                 "status": "failed", "session_identity": receipt["session_identity"],
@@ -6388,7 +6470,7 @@ while True:
         receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         body = json.dumps({"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}).encode()
         stored_receipt = {key: value for key, value in receipt.items() if key != "role"}
-        valid_job = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "status": "failed", "session_identity": identity, "receipt": stored_receipt}
+        valid_job = {"job_id": receipt["job_id"], "kind": "agent", "repo": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "status": "failed", "session_identity": identity, "receipt": stored_receipt}
         bad_jobs = (
             None,
             {**valid_job, "status": "queued"},
@@ -6515,7 +6597,9 @@ while True:
         write(
             {
                 "job_id": primary_receipt["job_id"],
+                "kind": "agent",
                 "status": "failed",
+                "repo": "scratch",
                 "created_at": primary_created_at,
                 "finished_at": primary_finished_at,
                 "launcher": primary_route["launcher"],
@@ -6529,7 +6613,9 @@ while True:
         write(
             {
                 "job_id": fallback_receipt["job_id"],
+                "kind": "agent",
                 "status": fallback_status,
+                "repo": "scratch",
                 "created_at": fallback_created_at,
                 "finished_at": fallback_finished_at if fallback_status == "completed" else None,
                 "launcher": fallback_route["launcher"],
@@ -6568,7 +6654,9 @@ while True:
             write(
                 {
                     "job_id": fresh_receipt["job_id"],
+                    "kind": "agent",
                     "status": "completed",
+                    "repo": "scratch",
                     "created_at": fresh_created_at,
                     "finished_at": "2026-08-26T12:02:30Z",
                     "launcher": primary_route["launcher"],
@@ -9353,6 +9441,297 @@ while True:
         self.assertEqual(payload["code"], "bad_launcher")
 
 
+    def test_receipt_normalization_requires_complete_execution_profile_agreement(self):
+        profile = _fixture_execution_profile(
+            "codex", "openai", "gpt-5.6-sol", requested="high", source="explicit"
+        )
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": "native-123",
+        }
+        job = {
+            "job_id": "a1" * 16, "kind": "agent", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol", **profile,
+            "repo": "scratch", "session_identity": identity,
+        }
+        valid = server.normalize_receipt(job, {"status": "ok"}, 0, False)
+        self.assertEqual((valid["status"], valid["failure_code"]), ("ok", "none"), valid)
+        self.assertEqual(valid["session_identity"], identity)
+
+        drifts = (
+            {"requested_effort": "default", "effort_source": "launcher_default"},
+            {"requested_effort": "default"},
+            {"effort_source": "launcher_default"},
+        )
+        for drift in drifts:
+            with self.subTest(drift=drift):
+                contradictory = deepcopy(job)
+                contradictory["session_identity"].update(drift)
+                receipt = server.normalize_receipt(
+                    contradictory, {"status": "ok", "summary": "TOKEN_SECRET"}, 0, False
+                )
+                self.assertEqual(
+                    (receipt["status"], receipt["failure_code"]),
+                    ("error", "session_provenance_invalid"),
+                    receipt,
+                )
+                self.assertIsNone(receipt["session_identity"])
+                self.assertTrue(
+                    all(receipt[field] is None for field in server.AGENT_PROFILE_FIELDS), receipt
+                )
+                self.assertNotIn("TOKEN_SECRET", json.dumps(receipt))
+
+    def test_native_agent_jobs_have_explicit_kind_and_classifier_rejects_absence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            binary = root / "codex"
+            binary.write_text("fixture")
+            body = json.dumps({
+                "prompt": "bounded", "cwd": "scratch", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
+            }).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+                 mock.patch.object(server, "enqueue_agent"):
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 202, payload)
+            self.assertEqual(payload.get("kind"), "agent", payload)
+            stored = json.loads((jobs / payload["job_id"] / "job.json").read_text())
+            self.assertEqual(stored.get("kind"), "agent", stored)
+            self.assertTrue(server.is_agent_job_record(stored))
+            for kind in (None, "alien", 7, {"agent": True}):
+                candidate = deepcopy(stored)
+                if kind is None:
+                    candidate.pop("kind", None)
+                else:
+                    candidate["kind"] = kind
+                with self.subTest(kind=kind):
+                    self.assertFalse(server.is_agent_job_record(candidate))
+                    with mock.patch.object(server, "read_job", return_value=candidate):
+                        get_status, get_payload, _ = server.dispatch(
+                            "GET", f"/v1/agent/jobs/{stored['job_id']}", {}, True, b""
+                        )
+                        wait_status, wait_payload = server.agent_job_wait(json.dumps({
+                            "job_id": stored["job_id"], "timeout_seconds": 1,
+                        }).encode())
+                    self.assertEqual((get_status, wait_status), (404, 404))
+                    self.assertEqual((get_payload["code"], wait_payload["code"]), ("not_found", "not_found"))
+                    callback = server.normalize_receipt(candidate, {"status": "ok"}, 0, False)
+                    self.assertEqual(
+                        (callback["status"], callback["failure_code"]),
+                        ("error", "session_provenance_invalid"),
+                    )
+
+    def test_non_agent_records_cannot_authorize_resume_fallback_or_recovery(self):
+        profile = _fixture_execution_profile(
+            "codex", "openai", "gpt-5.6-sol", requested="high", source="route"
+        )
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": "native-123",
+        }
+        resume_id = "a2" * 16
+        resume_record = {
+            "job_id": resume_id, "kind": "agent", "status": "completed", "repo": "scratch",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **profile, "session_identity": identity,
+            "receipt": {
+                "status": "ok", "job_id": resume_id, "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol", **profile,
+                "session_identity": identity,
+            },
+        }
+        hostile_kinds = ("test", "script", "rr", "review", "alien", None, 9)
+        provenance_mutations = (
+            ("repo", "https://private.example/repo?token=TOKEN_SECRET"),
+            ("repo", "../private\nTOKEN_SECRET"), ("repo", "other"),
+            ("branch", "other"), ("starting_head", "b" * 40),
+        )
+        for kind in hostile_kinds:
+            prior = deepcopy(resume_record)
+            if kind is None:
+                prior.pop("kind")
+            else:
+                prior["kind"] = kind
+            with self.subTest(surface="resume", kind=kind), \
+                 mock.patch.object(server, "read_job", return_value=prior):
+                error = server.validate_native_resume_provenance(
+                    {"resume_job_id": resume_id}, identity, "codex"
+                )
+            self.assertEqual(error.get("code"), "untraceable_resume_session", error)
+        for field, value in provenance_mutations:
+            prior = deepcopy(resume_record)
+            prior[field] = value
+            with self.subTest(surface="resume_provenance", field=field, value=value), \
+                 mock.patch.object(server, "read_job", return_value=prior):
+                error = server.validate_native_resume_provenance(
+                    {"resume_job_id": resume_id}, identity, "codex"
+                )
+            self.assertEqual(error.get("code"), "untraceable_resume_session", error)
+            self.assertNotIn("TOKEN_SECRET", json.dumps(error))
+
+        route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        fallback_identity = {**identity, "native_session_id": None}
+        fallback_receipt = {
+            "status": "error", "job_id": "a3" * 16, "role": "primary",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **profile, "session_identity": fallback_identity,
+            "failure_class": "provider_availability", "failure_code": "provider_rate_limit",
+            "failover_eligible": True,
+        }
+        fallback_record = {
+            "job_id": fallback_receipt["job_id"], "kind": "agent", "status": "failed",
+            "repo": "scratch", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", **profile, "session_identity": fallback_identity,
+            "receipt": {key: value for key, value in fallback_receipt.items() if key != "role"},
+        }
+        request = {
+            "class": "mechanical", "size": "M", "work_kind": "go_coding",
+            "primary_route": route, "primary_receipt": fallback_receipt,
+        }
+        for kind in hostile_kinds:
+            stored = deepcopy(fallback_record)
+            if kind is None:
+                stored.pop("kind")
+            else:
+                stored["kind"] = kind
+            with self.subTest(surface="fallback", kind=kind), \
+                 mock.patch.object(server, "read_job", return_value=stored):
+                status, payload = server.derive_slice_fallback_route(request)
+            self.assertEqual((status, payload.get("code")), (400, "primary_receipt_mismatch"), payload)
+        for field, value in provenance_mutations:
+            stored = deepcopy(fallback_record)
+            stored[field] = value
+            with self.subTest(surface="fallback_provenance", field=field, value=value), \
+                 mock.patch.object(server, "read_job", return_value=stored):
+                status, payload = server.derive_slice_fallback_route(request)
+            self.assertEqual((status, payload.get("code")), (400, "primary_receipt_mismatch"), payload)
+            self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+
+        for kind in hostile_kinds:
+            with self.subTest(surface="recovery", kind=kind), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                recovery = self._provider_recovery_fixture(jobs, "provider_network")
+                primary_path = jobs / recovery["primary_receipt"]["job_id"] / "job.json"
+                primary = json.loads(primary_path.read_text())
+                if kind is None:
+                    primary.pop("kind", None)
+                else:
+                    primary["kind"] = kind
+                primary_path.write_text(json.dumps(primary) + "\n")
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(
+                         server, "resolve_launcher_binary_now",
+                         side_effect=AssertionError("provider access forbidden"),
+                     ):
+                    status, payload = server.derive_slice_recovery_route(recovery)
+                self.assertEqual(
+                    (status, payload.get("code")), (400, "primary_receipt_mismatch"), payload
+                )
+        for field, value in provenance_mutations:
+            with self.subTest(surface="recovery_provenance", field=field, value=value), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                recovery = self._provider_recovery_fixture(jobs, "provider_network")
+                primary_path = jobs / recovery["primary_receipt"]["job_id"] / "job.json"
+                primary = json.loads(primary_path.read_text())
+                primary[field] = value
+                primary_path.write_text(json.dumps(primary) + "\n")
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(
+                         server, "resolve_launcher_binary_now",
+                         side_effect=AssertionError("provider access forbidden"),
+                     ):
+                    status, payload = server.derive_slice_recovery_route(recovery)
+                self.assertEqual(
+                    (status, payload.get("code")), (400, "primary_receipt_mismatch"), payload
+                )
+                self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+
+    def test_agent_trust_boundaries_bind_top_level_repository_provenance(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "a" * 40, "native_session_id": "native-123",
+        }
+        job_id = "a4" * 16
+        valid = {
+            "job_id": job_id, "kind": "agent", "status": "completed", "repo": "scratch",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **profile, "session_identity": identity,
+            "receipt": {
+                "status": "ok", "job_id": job_id, "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol", **profile,
+                "session_identity": identity, "failure_class": "none", "failure_code": "none",
+                "failover_eligible": False,
+            },
+        }
+        self.assertTrue(server.is_agent_job_record(valid))
+        self.assertEqual(server.public_job(valid)["repo"], "scratch")
+        mutations = (
+            ("repo", "https://private.example/repo?token=TOKEN_SECRET"),
+            ("repo", "other"),
+            ("branch", "other"),
+            ("starting_head", "b" * 40),
+        )
+        for field, value in mutations:
+            hostile = deepcopy(valid)
+            hostile[field] = value
+            with self.subTest(field=field, value=value):
+                self.assertFalse(server.is_agent_job_record(hostile))
+                with mock.patch.object(server, "read_job", return_value=hostile):
+                    get_status, get_payload, _ = server.dispatch(
+                        "GET", f"/v1/agent/jobs/{job_id}", {}, True, b""
+                    )
+                    wait_status, wait_payload = server.agent_job_wait(json.dumps({
+                        "job_id": job_id, "timeout_seconds": 1,
+                    }).encode())
+                rendered = json.dumps({"get": get_payload, "wait": wait_payload})
+                self.assertEqual((get_status, wait_status), (404, 404))
+                self.assertNotIn("TOKEN_SECRET", rendered)
+                self.assertNotIn("private.example", rendered)
+                callback = server.normalize_receipt(
+                    hostile, {"status": "ok", "summary": "TOKEN_SECRET"}, 0, False
+                )
+                self.assertEqual(
+                    (callback["status"], callback["failure_code"]),
+                    ("error", "session_provenance_invalid"),
+                    callback,
+                )
+                self.assertIsNone(callback["session_identity"])
+                self.assertNotIn("TOKEN_SECRET", json.dumps(callback))
+
+    def test_branch_validator_matches_git_for_phase1_reference_rules(self):
+        valid = (
+            "main", "feature/model-routing", "release/2026.08", "user_name/topic-1",
+        )
+        git_invalid = (
+            "feature.lock/child", "FEATURE.LOCK/child", "feature/child.lock", "a..b",
+            "a@{b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b",
+            "a\\b", "/a", "a/", "a//b", ".a", "a/.b", "a.", "@", "-branch",
+            "bad\x7fbranch", "b" * 256,
+        )
+        conservative_only = {"@", "FEATURE.LOCK/child", "b" * 256}
+        for name in valid + tuple(name for name in git_invalid if name not in conservative_only):
+            with self.subTest(name=name):
+                git_ok = subprocess.run(
+                    ["git", "check-ref-format", "--branch", name],
+                    check=False, capture_output=True, text=True,
+                ).returncode == 0
+                self.assertEqual(server.valid_branch(name), git_ok, name)
+        self.assertTrue(all(server.valid_branch(name) for name in valid))
+        self.assertTrue(all(not server.valid_branch(name) for name in git_invalid))
+        pattern = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]["properties"]["branch"]["pattern"]
+        self.assertIsNone(re.fullmatch(pattern, "feature.lock/child"))
+        for name in valid:
+            self.assertIsNotNone(re.fullmatch(pattern, name), name)
+
+
 class CodeOffTests(unittest.TestCase):
     """Issue 67 is a bounded protocol; no fixture may launch a model or use network."""
 
@@ -10429,9 +10808,11 @@ class CodeOffTests(unittest.TestCase):
             "native_session_id": "fixture-resume",
         }
         server.write_job({
-            "job_id": resume_id, "status": "completed",
+            "job_id": resume_id, "kind": "agent", "status": "completed",
+            "repo": resume_identity["repo"],
             "launcher": resume_body["launcher"], "provider": resume_body["provider"],
             "model": resume_body["model"], **profile, "session_identity": resume_identity,
+            "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-2"},
             "receipt": {"status": "ok", "job_id": resume_id,
                         "launcher": resume_body["launcher"], "provider": resume_body["provider"],
                         "model": resume_body["model"], **profile,
@@ -11092,8 +11473,8 @@ class CodeOffTests(unittest.TestCase):
         job_id = "ab" * 16
         state["agent_jobs"]["author-1"] = [job_id]
         server._codeoff_write_state(self.records / experiment_id, state)
-        running = {"job_id": job_id, "status": "running"}
-        completed = {"job_id": job_id, "status": "completed"}
+        running = _minimal_agent_record(job_id, "running")
+        completed = _minimal_agent_record(job_id, "completed")
         with mock.patch.object(server, "read_job", side_effect=[running, completed]), \
              mock.patch.object(server.time, "sleep") as sleep:
             status, terminal = self._post("/v1/code-off/terminal", {
@@ -11113,8 +11494,8 @@ class CodeOffTests(unittest.TestCase):
         state["agent_jobs"]["author-2"] = [second]
         server._codeoff_write_state(self.records / experiment_id, state)
         reads = [
-            {"job_id": first, "status": "completed"}, {"job_id": second, "status": "running"},
-            {"job_id": first, "status": "completed"}, {"job_id": second, "status": "failed"},
+            _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "running"),
+            _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "failed"),
         ]
         with mock.patch.object(server, "read_job", side_effect=reads), \
              mock.patch.object(server.time, "sleep") as sleep:
@@ -11158,7 +11539,7 @@ class CodeOffTests(unittest.TestCase):
         job_id = "cd" * 16
         state["agent_jobs"]["author-1"] = [job_id]
         server._codeoff_write_state(self.records / experiment_id, state)
-        with mock.patch.object(server, "read_job", return_value={"job_id": job_id, "status": "running"}), \
+        with mock.patch.object(server, "read_job", return_value=_minimal_agent_record(job_id, "running")), \
              mock.patch.object(server.time, "monotonic", side_effect=[0, server.CODEOFF_TERMINAL_DRAIN_SECONDS + 1]):
             status, terminal = self._post("/v1/code-off/terminal", {
                 "experiment_id": experiment_id, "outcome": "failed",
