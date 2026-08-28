@@ -1950,12 +1950,14 @@ class DispatchTests(unittest.TestCase):
     def _write_grok_acp_fixture(self, root: Path) -> Path:
         fixture = root / "grok-fixture"
         fixture.write_text("""#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, sys, tempfile, time
 cfg = json.loads(os.environ.get("ACP_TEST_FIXTURE", "{}"))
 capture = os.environ["ACP_TEST_CAPTURE"]
 seen = {"pid":os.getpid(), "argv":sys.argv[1:], "cwd":os.getcwd(), "env":{key:os.environ.get(key) for key in ["GROK_DISABLE_AUTOUPDATER","PWD","TERMINAL_CWD","GRAPHWING_JOB_ID","GIT_TERMINAL_PROMPT","GH_PROMPT_DISABLED"]}, "requests":[]}
 def save():
-    with open(capture, "w") as fh: json.dump(seen, fh)
+    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(capture), prefix=os.path.basename(capture) + ".", delete=False) as fh:
+        json.dump(seen, fh)
+    os.replace(fh.name, capture)
 def send(value):
     print(json.dumps(value), flush=True)
 def response_id(request):
