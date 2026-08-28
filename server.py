@@ -1179,6 +1179,10 @@ def safe_file(repo: Path, rel: str) -> tuple[Path, None] | tuple[None, dict[str,
 def valid_branch(name: str) -> bool:
     if not isinstance(name, str) or not name or len(name) > 255:
         return False
+    # Phase 1 intentionally exposes one portable ASCII subset, not every name
+    # accepted by git-check-ref-format. Keep this set aligned with BranchName.
+    if re.fullmatch(r"[A-Za-z0-9._/-]+", name) is None:
+        return False
     if name == "@" or name.startswith(("-", "/")) or name.endswith("/"):
         return False
     if ".." in name or "@{" in name or "//" in name:
@@ -3597,16 +3601,23 @@ def trusted_agent_profile(job: dict[str, Any]) -> dict[str, Any] | None:
     return {key: job.get(key) for key in AGENT_PROFILE_FIELDS} | {"session_identity": identity}
 
 
+def receipt_profile_matches_job(job: dict[str, Any], receipt: Any) -> bool:
+    """Require one complete canonical profile on job, receipt, and identity."""
+    profile = trusted_agent_profile(job)
+    return bool(
+        profile is not None and isinstance(receipt, dict)
+        and receipt.get("job_id") == job.get("job_id")
+        and receipt.get("session_identity") == profile["session_identity"]
+        and all(receipt.get(key) == profile[key] for key in AGENT_PROFILE_FIELDS)
+    )
+
+
 def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
     stored = job.get("receipt")
     if not isinstance(stored, dict):
         return None
     profile = trusted_agent_profile(job)
-    receipt_profile_valid = bool(
-        profile is not None
-        and all(stored.get(key) == profile[key] for key in AGENT_PROFILE_FIELDS)
-        and stored.get("session_identity") == profile["session_identity"]
-    )
+    receipt_profile_valid = receipt_profile_matches_job(job, stored)
     if not receipt_profile_valid:
         classified = classify_agent_failure("session_provenance_invalid")
         return {
@@ -3657,6 +3668,33 @@ def is_agent_job_record(job: Any) -> bool:
         and isinstance(identity, dict) and identity_err is None and parsed_identity == identity
         and trusted_agent_profile(job) is not None
     )
+
+
+def agent_execution_snapshot(job: Any) -> dict[str, Any] | None:
+    """Capture immutable launch inputs while excluding safe worker bookkeeping."""
+    if not is_agent_job_record(job):
+        return None
+    assert isinstance(job, dict)
+    immutable = {
+        key: job.get(key)
+        for key in (
+            "job_id", "kind", "repo", "cwd", "launcher", "provider", "model",
+            "requested_effort", "effective_effort", "effort_source", "launcher_version",
+            "max_turns", "run_budget_seconds", "codeoff_workspace", "prompt_hash",
+            "git_baseline", "resume_job_id", "response_webhook_url",
+            "response_webhook_token", "resume_url",
+        )
+    }
+    immutable["session_identity"] = dict(job["session_identity"])
+    prompt = job.get("prompt")
+    immutable["prompt_sha256"] = (
+        hashlib.sha256(prompt.encode()).hexdigest() if isinstance(prompt, str) else None
+    )
+    return immutable
+
+
+def agent_record_matches_execution_snapshot(job: Any, snapshot: dict[str, Any]) -> bool:
+    return agent_execution_snapshot(job) == snapshot
 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -5074,6 +5112,8 @@ def run_agent_job(job_id: str) -> None:
             write_job(job)
         herdr_job_done(job)
         return
+    execution_snapshot = agent_execution_snapshot(job)
+    assert execution_snapshot is not None
     job["status"] = "running"
     job["started_at"] = utcnow()
     write_job(job)
@@ -5158,7 +5198,15 @@ def run_agent_job(job_id: str) -> None:
         else:
             receipt["execution_identity"] = execution_identity
     refreshed = read_job(job_id)
-    job = refreshed if is_agent_job_record(refreshed) else job
+    if agent_record_matches_execution_snapshot(refreshed, execution_snapshot):
+        job = refreshed
+    else:
+        receipt["status"] = "error"
+        receipt.pop("execution_identity", None)
+        execution_identity = None
+        receipt.update(classify_agent_failure("session_provenance_invalid"))
+        receipt["summary"] = receipt["diagnostic"]["summary"]
+        job["error"] = "persisted agent execution identity changed during execution"
     assert isinstance(job, dict)
     if isinstance(receipt.get("session_identity"), dict):
         job["session_identity"] = dict(receipt["session_identity"])
@@ -6076,6 +6124,7 @@ def _codeoff_terminal_identity_matches(
     )
     return bool(
         expected is not None and source is not None and execution is not None
+        and receipt_profile_matches_job(job, receipt)
         and all(_codeoff_identity_values(surface) == expected for surface in surfaces)
         and receipt.get("session_identity") == job.get("session_identity")
         and execution.get("source") == source
