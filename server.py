@@ -1177,16 +1177,20 @@ def safe_file(repo: Path, rel: str) -> tuple[Path, None] | tuple[None, dict[str,
 
 
 def valid_branch(name: str) -> bool:
-    if not isinstance(name, str) or not REF_NAME_RE.fullmatch(name):
+    if not isinstance(name, str) or not name or len(name) > 255:
         return False
-    if name.startswith(".") or name.endswith(".") or name.endswith("/") or name.endswith(".lock"):
+    if name == "@" or name.startswith(("-", "/")) or name.endswith("/"):
         return False
-    if ".." in name or "//" in name or "\\" in name:
+    if ".." in name or "@{" in name or "//" in name:
         return False
-    if Path(name).is_absolute() or name.startswith("/") or name.startswith("~"):
+    if any(ord(char) < 32 or ord(char) == 127 or char in " ~^:?*[\\" for char in name):
         return False
     parts = name.split("/")
-    if any(p in ("", ".", "..") or p.startswith(".") for p in parts):
+    if any(
+        not part or part.startswith(".") or part.endswith(".")
+        or part.lower().endswith(".lock")
+        for part in parts
+    ):
         return False
     return True
 
@@ -1399,11 +1403,17 @@ def git_commit(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     writer_paths: list[str] = []
     if writer_id is not None:
         writer = read_job(writer_id) if isinstance(writer_id, str) and JOB_ID_RE.fullmatch(writer_id) else None
+        if not is_agent_job_record(writer):
+            writer = None
         descendants: dict[str, list[dict[str, Any]]] = {}
         for path in JOBS_DIR.glob("*/job.json"):
             child = read_job(path.parent.name) or {}
             parent_id = child.get("writer_parent_job_id")
-            if parent_id and child.get("status") == "completed" and (child.get("receipt") or {}).get("status") == "ok":
+            if (
+                parent_id and is_agent_job_record(child)
+                and child.get("status") == "completed"
+                and (child.get("receipt") or {}).get("status") == "ok"
+            ):
                 descendants.setdefault(parent_id, []).append(child)
         visited_writer_jobs: set[str] = set()
         while writer:
@@ -2140,7 +2150,8 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         "failure_class", "failure_code", "failover_eligible",
     )
     if (
-        not isinstance(stored_receipt, dict)
+        not is_agent_job_record(stored_job)
+        or not isinstance(stored_receipt, dict)
         or stored_job.get("status") != "failed"
         or stored_job.get("session_identity") != session_identity
         or any(receipt.get(key) != stored_receipt.get(key) for key in receipt_fields)
@@ -2298,8 +2309,9 @@ def recovery_job_evidence(
     ):
         return None, {"error": "successful recovery receipt is malformed", "code": "malformed_recovery_evidence"}
     job = read_job(job_id)
-    if not isinstance(job, dict):
+    if not is_agent_job_record(job):
         return None, {"error": "recovery receipt has no durable job", "code": "recovery_evidence_mismatch"}
+    assert isinstance(job, dict)
     if job.get("status") in ("queued", "running"):
         return None, {"error": "recovery job is not terminal", "code": "nonterminal_recovery_evidence"}
     stored = job.get("receipt")
@@ -3552,6 +3564,8 @@ AGENT_PROFILE_FIELDS = (
 
 def trusted_agent_profile(job: dict[str, Any]) -> dict[str, Any] | None:
     """Return a complete corroborated profile, never a best-effort projection."""
+    if job.get("kind") != "agent":
+        return None
     launcher, provider, model = (job.get(key) for key in ("launcher", "provider", "model"))
     source = job.get("effort_source")
     requested = job.get("requested_effort")
@@ -3573,6 +3587,11 @@ def trusted_agent_profile(job: dict[str, Any]) -> dict[str, Any] | None:
         or not isinstance(launcher_version, str) or not LAUNCHER_VERSION_RE.fullmatch(launcher_version)
         or identity_err or parsed != identity or not isinstance(identity, dict)
         or any(identity.get(key) != job.get(key) for key in AGENT_PROFILE_FIELDS)
+        or job.get("repo") != identity.get("repo")
+        or any(
+            key in job and job.get(key) != identity.get(key)
+            for key in ("branch", "starting_head")
+        )
     ):
         return None
     return {key: job.get(key) for key in AGENT_PROFILE_FIELDS} | {"session_identity": identity}
@@ -3613,7 +3632,7 @@ def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
 
 def is_agent_job_record(job: Any) -> bool:
     """Recognize only records created by the native agent job path."""
-    if not isinstance(job, dict) or job.get("kind") not in (None, "agent"):
+    if not isinstance(job, dict) or job.get("kind") != "agent":
         return False
     launcher, provider, model = (job.get(key) for key in ("launcher", "provider", "model"))
     identity = job.get("session_identity")
@@ -3636,16 +3655,20 @@ def is_agent_job_record(job: Any) -> bool:
         isinstance(job.get("job_id"), str) and JOB_ID_RE.fullmatch(job["job_id"])
         and (ordinary or codeoff)
         and isinstance(identity, dict) and identity_err is None and parsed_identity == identity
+        and trusted_agent_profile(job) is not None
     )
 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
     profile = trusted_agent_profile(job)
+    identity = profile["session_identity"] if profile else None
     return {
         "ok": True,
-        **{key: job.get(key) for key in ("job_id", "status", "repo")},
+        "kind": "agent",
+        **{key: job.get(key) for key in ("job_id", "status")},
+        "repo": identity["repo"] if identity else None,
         **({key: profile[key] for key in AGENT_PROFILE_FIELDS} if profile else {key: None for key in AGENT_PROFILE_FIELDS}),
-        "session_identity": profile["session_identity"] if profile else None,
+        "session_identity": identity,
         **{key: job.get(key) for key in ("created_at", "started_at", "finished_at")},
         "receipt": sanitized_agent_receipt(job),
     }
@@ -3729,13 +3752,13 @@ def recover_interrupted_agent_jobs() -> int:
         for path in JOBS_DIR.glob("*/job.json") if JOBS_DIR.is_dir() else ():
             job = read_job(path.parent.name) or {}
             raw_kind = job.get("kind")
-            kind = "agent" if raw_kind in (None, "agent") else (raw_kind if isinstance(raw_kind, str) else None)
+            kind = raw_kind if isinstance(raw_kind, str) else None
             launcher = job.get("launcher")
             job_id = job.get("job_id")
             if (
                 job.get("status") not in ("queued", "running")
                 or kind not in PROCESS_JOB_KINDS
-                or (kind == "agent" and (not isinstance(launcher, str) or launcher not in NATIVE_LAUNCHERS))
+                or (kind == "agent" and not is_agent_job_record(job))
                 or not isinstance(job_id, str)
                 or not JOB_ID_RE.fullmatch(job_id)
                 or job_id != path.parent.name
@@ -4117,6 +4140,7 @@ def validate_native_resume_provenance(
     profile = trusted_agent_profile(prior) if isinstance(prior, dict) else None
     if not (
         isinstance(prior, dict)
+        and is_agent_job_record(prior)
         and prior.get("status") == "completed"
         and prior.get("session_identity") == requested_identity
         and profile is not None
@@ -4343,16 +4367,20 @@ def normalize_receipt(
     ) or "missing"
     parsed_identity, identity_err = parse_session_identity(identity)
     profile_complete = bool(
-        raw_requested in EFFORT_VALUES and raw_source in EFFORT_SOURCES
+        job.get("kind") == "agent"
+        and raw_requested in EFFORT_VALUES and raw_source in EFFORT_SOURCES
         and profile_err is None and profile is not None
         and job.get("effective_effort") == profile["effective_effort"]
         and isinstance(job.get("launcher_version"), str)
         and LAUNCHER_VERSION_RE.fullmatch(job["launcher_version"])
         and identity_err is None and parsed_identity == identity
         and isinstance(identity, dict)
-        and all(identity.get(key) == job.get(key) for key in ("launcher", "provider", "model"))
-        and identity.get("effective_effort") == job.get("effective_effort")
-        and identity.get("launcher_version") == job.get("launcher_version")
+        and all(identity.get(key) == job.get(key) for key in AGENT_PROFILE_FIELDS)
+        and job.get("repo") == identity.get("repo")
+        and all(
+            key not in job or job.get(key) == identity.get(key)
+            for key in ("branch", "starting_head")
+        )
     )
     failure: str | None = None
     if timed_out:
@@ -4380,14 +4408,14 @@ def normalize_receipt(
     rec = {
         "status": status,
         "job_id": job["job_id"],
-        "launcher": job.get("launcher"),
-        "provider": job.get("provider"),
-        "model": job.get("model"),
+        "launcher": job.get("launcher") if profile_complete else None,
+        "provider": job.get("provider") if profile_complete else None,
+        "model": job.get("model") if profile_complete else None,
         "session_identity": parsed_identity if profile_complete else None,
-        "requested_effort": requested_effort,
-        "effective_effort": effective_effort,
-        "effort_source": effort_source,
-        "launcher_version": launcher_version,
+        "requested_effort": requested_effort if profile_complete else None,
+        "effective_effort": effective_effort if profile_complete else None,
+        "effort_source": effort_source if profile_complete else None,
+        "launcher_version": launcher_version if profile_complete else None,
     }
     rec.update(classify_agent_failure(evidence_code or evidence, structured_output))
     rec["summary"] = rec["diagnostic"]["summary"]
@@ -5028,7 +5056,23 @@ def staging_failure_summary(failure: dict[str, Any]) -> str:
 
 def run_agent_job(job_id: str) -> None:
     job = read_job(job_id)
-    if not job:
+    if not isinstance(job, dict) or job.get("kind") != "agent":
+        return
+    if not is_agent_job_record(job):
+        job["status"] = "failed"
+        job["started_at"] = job.get("started_at") or utcnow()
+        job["finished_at"] = utcnow()
+        job["error"] = "agent job provenance is invalid"
+        job["receipt"] = normalize_receipt(
+            job, {"status": "error"}, 1, False,
+            evidence_code="session_provenance_invalid",
+        )
+        write_job(job)
+        hook = deliver_webhook(job, job["receipt"])
+        if hook is not None:
+            job["webhook"] = hook
+            write_job(job)
+        herdr_job_done(job)
         return
     job["status"] = "running"
     job["started_at"] = utcnow()
@@ -5113,7 +5157,9 @@ def run_agent_job(job_id: str) -> None:
             receipt.update(classify_agent_failure("session_provenance_invalid"))
         else:
             receipt["execution_identity"] = execution_identity
-    job = read_job(job_id) or job
+    refreshed = read_job(job_id)
+    job = refreshed if is_agent_job_record(refreshed) else job
+    assert isinstance(job, dict)
     if isinstance(receipt.get("session_identity"), dict):
         job["session_identity"] = dict(receipt["session_identity"])
     if receipt["status"] == "ok" and job.get("git_baseline"):
@@ -6042,10 +6088,13 @@ def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str
     if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id) or job_id not in state.get("agent_jobs", {}).get(slot, []):
         return None, {"error": "job is not pinned to this experiment slot", "code": "job_mismatch"}
     job = read_job(job_id)
-    if isinstance(job, dict) and job.get("status") in ("queued", "running"): return None, {"error": "slot agent has not reached a terminal receipt", "code": "agent_not_terminal"}
+    if not is_agent_job_record(job):
+        return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
+    assert isinstance(job, dict)
+    if job.get("status") in ("queued", "running"): return None, {"error": "slot agent has not reached a terminal receipt", "code": "agent_not_terminal"}
     identity = manifest["identities"][slot]
-    receipt = job.get("receipt") if isinstance(job, dict) else None
-    if not (isinstance(job, dict) and job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and _codeoff_terminal_identity_matches(job, receipt, identity) and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot}):
+    receipt = job.get("receipt")
+    if not (job.get("status") == "completed" and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id and _codeoff_terminal_identity_matches(job, receipt, identity) and job.get("codeoff_workspace") == {"experiment_id": manifest["experiment_id"], "slot": slot}):
         return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
     return job, None
 
@@ -6551,8 +6600,9 @@ def _codeoff_wait_for_jobs(state: dict[str, Any], timeout_seconds: int = CODEOFF
         active = []
         for job_id in job_ids:
             job = read_job(job_id)
-            if not job:
+            if not is_agent_job_record(job):
                 return {"error": "launched code-off job record is unavailable", "code": "agent_job_missing", "job_id": job_id}
+            assert isinstance(job, dict)
             if job.get("status") in ("queued", "running"):
                 active.append(job_id)
         if not active:
@@ -6845,6 +6895,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         log_ref = str(job_dir(job_id) / "stdout.log")
         job = {
             "job_id": job_id,
+            "kind": "agent",
             "status": "queued",
             "repo": repo_name,
             "cwd": str(resolved),
@@ -6896,6 +6947,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     enqueue_agent(job)
     return 202, {
         "ok": True,
+        "kind": "agent",
         "job_id": job_id,
         "status": "queued",
         "repo": repo_name,

@@ -1494,6 +1494,7 @@
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "kind": { "type": "string", "enum": ["agent"] },
           "job_id": { "type": "string" },
           "status": { "type": "string" },
           "repo": { "type": "string" },
@@ -1522,7 +1523,7 @@
           "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
           "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$", "description": "Path-free SHA-256 fingerprint of the resolved launcher executable, or missing for an availability-failure job." },
           "repo": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "description": "Validated path-free allowlist short name, including internal code-off identities." },
-          "branch": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^(?![./~])(?!.*(?:\\.\\.|//|\\\\))(?!.*(?:^|/)\\.)(?!.*(?:\\.|/|\\.lock)$)[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$", "description": "Validated bounded Git branch name; slash-separated names are allowed." },
+          "branch": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^(?![./~-])(?!.*(?:\\.\\.|//|\\\\|@\\{))(?!.*(?:^|/)\\.)(?![^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*\/[^/]*\\.[Ll][Oo][Cc][Kk](?:/|$))(?!.*(?:\\.|/)$)[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$", "description": "Conservative validated Git branch subset; slash-separated names are allowed, while Git-forbidden controls, punctuation, dot components, and case-insensitive .lock components are rejected." },
           "starting_head": { "type": "string", "minLength": 40, "maxLength": 64, "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$", "description": "Validated full lowercase Git object ID (SHA-1 or SHA-256 object format)." },
           "native_session_id": { "type": ["string", "null"], "description": "Parsed from launcher-owned structured output: Codex thread.started.thread_id, Claude result.session_id, or Grok ACP session/new result.sessionId. Required non-null for success and resume." }
         }
@@ -1559,9 +1560,10 @@
       "AgentJob": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["ok", "job_id", "status", "repo", "launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "launcher_version", "session_identity", "created_at", "started_at", "finished_at", "receipt"],
+        "required": ["ok", "kind", "job_id", "status", "repo", "launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "launcher_version", "session_identity", "created_at", "started_at", "finished_at", "receipt"],
         "properties": {
           "ok": { "type": "boolean" },
+          "kind": { "type": "string", "enum": ["agent"] },
           "job_id": { "type": "string" },
           "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
           "repo": { "type": "string" },
