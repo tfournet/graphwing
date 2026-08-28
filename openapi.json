@@ -519,7 +519,7 @@
         "responses": {
           "200": { "description": "terminal synchronous review", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } },
           "202": { "description": "queued review", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
+          "400": { "description": "invalid review request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "409": {
             "description": "busy or synchronous execution identity mismatch",
@@ -527,14 +527,14 @@
               "application/json": {
                 "schema": {
                   "oneOf": [
-                    { "$ref": "#/components/schemas/Error" },
+                    { "$ref": "#/components/schemas/ReviewError" },
                     { "$ref": "#/components/schemas/ReviewReceipt" }
                   ]
                 }
               }
             }
           },
-          "501": { "description": "launcher unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } },
+          "501": { "description": "launcher unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "504": { "description": "synchronous review timed out", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewReceipt" } } } }
         }
       }
@@ -549,10 +549,10 @@
         ],
         "responses": {
           "200": { "description": "review job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
+          "400": { "description": "invalid review job id", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "409": { "$ref": "#/components/responses/Error" }
+          "404": { "description": "review job not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
+          "409": { "description": "review record unavailable or invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } }
         }
       }
     },
@@ -564,11 +564,11 @@
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJobWaitRequest" } } } },
         "responses": {
           "200": { "description": "terminal review job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewJob" } } } },
-          "400": { "$ref": "#/components/responses/Error" },
+          "400": { "description": "invalid review wait request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "408": { "$ref": "#/components/responses/Error" },
-          "409": { "$ref": "#/components/responses/Error" }
+          "404": { "description": "review job not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
+          "408": { "description": "bounded review wait expired", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
+          "409": { "description": "review record unavailable or invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } }
         }
       }
     },
@@ -1460,6 +1460,15 @@
           "permission_profile": { "type": "string", "enum": ["codex-read-only", "claude-plan", "grok-read-only-acp"] }
         }
       },
+      "ReviewError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error", "code"],
+        "properties": {
+          "error": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "code": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" }
+        }
+      },
       "ReviewReceipt": {
         "type": "object",
         "additionalProperties": false,
@@ -1486,9 +1495,9 @@
           "kind": { "type": "string", "const": "review" },
           "status": { "type": "string", "enum": ["queued", "running", "completed", "failed"] },
           "execution_identity": { "$ref": "#/components/schemas/ReviewExecutionIdentity" },
-          "created_at": { "type": "string" },
-          "started_at": { "type": ["string", "null"] },
-          "finished_at": { "type": ["string", "null"] },
+          "created_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+          "started_at": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+          "finished_at": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
           "receipt": { "anyOf": [{ "$ref": "#/components/schemas/ReviewReceipt" }, { "type": "null" }] },
           "poll": { "type": "string", "pattern": "^/v1/review/jobs/[0-9a-f]{32}$" }
         }

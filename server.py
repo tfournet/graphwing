@@ -104,6 +104,7 @@ NATIVE_LAUNCHERS = {
 }
 EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
+REVIEW_EFFORT_SOURCES = frozenset({"explicit", "launcher_default"})
 REVIEW_EXECUTION_VERSION = "review-execution-v1"
 REVIEW_PERMISSION_PROFILES = {
     "codex": "codex-read-only",
@@ -127,6 +128,12 @@ REVIEW_JOB_IDENTITY_FIELDS = (
     "prompt_sha256", "diff_sha256", "run_budget_seconds", "max_turns",
     "permission_profile",
 )
+REVIEW_JOB_FIELDS = frozenset({
+    "job_id", "kind", "status", *REVIEW_JOB_IDENTITY_FIELDS, "execution_identity",
+    "cwd", "prompt", "response_webhook_url", "response_webhook_token", "resume_url",
+    "created_at", "started_at", "finished_at", "receipt", "error", "webhook",
+    "review_snapshot_sha256",
+})
 # Native support proven against the installed launcher contracts. Graphwing's
 # closed vocabulary deliberately excludes launcher-only aliases such as xhigh.
 EFFORT_PROFILES = {
@@ -177,6 +184,22 @@ def normalize_effort(
         "effective_effort": effective,
         "effort_source": source,
     }, None
+
+
+def normalize_review_effort(
+    launcher: str,
+    provider: str,
+    model: str,
+    requested: Any,
+    source: str,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Validate direct-review effort without routed provenance."""
+    if source not in REVIEW_EFFORT_SOURCES:
+        return None, {
+            "error": "review effort source must be explicit or launcher_default",
+            "code": "bad_effort_source",
+        }
+    return normalize_effort(launcher, provider, model, requested, source)
 
 
 def native_effort_value(job: dict[str, Any]) -> tuple[bool, str | None]:
@@ -2834,7 +2857,7 @@ def native_review_result(
     if provider != spec["provider"] or model not in spec["models"]:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
-    effort_profile, effort_error = normalize_effort(
+    effort_profile, effort_error = normalize_review_effort(
         launcher, provider, model, requested_effort, effort_source
     )
     if effort_error is not None or effort_profile is None:
@@ -3074,7 +3097,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 400, {"error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
     requested_effort = data.get("effort", "default")
     effort_source = "explicit" if "effort" in data else "launcher_default"
-    effort_profile, effort_error = normalize_effort(
+    effort_profile, effort_error = normalize_review_effort(
         launcher, provider, model, requested_effort, effort_source
     )
     if effort_error is not None or effort_profile is None:
@@ -3087,7 +3110,18 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     prompt = prompt.strip()
     name, resolved = repo_from_body(data, repos)
     if name is None:
-        return 400, resolved
+        assert isinstance(resolved, dict)
+        code = resolved.get("code")
+        messages = {
+            "missing_repo": "review repo is required",
+            "bad_repo": "review repo must be an allowlisted short name",
+            "no_repos": "no review repos are allowlisted",
+            "unknown_repo": "review repo is not allowlisted",
+            "repo_missing": "review repo is unavailable",
+            "not_git": "review repo is not a git worktree",
+        }
+        safe_code = code if isinstance(code, str) and code in messages else "bad_repo"
+        return 400, {"error": messages[safe_code], "code": safe_code}
     assert isinstance(resolved, Path)
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
@@ -3188,7 +3222,10 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
                 }
         receipt = review_receipt(job, result, identity=identity)
         if result.get("code") == "not_implemented":
-            return 501, receipt
+            return 501, {
+                "error": "review launcher identity is unavailable",
+                "code": "not_implemented",
+            }
         if result.get("code") == "timeout":
             return 504, receipt
         if result.get("code") == "review_execution_identity_mismatch":
@@ -3199,10 +3236,10 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     try:
         accepted_launcher = pin_launcher(binary)
     except FileNotFoundError:
-        return 501, review_receipt(job, {
-            "ok": False, "verdict": "NACK", "no_verdict": True,
+        return 501, {
+            "error": "review launcher identity is unavailable",
             "code": "not_implemented",
-        }, identity=identity)
+        }
     except OSError:
         return 409, review_receipt(job, {
             "ok": False, "verdict": "NACK", "no_verdict": True,
@@ -3825,6 +3862,8 @@ def write_job(job: dict[str, Any]) -> bool:
         return False
     with job_record_lock(job_id):
         current = _read_job_unlocked(job_id)
+        if current != job and isinstance(current, dict) and current.get("kind") == "review":
+            return False
         if (
             current != job and isinstance(current, dict)
             and current.get("kind") in ("agent", "review")
@@ -3935,7 +3974,7 @@ def trusted_review_identity(job: Any) -> dict[str, Any] | None:
     provider = identity.get("provider")
     model = identity.get("model")
     spec = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
-    normalized, effort_err = normalize_effort(
+    normalized, effort_err = normalize_review_effort(
         str(launcher or ""), str(provider or ""), str(model or ""),
         identity.get("requested_effort"), str(identity.get("effort_source") or ""),
     )
@@ -4131,7 +4170,7 @@ def review_terminal_transition(
             and prepared_from.get("status") == "running"
             and receipt.get("execution_identity") == prepared_from.get("execution_identity")
         ):
-            return review_fail_invalid_record(job_id, snapshot), False
+            return None, False
         prepared_from = json.loads(json.dumps(prepared_from))
     terminal = json.loads(json.dumps(prepared_from))
     terminal.update({
@@ -4154,7 +4193,7 @@ def review_terminal_transition(
                 or persisted.get("status") != "running"
                 or not review_record_matches_authority(persisted, snapshot, authority)
             ):
-                return review_fail_invalid_record(job_id, snapshot), False
+                return None, False
             _write_job_unlocked(terminal)
             return terminal, True
         finally:
@@ -4175,7 +4214,14 @@ def review_set_webhook_result(
             and current.get("receipt") == receipt
         ):
             return False
-        current["webhook"] = hook
+        status = hook.get("status") if isinstance(hook, dict) else None
+        if (
+            isinstance(hook, dict) and type(hook.get("ok")) is bool
+            and type(status) is int and 100 <= status <= 599
+        ):
+            current["webhook"] = {"ok": hook["ok"], "status": status}
+        else:
+            current["webhook"] = {"ok": False}
         _write_job_unlocked(current)
         return True
 
@@ -4226,8 +4272,75 @@ def sanitized_review_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
     return {key: json.loads(json.dumps(stored[key])) for key in REVIEW_RECEIPT_FIELDS}
 
 
+def valid_review_timestamps(job: Any) -> bool:
+    """Accept only exact server-authored second-resolution UTC lifecycle stamps."""
+    if not isinstance(job, dict):
+        return False
+
+    def valid(value: Any) -> bool:
+        if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value
+        ):
+            return False
+        try:
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return False
+        return True
+
+    status = job.get("status")
+    created = job.get("created_at")
+    started = job.get("started_at")
+    finished = job.get("finished_at")
+    if not valid(created):
+        return False
+    if status == "queued":
+        return started is None and finished is None
+    if status == "running":
+        return valid(started) and finished is None
+    if status == "completed":
+        return valid(started) and valid(finished)
+    if status == "failed":
+        return (started is None or valid(started)) and valid(finished)
+    return False
+
+
+def valid_review_operational_fields(job: Any) -> bool:
+    """Validate mutable review lifecycle fields before any public projection."""
+    if not isinstance(job, dict):
+        return False
+    status = job.get("status")
+    receipt = job.get("receipt")
+    error = job.get("error")
+    webhook = job.get("webhook")
+    if status in ("queued", "running"):
+        return receipt is None and error is None and webhook is None
+    if status not in ("completed", "failed") or not isinstance(receipt, dict):
+        return False
+    if error is not None and not (
+        status == "failed" and error == "review execution identity mismatch"
+    ):
+        return False
+    if webhook is None:
+        return True
+    if not isinstance(webhook, dict) or type(webhook.get("ok")) is not bool:
+        return False
+    if set(webhook) == {"ok"}:
+        return webhook["ok"] is False
+    return bool(
+        set(webhook) == {"ok", "status"}
+        and type(webhook.get("status")) is int
+        and 100 <= webhook["status"] <= 599
+    )
+
+
 def is_review_job_record(job: Any) -> bool:
-    if not isinstance(job, dict) or job.get("kind") != "review":
+    if (
+        not isinstance(job, dict) or job.get("kind") != "review"
+        or set(job) != REVIEW_JOB_FIELDS
+        or not valid_review_timestamps(job)
+        or not valid_review_operational_fields(job)
+    ):
         return False
     status = job.get("status")
     if status in ("queued", "running"):
@@ -4238,11 +4351,18 @@ def is_review_job_record(job: Any) -> bool:
             and review_record_matches_authority(job, snapshot, authority)
         )
     if status in ("completed", "failed"):
-        return sanitized_review_receipt(job) is not None
+        snapshot = read_review_snapshot(str(job.get("job_id") or ""))
+        return bool(
+            snapshot is not None
+            and review_record_matches_snapshot(job, snapshot)
+            and sanitized_review_receipt(job) is not None
+        )
     return False
 
 
 def public_review_job(job: dict[str, Any]) -> dict[str, Any]:
+    if not is_review_job_record(job):
+        return {"error": "review record is not canonical", "code": "review_record_invalid"}
     identity = trusted_review_identity(job)
     receipt = sanitized_review_receipt(job) if job.get("status") in ("completed", "failed") else None
     return {
@@ -4311,8 +4431,8 @@ def review_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
             return 200, payload
         if time.monotonic() >= deadline:
             return 408, {
-                "ok": False, "error": "review did not finish before the bounded wait",
-                "code": "job_wait_timeout", "job_id": job_id,
+                "error": "review did not finish before the bounded wait",
+                "code": "job_wait_timeout",
             }
         time.sleep(0.2)
 
@@ -4321,10 +4441,19 @@ def review_runtime_matches_identity(
     identity: dict[str, Any], prompt: str, resolved: Path, diff_text: str
 ) -> bool:
     branch, head, err = current_branch_head(resolved)
+    normalized, effort_err = normalize_review_effort(
+        str(identity.get("launcher") or ""),
+        str(identity.get("provider") or ""),
+        str(identity.get("model") or ""),
+        identity.get("requested_effort"),
+        str(identity.get("effort_source") or ""),
+    )
     return bool(
         set(identity) == set(REVIEW_IDENTITY_FIELDS)
         and identity.get("version") == REVIEW_EXECUTION_VERSION
         and identity.get("kind") == "review"
+        and effort_err is None and normalized is not None
+        and identity.get("effective_effort") == normalized["effective_effort"]
         and err is None
         and branch == identity.get("branch")
         and head == identity.get("starting_head")

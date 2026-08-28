@@ -6861,9 +6861,16 @@ while True:
         self.assertEqual(identity["properties"]["kind"]["const"], "review")
         receipt = schemas["ReviewReceipt"]
         job = schemas["ReviewJob"]
-        for schema in (receipt, job):
+        review_error = schemas["ReviewError"]
+        for schema in (receipt, job, review_error):
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(set(schema["required"]), set(schema["properties"]))
+        self.assertEqual(set(review_error["properties"]), {"error", "code"})
+        for field in ("created_at", "started_at", "finished_at"):
+            self.assertEqual(
+                job["properties"][field]["pattern"],
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            )
         self.assertEqual(
             receipt["properties"]["execution_identity"],
             {"$ref": "#/components/schemas/ReviewExecutionIdentity"},
@@ -8794,6 +8801,111 @@ while True:
             self.assertNotIn("raw provider text", public)
             self.assertEqual(terminal["receipt"]["summary"], "review passed")
 
+    def test_review_poll_and_wait_reject_hostile_timestamps_without_leaking(self):
+        hostile = "TOKEN_SECRET /private/review https://evil.invalid/provider-output"
+        for field, status_value in (("started_at", "running"), ("finished_at", "completed")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+                self.assertEqual(status, 202, accepted)
+                job_id = accepted["job_id"]
+                path = jobs / job_id / "job.json"
+                stored = json.loads(path.read_text())
+                if status_value == "running":
+                    stored.update({"status": "running", field: hostile})
+                else:
+                    receipt = server.review_receipt(
+                        stored,
+                        {"ok": True, "verdict": "PASS", "no_verdict": False},
+                        identity=accepted["execution_identity"],
+                    )
+                    stored.update({
+                        "status": "completed", "started_at": "2026-08-28T00:00:00Z",
+                        field: hostile, "receipt": receipt,
+                    })
+                path.write_text(json.dumps(stored))
+
+                poll_status, poll, _ = server.dispatch(
+                    "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+                )
+                wait_status, waited, _ = server.dispatch(
+                    "POST", "/v1/review/jobs/wait", {}, True,
+                    json.dumps({"job_id": job_id, "timeout_seconds": 1}).encode(),
+                )
+                self.assertEqual((poll_status, poll["code"]), (409, "review_record_invalid"))
+                self.assertEqual((wait_status, waited["code"]), (409, "review_record_invalid"))
+                self.assertNotIn(hostile, json.dumps(poll))
+                self.assertNotIn(hostile, json.dumps(waited))
+
+        for field in (
+            "cwd", "response_webhook_token", "response_webhook_url", "provider_output",
+            "error", "webhook",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+                self.assertEqual(status, 202, accepted)
+                job_id = accepted["job_id"]
+                path = jobs / job_id / "job.json"
+                stored = json.loads(path.read_text())
+                stored.update({
+                    "status": "completed", "started_at": "2026-08-28T00:00:00Z",
+                    "finished_at": "2026-08-28T00:00:01Z", field: hostile,
+                })
+                stored["receipt"] = server.review_receipt(
+                    stored,
+                    {"ok": True, "verdict": "PASS", "no_verdict": False},
+                    identity=accepted["execution_identity"],
+                )
+                path.write_text(json.dumps(stored))
+                poll_status, poll, _ = server.dispatch(
+                    "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+                )
+                wait_status, waited, _ = server.dispatch(
+                    "POST", "/v1/review/jobs/wait", {}, True,
+                    json.dumps({"job_id": job_id, "timeout_seconds": 1}).encode(),
+                )
+                self.assertEqual((poll_status, poll["code"]), (409, "review_record_invalid"))
+                self.assertEqual((wait_status, waited["code"]), (409, "review_record_invalid"))
+                self.assertNotIn(hostile, json.dumps(poll))
+                self.assertNotIn(hostile, json.dumps(waited))
+
+    def test_review_route_source_coordinated_mutation_is_noncanonical(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, repo, launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            path = jobs / job_id / "job.json"
+            stored = json.loads(path.read_text())
+            stored["effort_source"] = "route"
+            stored["execution_identity"]["effort_source"] = "route"
+            stored.update({
+                "status": "completed", "started_at": "2026-08-28T00:00:00Z",
+                "finished_at": "2026-08-28T00:00:01Z",
+            })
+            stored["receipt"] = {
+                "ok": True, "status": "ok", "job_id": job_id, "kind": "review",
+                "verdict": "PASS", "no_verdict": False,
+                "execution_identity": deepcopy(stored["execution_identity"]),
+                "summary": "review passed", "code": None,
+            }
+            path.write_text(json.dumps(stored))
+
+            poll_status, poll, _ = server.dispatch(
+                "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+            )
+            self.assertEqual((poll_status, poll["code"]), (409, "review_record_invalid"))
+            with mock.patch.object(
+                server.subprocess, "run", side_effect=AssertionError("route review must not spawn")
+            ) as spawn:
+                result = server.native_review_result(
+                    "claude", "anthropic", "claude-sonnet-5", "bounded ticket", repo,
+                    requested_effort="default", effort_source="route", binary=launcher,
+                )
+            spawn.assert_not_called()
+            self.assertEqual(result["code"], "bad_effort_source")
+
     def test_review_worker_rejects_every_snapshot_drift_before_spawn(self):
         mutations = (
             {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"},
@@ -8860,7 +8972,7 @@ while True:
             self.assertEqual(saved["status"], "completed")
             self.assertEqual(saved["receipt"]["status"], "ok")
 
-    def test_review_terminal_transition_rejects_source_only_drift_after_spawn(self):
+    def test_review_terminal_transition_preserves_source_drift_without_callback(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             status, accepted, jobs, _repo, launcher, _ = self._queue_closed_review(root)
@@ -8878,14 +8990,38 @@ while True:
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
                  mock.patch.object(server, "native_review_result", side_effect=drift_then_pass), \
                  mock.patch.object(server, "herdr_job_done"), \
-                 mock.patch.object(server, "deliver_webhook", return_value=None):
+                 mock.patch.object(server, "deliver_webhook") as callback:
                 server.run_review_job(accepted["job_id"])
+            callback.assert_not_called()
             saved = json.loads(path.read_text())
-            self.assertEqual(saved["status"], "failed")
-            self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
-            self.assertEqual(
-                saved["execution_identity"], accepted["execution_identity"]
-            )
+            self.assertEqual(saved["status"], "running")
+            self.assertEqual(saved["effort_source"], "explicit")
+            self.assertEqual(saved["execution_identity"]["effort_source"], "explicit")
+            self.assertIsNone(saved["receipt"])
+
+    def test_review_ordinary_write_rejects_immutable_drift_and_guarded_lifecycle_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            path = jobs / job_id / "job.json"
+            original = json.loads(path.read_text())
+            drift = deepcopy(original)
+            drift["prompt"] = "coordinated trusted drift"
+            drift["prompt_sha256"] = hashlib.sha256(drift["prompt"].encode()).hexdigest()
+            drift["execution_identity"]["prompt_sha256"] = drift["prompt_sha256"]
+            self.assertFalse(server.write_job(drift))
+            self.assertEqual(json.loads(path.read_text()), original)
+
+            with mock.patch.object(server, "native_review_result", return_value={
+                "ok": True, "verdict": "PASS", "no_verdict": False,
+            }), mock.patch.object(server, "deliver_webhook", return_value=None), \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["status"], "completed")
+            self.assertEqual(saved["receipt"]["status"], "ok")
 
     def test_review_endpoints_reject_nonreview_kinds_and_agent_endpoint_rejects_review(self):
         with tempfile.TemporaryDirectory() as td:
@@ -9115,15 +9251,92 @@ while True:
                 json.loads((jobs / ("a4" * 16) / "job.json").read_text())["status"], "running"
             )
 
-    def test_review_run_409_openapi_allows_error_or_receipt(self):
+    def test_review_run_409_and_501_actual_bodies_match_exact_openapi_branches(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:  # catalog CI intentionally installs no third-party packages
+            Draft202012Validator = None
+
         spec = json.loads(server.openapi_bytes())
-        schema = spec["paths"]["/v1/review/run"]["post"]["responses"]["409"]
-        refs = {
-            item["$ref"] for item in schema["content"]["application/json"]["schema"]["oneOf"]
-        }
-        self.assertEqual(refs, {
-            "#/components/schemas/Error", "#/components/schemas/ReviewReceipt",
-        })
+        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        response_409 = responses["409"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            {item["$ref"] for item in response_409["oneOf"]},
+            {"#/components/schemas/ReviewError", "#/components/schemas/ReviewReceipt"},
+        )
+        def dereference(value):
+            if isinstance(value, dict):
+                if set(value) == {"$ref"} and value["$ref"].startswith("#/"):
+                    target = spec
+                    for part in value["$ref"][2:].split("/"):
+                        target = target[part.replace("~1", "/").replace("~0", "~")]
+                    return dereference(target)
+                return {key: dereference(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [dereference(item) for item in value]
+            return value
+
+        def subset_valid(schema, instance):
+            """Draft 2020-12 semantics for every keyword used by these closed shapes."""
+            schema = dereference(schema)
+            if "oneOf" in schema and sum(subset_valid(item, instance) for item in schema["oneOf"]) != 1:
+                return False
+            if "anyOf" in schema and not any(subset_valid(item, instance) for item in schema["anyOf"]):
+                return False
+            expected = schema.get("type")
+            if expected is not None:
+                expected = [expected] if isinstance(expected, str) else expected
+                matches_type = {
+                    "object": lambda: isinstance(instance, dict),
+                    "array": lambda: isinstance(instance, list),
+                    "string": lambda: isinstance(instance, str),
+                    "integer": lambda: type(instance) is int,
+                    "number": lambda: type(instance) in (int, float),
+                    "boolean": lambda: type(instance) is bool,
+                    "null": lambda: instance is None,
+                }
+                if not any(matches_type[item]() for item in expected):
+                    return False
+            if "const" in schema and instance != schema["const"]:
+                return False
+            if "enum" in schema and instance not in schema["enum"]:
+                return False
+            if isinstance(instance, str):
+                if len(instance) < schema.get("minLength", 0):
+                    return False
+                if "maxLength" in schema and len(instance) > schema["maxLength"]:
+                    return False
+                if "pattern" in schema and re.search(schema["pattern"], instance) is None:
+                    return False
+            if type(instance) in (int, float):
+                if "minimum" in schema and instance < schema["minimum"]:
+                    return False
+                if "maximum" in schema and instance > schema["maximum"]:
+                    return False
+            if isinstance(instance, dict):
+                if not set(schema.get("required", ())) <= set(instance):
+                    return False
+                properties = schema.get("properties", {})
+                if schema.get("additionalProperties") is False and not set(instance) <= set(properties):
+                    return False
+                if any(
+                    key in properties and not subset_valid(properties[key], value)
+                    for key, value in instance.items()
+                ):
+                    return False
+            if isinstance(instance, list) and "items" in schema:
+                if not all(subset_valid(schema["items"], item) for item in instance):
+                    return False
+            return True
+
+        def valid(schema, instance):
+            resolved = dereference(schema)
+            portable = subset_valid(resolved, instance)
+            if Draft202012Validator is None:
+                return portable
+            authoritative = not list(Draft202012Validator(resolved).iter_errors(instance))
+            self.assertEqual(portable, authoritative)
+            return authoritative
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -9142,6 +9355,17 @@ while True:
                 "repo": "scratch", "launcher": "claude", "provider": "anthropic",
                 "model": "claude-sonnet-5", "prompt": "bounded ticket",
             }).encode()
+            hostile_body = json.dumps({
+                "repo": "TOKEN_SECRET/private/review", "launcher": "claude",
+                "provider": "anthropic", "model": "claude-sonnet-5",
+                "prompt": "bounded ticket",
+            }).encode()
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
+                invalid_status, invalid, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, hostile_body
+                )
+            self.assertEqual(invalid_status, 400)
+            self.assertNotIn("TOKEN_SECRET", json.dumps(invalid))
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
                  mock.patch.object(
@@ -9155,6 +9379,24 @@ while True:
             self.assertEqual(mismatch_status, 409)
             self.assertEqual(set(mismatch), set(server.REVIEW_RECEIPT_FIELDS))
             self.assertEqual(mismatch["code"], "review_execution_identity_mismatch")
+
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "launcher_version_fingerprint", return_value=None), \
+                 mock.patch.object(server, "native_review_result") as unavailable_spawn:
+                unavailable_status, unavailable, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, body
+                )
+            unavailable_spawn.assert_not_called()
+            self.assertEqual((unavailable_status, set(unavailable)), (501, {"error", "code"}))
+
+        for instance in (busy, mismatch):
+            self.assertTrue(valid(response_409, instance))
+            self.assertEqual(sum(valid(branch, instance) for branch in response_409["oneOf"]), 1)
+        response_400 = responses["400"]["content"]["application/json"]["schema"]
+        self.assertTrue(valid(response_400, invalid))
+        response_501 = responses["501"]["content"]["application/json"]["schema"]
+        self.assertTrue(valid(response_501, unavailable))
 
     def test_review_alien_replacement_at_terminal_cas_is_preserved_without_callback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -9171,7 +9413,7 @@ while True:
             }
 
             def replace_then_pass(*_args, **_kwargs):
-                self.assertTrue(server.write_job(alien))
+                _replace_persisted_job_fixture(job_id, alien)
                 return {"ok": True, "verdict": "PASS", "no_verdict": False}
 
             with mock.patch.object(
