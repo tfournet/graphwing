@@ -3711,9 +3711,14 @@ while True:
                      mock.patch.object(server, "herdr_job_done"):
                     server.run_agent_job(job_id)
                     saved = server.read_job(job_id)
-                self.assertEqual((saved["status"], saved["receipt"]["status"]), ("failed", "error"), saved)
-                self.assertEqual(saved["receipt"]["failure_code"], "session_provenance_invalid")
-                self.assertEqual(posted.call_args.args[1], saved["receipt"])
+                if case in {"missing_kind", "alien_kind"}:
+                    self.assertEqual(saved["status"], "running", saved)
+                    self.assertIsNone(saved["receipt"], saved)
+                    posted.assert_not_called()
+                else:
+                    self.assertEqual((saved["status"], saved["receipt"]["status"]), ("failed", "error"), saved)
+                    self.assertEqual(saved["receipt"]["failure_code"], "session_provenance_invalid")
+                    self.assertEqual(posted.call_args.args[1], saved["receipt"])
 
     def test_agent_worker_preserves_safe_operational_refresh_without_identity_drift(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3768,6 +3773,72 @@ while True:
             self.assertEqual((saved["status"], saved["receipt"]["status"]), ("completed", "ok"), saved)
             self.assertEqual(saved["webhook_attempts"], 2)
             self.assertEqual(posted.call_args.args[1], saved["receipt"])
+
+    def test_agent_worker_terminal_transition_rejects_replacement_after_postcheck(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_id = "7b" * 16
+            jdir = jobs / job_id
+            jdir.mkdir(parents=True)
+            binary = root / "codex"
+            binary.write_text("fixture")
+            identity = {
+                "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
+                "native_session_id": None,
+            }
+            job = {
+                "job_id": job_id, "kind": "agent", "status": "queued", "repo": "scratch",
+                "cwd": td, "prompt": "x", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", "session_identity": identity, "created_at": "t",
+                "started_at": None, "finished_at": None, "max_turns": 1,
+                "run_budget_seconds": 30, "receipt": None,
+                "log_ref": str(jdir / "stdout.log"), "error": None, "webhook": None,
+                "response_webhook_url": "https://example.invalid/callback",
+                "response_webhook_token": None,
+            }
+            _stamp_fixture_execution_profile(job, binary)
+            (jdir / "job.json").write_text(json.dumps(job))
+
+            process = mock.Mock(pid=42, returncode=0)
+            process.wait.return_value = 0
+            (jdir / "stdout.log").write_text(
+                '{"type":"thread.started","thread_id":"codex-terminal-race"}\n'
+                + json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message",
+                    "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}',
+                }})
+            )
+            original_match = server.agent_record_matches_execution_snapshot
+            injected = False
+
+            def replace_after_postcheck(current, snapshot):
+                nonlocal injected
+                matched = original_match(current, snapshot)
+                if matched and current.get("status") == "running" and current.get("pid") == 42 and not injected:
+                    injected = True
+                    server.write_job({
+                        "job_id": job_id, "kind": "script", "status": "failed",
+                        "receipt": {"status": "error", "job_id": job_id},
+                        "error": "trusted daemon replacement",
+                    })
+                return matched
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(binary)}), \
+                 mock.patch.object(server, "spawn_writer", return_value=(process, None)), \
+                 mock.patch.object(server, "agent_record_matches_execution_snapshot", side_effect=replace_after_postcheck), \
+                 mock.patch.object(server, "post_receipt", return_value={"ok": True}) as posted, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_agent_job(job_id)
+                saved = server.read_job(job_id)
+
+            self.assertTrue(injected)
+            self.assertEqual(saved["kind"], "script", saved)
+            self.assertEqual(saved["status"], "failed", saved)
+            self.assertEqual(saved["receipt"]["status"], "error", saved)
+            posted.assert_not_called()
 
     def test_native_writer_job_stages_server_attributed_paths_after_valid_receipt(self):
         with tempfile.TemporaryDirectory() as td:
@@ -10001,6 +10072,7 @@ class CodeOffTests(unittest.TestCase):
             },
         })
         server.write_job(job)
+        self.assertTrue(server._codeoff_record_terminal_manifest(job))
         return job["job_id"]
 
     @staticmethod
@@ -11107,6 +11179,121 @@ class CodeOffTests(unittest.TestCase):
         self.assertIsNone(accepted)
         self.assertEqual(error["code"], "agent_receipt_mismatch")
         server.write_job(pristine)
+
+    def test_codeoff_terminal_validation_rejects_coordinated_complete_manifest_drift(self):
+        experiment_id = "terminal-manifest-drift"
+        self._prepare(experiment_id)
+        job_id = self._launch_done(experiment_id, "author-1")
+        pristine = server.read_job(job_id)
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        accepted, error = server._codeoff_validate_job(job_id, state, manifest, "author-1")
+        self.assertIsNone(error)
+        self.assertEqual(accepted, pristine)
+
+        def mutate_identity(job, field, value):
+            job["session_identity"][field] = value
+            job["receipt"]["session_identity"][field] = value
+
+        def mutate_complete_profile(job):
+            if job["launcher"] == "claude":
+                profile = {
+                    "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    "requested_effort": "high", "effective_effort": "high",
+                    "effort_source": "explicit", "launcher_version": "sha256:" + "e" * 64,
+                }
+                source = "codex-rollout-v1"
+            else:
+                profile = {
+                    "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+                    "requested_effort": "default", "effective_effort": "default",
+                    "effort_source": "explicit", "launcher_version": "sha256:" + "e" * 64,
+                }
+                source = "claude-result-v1"
+            job.update(profile)
+            job["receipt"].update(profile)
+            job["session_identity"].update(profile)
+            job["receipt"]["session_identity"].update(profile)
+            job["execution_identity"].update({
+                "launcher": profile["launcher"], "provider": profile["provider"],
+                "model": profile["model"], "source": source,
+            })
+            job["receipt"]["execution_identity"].update(job["execution_identity"])
+
+        cases = {
+            "complete_profile": mutate_complete_profile,
+            "repo": lambda job: (
+                job.__setitem__("repo", "forged-repo"),
+                mutate_identity(job, "repo", "forged-repo"),
+            ),
+            "branch": lambda job: mutate_identity(job, "branch", "forged/branch"),
+            "starting_head": lambda job: mutate_identity(job, "starting_head", "f" * 40),
+            "requested_effective_source": lambda job: (
+                job.update({
+                    "requested_effort": "high", "effective_effort": "high",
+                    "effort_source": "explicit",
+                }),
+                job["receipt"].update({
+                    "requested_effort": "high", "effective_effort": "high",
+                    "effort_source": "explicit",
+                }),
+                job["session_identity"].update({
+                    "requested_effort": "high", "effective_effort": "high",
+                    "effort_source": "explicit",
+                }),
+                job["receipt"]["session_identity"].update({
+                    "requested_effort": "high", "effective_effort": "high",
+                    "effort_source": "explicit",
+                }),
+            ),
+            "launcher_version": lambda job: (
+                job.__setitem__("launcher_version", "sha256:" + "f" * 64),
+                job["receipt"].__setitem__("launcher_version", "sha256:" + "f" * 64),
+                mutate_identity(job, "launcher_version", "sha256:" + "f" * 64),
+            ),
+            "native_session_id": lambda job: (
+                mutate_identity(job, "native_session_id", "forged-native-session"),
+                job["execution_identity"].__setitem__("native_session_id", "forged-native-session"),
+                job["receipt"]["execution_identity"].__setitem__("native_session_id", "forged-native-session"),
+            ),
+            "launch_native_session_id": lambda job: job.__setitem__(
+                "launch_native_session_id", "forged-launch-session"
+            ),
+            "missing_launch_native_session_id": lambda job: job.pop("launch_native_session_id"),
+            "missing_top_level_branch": lambda job: job.pop("branch"),
+            "job_id": lambda job: (
+                job.__setitem__("job_id", "e" * 32),
+                job["receipt"].__setitem__("job_id", "e" * 32),
+            ),
+        }
+        for case, mutate in cases.items():
+            with self.subTest(case=case):
+                forged = deepcopy(pristine)
+                mutate(forged)
+                # Keep the original storage location: this is mutation of one
+                # mutable record, not creation of another job.
+                (self.jobs / job_id / "job.json").write_text(json.dumps(forged))
+                accepted, error = server._codeoff_validate_job(
+                    job_id, state, manifest, "author-1"
+                )
+                self.assertIsNone(accepted)
+                self.assertEqual(error["code"], "agent_receipt_mismatch")
+
+        for case, mutate_state in {
+            "missing_manifest": lambda checked: checked.pop("execution_manifests"),
+            "unknown_manifest": lambda checked: checked["execution_manifests"]["author-1"][job_id].update({
+                "launch_manifest_hash": "f" * 64,
+            }),
+        }.items():
+            with self.subTest(case=case):
+                checked_state = deepcopy(state)
+                mutate_state(checked_state)
+                accepted, error = server._codeoff_validate_job(
+                    job_id, checked_state, manifest, "author-1"
+                )
+                self.assertIsNone(accepted)
+                self.assertEqual(error["code"], "agent_receipt_mismatch")
+        (self.jobs / job_id / "job.json").write_text(json.dumps(pristine))
 
     def test_nonterminal_agent_receipt_remains_retryable(self):
         self._prepare()
