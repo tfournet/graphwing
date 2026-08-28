@@ -104,6 +104,29 @@ NATIVE_LAUNCHERS = {
 }
 EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
+REVIEW_EXECUTION_VERSION = "review-execution-v1"
+REVIEW_PERMISSION_PROFILES = {
+    "codex": "codex-read-only",
+    "claude": "claude-plan",
+    "grok": "grok-read-only-acp",
+}
+REVIEW_REQUEST_FIELDS = frozenset({
+    "repo", "launcher", "provider", "model", "prompt", "effort", "async",
+    "run_budget_seconds", "max_turns", "response_webhook_url",
+    "response_webhook_token",
+})
+REVIEW_IDENTITY_FIELDS = (
+    "version", "kind", "launcher", "provider", "model", "requested_effort",
+    "effective_effort", "effort_source", "launcher_version", "repo", "branch",
+    "starting_head", "prompt_sha256", "diff_sha256", "run_budget_seconds",
+    "max_turns", "permission_profile",
+)
+REVIEW_JOB_IDENTITY_FIELDS = (
+    "launcher", "provider", "model", "requested_effort", "effective_effort",
+    "effort_source", "launcher_version", "repo", "branch", "starting_head",
+    "prompt_sha256", "diff_sha256", "run_budget_seconds", "max_turns",
+    "permission_profile",
+)
 # Native support proven against the installed launcher contracts. Graphwing's
 # closed vocabulary deliberately excludes launcher-only aliases such as xhigh.
 EFFORT_PROFILES = {
@@ -122,12 +145,14 @@ EFFORT_PROFILES = {
     ("claude", "anthropic", "claude-fable-5"): {
         "default": "default", "low": "low", "medium": "medium", "high": "high", "max": "max",
     },
-    ("grok", "xai", "grok-4.6"): {"default": "default"},
+    ("grok", "xai", "grok-4.6"): {
+        "default": "high", "low": "low", "medium": "medium", "high": "high",
+    },
 }
 NATIVE_EFFORT_VALUES = {
     "codex": {"low": "low", "medium": "medium", "high": "high", "max": "max"},
     "claude": {"default": None, "low": "low", "medium": "medium", "high": "high", "max": "max"},
-    "grok": {"default": "default"},
+    "grok": {"low": "low", "medium": "medium", "high": "high"},
 }
 
 
@@ -2777,6 +2802,9 @@ def native_review_result(
     max_turns: int = REVIEW_MAX_TURNS,
     requested_effort: str = "default",
     effort_source: str = "launcher_default",
+    *,
+    binary: Path | None = None,
+    execution_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     spec = NATIVE_LAUNCHERS.get(launcher)
@@ -2794,12 +2822,20 @@ def native_review_result(
             "ok": False, "verdict": "NACK", "no_verdict": True,
             **(effort_error or {"error": "unsupported effort profile", "code": "unsupported_effort"}),
         }
-    binary = resolve_launcher_binary_now(launcher)
+    binary = binary or resolve_launcher_binary_now(launcher)
     if not binary.is_file():
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                "error": f"{launcher} binary missing: {binary}", "code": "not_implemented"}
+                "error": "review launcher is unavailable", "code": "not_implemented"}
     diff = git_diff(resolved, "HEAD", None)
     diff_text = str(diff.get("diff") or "")[:12000]
+    if execution_identity is not None and not review_runtime_matches_identity(
+        execution_identity, prompt, resolved, diff_text
+    ):
+        return {
+            "ok": False, "verdict": "NACK", "no_verdict": True,
+            "error": "review execution identity changed before launch",
+            "code": "review_execution_identity_mismatch",
+        }
     body_prompt = (
         "Spec-review only. Do not edit files, commit, or push.\n"
         "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
@@ -2901,50 +2937,100 @@ def native_review_result(
     return result
 
 
-def review_receipt(job: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def review_receipt(
+    job: dict[str, Any], result: dict[str, Any], *,
+    identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity = identity or trusted_review_identity(job)
+    code = result.get("code")
+    no_verdict = bool(result.get("no_verdict"))
+    verdict = result.get("verdict") if result.get("verdict") in ("PASS", "NACK") else None
+    if code == "review_execution_identity_mismatch" or identity is None:
+        status, verdict, no_verdict = "error", None, True
+        code, summary = "review_execution_identity_mismatch", "review execution identity mismatch"
+    elif code == "not_implemented":
+        status, verdict, no_verdict = "error", None, True
+        summary = "review launcher unavailable"
+    elif code == "timeout":
+        status, verdict, no_verdict = "error", None, True
+        summary = "review timed out"
+    elif code == "review_failed":
+        status, verdict, no_verdict = "error", None, True
+        summary = "review execution failed"
+    elif result.get("ok") and verdict == "PASS" and not no_verdict:
+        status, code, summary = "ok", None, "review passed"
+    elif verdict == "NACK" and not no_verdict:
+        status, code, summary = "nack", None, "review requested changes"
+    else:
+        status, code, summary = "error", "review_failed", "review returned no verdict"
+        verdict, no_verdict = None, True
     return {
-        "status": "ok" if result.get("ok") else "nack",
+        "ok": status == "ok",
+        "status": status,
         "job_id": job["job_id"],
-        "verdict": result.get("verdict"),
-        "no_verdict": bool(result.get("no_verdict")),
-        "reviewer": job.get("model"),
-        "launcher": job.get("launcher"),
-        "provider": job.get("provider"),
-        "model": job.get("model"),
-        "requested_effort": job.get("requested_effort"),
-        "effective_effort": job.get("effective_effort"),
-        "effort_source": job.get("effort_source"),
-        "summary": str(result.get("summary") or result.get("error") or "")[:500],
-        "compact": result.get("compact") or "",
+        "kind": "review",
+        "verdict": verdict,
+        "no_verdict": no_verdict,
+        "execution_identity": identity,
+        "summary": summary,
+        "code": code,
     }
 
 
 def run_review_job(job_id: str) -> None:
-    job = read_job(job_id)
-    if not job:
+    snapshot = read_review_snapshot(job_id)
+    if snapshot is None:
+        review_fail_invalid_record(job_id, None)
         return
-    job["status"] = "running"
-    job["started_at"] = utcnow()
-    write_job(job)
-    result = native_review_result(
-        job["launcher"], job["provider"], job["model"], job["prompt"],
-        Path(job["cwd"]), job_id=job["job_id"],
-        run_budget_seconds=job["run_budget_seconds"],
-        max_turns=job["max_turns"],
-        requested_effort=job["requested_effort"],
-        effort_source=job["effort_source"],
-    )
-    receipt = review_receipt(job, result)
-    job = read_job(job_id) or job
-    job["finished_at"] = utcnow()
-    job["receipt"] = receipt
-    job["result"] = result
-    job["status"] = "completed"
-    hook = deliver_webhook(job, receipt)
-    if hook is not None:
-        job["webhook"] = hook
-    write_job(job)
-    herdr_job_done(job)
+    job = review_mark_running(job_id, snapshot)
+    if job is None:
+        review_fail_invalid_record(job_id, snapshot)
+        return
+    identity = trusted_review_identity(job)
+    if identity is None:
+        review_fail_invalid_record(job_id, snapshot)
+        return
+    result: dict[str, Any]
+    binary = resolve_launcher_binary_now(str(job["launcher"]))
+    try:
+        with pinned_launcher(binary) as pinned:
+            if (
+                pinned.fingerprint != identity["launcher_version"]
+                or not review_record_matches_snapshot(read_job(job_id), snapshot)
+            ):
+                result = {
+                    "ok": False, "verdict": "NACK", "no_verdict": True,
+                    "code": "review_execution_identity_mismatch",
+                }
+            else:
+                result = native_review_result(
+                    job["launcher"], job["provider"], job["model"], job["prompt"],
+                    Path(job["cwd"]), job_id=job["job_id"],
+                    run_budget_seconds=job["run_budget_seconds"],
+                    max_turns=job["max_turns"],
+                    requested_effort=job["requested_effort"],
+                    effort_source=job["effort_source"],
+                    binary=pinned.path, execution_identity=identity,
+                )
+    except FileNotFoundError:
+        result = {
+            "ok": False, "verdict": "NACK", "no_verdict": True,
+            "code": "not_implemented",
+        }
+    except OSError:
+        result = {
+            "ok": False, "verdict": "NACK", "no_verdict": True,
+            "code": "review_execution_identity_mismatch",
+        }
+    receipt = review_receipt(job, result, identity=identity)
+    terminal, installed = review_terminal_transition(job_id, snapshot, receipt)
+    if terminal is None:
+        return
+    if installed:
+        hook = deliver_webhook(terminal, receipt)
+        if hook is not None:
+            review_set_webhook_result(job_id, snapshot, receipt, hook)
+    herdr_job_done(terminal)
 
 
 def enqueue_review(job: dict[str, Any]) -> None:
@@ -2956,18 +3042,13 @@ def enqueue_review(job: dict[str, Any]) -> None:
 
 
 def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    """Spec-review. Async when a webhook is supplied, otherwise synchronous.
-
-    A real review reads a 12KB diff and thinks, which routinely outlives the
-    Cloudflare tunnel's 120s proxy read timeout: SC-110290's second run died
-    with a 524 mid-review. agentRun already solves this by returning 202 and
-    POSTing the verdict back to a wait node. Do the same here. The sync path
-    stays for direct calls that are not behind the tunnel.
-    """
+    """Run or queue one immutable, read-only native review."""
     data, err = parse_json_object(body)
     if err:
         return 400, err
     assert data is not None
+    if not set(data) <= REVIEW_REQUEST_FIELDS:
+        return 400, {"error": "review request has unsupported fields", "code": "unexpected_fields"}
     launcher = str(data.get("launcher") or "").strip()
     native_spec = NATIVE_LAUNCHERS.get(launcher)
     if native_spec is None:
@@ -2996,7 +3077,6 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
-
     async_requested = data.get("async", False)
     if not isinstance(async_requested, bool):
         return 400, {"error": "async must be a boolean", "code": "bad_async"}
@@ -3024,64 +3104,96 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             ),
             "code": "bad_max_turns",
         }
-
-    if not webhook_url and not async_requested:
-        result = native_review_result(
-            launcher, provider, model, prompt, resolved,
-            run_budget_seconds=run_budget_seconds,
-            max_turns=max_turns,
-            requested_effort=effort_profile["requested_effort"],
-            effort_source=effort_profile["effort_source"],
-        )
-        if result.get("code") == "not_implemented":
-            return 501, result
-        if result.get("code") == "timeout":
-            return 504, result
-        return 200, result
-
-    with JOB_LOCK:
-        if active_job_count() >= AGENT_MAX_CONCURRENT:
-            return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
-        job_id = uuid.uuid4().hex
-        job = {
-            "job_id": job_id,
-            "kind": "review",
-            "status": "queued",
-            "launcher": launcher,
-            "provider": provider,
-            "model": model,
-            **effort_profile,
-            "repo": name,
-            "cwd": str(resolved),
-            "prompt": prompt,
-            "run_budget_seconds": run_budget_seconds,
-            "max_turns": max_turns,
-            "response_webhook_url": webhook_url,
-            "response_webhook_token": webhook_token,
-            "resume_url": webhook_url,
-            "created_at": utcnow(),
-            "started_at": None,
-            "finished_at": None,
-            "receipt": None,
-            "log_ref": str(job_dir(job_id) / "stdout.log"),
-            "error": None,
-            "webhook": None,
-        }
-        job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        write_job(job)
-    enqueue_review(job)
-    return 202, {
-        "ok": True,
-        "job_id": job_id,
+    branch, starting_head, git_err = current_branch_head(resolved)
+    if (
+        git_err or not isinstance(branch, str) or not valid_branch(branch)
+        or not isinstance(starting_head, str) or not GIT_SHA_RE.fullmatch(starting_head)
+    ):
+        return 409, {"error": "review repository identity is unavailable", "code": "git_state_unavailable"}
+    diff_text = str(git_diff(resolved, "HEAD", None).get("diff") or "")[:12000]
+    binary = resolve_launcher_binary_now(launcher)
+    launcher_version = launcher_version_fingerprint(binary)
+    if launcher_version is None:
+        return 501, {"error": "review launcher identity is unavailable", "code": "not_implemented"}
+    identity = {
+        "version": REVIEW_EXECUTION_VERSION,
         "kind": "review",
-        "status": "queued",
         "launcher": launcher,
         "provider": provider,
         "model": model,
         **effort_profile,
+        "launcher_version": launcher_version,
         "repo": name,
-        "poll": f"/v1/agent/jobs/{job_id}",
+        "branch": branch,
+        "starting_head": starting_head,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "diff_sha256": hashlib.sha256(diff_text.encode()).hexdigest(),
+        "run_budget_seconds": run_budget_seconds,
+        "max_turns": max_turns,
+        "permission_profile": REVIEW_PERMISSION_PROFILES[launcher],
     }
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id, "kind": "review", "status": "queued",
+        **{key: identity[key] for key in REVIEW_JOB_IDENTITY_FIELDS},
+        "execution_identity": identity,
+        "cwd": str(resolved), "prompt": prompt,
+        "response_webhook_url": webhook_url,
+        "response_webhook_token": webhook_token,
+        "resume_url": webhook_url,
+        "created_at": utcnow(), "started_at": None, "finished_at": None,
+        "receipt": None, "error": None, "webhook": None,
+    }
+    if not webhook_url and not async_requested:
+        if launcher_version == "missing":
+            result = {
+                "ok": False, "verdict": "NACK", "no_verdict": True,
+                "code": "not_implemented",
+            }
+        else:
+            try:
+                with pinned_launcher(binary) as pinned:
+                    if pinned.fingerprint != launcher_version:
+                        result = {
+                            "ok": False, "verdict": "NACK", "no_verdict": True,
+                            "code": "review_execution_identity_mismatch",
+                        }
+                    else:
+                        result = native_review_result(
+                            launcher, provider, model, prompt, resolved,
+                            run_budget_seconds=run_budget_seconds, max_turns=max_turns,
+                            requested_effort=effort_profile["requested_effort"],
+                            effort_source=effort_profile["effort_source"], binary=pinned.path,
+                            execution_identity=identity,
+                        )
+            except (FileNotFoundError, OSError):
+                result = {
+                    "ok": False, "verdict": "NACK", "no_verdict": True,
+                    "code": "review_execution_identity_mismatch",
+                }
+        receipt = review_receipt(job, result, identity=identity)
+        if result.get("code") == "not_implemented":
+            return 501, receipt
+        if result.get("code") == "timeout":
+            return 504, receipt
+        if result.get("code") == "review_execution_identity_mismatch":
+            return 409, receipt
+        return 200, receipt
+
+    with JOB_LOCK:
+        if active_job_count() >= AGENT_MAX_CONCURRENT:
+            return 409, {"error": "too many in-flight review jobs", "code": "busy"}
+        job_dir(job_id).mkdir(parents=True, exist_ok=True)
+        snapshot = review_execution_snapshot(job)
+        if snapshot is None:
+            return 409, {"error": "review execution identity is invalid", "code": "review_execution_identity_mismatch"}
+        snapshot_hash = write_review_snapshot(job_id, snapshot)
+        job["review_snapshot_sha256"] = snapshot_hash
+        write_job(job)
+    enqueue_review(job)
+    accepted = public_review_job(job)
+    accepted["poll"] = f"/v1/review/jobs/{job_id}"
+    return 202, accepted
 
 
 def gh_json(path: Path, args: list[str]) -> dict[str, Any]:
@@ -3568,7 +3680,7 @@ def summarize_op(path: str, status: int, payload: dict[str, Any] | bytes) -> str
     return " ".join(bits)
 
 
-_ANNOUNCE_SKIP_PREFIX = ("/v1/agent/jobs/",)
+_ANNOUNCE_SKIP_PREFIX = ("/v1/agent/jobs/", "/v1/review/jobs/")
 _ANNOUNCE_SKIP = {
     "/v1/health",
     "/health",
@@ -3673,6 +3785,292 @@ def write_job(job: dict[str, Any]) -> bool:
             return False
         _write_job_unlocked(job)
         return True
+
+
+def _review_snapshot_bytes(snapshot: dict[str, Any]) -> bytes:
+    return json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+
+
+def trusted_review_identity(job: Any) -> dict[str, Any] | None:
+    """Validate a canonical review identity without classifying it as an agent."""
+    if not isinstance(job, dict) or job.get("kind") != "review":
+        return None
+    identity = job.get("execution_identity")
+    if not isinstance(identity, dict) or set(identity) != set(REVIEW_IDENTITY_FIELDS):
+        return None
+    if (
+        identity.get("version") != REVIEW_EXECUTION_VERSION
+        or identity.get("kind") != "review"
+        or job.get("job_id") is None
+        or not isinstance(job.get("job_id"), str)
+        or not JOB_ID_RE.fullmatch(job["job_id"])
+        or job.get("status") not in ("queued", "running", "completed", "failed")
+    ):
+        return None
+    launcher = identity.get("launcher")
+    provider = identity.get("provider")
+    model = identity.get("model")
+    spec = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
+    normalized, effort_err = normalize_effort(
+        str(launcher or ""), str(provider or ""), str(model or ""),
+        identity.get("requested_effort"), str(identity.get("effort_source") or ""),
+    )
+    if (
+        spec is None or provider != spec["provider"] or model not in spec["models"]
+        or effort_err or normalized is None
+        or identity.get("effective_effort") != normalized["effective_effort"]
+        or not isinstance(identity.get("launcher_version"), str)
+        or not LAUNCHER_VERSION_RE.fullmatch(identity["launcher_version"])
+        or not isinstance(identity.get("repo"), str)
+        or not SESSION_REPO_RE.fullmatch(identity["repo"])
+        or not isinstance(identity.get("branch"), str)
+        or not valid_branch(identity["branch"])
+        or not isinstance(identity.get("starting_head"), str)
+        or not GIT_SHA_RE.fullmatch(identity["starting_head"])
+        or not isinstance(identity.get("prompt_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", identity["prompt_sha256"])
+        or not isinstance(identity.get("diff_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", identity["diff_sha256"])
+        or type(identity.get("run_budget_seconds")) is not int
+        or not REVIEW_MIN_BUDGET_SECONDS <= identity["run_budget_seconds"] <= REVIEW_MAX_BUDGET_SECONDS
+        or type(identity.get("max_turns")) is not int
+        or not REVIEW_MIN_REQUEST_TURNS <= identity["max_turns"] <= REVIEW_MAX_REQUEST_TURNS
+        or identity.get("permission_profile") != REVIEW_PERMISSION_PROFILES[launcher]
+        or any(job.get(key) != identity.get(key) for key in REVIEW_JOB_IDENTITY_FIELDS)
+    ):
+        return None
+    prompt = job.get("prompt")
+    if (
+        not isinstance(prompt, str)
+        or hashlib.sha256(prompt.encode()).hexdigest() != identity["prompt_sha256"]
+        or not isinstance(job.get("cwd"), str)
+    ):
+        return None
+    return dict(identity)
+
+
+def review_execution_snapshot(job: Any) -> dict[str, Any] | None:
+    identity = trusted_review_identity(job)
+    if identity is None or not isinstance(job, dict):
+        return None
+    return {
+        key: json.loads(json.dumps(job.get(key)))
+        for key in (
+            "job_id", "kind", *REVIEW_JOB_IDENTITY_FIELDS, "execution_identity",
+            "cwd", "prompt", "response_webhook_url", "response_webhook_token",
+            "resume_url", "created_at",
+        )
+    }
+
+
+def write_review_snapshot(job_id: str, snapshot: dict[str, Any]) -> str:
+    raw = _review_snapshot_bytes(snapshot)
+    digest = hashlib.sha256(raw).hexdigest()
+    path = job_dir(job_id) / "review-snapshot.json"
+    if path.exists():
+        if path.read_bytes() != raw:
+            raise OSError("review snapshot already exists with different bytes")
+        return digest
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("could not write review snapshot")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return digest
+
+
+def read_review_snapshot(job_id: str) -> dict[str, Any] | None:
+    path = job_dir(job_id) / "review-snapshot.json"
+    try:
+        raw = path.read_bytes()
+        snapshot = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("job_id") != job_id
+        or snapshot.get("kind") != "review"
+        or _review_snapshot_bytes(snapshot) != raw
+    ):
+        return None
+    return snapshot
+
+
+def review_record_matches_snapshot(job: Any, snapshot: dict[str, Any]) -> bool:
+    if not isinstance(job, dict):
+        return False
+    expected_hash = hashlib.sha256(_review_snapshot_bytes(snapshot)).hexdigest()
+    return bool(
+        job.get("review_snapshot_sha256") == expected_hash
+        and review_execution_snapshot(job) == snapshot
+    )
+
+
+def review_mark_running(job_id: str, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if (
+            not review_record_matches_snapshot(current, snapshot)
+            or current.get("status") != "queued"
+        ):
+            return None
+        current["status"] = "running"
+        current["started_at"] = utcnow()
+        _write_job_unlocked(current)
+        return current
+
+
+def _restore_review_snapshot(current: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    for key, value in snapshot.items():
+        current[key] = json.loads(json.dumps(value))
+    current["review_snapshot_sha256"] = hashlib.sha256(
+        _review_snapshot_bytes(snapshot)
+    ).hexdigest()
+
+
+def review_fail_invalid_record(
+    job_id: str, snapshot: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if not (
+            isinstance(current, dict) and current.get("job_id") == job_id
+            and current.get("kind") == "review"
+            and current.get("status") in ("queued", "running")
+        ):
+            return None
+        if snapshot is not None:
+            _restore_review_snapshot(current, snapshot)
+        identity = trusted_review_identity(current)
+        failure = review_receipt(
+            current,
+            {"ok": False, "no_verdict": True, "code": "review_execution_identity_mismatch"},
+            identity=identity,
+        )
+        current.update({
+            "status": "failed", "finished_at": utcnow(), "receipt": failure,
+            "error": "review execution identity mismatch",
+        })
+        _write_job_unlocked(current)
+        return current
+
+
+def review_terminal_transition(
+    job_id: str, snapshot: dict[str, Any], receipt: dict[str, Any]
+) -> tuple[dict[str, Any] | None, bool]:
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if not (
+            review_record_matches_snapshot(current, snapshot)
+            and current.get("status") == "running"
+            and receipt.get("execution_identity") == current.get("execution_identity")
+        ):
+            return review_fail_invalid_record(job_id, snapshot), False
+        current.update({
+            "status": (
+                "failed" if receipt.get("code") == "review_execution_identity_mismatch"
+                else "completed"
+            ),
+            "finished_at": utcnow(), "receipt": receipt,
+            "error": None,
+        })
+        _write_job_unlocked(current)
+        return current, True
+
+
+def review_set_webhook_result(
+    job_id: str, snapshot: dict[str, Any], receipt: dict[str, Any], hook: dict[str, Any]
+) -> bool:
+    with job_record_lock(job_id):
+        current = _read_job_unlocked(job_id)
+        if not (
+            review_record_matches_snapshot(current, snapshot)
+            and current.get("status") in ("completed", "failed")
+            and current.get("receipt") == receipt
+        ):
+            return False
+        current["webhook"] = hook
+        _write_job_unlocked(current)
+        return True
+
+
+def is_review_job_record(job: Any) -> bool:
+    if not isinstance(job, dict):
+        return False
+    snapshot = read_review_snapshot(str(job.get("job_id") or ""))
+    return bool(snapshot is not None and review_record_matches_snapshot(job, snapshot))
+
+
+def public_review_job(job: dict[str, Any]) -> dict[str, Any]:
+    identity = trusted_review_identity(job)
+    receipt = job.get("receipt")
+    return {
+        "ok": True,
+        "job_id": job.get("job_id"),
+        "kind": "review",
+        "status": job.get("status"),
+        "execution_identity": identity,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "receipt": receipt if isinstance(receipt, dict) else None,
+        "poll": f"/v1/review/jobs/{job.get('job_id')}",
+    }
+
+
+def review_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"job_id", "timeout_seconds"}:
+        return 400, {"error": "review wait requires only job_id and timeout_seconds", "code": "unexpected_fields"}
+    job_id = data.get("job_id")
+    timeout = data.get("timeout_seconds")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"error": "invalid job_id", "code": "bad_job_id"}
+    if isinstance(timeout, str):
+        if not re.fullmatch(r"[0-9]{1,4}", timeout):
+            return 400, {"error": "timeout_seconds must be 1..1800", "code": "bad_timeout"}
+        timeout = int(timeout)
+    if type(timeout) is not int or not 1 <= timeout <= 1800:
+        return 400, {"error": "timeout_seconds must be 1..1800", "code": "bad_timeout"}
+    deadline = time.monotonic() + timeout
+    while True:
+        job = read_job(job_id)
+        if not is_review_job_record(job):
+            return 404, {"error": "review job not found", "code": "not_found"}
+        assert isinstance(job, dict)
+        if job.get("status") not in ("queued", "running"):
+            return 200, public_review_job(job)
+        if time.monotonic() >= deadline:
+            return 408, {
+                "ok": False, "error": "review did not finish before the bounded wait",
+                "code": "job_wait_timeout", "job_id": job_id,
+            }
+        time.sleep(0.2)
+
+
+def review_runtime_matches_identity(
+    identity: dict[str, Any], prompt: str, resolved: Path, diff_text: str
+) -> bool:
+    branch, head, err = current_branch_head(resolved)
+    return bool(
+        set(identity) == set(REVIEW_IDENTITY_FIELDS)
+        and identity.get("version") == REVIEW_EXECUTION_VERSION
+        and identity.get("kind") == "review"
+        and err is None
+        and branch == identity.get("branch")
+        and head == identity.get("starting_head")
+        and hashlib.sha256(prompt.encode()).hexdigest() == identity.get("prompt_sha256")
+        and hashlib.sha256(diff_text.encode()).hexdigest() == identity.get("diff_sha256")
+    )
 
 
 AGENT_PROFILE_FIELDS = (
@@ -7668,6 +8066,18 @@ def dispatch_inner(
     if method == "POST" and path == "/v1/review/run":
         status, payload = review_run(body, repos)
         return json_out(status, payload)
+    if method == "POST" and path == "/v1/review/jobs/wait":
+        status, payload = review_job_wait(body)
+        return json_out(status, payload)
+    if method == "GET" and path.startswith("/v1/review/jobs/"):
+        job_id = path.removeprefix("/v1/review/jobs/").strip("/")
+        if not JOB_ID_RE.fullmatch(job_id):
+            return json_out(400, {"error": "invalid job_id", "code": "bad_job_id"})
+        job = read_job(job_id)
+        if not is_review_job_record(job):
+            return json_out(404, {"error": "review job not found", "code": "not_found"})
+        assert isinstance(job, dict)
+        return json_out(200, public_review_job(job))
     if method == "POST" and path == "/v1/slice/e2e":
         status, payload = slice_e2e(body, repos)
         return json_out(status, payload)

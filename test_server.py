@@ -32,7 +32,7 @@ def _fixture_execution_profile(
         # outside the public AgentRun contract.
         profile = {
             "requested_effort": requested,
-            "effective_effort": "high" if launcher == "codex" else "default",
+            "effective_effort": "high" if launcher in {"codex", "grok"} else "default",
             "effort_source": source,
         }
     version_bytes = (
@@ -403,7 +403,7 @@ class DispatchTests(unittest.TestCase):
     def test_agent_run_rejects_unsupported_effort(self):
         body = json.dumps({
             "prompt": "bounded fixture", "cwd": "scratch", "launcher": "grok",
-            "provider": "xai", "model": "grok-4.6", "effort": "high",
+            "provider": "xai", "model": "grok-4.6", "effort": "max",
         }).encode()
         with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
              mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("provider execution forbidden")):
@@ -415,7 +415,7 @@ class DispatchTests(unittest.TestCase):
         cases = (
             ("codex", "openai", "gpt-5.6-sol", "high"),
             ("claude", "anthropic", "claude-opus-5", "default"),
-            ("grok", "xai", "grok-4.6", "default"),
+            ("grok", "xai", "grok-4.6", "high"),
         )
         for launcher, provider, model, effective in cases:
             with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as td:
@@ -2880,7 +2880,9 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("resume", initial_cmd)
         self.assertEqual(initial_cmd[-1], "-")
 
-    def _adapter_contract_job(self, launcher, provider, model, requested, effective):
+    def _adapter_contract_job(
+        self, launcher, provider, model, requested, effective, source=None
+    ):
         return {
             "job_id": "ab" * 16,
             "cwd": str(self.scratch),
@@ -2889,7 +2891,9 @@ class DispatchTests(unittest.TestCase):
             "model": model,
             "requested_effort": requested,
             "effective_effort": effective,
-            "effort_source": "explicit" if requested != "default" else "launcher_default",
+            "effort_source": source or (
+                "explicit" if requested != "default" else "launcher_default"
+            ),
             "max_turns": 12,
             "session_identity": {"native_session_id": None},
         }
@@ -2969,29 +2973,35 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
 
     def test_grok_acp_command_uses_effective_effort(self):
-        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "default", "default")
+        job = self._adapter_contract_job(
+            "grok", "xai", "grok-4.6", "default", "high"
+        )
         cmd = server.grok_acp_command(job, Path("/fixture/grok"), mode="writer")
         self.assertEqual(
             cmd,
             [
                 "/fixture/grok", "agent", "--always-approve", "--model", "grok-4.6",
-                "--reasoning-effort", "default", "stdio",
+                "--reasoning-effort", "high", "stdio",
             ],
         )
+        self.assertNotIn("default", cmd)
 
     def test_grok_review_uses_reviewer_effort(self):
-        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "default", "default")
+        job = self._adapter_contract_job(
+            "grok", "xai", "grok-4.6", "default", "high"
+        )
         cmd = server.grok_acp_command(job, Path("/fixture/grok"), mode="review")
         self.assertEqual(
             cmd,
             [
                 "/fixture/grok", "agent", "--model", "grok-4.6",
-                "--reasoning-effort", "default", "stdio",
+                "--reasoning-effort", "high", "stdio",
             ],
         )
+        self.assertNotIn("default", cmd)
 
     def test_grok_unsupported_effort_fails_before_process_launch(self):
-        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "high", "high")
+        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "max", "max")
         with mock.patch.object(
             server.subprocess, "Popen", side_effect=AssertionError("process must not launch")
         ) as popen:
@@ -3001,59 +3011,125 @@ class DispatchTests(unittest.TestCase):
         popen.assert_not_called()
 
     def test_all_native_adapters_bind_execution_profile(self):
-        cases = tuple(
-            (launcher, provider, model, requested, effective)
-            for (launcher, provider, model), supported in server.EFFORT_PROFILES.items()
-            for requested, effective in supported.items()
+        # Independent contract: do not derive expected rows from implementation tables.
+        expected_profiles = {
+            ("codex", "openai", "gpt-5.6-sol"): (
+                ("default", "high", "launcher_default"),
+                ("default", "high", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"), ("max", "max", "explicit"),
+            ),
+            ("codex", "openai", "gpt-5.6-terra"): (
+                ("default", "high", "launcher_default"),
+                ("default", "high", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"), ("max", "max", "explicit"),
+            ),
+            ("claude", "anthropic", "claude-opus-5"): (
+                ("default", "default", "launcher_default"),
+                ("default", "default", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"), ("max", "max", "explicit"),
+            ),
+            ("claude", "anthropic", "claude-sonnet-5"): (
+                ("default", "default", "launcher_default"),
+                ("default", "default", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"), ("max", "max", "explicit"),
+            ),
+            ("claude", "anthropic", "claude-fable-5"): (
+                ("default", "default", "launcher_default"),
+                ("default", "default", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"), ("max", "max", "explicit"),
+            ),
+            ("grok", "xai", "grok-4.6"): (
+                ("default", "high", "launcher_default"),
+                ("default", "high", "explicit"),
+                ("low", "low", "explicit"), ("medium", "medium", "explicit"),
+                ("high", "high", "explicit"),
+            ),
+        }
+        self.assertEqual(
+            server.EFFORT_PROFILES,
+            {
+                identity: {requested: effective for requested, effective, _ in rows}
+                for identity, rows in expected_profiles.items()
+            },
         )
-        for launcher, provider, model, requested, effective in cases:
-            for mode in ("writer", "review"):
-                with self.subTest(launcher=launcher, mode=mode):
-                    job = self._adapter_contract_job(
-                        launcher, provider, model, requested, effective
-                    )
-                    if launcher == "codex":
-                        cmd = server.codex_command(
-                            job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
-                            Path("/fixture/codex"),
-                            sandbox="workspace-write" if mode == "writer" else "read-only",
+        observed = 0
+        for (launcher, provider, model), rows in expected_profiles.items():
+            for requested, effective, source in rows:
+                for mode in ("writer", "review"):
+                    observed += 1
+                    with self.subTest(
+                        launcher=launcher, model=model, requested=requested,
+                        source=source, mode=mode,
+                    ):
+                        job = self._adapter_contract_job(
+                            launcher, provider, model, requested, effective, source
                         )
-                        native_effort = [
-                            value.split("=", 1)[1]
-                            for value in cmd if value.startswith("model_reasoning_effort=")
-                        ]
-                        permission = cmd[cmd.index("--sandbox") + 1]
-                    elif launcher == "claude":
-                        cmd = server.claude_command(
-                            job, "fixture", "/fixture/repo", Path("/fixture/claude"),
-                            permission_mode="acceptEdits" if mode == "writer" else "plan",
-                            output_format="json" if mode == "writer" else "text",
+                        if launcher == "codex":
+                            cmd = server.codex_command(
+                                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                                Path("/fixture/codex"),
+                                sandbox="workspace-write" if mode == "writer" else "read-only",
+                            )
+                            tokens = [
+                                (index, cmd[index + 1].split("=", 1)[1])
+                                for index, value in enumerate(cmd[:-1])
+                                if value == "-c" and cmd[index + 1].startswith("model_reasoning_effort=")
+                            ]
+                            permission = cmd[cmd.index("--sandbox") + 1]
+                            self.assertEqual(len(tokens), 1)
+                            self.assertLess(tokens[0][0], cmd.index("-C"))
+                        elif launcher == "claude":
+                            cmd = server.claude_command(
+                                job, "fixture", "/fixture/repo", Path("/fixture/claude"),
+                                permission_mode="acceptEdits" if mode == "writer" else "plan",
+                                output_format="json" if mode == "writer" else "text",
+                            )
+                            positions = [i for i, value in enumerate(cmd) if value == "--effort"]
+                            tokens = [(i, cmd[i + 1]) for i in positions]
+                            permission = cmd[cmd.index("--permission-mode") + 1]
+                            self.assertEqual(len(tokens), 0 if effective == "default" else 1)
+                            if tokens:
+                                self.assertLess(tokens[0][0], len(cmd) - 1)
+                        else:
+                            cmd = server.grok_acp_command(
+                                job, Path("/fixture/grok"), mode=mode
+                            )
+                            positions = [
+                                i for i, value in enumerate(cmd) if value == "--reasoning-effort"
+                            ]
+                            tokens = [(i, cmd[i + 1]) for i in positions]
+                            permission = (
+                                "always-approve" if "--always-approve" in cmd else "read-only-acp"
+                            )
+                            self.assertEqual(len(tokens), 1)
+                            self.assertLess(tokens[0][0], cmd.index("stdio"))
+                            self.assertNotEqual(tokens[0][1], "default")
+                        self.assertEqual(cmd[cmd.index("--model") + 1], model)
+                        self.assertEqual(
+                            [value for _, value in tokens],
+                            [] if launcher == "claude" and effective == "default" else [effective],
                         )
-                        native_effort = (
-                            [cmd[cmd.index("--effort") + 1]] if "--effort" in cmd else []
+                        self.assertEqual(job["provider"], provider)
+                        self.assertEqual(job["requested_effort"], requested)
+                        self.assertEqual(job["effective_effort"], effective)
+                        self.assertEqual(job["effort_source"], source)
+                        self.assertEqual(
+                            permission,
+                            {
+                                ("codex", "writer"): "workspace-write",
+                                ("codex", "review"): "read-only",
+                                ("claude", "writer"): "acceptEdits",
+                                ("claude", "review"): "plan",
+                                ("grok", "writer"): "always-approve",
+                                ("grok", "review"): "read-only-acp",
+                            }[(launcher, mode)],
                         )
-                        permission = cmd[cmd.index("--permission-mode") + 1]
-                    else:
-                        cmd = server.grok_acp_command(job, Path("/fixture/grok"), mode=mode)
-                        native_effort = [cmd[cmd.index("--reasoning-effort") + 1]]
-                        permission = "always-approve" if "--always-approve" in cmd else "read-only-acp"
-                    self.assertEqual(cmd[cmd.index("--model") + 1], model)
-                    self.assertEqual(
-                        native_effort,
-                        [] if launcher == "claude" and effective == "default" else [effective],
-                    )
-                    self.assertEqual(job["provider"], provider)
-                    self.assertEqual(job["requested_effort"], requested)
-                    self.assertEqual(job["effective_effort"], effective)
-                    expected_permission = {
-                        ("codex", "writer"): "workspace-write",
-                        ("codex", "review"): "read-only",
-                        ("claude", "writer"): "acceptEdits",
-                        ("claude", "review"): "plan",
-                        ("grok", "writer"): "always-approve",
-                        ("grok", "review"): "read-only-acp",
-                    }[(launcher, mode)]
-                    self.assertEqual(permission, expected_permission)
+        self.assertEqual(observed, 70)
 
     def test_native_adapter_source_has_no_dead_hardcoded_effort_setting(self):
         source = Path(server.__file__).read_text()
@@ -3260,7 +3336,12 @@ while True:
         native_launchers["grok"]["models"] = tuple(dict.fromkeys(
             (*native_launchers["grok"]["models"], model)
         ))
-        effort_profiles = {**server.EFFORT_PROFILES, ("grok", "xai", model): {"default": "default"}}
+        effort_profiles = {
+            **server.EFFORT_PROFILES,
+            ("grok", "xai", model): {
+                "default": "high", "low": "low", "medium": "medium", "high": "high",
+            },
+        }
         with mock.patch.object(server, "JOBS_DIR", jobs), \
              mock.patch.object(server, "NATIVE_LAUNCHERS", native_launchers), \
              mock.patch.object(server, "EFFORT_PROFILES", effort_profiles), \
@@ -3312,7 +3393,7 @@ while True:
         saved, capture, jdir = self._run_grok_fixture()
         self.assertEqual(capture["argv"], [
             "agent", "--always-approve", "--model", "grok-4.6",
-            "--reasoning-effort", "default", "stdio",
+            "--reasoning-effort", "high", "stdio",
         ])
         self.assertEqual(capture["cwd"], str(jdir.parent.parent.resolve()))
         self.assertEqual(capture["env"], {
@@ -3492,7 +3573,7 @@ while True:
             capture["argv"],
             [
                 "agent", "--always-approve", "--model", "grok-fixture-immutable",
-                "--reasoning-effort", "default", "stdio",
+                "--reasoning-effort", "high", "stdio",
             ],
         )
         self.assertEqual(saved["session_identity"]["model"], "grok-fixture-immutable")
@@ -6757,6 +6838,54 @@ while True:
         for forbidden in ("prompt", "log", "log_ref", "path", "cwd", "token", "provider_output"):
             self.assertNotIn(forbidden, receipt["properties"])
 
+    def test_review_openapi_contract_is_closed_typed_and_complete(self):
+        spec = json.loads(server.openapi_bytes())
+        schemas = spec["components"]["schemas"]
+        request = schemas["ReviewRunRequest"]
+        self.assertFalse(request["additionalProperties"])
+        self.assertEqual(
+            set(request["required"]), {"repo", "launcher", "provider", "model", "prompt"}
+        )
+        self.assertEqual(set(request["properties"]), {
+            "repo", "launcher", "provider", "model", "prompt", "effort", "async",
+            "run_budget_seconds", "max_turns", "response_webhook_url",
+            "response_webhook_token",
+        })
+        identity = schemas["ReviewExecutionIdentity"]
+        self.assertFalse(identity["additionalProperties"])
+        self.assertEqual(set(identity["required"]), set(identity["properties"]))
+        self.assertEqual(identity["properties"]["version"]["const"], "review-execution-v1")
+        self.assertEqual(identity["properties"]["kind"]["const"], "review")
+        receipt = schemas["ReviewReceipt"]
+        job = schemas["ReviewJob"]
+        for schema in (receipt, job):
+            self.assertFalse(schema["additionalProperties"])
+            self.assertEqual(set(schema["required"]), set(schema["properties"]))
+        self.assertEqual(
+            receipt["properties"]["execution_identity"],
+            {"$ref": "#/components/schemas/ReviewExecutionIdentity"},
+        )
+        self.assertEqual(
+            job["properties"]["execution_identity"],
+            {"$ref": "#/components/schemas/ReviewExecutionIdentity"},
+        )
+        run_responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        self.assertEqual(
+            set(run_responses), {"200", "202", "400", "401", "409", "501", "504"}
+        )
+        self.assertEqual(
+            run_responses["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewReceipt",
+        )
+        self.assertEqual(
+            run_responses["202"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewJob",
+        )
+        poll = spec["paths"]["/v1/review/jobs/{job_id}"]["get"]
+        self.assertEqual(set(poll["responses"]), {"200", "400", "401", "404"})
+        wait = spec["paths"]["/v1/review/jobs/wait"]["post"]
+        self.assertEqual(set(wait["responses"]), {"200", "400", "401", "404", "408"})
+
     def test_agent_and_review_effort_are_real_while_graph_effort_remains_unwired(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
@@ -6768,21 +6897,14 @@ while True:
         )
 
         review_request = schemas["ReviewRunRequest"]
-        self.assertNotIn("additionalProperties", review_request)
+        self.assertFalse(review_request["additionalProperties"])
         self.assertEqual(
             review_request["properties"]["effort"]["enum"],
             ["default", "low", "medium", "high", "max"],
         )
-        expected = {
-            "ok": True,
-            "verdict": "PASS",
-            "launcher": "claude",
-            "provider": "anthropic",
-            "model": "claude-sonnet-5",
-            "requested_effort": "medium",
-            "effective_effort": "medium",
-            "effort_source": "explicit",
-            "summary": "fixture",
+        raw_result = {
+            "ok": True, "verdict": "PASS", "no_verdict": False,
+            "summary": "provider prose must not escape", "returncode": 0,
         }
         body = json.dumps({
             "repo": "scratch",
@@ -6792,7 +6914,8 @@ while True:
             "prompt": "bounded fixture",
             "effort": "medium",
         }).encode()
-        with mock.patch.object(server, "native_review_result", return_value=expected) as review, \
+        with mock.patch.object(server, "native_review_result", return_value=raw_result) as review, \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
              mock.patch.object(
                  server, "enqueue_review", side_effect=AssertionError("review process forbidden")
              ):
@@ -6800,19 +6923,22 @@ while True:
                 "POST", "/v1/review/run", {}, True, body
             )
         self.assertEqual(status, 200, payload)
-        self.assertEqual(payload, expected)
-        review.assert_called_once_with(
-            "claude",
-            "anthropic",
-            "claude-sonnet-5",
-            "bounded fixture",
-            self.scratch,
-            run_budget_seconds=server.REVIEW_DEFAULT_BUDGET_SECONDS,
-            max_turns=server.REVIEW_MAX_TURNS,
-            requested_effort="medium",
-            effort_source="explicit",
-        )
-        self.assertEqual(payload["effective_effort"], "medium")
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["summary"], "review passed")
+        self.assertEqual(payload["execution_identity"]["requested_effort"], "medium")
+        self.assertEqual(payload["execution_identity"]["effective_effort"], "medium")
+        self.assertEqual(payload["execution_identity"]["effort_source"], "explicit")
+        self.assertNotIn("provider prose", json.dumps(payload))
+        review.assert_called_once()
+        args, kwargs = review.call_args
+        self.assertEqual(args[:5], (
+            "claude", "anthropic", "claude-sonnet-5", "bounded fixture", self.scratch,
+        ))
+        self.assertEqual(kwargs["run_budget_seconds"], server.REVIEW_DEFAULT_BUDGET_SECONDS)
+        self.assertEqual(kwargs["max_turns"], server.REVIEW_MAX_TURNS)
+        self.assertEqual(kwargs["requested_effort"], "medium")
+        self.assertEqual(kwargs["effort_source"], "explicit")
+        self.assertEqual(kwargs["execution_identity"], payload["execution_identity"])
 
         root = Path(server.__file__).resolve().parent
         checked_nodes = []
@@ -8484,6 +8610,298 @@ while True:
         route = next(m for m in mappings if m["output"] == "route")
         self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
 
+    def _queue_closed_review(self, root, *, effort=None, extra=None):
+        repo = self._scratch_git(root)
+        jobs = root / "jobs"
+        launcher = root / "claude-review-wrapper"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        request = {
+            "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-sonnet-5", "prompt": "bounded ticket", "async": True,
+        }
+        if effort is not None:
+            request["effort"] = effort
+        if extra:
+            request.update(extra)
+        patches = (
+            mock.patch.object(server, "JOBS_DIR", jobs),
+            mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}),
+            mock.patch.object(server, "active_job_count", return_value=0),
+            mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher),
+            mock.patch.object(server, "enqueue_review"),
+        )
+        entered = [patcher.start() for patcher in patches]
+        self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+        )
+        return status, payload, jobs, repo, launcher, entered[-1]
+
+    def test_review_run_rejects_hostile_extras_before_review_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(
+                server, "resolve_launcher_binary_now",
+                side_effect=AssertionError("launcher boundary must not be reached"),
+            ), mock.patch.object(
+                server, "native_review_result",
+                side_effect=AssertionError("review boundary must not be reached"),
+            ):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True,
+                    json.dumps({
+                        "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                        "model": "claude-sonnet-5", "prompt": "ticket",
+                        "hostile_extra": "TOKEN_SECRET /private/path",
+                    }).encode(),
+                )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["code"], "unexpected_fields")
+        self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+
+    def test_sync_review_receipt_identity_matches_command_and_pin_closes_fds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            launcher = root / "claude-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            body = json.dumps({
+                "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                "model": "claude-sonnet-5", "prompt": "bounded ticket", "effort": "medium",
+            }).encode()
+            captured = []
+
+            def pass_review(*args, **kwargs):
+                captured.append((args, kwargs))
+                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+            before = len(list(Path("/proc/self/fd").iterdir()))
+            receipts = []
+            with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "native_review_result", side_effect=pass_review):
+                for _ in range(30):
+                    status, receipt, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, body
+                    )
+                    self.assertEqual(status, 200, receipt)
+                    receipts.append(receipt)
+            after = len(list(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
+        self.assertEqual(len(captured), 30)
+        for receipt, (args, kwargs) in zip(receipts, captured):
+            identity = receipt["execution_identity"]
+            self.assertEqual(kwargs["execution_identity"], identity)
+            self.assertEqual(kwargs["requested_effort"], identity["requested_effort"])
+            self.assertEqual(kwargs["effort_source"], identity["effort_source"])
+            self.assertEqual(kwargs["binary"].parent, Path("/proc/self/fd"))
+            adapter_job = {
+                "launcher": args[0], "provider": args[1], "model": args[2],
+                "requested_effort": identity["requested_effort"],
+                "effective_effort": identity["effective_effort"],
+                "effort_source": identity["effort_source"],
+                "max_turns": identity["max_turns"],
+            }
+            command = server.claude_command(
+                adapter_job, "fixture", str(repo), kwargs["binary"],
+                permission_mode="plan", output_format="text",
+            )
+            self.assertEqual(command[command.index("--effort") + 1], "medium")
+            self.assertEqual(command[command.index("--permission-mode") + 1], "plan")
+
+    def test_review_async_poll_wait_lifecycle_is_closed_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _enqueued = self._queue_closed_review(
+                root, effort="medium"
+            )
+            self.assertEqual(status, 202, accepted)
+            self.assertEqual(accepted["poll"], f"/v1/review/jobs/{accepted['job_id']}")
+            identity = accepted["execution_identity"]
+            self.assertEqual(set(identity), {
+                "version", "kind", "launcher", "provider", "model",
+                "requested_effort", "effective_effort", "effort_source",
+                "launcher_version", "repo", "branch", "starting_head",
+                "prompt_sha256", "diff_sha256", "run_budget_seconds", "max_turns",
+                "permission_profile",
+            })
+            self.assertEqual(identity["version"], "review-execution-v1")
+            self.assertEqual(identity["kind"], "review")
+            self.assertRegex(identity["launcher_version"], r"^sha256:[0-9a-f]{64}$")
+
+            poll_status, queued, _ = server.dispatch(
+                "GET", accepted["poll"], {}, True, b""
+            )
+            self.assertEqual((poll_status, queued["status"]), (200, "queued"))
+            self.assertEqual(queued["execution_identity"], identity)
+            self.assertIsNone(queued["receipt"])
+
+            path = jobs / accepted["job_id"] / "job.json"
+            stored = json.loads(path.read_text())
+            stored["status"] = "running"
+            stored["started_at"] = "2026-08-28T00:00:00Z"
+            path.write_text(json.dumps(stored))
+            poll_status, running, _ = server.dispatch(
+                "GET", accepted["poll"], {}, True, b""
+            )
+            self.assertEqual((poll_status, running["status"]), (200, "running"))
+            with mock.patch.object(server.time, "monotonic", side_effect=[0.0, 2.0]), \
+                 mock.patch.object(server.time, "sleep"):
+                wait_status, timeout, _ = server.dispatch(
+                    "POST", "/v1/review/jobs/wait", {}, True,
+                    json.dumps({"job_id": accepted["job_id"], "timeout_seconds": 1}).encode(),
+                )
+            self.assertEqual(wait_status, 408, timeout)
+            self.assertEqual(timeout["code"], "job_wait_timeout")
+
+            stored["status"] = "queued"
+            stored["started_at"] = None
+            path.write_text(json.dumps(stored))
+            raw_result = {
+                "ok": True, "verdict": "PASS", "no_verdict": False,
+                "summary": "TOKEN_SECRET /private/provider/log", "compact": "raw provider text",
+                "returncode": 0,
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=_launcher), \
+                 mock.patch.object(server, "native_review_result", return_value=raw_result) as review, \
+                 mock.patch.object(server, "herdr_job_done"), \
+                 mock.patch.object(server, "deliver_webhook", return_value=None):
+                server.run_review_job(accepted["job_id"])
+            review.assert_called_once()
+            _args, kwargs = review.call_args
+            self.assertEqual(kwargs["execution_identity"], identity)
+            self.assertEqual(kwargs["requested_effort"], "medium")
+            self.assertEqual(kwargs["effort_source"], "explicit")
+            self.assertEqual(kwargs["binary"].parent, Path("/proc/self/fd"))
+            wait_status, terminal, _ = server.dispatch(
+                "POST", "/v1/review/jobs/wait", {}, True,
+                json.dumps({"job_id": accepted["job_id"], "timeout_seconds": 1}).encode(),
+            )
+            self.assertEqual((wait_status, terminal["status"]), (200, "completed"))
+            self.assertEqual(terminal["execution_identity"], identity)
+            self.assertEqual(terminal["receipt"]["execution_identity"], identity)
+            public = json.dumps(terminal, sort_keys=True)
+            self.assertNotIn("TOKEN_SECRET", public)
+            self.assertNotIn("/private", public)
+            self.assertNotIn("raw provider text", public)
+            self.assertEqual(terminal["receipt"]["summary"], "review passed")
+
+    def test_review_worker_rejects_every_snapshot_drift_before_spawn(self):
+        mutations = (
+            {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"},
+            {"requested_effort": "high", "effective_effort": "high", "effort_source": "explicit"},
+            {"effort_source": "explicit"},
+            {"launcher_version": "sha256:" + "f" * 64},
+            {"execution_identity": None},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                status, accepted, jobs, _repo, launcher, _ = self._queue_closed_review(root)
+                self.assertEqual(status, 202, accepted)
+                path = jobs / accepted["job_id"] / "job.json"
+                stored = json.loads(path.read_text())
+                stored.update(mutation)
+                if isinstance(mutation.get("execution_identity", object()), dict):
+                    pass
+                elif "execution_identity" not in mutation:
+                    stored["execution_identity"].update(mutation)
+                path.write_text(json.dumps(stored))
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                     mock.patch.object(
+                         server, "native_review_result",
+                         side_effect=AssertionError("invalid profile must not spawn"),
+                     ) as spawn, mock.patch.object(server, "herdr_job_done"):
+                    server.run_review_job(accepted["job_id"])
+                spawn.assert_not_called()
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
+                self.assertNotIn("prompt", saved["receipt"])
+                self.assertNotIn("cwd", saved["receipt"])
+
+    def test_review_worker_pins_wrapper_and_rejects_path_mutation_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            accepted_fingerprint = accepted["execution_identity"]["launcher_version"]
+            launcher.write_text("#!/bin/sh\nexit 99\n")
+            self.assertNotEqual(
+                server.launcher_version_fingerprint(launcher), accepted_fingerprint
+            )
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(
+                     server, "native_review_result",
+                     side_effect=AssertionError("mutated wrapper must not spawn"),
+                 ) as spawn, mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(accepted["job_id"])
+            spawn.assert_not_called()
+            saved = json.loads((jobs / accepted["job_id"] / "job.json").read_text())
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
+
+    def test_review_terminal_transition_rejects_source_only_drift_after_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            path = jobs / accepted["job_id"] / "job.json"
+
+            def drift_then_pass(*args, **kwargs):
+                stored = json.loads(path.read_text())
+                stored["effort_source"] = "explicit"
+                stored["execution_identity"]["effort_source"] = "explicit"
+                path.write_text(json.dumps(stored))
+                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "native_review_result", side_effect=drift_then_pass), \
+                 mock.patch.object(server, "herdr_job_done"), \
+                 mock.patch.object(server, "deliver_webhook", return_value=None):
+                server.run_review_job(accepted["job_id"])
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["receipt"]["code"], "review_execution_identity_mismatch")
+            self.assertEqual(
+                saved["execution_identity"], accepted["execution_identity"]
+            )
+
+    def test_review_endpoints_reject_nonreview_kinds_and_agent_endpoint_rejects_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            with mock.patch.object(server, "JOBS_DIR", jobs):
+                for index, kind in enumerate(("agent", "test", "script", "rr", "alien", None), 1):
+                    job_id = f"{index:02x}" * 16
+                    (jobs / job_id).mkdir(parents=True)
+                    (jobs / job_id / "job.json").write_text(json.dumps({
+                        "job_id": job_id, "kind": kind, "status": "queued",
+                    }))
+                    status, payload, _ = server.dispatch(
+                        "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+                    )
+                    self.assertEqual(status, 404, (kind, payload))
+                review_id = "aa" * 16
+                (jobs / review_id).mkdir(parents=True)
+                (jobs / review_id / "job.json").write_text(json.dumps({
+                    "job_id": review_id, "kind": "review", "status": "queued",
+                }))
+                status, _, _ = server.dispatch(
+                    "GET", f"/v1/agent/jobs/{review_id}", {}, True, b""
+                )
+                self.assertEqual(status, 404)
+                for bad_id in ("bad", "ff" * 16):
+                    status, payload, _ = server.dispatch(
+                        "GET", f"/v1/review/jobs/{bad_id}", {}, True, b""
+                    )
+                    self.assertEqual(status, 400 if bad_id == "bad" else 404, payload)
+
     def test_review_run_is_async_when_given_a_webhook(self):
         body = json.dumps({
             "repo": "scratch", "launcher": "claude", "provider": "anthropic",
@@ -8498,11 +8916,12 @@ while True:
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
                 status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+        assert isinstance(payload, dict)
         self.assertEqual(status, 202, payload)
         self.assertEqual(payload["status"], "queued")
         self.assertEqual(payload["kind"], "review")
         self.assertEqual(
-            (payload["launcher"], payload["provider"], payload["model"]),
+            tuple(payload["execution_identity"][key] for key in ("launcher", "provider", "model")),
             ("claude", "anthropic", "claude-sonnet-5"),
         )
         self.assertTrue(payload["job_id"])
@@ -8567,40 +8986,36 @@ while True:
 
     def test_review_job_uses_persisted_budget_and_retains_timeout_receipt(self):
         with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs"
-            job_id = "ab" * 16
-            job = {
-                "job_id": job_id, "kind": "review", "status": "queued",
-                "launcher": "claude", "provider": "anthropic", "model": "claude-sonnet-5",
-                "requested_effort": "high", "effective_effort": "high",
-                "effort_source": "explicit",
-                "repo": "scratch", "cwd": td, "prompt": "ticket",
-                "run_budget_seconds": 600, "max_turns": 20, "response_webhook_url": None,
-                "response_webhook_token": None, "resume_url": None,
-                "created_at": "t", "started_at": None, "finished_at": None,
-                "receipt": None, "log_ref": str(jobs / job_id / "stdout.log"),
-                "error": None, "webhook": None,
-            }
-            (jobs / job_id).mkdir(parents=True)
-            (jobs / job_id / "job.json").write_text(json.dumps(job))
+            root = Path(td)
+            status, accepted, jobs, repo, _launcher, _ = self._queue_closed_review(
+                root, effort="high", extra={"run_budget_seconds": 600, "max_turns": 20}
+            )
+            assert isinstance(accepted, dict)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
             timed_out = {
                 "ok": False, "verdict": "NACK", "no_verdict": True,
-                "launcher": "claude", "provider": "anthropic", "model": "claude-sonnet-5",
-                "reviewer": "claude-sonnet-5", "summary": "review timed out",
-                "compact": "timeout", "returncode": 1, "code": "timeout",
+                "summary": "provider timeout detail", "compact": "timeout",
+                "returncode": 1, "code": "timeout",
             }
-            with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "native_review_result", return_value=timed_out) as review, \
+            with mock.patch.object(server, "native_review_result", return_value=timed_out) as review, \
                  mock.patch.object(server, "herdr_job_done"):
                 server.run_review_job(job_id)
             saved = json.loads((jobs / job_id / "job.json").read_text())
-        review.assert_called_once_with(
-            "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td),
-            job_id=job_id, run_budget_seconds=600, max_turns=20,
-            requested_effort="high", effort_source="explicit",
-        )
+        review.assert_called_once()
+        args, kwargs = review.call_args
+        self.assertEqual(args[:4], ("claude", "anthropic", "claude-sonnet-5", "bounded ticket"))
+        self.assertEqual(args[4], repo)
+        self.assertEqual(kwargs["job_id"], job_id)
+        self.assertEqual(kwargs["run_budget_seconds"], 600)
+        self.assertEqual(kwargs["max_turns"], 20)
+        self.assertEqual(kwargs["requested_effort"], "high")
+        self.assertEqual(kwargs["effort_source"], "explicit")
+        self.assertEqual(kwargs["execution_identity"], accepted["execution_identity"])
+        self.assertEqual(kwargs["binary"].parent, Path("/proc/self/fd"))
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(saved["receipt"]["status"], "nack")
+        self.assertEqual(saved["receipt"]["status"], "error")
+        self.assertEqual(saved["receipt"]["code"], "timeout")
         self.assertTrue(saved["receipt"]["no_verdict"])
         self.assertEqual(saved["receipt"]["summary"], "review timed out")
 
@@ -8609,7 +9024,7 @@ while True:
             repo = self._scratch_git(Path(td))
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
                 for request, code in (
-                    ({"repo": "scratch", "reviewer": "terra", "prompt": "x"}, "bad_launcher"),
+                    ({"repo": "scratch", "reviewer": "terra", "prompt": "x"}, "unexpected_fields"),
                     ({"repo": "scratch", "launcher": "codex", "provider": "anthropic", "model": "gpt-5.6-sol", "prompt": "x"}, "bad_model_identity"),
                 ):
                     status, payload, _ = server.dispatch(
@@ -8674,7 +9089,7 @@ while True:
         self.assertEqual(claude_cmd[claude_cmd.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS))
         self.assertEqual(
             grok_capture["argv"],
-            ["agent", "--model", "grok-4.6", "--reasoning-effort", "default", "stdio"],
+            ["agent", "--model", "grok-4.6", "--reasoning-effort", "high", "stdio"],
         )
         initialize = next(
             request for request in grok_capture["requests"]
