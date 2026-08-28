@@ -138,6 +138,24 @@ def normalize_effort(
         "effective_effort": effective,
         "effort_source": source,
     }, None
+
+
+def authoritative_route_effort_profiles(
+    launcher: str, provider: str, model: str, routed_effort: Any
+) -> tuple[dict[str, str], ...]:
+    """Closed profiles attributable to Phase 1 route execution.
+
+    Route-wired evidence uses ``route``. Until Phase 2 wires graph effort into
+    agentRun, omission is also authoritative as the launcher's default profile.
+    Caller-controlled ``explicit`` provenance is never inferred from a route.
+    """
+    profiles: list[dict[str, str]] = []
+    for requested, source in ((routed_effort, "route"), ("default", "launcher_default")):
+        profile, error = normalize_effort(launcher, provider, model, requested, source)
+        if error is None and profile is not None and profile not in profiles:
+            profiles.append(profile)
+    return tuple(profiles)
+
 GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/announcements/update",
     "_x.ai/mcp/init_progress",
@@ -333,6 +351,7 @@ SLICE_BUDGET = {
 }
 REF_NAME_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SESSION_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 JOB_LOCK = threading.Lock()
 REPO_LOCKS_LOCK = threading.Lock()
 REPO_LOCKS: dict[str, threading.RLock] = {}
@@ -2071,11 +2090,19 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
     ):
         return 400, {"error": "receipt session_identity does not match normal route", "code": "primary_provider_mismatch"}
+    parsed_identity, identity_err = parse_session_identity(session_identity)
+    if identity_err or parsed_identity != session_identity:
+        code = "primary_execution_profile_mismatch"
+        return 400, {
+            "error": "primary receipt execution profile does not match normal route",
+            "code": code,
+            "diagnostic": compact_diagnostic(code),
+        }
     failure_code = str(receipt.get("failure_code") or "unknown_failure").strip() or "unknown_failure"
     if failure_code not in PROVIDER_AVAILABILITY_CODES:
         return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
-    expected_effort, expected_effort_err = normalize_effort(
-        normal_launcher, normal_provider, normal_model, primary_route.get("effort"), "route"
+    expected_efforts = authoritative_route_effort_profiles(
+        normal_launcher, normal_provider, normal_model, primary_route.get("effort")
     )
     receipt_source = receipt.get("effort_source")
     receipt_effort, receipt_effort_err = normalize_effort(
@@ -2083,12 +2110,12 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         receipt.get("requested_effort"),
         receipt_source if isinstance(receipt_source, str) and receipt_source in EFFORT_SOURCES else "route",
     )
-    assert expected_effort_err is None and expected_effort is not None
     launcher_version = session_identity.get("launcher_version")
     if (
-        receipt_effort_err is not None or receipt_effort is None
+        not expected_efforts
+        or receipt_effort_err is not None or receipt_effort is None
         or receipt_source not in EFFORT_SOURCES
-        or receipt_effort["effective_effort"] != expected_effort["effective_effort"]
+        or receipt_effort not in expected_efforts
         or any(session_identity.get(key) != value for key, value in receipt_effort.items())
         or any(receipt.get(key) != session_identity.get(key) for key in AGENT_PROFILE_FIELDS)
         or not isinstance(launcher_version, str)
@@ -2250,16 +2277,16 @@ def recovery_job_evidence(
     if any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model")):
         return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
     source = receipt.get("effort_source")
-    route_profile, route_profile_err = normalize_effort(
-        route["launcher"], route["provider"], route["model"], route.get("effort"), "route"
+    route_profiles = authoritative_route_effort_profiles(
+        route["launcher"], route["provider"], route["model"], route.get("effort")
     )
     receipt_profile, receipt_profile_err = normalize_effort(
         route["launcher"], route["provider"], route["model"], receipt.get("requested_effort"),
         source if isinstance(source, str) and source in EFFORT_SOURCES else "route",
     )
     if (
-        route_profile_err or receipt_profile_err or route_profile is None or receipt_profile is None
-        or receipt_profile["effective_effort"] != route_profile["effective_effort"]
+        not route_profiles or receipt_profile_err or receipt_profile is None
+        or receipt_profile not in route_profiles
         or any(identity.get(key) != value for key, value in receipt_profile.items())
         or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
         or source not in EFFORT_SOURCES
@@ -2394,7 +2421,7 @@ def validate_writer_evidence(job_id: Any, repo_name: str, repo: Path, branch: st
     parsed, identity_err = parse_session_identity(identity)
     profile = trusted_agent_profile(job) if isinstance(job, dict) else None
     if not (
-        isinstance(job, dict) and job.get("status") == "completed" and job.get("kind") not in {"test", "script", "rr", "review"}
+        isinstance(job, dict) and is_agent_job_record(job) and job.get("status") == "completed"
         and job.get("repo") == repo_name and job.get("cwd") == str(repo.resolve())
         and isinstance(receipt, dict) and receipt.get("status") == "ok" and receipt.get("job_id") == job_id
         and receipt.get("failure_class") == "none" and receipt.get("failure_code") == "none" and receipt.get("failover_eligible") is False
@@ -3590,6 +3617,7 @@ def is_agent_job_record(job: Any) -> bool:
         return False
     launcher, provider, model = (job.get(key) for key in ("launcher", "provider", "model"))
     identity = job.get("session_identity")
+    parsed_identity, identity_err = parse_session_identity(identity)
     native_spec = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
     ordinary = bool(
         native_spec and provider == native_spec["provider"] and model in native_spec["models"]
@@ -3607,7 +3635,7 @@ def is_agent_job_record(job: Any) -> bool:
     return bool(
         isinstance(job.get("job_id"), str) and JOB_ID_RE.fullmatch(job["job_id"])
         and (ordinary or codeoff)
-        and isinstance(identity, dict)
+        and isinstance(identity, dict) and identity_err is None and parsed_identity == identity
     )
 
 
@@ -4049,10 +4077,17 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
         value = raw.get(key)
         if value is None and key == "native_session_id":
             out[key] = None
-        elif not isinstance(value, str) or not value.strip():
+        elif not isinstance(value, str) or not value or value != value.strip():
             return None, {"error": f"session_identity.{key} is required", "code": "bad_session_identity"}
         else:
-            out[key] = value.strip()
+            out[key] = value
+    if (
+        not SESSION_REPO_RE.fullmatch(out["repo"])
+        or len(out["branch"]) > 255
+        or not valid_branch(out["branch"])
+        or not GIT_SHA_RE.fullmatch(out["starting_head"])
+    ):
+        return None, {"error": "session_identity repository provenance is invalid", "code": "bad_session_identity"}
     session_id = out["native_session_id"]
     if session_id is not None and not NATIVE_SESSION_RE.fullmatch(session_id):
         return None, {"error": "session_identity.native_session_id is invalid", "code": "bad_session_identity"}
@@ -4348,7 +4383,7 @@ def normalize_receipt(
         "launcher": job.get("launcher"),
         "provider": job.get("provider"),
         "model": job.get("model"),
-        "session_identity": identity,
+        "session_identity": parsed_identity if profile_complete else None,
         "requested_effort": requested_effort,
         "effective_effort": effective_effort,
         "effort_source": effort_source,
