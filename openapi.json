@@ -325,7 +325,7 @@
       "post": {
         "operationId": "gitCommit",
         "tags": ["git"],
-        "summary": "Commit in an allowlisted repo. Without writer_job_id, commit the real staged index after optional explicit adds. With writer_job_id, commit only attributed writer paths plus explicit add paths using an isolated index.",
+        "summary": "Commit in an allowlisted repo only with validated writer evidence, or with the complete code-off experiment/final-verification gate. Writer commits use an isolated index containing only attributed writer paths plus explicit add paths.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1091,7 +1091,7 @@
           "final_verification_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "writer_job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$", "description": "Successful writer job whose server-attributed paths are the only model changes committed. The commit fails closed if any attributed path changes after the successful receipt." },
           "add": {
-            "description": "Relative paths to add before commit, or a single path string. Without writer_job_id, paths are added to the real index and omitted add commits the real staged index. With writer_job_id, explicit paths are also added to the real index, but the commit is built from only attributed writer paths plus explicit paths using an isolated index. No .. or absolute paths; add -A is never used.",
+            "description": "Relative paths to add before commit, or a single path string. Explicit adds are accepted only with validated writer evidence or the complete code-off gate. Writer commits use an isolated index containing only attributed writer paths plus explicit paths; code-off commits use the verified staged index. No .. or absolute paths; add -A is never used.",
             "oneOf": [
               { "type": "string" },
               { "type": "array", "items": { "type": "string" } }
@@ -1511,13 +1511,15 @@
       "SessionIdentity": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["launcher", "provider", "model", "effective_effort", "launcher_version", "repo", "branch", "starting_head", "native_session_id"],
+        "required": ["launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "launcher_version", "repo", "branch", "starting_head", "native_session_id"],
         "allOf": [{"$ref":"#/components/schemas/CodeOffIdentityTuple"}],
         "properties": {
           "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
           "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
           "model": { "type": "string", "enum": ["gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "grok-4.6"] },
+          "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
           "effective_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] },
+          "effort_source": { "type": "string", "enum": ["route", "explicit", "launcher_default"] },
           "launcher_version": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64}|missing)$", "description": "Path-free SHA-256 fingerprint of the resolved launcher executable, or missing for an availability-failure job." },
           "repo": { "type": "string" },
           "branch": { "type": "string" },
