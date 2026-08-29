@@ -9753,6 +9753,88 @@ while True:
             self.assertNotIn("raw provider text", public)
             self.assertEqual(terminal["receipt"]["summary"], "review passed")
 
+    def test_review_async_returns_accepted_snapshot_when_worker_finishes_during_enqueue(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            launcher = root / "claude-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            request = {
+                "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                "model": "claude-sonnet-5", "prompt": "bounded ticket", "async": True,
+            }
+            observed = {}
+
+            def finish_before_enqueue_returns(job):
+                observed["accepted"] = json.loads(
+                    server._review_snapshot_bytes(server.public_review_job(job))
+                )
+                server.run_review_job(job["job_id"])
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "enqueue_review", side_effect=finish_before_enqueue_returns), \
+                 mock.patch.object(server, "native_review_result", return_value={
+                     "ok": True, "verdict": "PASS", "no_verdict": False,
+                 }), mock.patch.object(server, "deliver_webhook", return_value=None), \
+                 mock.patch.object(server, "herdr_job_done"):
+                status, accepted, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                )
+                poll_status, terminal, _ = server.dispatch(
+                    "GET", observed["accepted"]["poll"], {}, True, b""
+                )
+
+        self.assertEqual(status, 202, accepted)
+        self.assertEqual(accepted, observed["accepted"])
+        self.assertEqual(set(accepted), {
+            "ok", "job_id", "kind", "status", "execution_identity", "created_at",
+            "started_at", "finished_at", "receipt", "poll",
+        })
+        self.assertEqual((accepted["kind"], accepted["status"]), ("review", "queued"))
+        self.assertIsNone(accepted["started_at"])
+        self.assertIsNone(accepted["finished_at"])
+        self.assertIsNone(accepted["receipt"])
+        self.assertEqual((poll_status, terminal["status"]), (200, "completed"))
+        self.assertEqual(terminal["job_id"], accepted["job_id"])
+        self.assertEqual(terminal["execution_identity"], accepted["execution_identity"])
+        self.assertEqual(terminal["receipt"]["status"], "ok")
+
+    def test_review_async_does_not_enqueue_when_accepted_projection_is_invalid(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            launcher = root / "claude-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            request = {
+                "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+                "model": "claude-sonnet-5", "prompt": "bounded ticket", "async": True,
+            }
+            invalid = {
+                "error": "review record is not canonical", "code": "review_record_invalid",
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "public_review_job", return_value=invalid), \
+                 mock.patch.object(server, "enqueue_review") as enqueue, \
+                 mock.patch.object(server, "native_review_result") as launch:
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                )
+
+        self.assertEqual((status, payload), (409, invalid))
+        enqueue.assert_not_called()
+        launch.assert_not_called()
+        self.assertFalse(server.REVIEW_AUTHORITIES)
+
     def test_review_poll_and_wait_reject_hostile_timestamps_without_leaking(self):
         hostile = "TOKEN_SECRET /private/review https://evil.invalid/provider-output"
         for field, status_value in (("started_at", "running"), ("finished_at", "completed")):
