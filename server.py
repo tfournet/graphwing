@@ -3030,19 +3030,18 @@ def run_review_job(job_id: str) -> None:
     try:
         snapshot = authority.snapshot()
         if snapshot is None:
-            review_fail_invalid_record(job_id, None)
             return
         job = review_mark_running(job_id, snapshot, authority)
         if job is None:
-            review_fail_invalid_record(job_id, snapshot)
             return
         identity = trusted_review_identity(job)
         if identity is None:
-            review_fail_invalid_record(job_id, snapshot)
             return
         if (
             authority.launcher.fingerprint != identity["launcher_version"]
-            or not review_record_matches_authority(read_job(job_id), snapshot, authority)
+            or not review_record_matches_running_authority(
+                read_job(job_id), snapshot, authority
+            )
         ):
             result = {
                 "ok": False, "verdict": "NACK", "no_verdict": True,
@@ -3065,7 +3064,7 @@ def run_review_job(job_id: str) -> None:
         if installed:
             hook = deliver_webhook(terminal, receipt)
             if hook is not None:
-                review_set_webhook_result(job_id, identity, receipt, hook)
+                review_set_webhook_result(job_id, terminal, hook)
         herdr_job_done(terminal)
     finally:
         release_review_authority(job_id)
@@ -3851,10 +3850,10 @@ def _job_terminal_transition_keys() -> set[str]:
 
 
 def write_job(job: dict[str, Any]) -> bool:
-    """Write an ordinary trusted record unless terminal execution authority is sealed.
+    """Write ordinary records, never mutate an accepted/running/terminal review.
 
-    Terminal agent bookkeeping has narrow guarded APIs below.  Returning False
-    makes both queued and same-thread reentrant replacement attempts explicit.
+    Review lifecycle and callback bookkeeping use narrow guarded APIs below.
+    Returning False makes queued and same-thread reentrant replacement attempts explicit.
     """
     job_id = job["job_id"]
     key = str(job_path(job_id).resolve())
@@ -3879,44 +3878,79 @@ def _review_snapshot_bytes(snapshot: dict[str, Any]) -> bytes:
 
 
 class ReviewAuthority:
-    """Process-local, sealed review launch authority; never reconstructed from disk."""
+    """Process-local sealed launch and full running-record CAS authority."""
 
     def __init__(self, snapshot: dict[str, Any], launcher: PinnedLauncher):
         self.snapshot_bytes = _review_snapshot_bytes(snapshot)
         self.snapshot_hash = hashlib.sha256(self.snapshot_bytes).hexdigest()
-        self.snapshot_fd = os.memfd_create(
-            "graphwing-review-snapshot", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
-        )
+        self.snapshot_fd = self._seal_bytes("graphwing-review-snapshot", self.snapshot_bytes)
+        self.running_record_bytes: bytes | None = None
+        self.running_record_hash: str | None = None
+        self.running_record_fd = -1
+        self.launcher = launcher
+        self.claimed = False
+
+    @staticmethod
+    def _seal_bytes(name: str, raw: bytes) -> int:
+        fd = os.memfd_create(name, os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         try:
-            view = memoryview(self.snapshot_bytes)
+            view = memoryview(raw)
             while view:
-                written = os.write(self.snapshot_fd, view)
+                written = os.write(fd, view)
                 if written <= 0:
                     raise OSError("could not seal review authority")
                 view = view[written:]
-            os.lseek(self.snapshot_fd, 0, os.SEEK_SET)
+            os.lseek(fd, 0, os.SEEK_SET)
             seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
-            fcntl.fcntl(self.snapshot_fd, fcntl.F_ADD_SEALS, seals)
-            self.launcher = launcher
-            self.claimed = False
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+            return fd
         except Exception:
-            os.close(self.snapshot_fd)
+            os.close(fd)
             raise
 
-    def snapshot(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _read_sealed_record(fd: int, expected: bytes, digest: str) -> dict[str, Any] | None:
         try:
-            raw = os.pread(self.snapshot_fd, len(self.snapshot_bytes) + 1, 0)
+            raw = os.pread(fd, len(expected) + 1, 0)
             parsed = json.loads(raw)
         except (OSError, json.JSONDecodeError):
             return None
-        if raw != self.snapshot_bytes or hashlib.sha256(raw).hexdigest() != self.snapshot_hash:
+        if raw != expected or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest):
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def snapshot(self) -> dict[str, Any] | None:
+        return self._read_sealed_record(
+            self.snapshot_fd, self.snapshot_bytes, self.snapshot_hash
+        )
+
+    def seal_running_record(self, record: dict[str, Any]) -> bool:
+        """Bind the one exact canonical queued->running transition once."""
+        if self.running_record_fd >= 0:
+            return False
+        raw = _review_snapshot_bytes(record)
+        fd = self._seal_bytes("graphwing-review-running-record", raw)
+        self.running_record_bytes = raw
+        self.running_record_hash = hashlib.sha256(raw).hexdigest()
+        self.running_record_fd = fd
+        return True
+
+    def running_record(self) -> dict[str, Any] | None:
+        if (
+            self.running_record_fd < 0 or self.running_record_bytes is None
+            or self.running_record_hash is None
+        ):
+            return None
+        return self._read_sealed_record(
+            self.running_record_fd, self.running_record_bytes, self.running_record_hash
+        )
+
     def close(self) -> None:
-        if self.snapshot_fd >= 0:
-            os.close(self.snapshot_fd)
-            self.snapshot_fd = -1
+        for attr in ("snapshot_fd", "running_record_fd"):
+            fd = getattr(self, attr)
+            if fd >= 0:
+                os.close(fd)
+                setattr(self, attr, -1)
         self.launcher.close()
 
 
@@ -4065,12 +4099,28 @@ def read_review_snapshot(job_id: str) -> dict[str, Any] | None:
     return snapshot
 
 
+def canonical_review_record(job: Any, allowed_statuses: tuple[str, ...]) -> bool:
+    """Validate one exact closed persisted review state without disk authority."""
+    if (
+        not isinstance(job, dict) or set(job) != REVIEW_JOB_FIELDS
+        or job.get("status") not in allowed_statuses
+        or trusted_review_identity(job) is None
+        or not valid_review_timestamps(job)
+        or not valid_review_operational_fields(job)
+    ):
+        return False
+    return bool(
+        job.get("status") not in ("completed", "failed")
+        or sanitized_review_receipt(job) is not None
+    )
+
+
 def review_record_matches_snapshot(job: Any, snapshot: dict[str, Any]) -> bool:
-    if not isinstance(job, dict):
+    if not canonical_review_record(job, ("queued", "running", "completed", "failed")):
         return False
     expected_hash = hashlib.sha256(_review_snapshot_bytes(snapshot)).hexdigest()
     return bool(
-        job.get("review_snapshot_sha256") == expected_hash
+        hmac.compare_digest(str(job.get("review_snapshot_sha256") or ""), expected_hash)
         and review_execution_snapshot(job) == snapshot
     )
 
@@ -4080,8 +4130,30 @@ def review_record_matches_authority(
 ) -> bool:
     return bool(
         authority.snapshot() == snapshot
-        and authority.snapshot_hash == hashlib.sha256(_review_snapshot_bytes(snapshot)).hexdigest()
+        and hmac.compare_digest(
+            authority.snapshot_hash,
+            hashlib.sha256(_review_snapshot_bytes(snapshot)).hexdigest(),
+        )
         and review_record_matches_snapshot(job, snapshot)
+    )
+
+
+def review_record_matches_running_authority(
+    job: Any, snapshot: dict[str, Any], authority: ReviewAuthority
+) -> bool:
+    """Compare the complete canonical running value to sealed CAS bytes."""
+    sealed = authority.running_record()
+    if (
+        sealed is None or not canonical_review_record(job, ("running",))
+        or not review_record_matches_authority(job, snapshot, authority)
+        or authority.running_record_bytes is None or authority.running_record_hash is None
+    ):
+        return False
+    raw = _review_snapshot_bytes(job)
+    return bool(
+        raw == authority.running_record_bytes
+        and hmac.compare_digest(hashlib.sha256(raw).hexdigest(), authority.running_record_hash)
+        and job == sealed
     )
 
 
@@ -4095,18 +4167,19 @@ def review_mark_running(
             or current.get("status") != "queued"
         ):
             return None
-        current["status"] = "running"
-        current["started_at"] = utcnow()
-        _write_job_unlocked(current)
-        return current
-
-
-def _restore_review_snapshot(current: dict[str, Any], snapshot: dict[str, Any]) -> None:
-    for key, value in snapshot.items():
-        current[key] = json.loads(json.dumps(value))
-    current["review_snapshot_sha256"] = hashlib.sha256(
-        _review_snapshot_bytes(snapshot)
-    ).hexdigest()
+        running = json.loads(json.dumps(current))
+        running.update({
+            "status": "running", "started_at": utcnow(), "finished_at": None,
+            "receipt": None, "error": None, "webhook": None,
+        })
+        if (
+            not canonical_review_record(running, ("running",))
+            or not authority.seal_running_record(running)
+            or not review_record_matches_running_authority(running, snapshot, authority)
+        ):
+            return None
+        _write_job_unlocked(running)
+        return running
 
 
 def close_review_authority_unavailable(job_id: str) -> dict[str, Any] | None:
@@ -4130,57 +4203,11 @@ def close_review_authority_unavailable(job_id: str) -> dict[str, Any] | None:
         return current
 
 
-def review_fail_invalid_record(
-    job_id: str, snapshot: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    with job_record_lock(job_id):
-        current = _read_job_unlocked(job_id)
-        if not (
-            isinstance(current, dict) and current.get("job_id") == job_id
-            and current.get("kind") == "review"
-            and current.get("status") in ("queued", "running")
-        ):
-            return None
-        if snapshot is not None:
-            _restore_review_snapshot(current, snapshot)
-        identity = trusted_review_identity(current)
-        failure = review_receipt(
-            current,
-            {"ok": False, "no_verdict": True, "code": "review_execution_identity_mismatch"},
-            identity=identity,
-        )
-        current.update({
-            "status": "failed", "finished_at": utcnow(), "receipt": failure,
-            "error": "review execution identity mismatch",
-        })
-        _write_job_unlocked(current)
-        return current
-
-
 def review_terminal_transition(
     job_id: str, snapshot: dict[str, Any], authority: ReviewAuthority,
     receipt: dict[str, Any]
 ) -> tuple[dict[str, Any] | None, bool]:
-    """Install exactly one review terminal record with a final guarded CAS."""
-    with job_record_lock(job_id):
-        prepared_from = _read_job_unlocked(job_id)
-        if not (
-            isinstance(prepared_from, dict)
-            and review_record_matches_authority(prepared_from, snapshot, authority)
-            and prepared_from.get("status") == "running"
-            and receipt.get("execution_identity") == prepared_from.get("execution_identity")
-        ):
-            return None, False
-        prepared_from = json.loads(json.dumps(prepared_from))
-    terminal = json.loads(json.dumps(prepared_from))
-    terminal.update({
-        "status": (
-            "failed" if receipt.get("code") == "review_execution_identity_mismatch"
-            else "completed"
-        ),
-        "finished_at": utcnow(), "receipt": json.loads(json.dumps(receipt)),
-        "error": None,
-    })
+    """CAS the exact sealed running value to one canonical terminal value."""
     with job_record_lock(job_id):
         key = str(job_path(job_id).resolve())
         transition_keys = _job_terminal_transition_keys()
@@ -4189,10 +4216,20 @@ def review_terminal_transition(
             persisted = _read_job_unlocked(job_id)
             if (
                 not isinstance(persisted, dict)
-                or persisted != prepared_from
-                or persisted.get("status") != "running"
-                or not review_record_matches_authority(persisted, snapshot, authority)
+                or not review_record_matches_running_authority(persisted, snapshot, authority)
+                or receipt.get("execution_identity") != persisted.get("execution_identity")
             ):
+                return None, False
+            terminal = json.loads(json.dumps(persisted))
+            terminal.update({
+                "status": (
+                    "failed" if receipt.get("code") == "review_execution_identity_mismatch"
+                    else "completed"
+                ),
+                "finished_at": utcnow(), "receipt": json.loads(json.dumps(receipt)),
+                "error": None, "webhook": None,
+            })
+            if not canonical_review_record(terminal, ("completed", "failed")):
                 return None, False
             _write_job_unlocked(terminal)
             return terminal, True
@@ -4201,28 +4238,31 @@ def review_terminal_transition(
 
 
 def review_set_webhook_result(
-    job_id: str, identity: dict[str, Any], receipt: dict[str, Any], hook: dict[str, Any]
+    job_id: str, terminal_revision: dict[str, Any], hook: dict[str, Any]
 ) -> bool:
+    """Apply only webhook bookkeeping to the exact committed terminal revision."""
     with job_record_lock(job_id):
         current = _read_job_unlocked(job_id)
-        if not (
-            isinstance(current, dict)
-            and current.get("kind") == "review"
-            and current.get("status") in ("completed", "failed")
-            and trusted_review_identity(current) == identity
-            and sanitized_review_receipt(current) == receipt
-            and current.get("receipt") == receipt
+        if (
+            not isinstance(current, dict)
+            or not canonical_review_record(terminal_revision, ("completed", "failed"))
+            or terminal_revision.get("webhook") is not None
+            or current != terminal_revision
+            or _review_snapshot_bytes(current) != _review_snapshot_bytes(terminal_revision)
         ):
             return False
         status = hook.get("status") if isinstance(hook, dict) else None
-        if (
-            isinstance(hook, dict) and type(hook.get("ok")) is bool
+        webhook = (
+            {"ok": hook["ok"], "status": status}
+            if isinstance(hook, dict) and type(hook.get("ok")) is bool
             and type(status) is int and 100 <= status <= 599
-        ):
-            current["webhook"] = {"ok": hook["ok"], "status": status}
-        else:
-            current["webhook"] = {"ok": False}
-        _write_job_unlocked(current)
+            else {"ok": False}
+        )
+        updated = json.loads(json.dumps(terminal_revision))
+        updated["webhook"] = webhook
+        if not canonical_review_record(updated, ("completed", "failed")):
+            return False
+        _write_job_unlocked(updated)
         return True
 
 
@@ -4343,12 +4383,19 @@ def is_review_job_record(job: Any) -> bool:
     ):
         return False
     status = job.get("status")
-    if status in ("queued", "running"):
+    if status == "queued":
         authority = review_authority(str(job.get("job_id") or ""))
         snapshot = authority.snapshot() if authority is not None else None
         return bool(
             authority is not None and snapshot is not None
             and review_record_matches_authority(job, snapshot, authority)
+        )
+    if status == "running":
+        authority = review_authority(str(job.get("job_id") or ""))
+        snapshot = authority.snapshot() if authority is not None else None
+        return bool(
+            authority is not None and snapshot is not None
+            and review_record_matches_running_authority(job, snapshot, authority)
         )
     if status in ("completed", "failed"):
         snapshot = read_review_snapshot(str(job.get("job_id") or ""))
