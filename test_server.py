@@ -2045,6 +2045,8 @@ class DispatchTests(unittest.TestCase):
                 self.assertEqual(receipt["diagnostic"]["category"], "provider_availability")
                 self.assertEqual(receipt["diagnostic"]["component"], "binary")
                 self.assertEqual(receipt["summary"], "writer binary unavailable")
+                self.assertIsNone(receipt["usage"])
+                self.assertEqual(receipt["usage_diagnostic"], "usage_not_reported")
                 self.assertNotIn(launcher, receipt["summary"])
 
     def test_wrap_prompt_locks_cwd_and_leaves_staging_to_graph(self):
@@ -2338,7 +2340,10 @@ class DispatchTests(unittest.TestCase):
                 def wait(self, timeout=None):
                     (jdir / "stdout.log").write_text(
                         '{"type":"thread.started","thread_id":"codex-123"}\n'
+                        + '{"type":"turn.started"}\n'
                         + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
+                        + '\n'
+                        + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 25, "cached_input_tokens": 5, "output_tokens": 8}})
                     )
                     return 0
 
@@ -2353,6 +2358,19 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(saved["receipt"]["failure_class"], "repository_state")
             self.assertEqual(saved["receipt"]["failure_code"], "repository_mismatch")
             self.assertNotIn("private detail", json.dumps(saved["receipt"]))
+            self.assertEqual(saved["receipt"]["usage"], {
+                "usage_version": "normalized-usage-v1",
+                "fresh_input_tokens": 20,
+                "cached_input_tokens": 5,
+                "cache_write_tokens": 0,
+                "output_tokens": 8,
+                "reasoning_tokens": 0,
+                "provider_cost_usd": None,
+                "wall_seconds": saved["receipt"]["usage"]["wall_seconds"],
+                "turns_observed": 1,
+            })
+            self.assertIsNone(saved["receipt"]["usage_diagnostic"])
+            self.assertNotIn("turn.completed", json.dumps(saved["receipt"]))
             posted.assert_called_once()
             self.assertEqual(posted.call_args.args[1], saved["receipt"])
 
@@ -3353,6 +3371,7 @@ while True:
         for text in cfg.get("chunks", ['{"status":"ok","sha":null,"pr_url":null,"summary":"done"}']):
             send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":cfg.get("chunk_content_type", "text"),"text":text}}}})
         result = {"stopReason":cfg.get("stop_reason", "end_turn")}
+        if "usage" in cfg: result["usage"] = cfg["usage"]
     else: result = {}
     send({"jsonrpc":"2.0","id":response_id(request),"result":result})
     if cfg.get("notification_after_method") == method:
@@ -3465,7 +3484,10 @@ while True:
         return result, json.loads(capture.read_text())
 
     def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
-        saved, capture, jdir = self._run_grok_fixture()
+        saved, capture, jdir = self._run_grok_fixture({"usage": {
+            "totalTokens": 27, "inputTokens": 18, "outputTokens": 6,
+            "thoughtTokens": 3, "cachedReadTokens": 4, "cachedWriteTokens": 2,
+        }})
         self.assertEqual(capture["argv"], [
             "agent", "--always-approve", "--model", "grok-4.6",
             "--reasoning-effort", "high", "stdio",
@@ -3497,6 +3519,21 @@ while True:
         self.assertEqual(saved["receipt"]["failure_class"], "none")
         self.assertEqual(saved["receipt"]["failure_code"], "none")
         self.assertFalse(saved["receipt"]["failover_eligible"])
+        self.assertEqual(saved["receipt"]["usage"], {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 12,
+            "cached_input_tokens": 4,
+            "cache_write_tokens": 2,
+            "output_tokens": 6,
+            "reasoning_tokens": 3,
+            "provider_cost_usd": None,
+            "wall_seconds": saved["receipt"]["usage"]["wall_seconds"],
+            "turns_observed": 1,
+        })
+        self.assertIsInstance(saved["receipt"]["usage"]["wall_seconds"], float)
+        self.assertGreaterEqual(saved["receipt"]["usage"]["wall_seconds"], 0)
+        self.assertIsNone(saved["receipt"]["usage_diagnostic"])
+        self.assertNotIn("totalTokens", json.dumps(saved["receipt"]))
         self.assertEqual((jdir / "last-message.txt").read_text(), '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}')
 
     def test_grok_acp_accepts_exact_vendor_notification_methods(self):
@@ -8738,6 +8775,246 @@ while True:
             {"findings"},
         )
 
+    def test_implement_slice_preserves_only_normalized_usage_for_workflow_outcomes(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        callback_sources = {
+            "record": "wait",
+            "record_fallback": "wait_fallback",
+            "record2": "wait2",
+            "record3": "wait3",
+            "record_rn1": "wait_rn1",
+            "record_rn2": "wait_rn2",
+        }
+        for node_id, wait_id in callback_sources.items():
+            mappings = {
+                mapping["output"]: mapping["expression"]
+                for mapping in nodes[node_id]["config"]["mappings"]
+            }
+            self.assertEqual(
+                mappings["usage"],
+                {"kind": "getField", "path": f"TASKS.{wait_id}.request.body.usage"},
+                node_id,
+            )
+            self.assertEqual(
+                mappings["usage_diagnostic"],
+                {"kind": "getField", "path": f"TASKS.{wait_id}.request.body.usage_diagnostic"},
+                node_id,
+            )
+            dumped = json.dumps(mappings)
+            for forbidden in (
+                "raw_event", "provider_payload", "prompt", "thought", "response_text",
+                "log_ref", "command_line", "/home/",
+            ):
+                self.assertNotIn(forbidden, dumped, node_id)
+
+    def test_rewst_durable_outcome_write_is_blocked_without_reviewed_storage_surface(self):
+        root = Path(server.__file__).parent
+        node_types = set()
+        for path in sorted((root / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            node_types.update(node["type"] for node in spec["nodes"])
+        storage_types = {
+            node_type for node_type in node_types
+            if "storage" in node_type.lower() or "database" in node_type.lower()
+        }
+        self.assertEqual(storage_types, set())
+        # Local execution aids must not become a second durable authority.
+        self.assertFalse(any(
+            token in node_type.lower()
+            for node_type in node_types
+            for token in ("sqlite", "postgres", "dynamodb", "redis")
+        ))
+
+    def test_claude_usage_normalization(self):
+        native = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "claude-usage-1", "duration_ms": 999999,
+            "num_turns": 2, "total_cost_usd": 0.0125,
+            "usage": {
+                "input_tokens": 40, "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 3, "output_tokens": 11,
+            },
+            "result": "hostile prompt TOKEN_SECRET /home/private response",
+        }) + "\n"
+        usage, diagnostic = server.normalize_native_usage("claude", native, 1.25)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 40, "cached_input_tokens": 7,
+            "cache_write_tokens": 3, "output_tokens": 11,
+            "reasoning_tokens": 0, "provider_cost_usd": 0.0125,
+            "wall_seconds": 1.25, "turns_observed": 2,
+        })
+
+    def test_codex_usage_normalization(self):
+        native = "\n".join(json.dumps(event) for event in (
+            {"type": "thread.started", "thread_id": "codex-usage-1"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 120, "cached_input_tokens": 20,
+                "output_tokens": 35,
+            }},
+        )) + "\n"
+        usage, diagnostic = server.normalize_native_usage("codex", native, 2)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 100, "cached_input_tokens": 20,
+            "cache_write_tokens": 0, "output_tokens": 35,
+            "reasoning_tokens": 0, "provider_cost_usd": None,
+            "wall_seconds": 2.0, "turns_observed": 1,
+        })
+
+    def test_grok_usage_normalization(self):
+        native = {
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 80, "inputTokens": 50, "outputTokens": 20,
+                "thoughtTokens": 10, "cachedReadTokens": 15,
+                "cachedWriteTokens": 5,
+            },
+            "cost": {"amount": 99, "currency": "hostile-not-api-dollars"},
+        }
+        usage, diagnostic = server.normalize_native_usage("grok", native, 0.5)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 30, "cached_input_tokens": 15,
+            "cache_write_tokens": 5, "output_tokens": 20,
+            "reasoning_tokens": 10, "provider_cost_usd": None,
+            "wall_seconds": 0.5, "turns_observed": 1,
+        })
+
+    def test_usage_receipt_is_numeric_and_sanitized(self):
+        hostile = "TOKEN_SECRET /home/private prompt thought response --dangerous"
+        native = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "claude-usage-safe", "num_turns": 1,
+            "usage": {
+                "input_tokens": 1, "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 3, "output_tokens": 4,
+            },
+            "result": hostile, "private_path": hostile, "provider_payload": {"raw": hostile},
+        })
+        usage, diagnostic = server.normalize_native_usage("claude", native, 0)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(set(usage or {}), {
+            "usage_version", "fresh_input_tokens", "cached_input_tokens",
+            "cache_write_tokens", "output_tokens", "reasoning_tokens",
+            "provider_cost_usd", "wall_seconds", "turns_observed",
+        })
+        compact = json.dumps(usage, sort_keys=True)
+        self.assertNotIn(hostile, compact)
+        self.assertNotIn("/home/", compact)
+        for key in (
+            "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+            "output_tokens", "reasoning_tokens", "wall_seconds",
+        ):
+            self.assertNotIsInstance(usage[key], bool)
+            self.assertIsInstance(usage[key], (int, float))
+        self.assertIsNone(usage["provider_cost_usd"])
+
+    def test_usage_normalization_rejects_partial_negative_overflow_bool_nan_and_infinity(self):
+        valid = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "claude-usage-bad", "num_turns": 1,
+            "usage": {
+                "input_tokens": 1, "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 3, "output_tokens": 4,
+            },
+        }
+        missing, missing_diagnostic = server.normalize_native_usage("claude", "", 1)
+        self.assertIsNone(missing)
+        self.assertEqual(missing_diagnostic, "usage_not_reported")
+        partial = deepcopy(valid)
+        del partial["usage"]["output_tokens"]
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(partial), 1),
+            (None, "usage_incomplete"),
+        )
+        mutations = (
+            ("negative", lambda event: event["usage"].update(input_tokens=-1), 1),
+            ("bool", lambda event: event["usage"].update(input_tokens=True), 1),
+            ("fraction", lambda event: event["usage"].update(output_tokens=1.5), 1),
+            ("overflow", lambda event: event["usage"].update(output_tokens=2**63), 1),
+            ("nan_cost", lambda event: event.update(total_cost_usd=float("nan")), 1),
+            ("infinite_cost", lambda event: event.update(total_cost_usd=float("inf")), 1),
+            ("nan_wall", lambda event: None, float("nan")),
+            ("infinite_wall", lambda event: None, float("inf")),
+            ("bool_wall", lambda event: None, True),
+        )
+        for name, mutate, wall in mutations:
+            with self.subTest(name=name):
+                event = deepcopy(valid)
+                mutate(event)
+                usage, diagnostic = server.normalize_native_usage(
+                    "claude", json.dumps(event), wall
+                )
+                self.assertIsNone(usage)
+                self.assertEqual(diagnostic, "usage_malformed")
+
+    def test_usage_receipt_authority_rejects_drift_and_restart(self):
+        usage = {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 10, "cached_input_tokens": 2,
+            "cache_write_tokens": 1, "output_tokens": 3,
+            "reasoning_tokens": 4, "provider_cost_usd": None,
+            "wall_seconds": 1.5, "turns_observed": 1,
+        }
+        for kind in ("agent", "review"):
+            with self.subTest(kind=kind):
+                receipt = {
+                    "job_id": ("a1" if kind == "agent" else "b2") * 16,
+                    "kind": kind, "usage": usage, "usage_diagnostic": None,
+                    "status": "ok",
+                }
+                server.seal_terminal_receipt_authority(kind, receipt)
+                self.assertEqual(
+                    server.authorized_receipt_usage(kind, receipt),
+                    (usage, None),
+                )
+                forged = deepcopy(receipt)
+                forged["usage"]["output_tokens"] = 999
+                self.assertEqual(
+                    server.authorized_receipt_usage(kind, forged),
+                    (None, "usage_authority_mismatch"),
+                )
+                forged_status = deepcopy(receipt)
+                forged_status["status"] = "error"
+                self.assertEqual(
+                    server.authorized_receipt_usage(kind, forged_status),
+                    (None, "usage_authority_mismatch"),
+                )
+                server.clear_terminal_receipt_authority(kind, receipt["job_id"])
+                self.assertEqual(
+                    server.authorized_receipt_usage(kind, receipt),
+                    (None, "usage_authority_unavailable"),
+                )
+
+    def test_receipts_fail_closed_when_native_usage_is_missing(self):
+        profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
+            "starting_head": "b" * 40, "native_session_id": "codex-usage-missing",
+        }
+        job = {
+            "job_id": "c3" * 16, "kind": "agent", "repo": "scratch",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            **profile, "session_identity": identity,
+        }
+        receipt = server.normalize_receipt(
+            job, {"status": "ok"}, 0, False,
+            usage=None, usage_diagnostic="usage_not_reported",
+        )
+        self.assertIsNone(receipt["usage"])
+        self.assertEqual(receipt["usage_diagnostic"], "usage_not_reported")
+        self.assertNotIn("_native_usage", json.dumps(receipt))
+        self.assertNotIn("provider_payload", json.dumps(receipt))
+
     def test_catalog_has_no_dead_effort_fields(self):
         root = Path(server.__file__).parent
         # This is an independent, hard-coded catalog contract. Never derive
@@ -10284,7 +10561,17 @@ while True:
                     self.assertEqual(current_stat.st_mtime_ns, original_stat.st_mtime_ns)
                     self.assertEqual(authority.running_record_bytes, sealed_bytes)
                     self.assertEqual(authority.running_record_hash, sealed_hash)
-                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+                return {
+                    "ok": True, "verdict": "PASS", "no_verdict": False,
+                    "usage": {
+                        "usage_version": "normalized-usage-v1",
+                        "fresh_input_tokens": 7, "cached_input_tokens": 2,
+                        "cache_write_tokens": 0, "output_tokens": 3,
+                        "reasoning_tokens": 0, "provider_cost_usd": None,
+                        "wall_seconds": 0.25, "turns_observed": 1,
+                    },
+                    "usage_diagnostic": None,
+                }
 
             with mock.patch.object(
                 server, "native_review_result", side_effect=attempt_equal_writes
@@ -10302,6 +10589,14 @@ while True:
             self.assertEqual((saved["kind"], saved["status"]), ("review", "completed"))
             self.assertEqual(saved["receipt"], callback_receipts[0])
             self.assertEqual(saved["webhook"], {"ok": True, "status": 204})
+            poll_status, polled, _ = server.dispatch(
+                "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
+            )
+            self.assertEqual(poll_status, 200, polled)
+            self.assertIsInstance(polled, dict)
+            assert isinstance(polled, dict)
+            self.assertEqual(polled["receipt"]["usage"], saved["receipt"]["usage"])
+            self.assertNotIn("provider_payload", json.dumps(polled))
 
     def test_review_ordinary_write_rejects_immutable_drift_and_guarded_lifecycle_works(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11006,6 +11301,8 @@ while True:
         self.assertEqual(saved["receipt"]["code"], "timeout")
         self.assertTrue(saved["receipt"]["no_verdict"])
         self.assertEqual(saved["receipt"]["summary"], "review timed out")
+        self.assertIsNone(saved["receipt"]["usage"])
+        self.assertEqual(saved["receipt"]["usage_diagnostic"], "usage_not_reported")
 
     def test_review_run_rejects_profile_named_or_mismatched_reviewers(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11056,11 +11353,27 @@ while True:
             ), mock.patch.object(server.subprocess, "run", fake_run):
                 codex = server.native_review_result(codex_context)
                 claude = server.native_review_result(claude_context)
-        grok, grok_capture = self._run_grok_review_fixture()
+        grok, grok_capture = self._run_grok_review_fixture({"usage": {
+            "totalTokens": 15, "inputTokens": 10, "outputTokens": 4,
+            "thoughtTokens": 1, "cachedReadTokens": 2, "cachedWriteTokens": 0,
+        }})
         self.assertEqual(
             (codex["verdict"], claude["verdict"], grok["verdict"]),
             ("PASS", "PASS", "PASS"),
         )
+        self.assertEqual(grok["usage"], {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 8,
+            "cached_input_tokens": 2,
+            "cache_write_tokens": 0,
+            "output_tokens": 4,
+            "reasoning_tokens": 1,
+            "provider_cost_usd": None,
+            "wall_seconds": grok["usage"]["wall_seconds"],
+            "turns_observed": 1,
+        })
+        self.assertIsNone(grok["usage_diagnostic"])
+        self.assertNotIn("totalTokens", json.dumps(grok))
         codex_cmd, codex_kwargs = commands[0]
         self.assertEqual(codex_cmd[codex_cmd.index("--sandbox") + 1], "read-only")
         self.assertNotIn("workspace-write", codex_cmd)
@@ -12175,6 +12488,8 @@ while True:
                 "job_id": {"kind": "getField", "path": f"TASKS.{wait}.request.body.job_id"},
                 "resume_job_id": {"kind": "getField", "path": f"TASKS.{wait}.request.body.job_id"},
                 "session_identity": {"kind": "getField", "path": f"TASKS.{wait}.request.body.session_identity"},
+                "usage": {"kind": "getField", "path": f"TASKS.{wait}.request.body.usage"},
+                "usage_diagnostic": {"kind": "getField", "path": f"TASKS.{wait}.request.body.usage_diagnostic"},
             })
             self.assertEqual(nodes[filt]["config"], {"group": "AND", "rules": [{"path": "status", "op": "equals", "value": "ok"}]})
             self.assertIn((wait, "out", record), edges)
@@ -15042,7 +15357,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "24128275db20e045a8580bd119324ae8b123ff89218653f461f993f8777f86fb")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "6d7404740f69048f42235e82470fb67fa8796b86a6b78c5a926e94d58e61f0cd")
 
 
 class InstallTests(unittest.TestCase):

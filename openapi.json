@@ -1492,10 +1492,30 @@
           "code": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" }
         }
       },
+      "NormalizedUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["usage_version", "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "provider_cost_usd", "wall_seconds", "turns_observed"],
+        "properties": {
+          "usage_version": { "type": "string", "const": "normalized-usage-v1" },
+          "fresh_input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+          "cached_input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+          "cache_write_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+          "output_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+          "reasoning_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+          "provider_cost_usd": { "type": ["number", "null"], "minimum": 0 },
+          "wall_seconds": { "type": "number", "minimum": 0 },
+          "turns_observed": { "type": ["integer", "null"], "minimum": 0, "maximum": 9223372036854775807 }
+        }
+      },
+      "UsageDiagnostic": {
+        "type": ["string", "null"],
+        "enum": ["usage_not_reported", "usage_incomplete", "usage_malformed", "usage_authority_unavailable", "usage_authority_mismatch", null]
+      },
       "ReviewReceipt": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["ok", "status", "job_id", "kind", "verdict", "no_verdict", "execution_identity", "summary", "code"],
+        "required": ["ok", "status", "job_id", "kind", "verdict", "no_verdict", "execution_identity", "summary", "code", "usage", "usage_diagnostic"],
         "properties": {
           "ok": { "type": "boolean" },
           "status": { "type": "string", "enum": ["ok", "nack", "error"] },
@@ -1505,7 +1525,9 @@
           "no_verdict": { "type": "boolean" },
           "execution_identity": { "$ref": "#/components/schemas/ReviewExecutionIdentity" },
           "summary": { "type": "string", "enum": ["review passed", "review requested changes", "review timed out", "review launcher unavailable", "review execution failed", "review returned no verdict", "review execution identity mismatch"] },
-          "code": { "type": ["string", "null"], "enum": ["timeout", "not_implemented", "review_failed", "review_execution_identity_mismatch", null] }
+          "code": { "type": ["string", "null"], "enum": ["timeout", "not_implemented", "review_failed", "review_execution_identity_mismatch", null] },
+          "usage": { "anyOf": [{ "$ref": "#/components/schemas/NormalizedUsage" }, { "type": "null" }] },
+          "usage_diagnostic": { "$ref": "#/components/schemas/UsageDiagnostic" }
         }
       },
       "ReviewJob": {
@@ -1677,7 +1699,7 @@
       "AgentReceipt": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["status", "job_id", "launcher", "provider", "model", "session_identity", "requested_effort", "effective_effort", "effort_source", "launcher_version", "summary", "failure_class", "failure_code", "failover_eligible", "diagnostic"],
+        "required": ["status", "job_id", "launcher", "provider", "model", "session_identity", "requested_effort", "effective_effort", "effort_source", "launcher_version", "summary", "failure_class", "failure_code", "failover_eligible", "diagnostic", "usage", "usage_diagnostic"],
         "properties": {
           "status": { "type": "string", "enum": ["ok", "error", "timeout"] },
           "job_id": { "type": "string" },
@@ -1699,7 +1721,9 @@
           },
           "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "launcher_version_mismatch", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"], "description": "Stable machine code within failure_class; none on success." },
           "failover_eligible": { "type": "boolean", "description": "True only for structured or deterministic provider availability failures." },
-          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" },
+          "usage": { "anyOf": [{ "$ref": "#/components/schemas/NormalizedUsage" }, { "type": "null" }], "description": "Closed numeric native aggregate; never raw provider events or inferred list-price cost." },
+          "usage_diagnostic": { "$ref": "#/components/schemas/UsageDiagnostic" }
         }
       },
       "AgentJob": {

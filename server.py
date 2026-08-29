@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import select
@@ -3038,6 +3039,7 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
 
 def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
+    usage_started = time.monotonic()
     if not review_runtime_matches_identity(context):
         return {
             "ok": False, "verdict": "NACK", "no_verdict": True,
@@ -3085,6 +3087,7 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
     text = ""
     ephemeral = job_id is None
     error: str | None = None
+    native_usage: Any = None
     adapter_job = {
         "launcher": launcher, "provider": provider, "model": model,
         **effort_profile, "max_turns": max_turns, "session_identity": None,
@@ -3109,6 +3112,7 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
         returncode, timed_out, _session_id, error = run_grok_acp(
             grok_job, binary, mode="review"
         )
+        native_usage = grok_job.pop("_native_usage", None)
         text = read_bounded_output(path / "last-message.txt")
     else:
         run_id = job_id or uuid.uuid4().hex
@@ -3122,7 +3126,7 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
         else:
             cmd = claude_command(
                 adapter_job, body_prompt, str(resolved), binary,
-                permission_mode="plan", output_format="text",
+                permission_mode="plan", output_format="json",
             )
             run_input = None
         try:
@@ -3133,6 +3137,7 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
             )
             returncode = proc.returncode
             stdout = (proc.stdout or b"").decode("utf-8", "replace")
+            native_usage = stdout
             text = read_bounded_output(path / "last-message.txt") or stdout
             if launcher == "codex":
                 parsed = parse_receipt_text(text) or parse_receipt_text(stdout)
@@ -3167,6 +3172,10 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
     }
     if code:
         result["code"] = code
+    usage, usage_diagnostic = normalize_native_usage(
+        launcher, native_usage, time.monotonic() - usage_started,
+    )
+    result.update({"usage": usage, "usage_diagnostic": usage_diagnostic})
     if ephemeral:
         shutil.rmtree(path, ignore_errors=True)
     return result
@@ -3199,6 +3208,18 @@ def review_receipt(
     else:
         status, code, summary = "error", "review_failed", "review returned no verdict"
         verdict, no_verdict = None, True
+    usage = result.get("usage")
+    usage_diagnostic = result.get("usage_diagnostic")
+    if not (
+        (valid_normalized_usage(usage) and usage_diagnostic is None)
+        or (
+            usage is None
+            and usage_diagnostic in {
+                "usage_not_reported", "usage_incomplete", "usage_malformed",
+            }
+        )
+    ):
+        usage, usage_diagnostic = None, "usage_not_reported"
     return {
         "ok": status == "ok",
         "status": status,
@@ -3209,6 +3230,8 @@ def review_receipt(
         "execution_identity": identity,
         "summary": summary,
         "code": code,
+        "usage": json.loads(json.dumps(usage)) if usage is not None else None,
+        "usage_diagnostic": usage_diagnostic,
     }
 
 
@@ -4509,6 +4532,7 @@ def review_terminal_transition(
             if not canonical_review_record(terminal, ("completed", "failed")):
                 return None, False
             _write_job_unlocked(terminal)
+            seal_terminal_receipt_authority("review", receipt)
             return terminal, True
         finally:
             transition_keys.discard(key)
@@ -4545,7 +4569,7 @@ def review_set_webhook_result(
 
 REVIEW_RECEIPT_FIELDS = frozenset({
     "ok", "status", "job_id", "kind", "verdict", "no_verdict",
-    "execution_identity", "summary", "code",
+    "execution_identity", "summary", "code", "usage", "usage_diagnostic",
 })
 REVIEW_RECEIPT_STATES = {
     ("ok", "PASS", False, None, "review passed", True),
@@ -4586,7 +4610,14 @@ def sanitized_review_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
         and stored.get("code") == "review_execution_identity_mismatch"
     ):
         return None
-    return {key: json.loads(json.dumps(stored[key])) for key in REVIEW_RECEIPT_FIELDS}
+    projected = {
+        key: json.loads(json.dumps(stored[key]))
+        for key in REVIEW_RECEIPT_FIELDS
+        if key not in {"usage", "usage_diagnostic"}
+    }
+    usage, diagnostic = authorized_receipt_usage("review", stored)
+    projected.update({"usage": usage, "usage_diagnostic": diagnostic})
+    return projected
 
 
 def valid_review_timestamps(job: Any) -> bool:
@@ -4919,6 +4950,7 @@ def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
             "status": "error", "job_id": job.get("job_id"),
             **{key: None for key in AGENT_PROFILE_FIELDS}, "session_identity": None,
             "summary": classified["diagnostic"]["summary"], **classified,
+            "usage": None, "usage_diagnostic": "usage_authority_mismatch",
         }
     assert profile is not None
     status = stored.get("status") if stored.get("status") in ("ok", "error", "timeout") else "error"
@@ -4930,9 +4962,11 @@ def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
     else:
         status = "error"
         classified = classify_agent_failure("invalid_receipt")
+    usage, usage_diagnostic = authorized_receipt_usage("agent", stored)
     return {
         "status": status, "job_id": job.get("job_id"), **profile,
         "summary": classified["diagnostic"]["summary"], **classified,
+        "usage": usage, "usage_diagnostic": usage_diagnostic,
     }
 
 
@@ -4999,6 +5033,7 @@ def _agent_provenance_failure_receipt(job_id: str) -> dict[str, Any]:
         "status": "error", "job_id": job_id,
         **{key: None for key in AGENT_PROFILE_FIELDS}, "session_identity": None,
         "summary": classified["diagnostic"]["summary"], **classified,
+        "usage": None, "usage_diagnostic": "usage_malformed",
     }
 
 
@@ -5066,6 +5101,7 @@ def agent_terminal_transition(
             })
             current.pop("execution_identity", None)
             _write_job_unlocked(current)
+            seal_terminal_receipt_authority("agent", failure)
             return current, False
         return None, False
 
@@ -5139,6 +5175,7 @@ def agent_terminal_transition(
                 ):
                     return reject_or_sanitize(persisted)
                 _write_job_unlocked(current)
+                seal_terminal_receipt_authority("agent", terminal_receipt)
                 return current, True
             finally:
                 transition_keys.discard(key)
@@ -5243,6 +5280,7 @@ def interrupted_job_receipt(job: dict[str, Any], kind: str) -> dict[str, Any]:
             **({key: profile[key] for key in AGENT_PROFILE_FIELDS} if profile else {key: None for key in AGENT_PROFILE_FIELDS}),
             "session_identity": profile["session_identity"] if profile else None,
             "summary": classified["diagnostic"]["summary"], **classified,
+            "usage": None, "usage_diagnostic": "usage_not_reported",
         }
     return {
         "status": "error", "job_id": job["job_id"],
@@ -5715,6 +5753,256 @@ def parse_native_session_id(text: str, launcher: str = "codex") -> str | None:
     return None
 
 
+USAGE_VERSION = "normalized-usage-v1"
+USAGE_MAX_COUNT = (1 << 63) - 1
+USAGE_FIELDS = frozenset({
+    "usage_version", "fresh_input_tokens", "cached_input_tokens",
+    "cache_write_tokens", "output_tokens", "reasoning_tokens",
+    "provider_cost_usd", "wall_seconds", "turns_observed",
+})
+USAGE_DIAGNOSTICS = frozenset({
+    "usage_not_reported", "usage_incomplete", "usage_malformed",
+    "usage_authority_unavailable", "usage_authority_mismatch",
+})
+TERMINAL_RECEIPT_AUTHORITY_LOCK = threading.Lock()
+TERMINAL_RECEIPT_AUTHORITY: dict[tuple[str, str], str] = {}
+
+
+def valid_normalized_usage(usage: Any) -> bool:
+    if not isinstance(usage, dict) or set(usage) != USAGE_FIELDS:
+        return False
+    if usage.get("usage_version") != USAGE_VERSION:
+        return False
+    if any(_usage_count(usage.get(key)) is None for key in (
+        "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+        "output_tokens", "reasoning_tokens",
+    )):
+        return False
+    cost = usage.get("provider_cost_usd")
+    turns = usage.get("turns_observed")
+    return bool(
+        _usage_number(usage.get("wall_seconds")) is not None
+        and (cost is None or _usage_number(cost) is not None)
+        and (turns is None or _usage_count(turns) is not None)
+    )
+
+
+def _terminal_receipt_digest(kind: str, receipt: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"kind": kind, "receipt": receipt}, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def seal_terminal_receipt_authority(kind: str, receipt: dict[str, Any]) -> None:
+    job_id = receipt.get("job_id") if isinstance(receipt, dict) else None
+    usage = receipt.get("usage") if isinstance(receipt, dict) else None
+    diagnostic = receipt.get("usage_diagnostic") if isinstance(receipt, dict) else None
+    if (
+        kind not in ("agent", "review")
+        or not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id)
+        or not (
+            (valid_normalized_usage(usage) and diagnostic is None)
+            or (usage is None and diagnostic in {
+                "usage_not_reported", "usage_incomplete", "usage_malformed",
+            })
+        )
+    ):
+        raise ValueError("terminal receipt usage is not canonical")
+    digest = _terminal_receipt_digest(kind, receipt)
+    with TERMINAL_RECEIPT_AUTHORITY_LOCK:
+        TERMINAL_RECEIPT_AUTHORITY[(kind, job_id)] = digest
+
+
+def clear_terminal_receipt_authority(kind: str, job_id: str) -> None:
+    with TERMINAL_RECEIPT_AUTHORITY_LOCK:
+        TERMINAL_RECEIPT_AUTHORITY.pop((kind, job_id), None)
+
+
+def authorized_receipt_usage(
+    kind: str, receipt: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(receipt, dict):
+        return None, "usage_authority_mismatch"
+    job_id = receipt.get("job_id")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return None, "usage_authority_mismatch"
+    with TERMINAL_RECEIPT_AUTHORITY_LOCK:
+        expected = TERMINAL_RECEIPT_AUTHORITY.get((kind, job_id))
+    if expected is None:
+        return None, "usage_authority_unavailable"
+    try:
+        actual = _terminal_receipt_digest(kind, receipt)
+    except (TypeError, ValueError):
+        return None, "usage_authority_mismatch"
+    if not hmac.compare_digest(expected, actual):
+        return None, "usage_authority_mismatch"
+    usage, diagnostic = receipt.get("usage"), receipt.get("usage_diagnostic")
+    if valid_normalized_usage(usage) and diagnostic is None:
+        return json.loads(json.dumps(usage)), None
+    if usage is None and diagnostic in {
+        "usage_not_reported", "usage_incomplete", "usage_malformed",
+    }:
+        return None, diagnostic
+    return None, "usage_authority_mismatch"
+
+
+def _usage_count(value: Any) -> int | None:
+    return value if type(value) is int and 0 <= value <= USAGE_MAX_COUNT else None
+
+
+def _usage_number(value: Any) -> float | int | None:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if not isinstance(text, str) or not text.strip():
+        return None, "usage_not_reported"
+    if len(text.encode("utf-8", "replace")) > CMD_MAX_BYTES + FILE_MAX_BYTES:
+        return None, "usage_malformed"
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None, "usage_malformed"
+        if not isinstance(event, dict):
+            return None, "usage_malformed"
+        events.append(event)
+    return (events, None) if events else (None, "usage_not_reported")
+
+
+def _closed_usage(
+    fresh: Any, cached: Any, cache_write: Any, output: Any, reasoning: Any,
+    provider_cost: Any, wall_seconds: Any, turns: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    counts = tuple(_usage_count(value) for value in (
+        fresh, cached, cache_write, output, reasoning,
+    ))
+    if any(value is None for value in counts):
+        return None, "usage_malformed"
+    wall = _usage_number(wall_seconds)
+    if wall is None:
+        return None, "usage_malformed"
+    cost = None if provider_cost is None else _usage_number(provider_cost)
+    if provider_cost is not None and cost is None:
+        return None, "usage_malformed"
+    observed = None if turns is None else _usage_count(turns)
+    if turns is not None and observed is None:
+        return None, "usage_malformed"
+    return {
+        "usage_version": USAGE_VERSION,
+        "fresh_input_tokens": counts[0],
+        "cached_input_tokens": counts[1],
+        "cache_write_tokens": counts[2],
+        "output_tokens": counts[3],
+        "reasoning_tokens": counts[4],
+        "provider_cost_usd": cost,
+        "wall_seconds": float(wall),
+        "turns_observed": observed,
+    }, None
+
+
+def normalize_native_usage(
+    launcher: str, native: Any, wall_seconds: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize one complete native usage report without retaining native data.
+
+    Claude result usage does not separately expose reasoning. Codex exec JSON does
+    not separately expose reasoning or cache writes. Those unexposed counters are
+    therefore zero counters of separately reported tokens, not inferred model
+    behavior. Grok ACP exposes thought/cache counters but no trusted API dollars.
+    Missing or malformed reports never become partial or all-zero usage.
+    """
+    if _usage_number(wall_seconds) is None:
+        return None, "usage_malformed"
+    if launcher == "grok":
+        if native is None:
+            return None, "usage_not_reported"
+        if not isinstance(native, dict):
+            return None, "usage_malformed"
+        detail = native.get("usage")
+        if detail is None:
+            return None, "usage_not_reported"
+        if not isinstance(detail, dict):
+            return None, "usage_malformed"
+        required = (
+            "totalTokens", "inputTokens", "outputTokens", "thoughtTokens",
+            "cachedReadTokens", "cachedWriteTokens",
+        )
+        if any(key not in detail for key in required):
+            return None, "usage_incomplete"
+        values = [_usage_count(detail[key]) for key in required]
+        if any(value is None for value in values):
+            return None, "usage_malformed"
+        total, input_tokens, output, thought, cached, cache_write = values
+        assert all(value is not None for value in values)
+        if (
+            total != input_tokens + output + thought
+            or cached + cache_write > input_tokens
+        ):
+            return None, "usage_malformed"
+        return _closed_usage(
+            input_tokens - cached - cache_write, cached, cache_write,
+            output, thought, None, wall_seconds, 1,
+        )
+
+    events, event_error = _usage_events(native)
+    if event_error is not None or events is None:
+        return None, event_error
+    if launcher == "claude":
+        results = [event for event in events if event.get("type") == "result"]
+        if not results:
+            return None, "usage_not_reported"
+        if len(results) != 1:
+            return None, "usage_malformed"
+        result = results[0]
+        detail = result.get("usage")
+        if detail is None:
+            return None, "usage_not_reported"
+        if not isinstance(detail, dict):
+            return None, "usage_malformed"
+        fields = (
+            "input_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "output_tokens",
+        )
+        if any(key not in detail for key in fields):
+            return None, "usage_incomplete"
+        return _closed_usage(
+            detail["input_tokens"], detail["cache_read_input_tokens"],
+            detail["cache_creation_input_tokens"], detail["output_tokens"], 0,
+            result.get("total_cost_usd"), wall_seconds, result.get("num_turns"),
+        )
+    if launcher == "codex":
+        completed = [event for event in events if event.get("type") == "turn.completed"]
+        if not completed:
+            return None, "usage_not_reported"
+        if len(completed) != 1:
+            return None, "usage_malformed"
+        detail = completed[0].get("usage")
+        if detail is None:
+            return None, "usage_not_reported"
+        if not isinstance(detail, dict):
+            return None, "usage_malformed"
+        fields = ("input_tokens", "cached_input_tokens", "output_tokens")
+        if any(key not in detail for key in fields):
+            return None, "usage_incomplete"
+        input_tokens = _usage_count(detail["input_tokens"])
+        cached = _usage_count(detail["cached_input_tokens"])
+        if input_tokens is None or cached is None or cached > input_tokens:
+            return None, "usage_malformed"
+        return _closed_usage(
+            input_tokens - cached, cached, 0, detail["output_tokens"], 0,
+            None, wall_seconds, 1,
+        )
+    return None, "usage_malformed"
+
+
 def record_native_session(job: dict[str, Any], session_id: str | None) -> str | None:
     launcher = str(job.get("launcher") or "")
     if launcher not in NATIVE_LAUNCHERS:
@@ -5890,6 +6178,9 @@ def normalize_receipt(
     timed_out: bool,
     evidence_code: str | None = None,
     structured_output: str = "",
+    *,
+    usage: dict[str, Any] | None = None,
+    usage_diagnostic: str | None = "usage_not_reported",
 ) -> dict[str, Any]:
     raw_requested = job.get("requested_effort")
     raw_source = job.get("effort_source")
@@ -5946,6 +6237,16 @@ def normalize_receipt(
             "error", f"missing structured {job.get('launcher')} session identity",
             "session_identity_missing",
         )
+    if not (
+        (valid_normalized_usage(usage) and usage_diagnostic is None)
+        or (
+            usage is None
+            and usage_diagnostic in {
+                "usage_not_reported", "usage_incomplete", "usage_malformed",
+            }
+        )
+    ):
+        usage, usage_diagnostic = None, "usage_malformed"
     rec = {
         "status": status,
         "job_id": job["job_id"],
@@ -5957,6 +6258,8 @@ def normalize_receipt(
         "effective_effort": effective_effort if profile_complete else None,
         "effort_source": effort_source if profile_complete else None,
         "launcher_version": launcher_version if profile_complete else None,
+        "usage": json.loads(json.dumps(usage)) if usage is not None else None,
+        "usage_diagnostic": usage_diagnostic,
     }
     rec.update(classify_agent_failure(evidence_code or evidence, structured_output))
     rec["summary"] = rec["diagnostic"]["summary"]
@@ -6401,6 +6704,7 @@ def run_grok_acp(
                 "sessionId": session_id,
                 "prompt": [{"type": "text", "text": path.joinpath("prompt.txt").read_text()}],
             }, collect=True)
+            job["_native_usage"] = prompted
             if prompted.get("stopReason") != "end_turn":
                 job["_adapter_failure_code"] = (
                     "cancelled" if prompted.get("stopReason") in ("cancelled", "canceled")
@@ -6696,6 +7000,7 @@ def run_agent_job(job_id: str) -> None:
     if claimed is None:
         return
     job = claimed
+    usage_started = time.monotonic()
     binary = resolve_launcher_binary_now(str(job["launcher"]))
     try:
         with pinned_launcher(binary) as pinned:
@@ -6716,9 +7021,14 @@ def run_agent_job(job_id: str) -> None:
     except OSError:
         proc, err = None, {"error": "launcher artifact could not be pinned", "code": "launcher_version_mismatch"}
     if err:
+        usage, usage_diagnostic = normalize_native_usage(
+            str(job.get("launcher") or ""), None,
+            time.monotonic() - usage_started,
+        )
         receipt = normalize_receipt(
             job, {"status": "error", "summary": err.get("error")}, 1, False,
             evidence_code=str(err.get("code") or "unknown_failure"),
+            usage=usage, usage_diagnostic=usage_diagnostic,
         )
         stored, transitioned = agent_terminal_transition(
             job_id, execution_snapshot, receipt, None, 1, False,
@@ -6762,10 +7072,16 @@ def run_agent_job(job_id: str) -> None:
                 else "session_identity_missing"
             )
     adapter_evidence = job.pop("_adapter_failure_code", None)
+    native_usage = job.pop("_native_usage", stdout)
+    usage, usage_diagnostic = normalize_native_usage(
+        str(job.get("launcher") or ""), native_usage,
+        time.monotonic() - usage_started,
+    )
     failure_summary = protocol_error if protocol_error and not timed_out else session_error
     receipt = normalize_receipt(
         job, parsed, returncode, timed_out,
         evidence_code=session_evidence or adapter_evidence, structured_output=stdout,
+        usage=usage, usage_diagnostic=usage_diagnostic,
     )
     if failure_summary:
         receipt["status"] = "error"
