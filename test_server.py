@@ -8827,23 +8827,160 @@ while True:
             ):
                 self.assertNotIn(forbidden, dumped, node_id)
 
-    def test_rewst_durable_outcome_write_is_blocked_without_reviewed_storage_surface(self):
-        root = Path(server.__file__).parent
-        node_types = set()
-        for path in sorted((root / "graphs").glob("*.json")):
-            spec = json.loads(path.read_text())["spec"]
-            node_types.update(node["type"] for node in spec["nodes"])
-        storage_types = {
-            node_type for node_type in node_types
-            if "storage" in node_type.lower() or "database" in node_type.lower()
+    def test_implement_slice_durable_outcome_uses_exact_datastore_records_contract(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        upsert = nodes["durable_outcome_upsert"]
+        readback = nodes["durable_outcome_readback"]
+        record_key = "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"
+
+        self.assertEqual(upsert["type"], "action.datastore.records.upsert")
+        self.assertEqual(upsert["config"], {
+            "alias": "durable_outcome_upsert",
+            "scope": "tenant",
+            "collection": "graphwing_verified_outcomes_v1",
+            "recordKey": record_key,
+            "indexedFields": [
+                "verified_outcome", "work_kind", "work_class", "effective_size",
+                "route_version", "role", "named_test_status",
+            ],
+            "data": "{{ CTX.durable_outcome }}",
+        })
+        self.assertNotIn("ttlSeconds", upsert["config"])
+        self.assertEqual(readback["type"], "action.datastore.records.get")
+        self.assertEqual(readback["config"], {
+            "alias": "durable_outcome_readback",
+            "scope": "tenant",
+            "collection": "graphwing_verified_outcomes_v1",
+            "recordKey": record_key,
+        })
+
+    def test_implement_slice_durable_outcome_has_closed_sanitized_record_allowlist(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        builder = nodes["durable_outcome"]
+        expected_fields = {
+            "schema_version", "workflow_slug", "workflow_id", "workflow_version",
+            "workflow_run_id", "workflow_stage", "route_version",
+            "route_profile_version", "role", "work_kind", "work_class",
+            "effective_size", "agent_job_id", "agent_status",
+            "agent_failure_class", "agent_failure_code", "launcher", "provider",
+            "model", "requested_effort", "effective_effort", "effort_source",
+            "named_test_name", "named_test_status", "commit_eligible",
+            "verified_outcome", "usage", "usage_diagnostic", "diagnostic",
         }
-        self.assertEqual(storage_types, set())
-        # Local execution aids must not become a second durable authority.
-        self.assertFalse(any(
-            token in node_type.lower()
-            for node_type in node_types
-            for token in ("sqlite", "postgres", "dynamodb", "redis")
-        ))
+        self.assertEqual(builder["type"], "transforms.codeExpression")
+        schema = builder["config"]["outputSchema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), expected_fields)
+        self.assertEqual(set(schema["properties"]), expected_fields)
+        self.assertEqual(
+            set(schema["properties"]["usage"]["properties"]),
+            {
+                "usage_version", "fresh_input_tokens", "cached_input_tokens",
+                "cache_write_tokens", "output_tokens", "reasoning_tokens",
+                "provider_cost_usd", "wall_seconds", "turns_observed",
+            },
+        )
+        self.assertFalse(schema["properties"]["usage"]["additionalProperties"])
+        self.assertEqual(
+            set(schema["properties"]["diagnostic"]["properties"]),
+            {"diagnostic_version", "stage", "status", "code", "summary"},
+        )
+        self.assertFalse(schema["properties"]["diagnostic"]["additionalProperties"])
+        code = builder["config"]["code"]["code"]
+        for identity in ("WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"):
+            self.assertIn(identity, code)
+        for forbidden in (
+            "prompt", "log", "path", "raw", "output_text", "provider_payload",
+            "token", "credential", "secret", "webhook", "resumeUrl", "/home/",
+        ):
+            self.assertNotIn(forbidden, code.lower())
+
+    def test_implement_slice_every_terminal_branch_converges_on_exactly_one_durable_write(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        terminal_sources = {
+            "recovery_route_fail", "fallback_route_fail", "fallback_wait_timeout",
+            "fallback_wait_fail", "fallback_action_fail", "fallback_receipt_fail",
+            "human_ack", "commit_fail", "push_fail", "done",
+            "primary_action_fail", "timeout", "fail", "receipt_fail",
+            "checkout_fail", "ticket_fail", "frontier_fail", "complete_fail",
+            "walk_fail", "slices_complete", "route_fail", "review_fail",
+            "e2e_fail", "test_http_fail", "correction_action_fail",
+            "wait2_timeout", "wait2_fail", "test2_http_fail", "nack_timeout",
+        }
+        into_join = [
+            edge for edge in graph["edges"]
+            if edge["target"] == "join_durable_outcome"
+        ]
+        self.assertEqual({edge["source"] for edge in into_join}, terminal_sources)
+        self.assertEqual(len(into_join), len(terminal_sources))
+        for source in terminal_sources:
+            self.assertEqual(
+                sum(edge["source"] == source for edge in into_join), 1, source
+            )
+
+        outgoing = {}
+        for edge in graph["edges"]:
+            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        self.assertEqual(outgoing["join_durable_outcome"], ["durable_outcome"])
+        self.assertEqual(outgoing["durable_outcome"], ["durable_outcome_upsert"])
+        self.assertEqual(
+            [node["id"] for node in graph["nodes"]
+             if node["type"] == "action.datastore.records.upsert"],
+            ["durable_outcome_upsert"],
+        )
+        # The pending dashboard notification is not terminal; the same wait can
+        # later acknowledge or time out and only that terminal leg is persisted.
+        self.assertNotIn("herdr_waiting", {edge["source"] for edge in into_join})
+        self.assertEqual(
+            {
+                node["id"] for node in graph["nodes"]
+                if node["id"] not in outgoing
+            },
+            {
+                "herdr_waiting", "durable_outcome_written",
+                "durable_outcome_write_failed", "durable_outcome_readback_failed",
+                "durable_outcome_readback_mismatch",
+            },
+        )
+
+    def test_implement_slice_durable_outcome_key_is_replay_idempotent_and_run_scoped(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        key = nodes["durable_outcome_upsert"]["config"]["recordKey"]
+        self.assertEqual(
+            key, "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"
+        )
+        self.assertEqual(key, nodes["durable_outcome_readback"]["config"]["recordKey"])
+        self.assertEqual(key.count("{{ WORKFLOW.runId }}"), 1)
+        self.assertNotIn("now", key.lower())
+        self.assertNotIn("uuid", key.lower())
+
+        edges = graph["edges"]
+        self.assertIn({
+            "id": "e_durable_write_readback", "source": "durable_outcome_upsert",
+            "sourceHandle": "success", "target": "durable_outcome_readback",
+            "targetHandle": "in",
+        }, edges)
+        self.assertIn({
+            "id": "e_durable_readback_check", "source": "durable_outcome_readback",
+            "sourceHandle": "success", "target": "if_durable_outcome_readback",
+            "targetHandle": "in",
+        }, edges)
+        readback_rules = nodes["if_durable_outcome_readback"]["config"]["rules"]
+        self.assertEqual(readback_rules, [
+            {"path": "found", "op": "equals", "value": True},
+            {"path": "recordKey", "op": "equals", "value": key},
+        ])
 
     @staticmethod
     def _claude_21250_usage_result(cost: object = 0.0125) -> dict:
@@ -10576,7 +10713,11 @@ while True:
         for node_id, node in nodes.items():
             dumped = json.dumps(node.get("config", {}))
             for alias in sorted(set(task_reference.findall(dumped))):
-                if alias not in dominators[node_id]:
+                code = node.get("config", {}).get("code", {}).get("code", "")
+                if alias not in dominators[node_id] and not (
+                    node_id == "durable_outcome"
+                    and f"TASKS.{alias} is defined" in code
+                ):
                     path_errors.append(f"{node_id} references non-dominating TASKS.{alias}")
             if node["type"].startswith("action."):
                 def scan(value, path):
@@ -10792,7 +10933,14 @@ while True:
         self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
         self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
         self.assertIn(("recovery_route", "failure", "recovery_route_fail"), triples)
-        self.assertFalse(any(e["source"] == "recovery_route_fail" for e in edges))
+        self.assertEqual(
+            [
+                (e.get("sourceHandle"), e["target"])
+                for e in edges
+                if e["source"] == "recovery_route_fail"
+            ],
+            [("out", "join_durable_outcome")],
+        )
         terminal_mappings = nodes["recovery_route_fail"]["config"]["mappings"]
         self.assertEqual([m["id"] for m in terminal_mappings], [f"m{i}" for i in range(1, 6)])
         self.assertEqual(
@@ -10968,7 +11116,17 @@ while True:
                     pending.extend(targets)
                 else:
                     leaves.add(current)
-            self.assertEqual(leaves, {terminal}, (source, handle, leaves))
+            self.assertIn(terminal, seen, (source, handle, seen))
+            self.assertEqual(
+                leaves,
+                {
+                    "durable_outcome_written",
+                    "durable_outcome_write_failed",
+                    "durable_outcome_readback_failed",
+                    "durable_outcome_readback_mismatch",
+                },
+                (source, handle, leaves),
+            )
             self.assertTrue(writer_actions.isdisjoint(seen), (source, handle, writer_actions & seen))
             self.assertNotIn("fallback_route", seen, (source, handle))
 
@@ -11110,9 +11268,17 @@ while True:
                            "stdout", "stderr", "trace", "log_ref"):
                 self.assertNotIn(unsafe, dumped, terminal)
 
-        # Diagnostics terminate; they cannot route a second fallback or writer.
+        # Diagnostics converge on one durable write; they cannot route a second fallback or writer.
         for terminal in terminals:
-            self.assertFalse(any(e["source"] == terminal for e in edges), terminal)
+            self.assertEqual(
+                [
+                    (e.get("sourceHandle"), e["target"])
+                    for e in edges
+                    if e["source"] == terminal
+                ],
+                [("out", "join_durable_outcome")],
+                terminal,
+            )
         self.assertEqual(
             [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
             ["fallback_route"],
@@ -16754,7 +16920,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "6d7404740f69048f42235e82470fb67fa8796b86a6b78c5a926e94d58e61f0cd")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9c73976d3782e9550d31a86417a12c4619f445c009b845b4c3ff5fafc2ae26a7")
 
 
 class InstallTests(unittest.TestCase):
