@@ -9350,6 +9350,183 @@ while True:
                         self.assertIsNotNone(usage)
                         self.assertIsNone(diagnostic)
 
+    @staticmethod
+    def _claude_result_with_raw_optional(field, raw_value):
+        event = DispatchTests._claude_21250_usage_result()
+        encoded = json.dumps(event, separators=(",", ":"))
+        if field == "permission_denials":
+            return encoded.replace('"permission_denials":[]', f'"permission_denials":{raw_value}')
+        return encoded[:-1] + f',"{field}":{raw_value}' + "}"
+
+    def test_optional_json_telemetry_depth_is_explicitly_bounded(self):
+        self.assertEqual(server._PROVIDER_JSON_MAX_DEPTH, 32)
+        expected = server.normalize_native_usage(
+            "claude", json.dumps(self._claude_21250_usage_result()), 1,
+        )
+        family_offsets = {
+            "structured_output": (1, lambda raw: raw),
+            "deferred_tool_use": (
+                2,
+                lambda raw: '{"id":"id","name":"name","input":' + raw + "}",
+            ),
+            "permission_denials": (
+                3,
+                lambda raw: (
+                    '[{"tool_name":"tool","tool_use_id":"id","tool_input":'
+                    + raw + "}]"
+                ),
+            ),
+        }
+        for field, (offset, wrap) in family_offsets.items():
+            for delta, accepted in ((-1, True), (0, True), (1, False)):
+                depth = server._PROVIDER_JSON_MAX_DEPTH + delta
+                raw = "{}"
+                for _ in range(depth - offset):
+                    raw = '{"nested":' + raw + "}"
+                native = self._claude_result_with_raw_optional(field, wrap(raw))
+                with self.subTest(field=field, depth=depth):
+                    result = server.normalize_native_usage("claude", native, 1)
+                    self.assertEqual(
+                        result,
+                        expected if accepted else (None, "usage_malformed"),
+                    )
+            raw = "{}"
+            for _ in range(1500 - offset):
+                raw = '{"nested":' + raw + "}"
+            native = self._claude_result_with_raw_optional(field, wrap(raw))
+            with self.subTest(field=field, depth=1500):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    (None, "usage_malformed"),
+                )
+
+    def test_optional_json_telemetry_width_and_strings_are_bounded(self):
+        self.assertEqual(server._PROVIDER_JSON_MAX_ARRAY_ITEMS, 1024)
+        self.assertEqual(server._PROVIDER_JSON_MAX_OBJECT_ITEMS, 1024)
+        self.assertEqual(server._PROVIDER_JSON_MAX_KEY_CHARS, 1024)
+        self.assertEqual(server._PROVIDER_JSON_MAX_STRING_CHARS, 256 * 1024)
+        expected = server.normalize_native_usage(
+            "claude", json.dumps(self._claude_21250_usage_result()), 1,
+        )
+
+        for count, accepted in ((1024, True), (1025, False)):
+            raw = "[" + ",".join("0" for _ in range(count)) + "]"
+            native = self._claude_result_with_raw_optional("structured_output", raw)
+            with self.subTest(family="structured_output", shape="array", count=count):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    expected if accepted else (None, "usage_malformed"),
+                )
+
+        for count, accepted in ((1024, True), (1025, False)):
+            raw = "{" + ",".join(f'"k{i}":0' for i in range(count)) + "}"
+            deferred = '{"id":"id","name":"name","input":' + raw + "}"
+            native = self._claude_result_with_raw_optional("deferred_tool_use", deferred)
+            with self.subTest(family="deferred_tool_use", shape="object", count=count):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    expected if accepted else (None, "usage_malformed"),
+                )
+
+        for length, accepted in ((1024, True), (1025, False)):
+            raw = json.dumps({"k" * length: 0}, separators=(",", ":"))
+            native = self._claude_result_with_raw_optional("structured_output", raw)
+            with self.subTest(family="structured_output", shape="key", length=length):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    expected if accepted else (None, "usage_malformed"),
+                )
+
+        for length, accepted in ((256 * 1024, True), (256 * 1024 + 1, False)):
+            raw = json.dumps({"value": "x" * length}, separators=(",", ":"))
+            deferred = '{"id":"id","name":"name","input":' + raw + "}"
+            native = self._claude_result_with_raw_optional("deferred_tool_use", deferred)
+            with self.subTest(family="deferred_tool_use", shape="string", length=length):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    expected if accepted else (None, "usage_malformed"),
+                )
+
+        denial = '{"tool_name":"tool","tool_use_id":"id","tool_input":{}}'
+        for count, accepted in ((512, True), (1025, False)):
+            raw = "[" + ",".join(denial for _ in range(count)) + "]"
+            native = self._claude_result_with_raw_optional("permission_denials", raw)
+            with self.subTest(family="permission_denials", shape="array", count=count):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", native, 1),
+                    expected if accepted else (None, "usage_malformed"),
+                )
+
+    def test_provider_json_aggregate_budgets_reject_distributed_excess(self):
+        self.assertEqual(server._PROVIDER_JSON_MAX_NODES, 8192)
+        self.assertEqual(server._PROVIDER_JSON_MAX_CONTAINERS, 2048)
+        self.assertEqual(server._PROVIDER_JSON_MAX_TOTAL_STRING_CHARS, 288 * 1024)
+        self.assertEqual(server._PROVIDER_JSON_MAX_TOTAL_ARRAY_ITEMS, 4096)
+        self.assertEqual(server._PROVIDER_JSON_MAX_TOTAL_OBJECT_ITEMS, 4096)
+
+        cases = (
+            [[0, 0, 0, 0] for _ in range(1024)],
+            [{"a": {}, "b": {}} for _ in range(683)],
+            {
+                f"k{i}": {f"v{j}": 0 for j in range(4)}
+                for i in range(1024)
+            },
+            {"a": "x" * (144 * 1024), "b": "y" * (144 * 1024 + 1)},
+        )
+        for index, value in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertFalse(server._provider_json_is_bounded(value))
+
+    def test_json_decoder_recursion_is_mapped_to_stable_malformed_diagnostic(self):
+        raw = json.dumps(self._claude_21250_usage_result())
+        with mock.patch.object(server.json, "loads", side_effect=RecursionError("deep")):
+            with self.assertRaisesRegex(ValueError, "malformed JSON object"):
+                server.strict_json_object(raw)
+            self.assertEqual(
+                server.normalize_native_usage("claude", raw, 1),
+                (None, "usage_malformed"),
+            )
+
+        provider_object = {}
+        for _ in range(1500):
+            provider_object = {"nested": provider_object}
+        self.assertEqual(
+            server.normalize_native_usage("grok", provider_object, 1),
+            (None, "usage_malformed"),
+        )
+        with mock.patch.object(
+            server, "_normalize_native_usage", side_effect=RecursionError("validator"),
+        ):
+            self.assertEqual(
+                server.normalize_native_usage("grok", {}, 1),
+                (None, "usage_malformed"),
+            )
+
+    def test_provider_output_consumers_fail_closed_on_deep_objects(self):
+        raw_value = "{}"
+        for _ in range(1500):
+            raw_value = '{"nested":' + raw_value + "}"
+        native = self._claude_result_with_raw_optional("structured_output", raw_value)
+        self.assertIsNone(server.parse_native_session_id(native, "claude"))
+
+        receipt_native = native.replace(
+            '"result":"sanitized fixture result"',
+            '"result":"{\\"status\\":\\"ok\\"}"',
+        )
+        self.assertIsNone(server.parse_receipt_text(receipt_native))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "provider.jsonl"
+            path.write_text(native + "\n")
+            self.assertIsNone(server._codeoff_jsonl(path))
+
+        error = '{"code":"rate_limit"}'
+        for _ in range(1500):
+            error = '{"data":' + error + "}"
+        self.assertIsNone(
+            server.structured_provider_failure('{"type":"error","error":' + error + "}")
+        )
+
     def test_claude_21250_origin_union_variants_are_validation_only(self):
         origins = (
             {"kind": "human"},
@@ -9393,6 +9570,56 @@ while True:
             "wall_seconds": 1.25, "turns_observed": None,
         })
 
+    def test_claude_empty_model_usage_is_valid_support_metadata(self):
+        nonzero = self._claude_21250_usage_result()
+        nonzero["modelUsage"] = {}
+        usage, diagnostic = server.normalize_native_usage(
+            "claude", json.dumps(nonzero), 1,
+        )
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 40, "cached_input_tokens": 7,
+            "cache_write_tokens": 3, "output_tokens": 11,
+            "reasoning_tokens": 0, "provider_cost_usd": 0.0125,
+            "wall_seconds": 1.0, "turns_observed": None,
+        })
+
+        zero = self._claude_21250_usage_result(0)
+        zero["modelUsage"] = {}
+        for field in (
+            "input_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens", "output_tokens",
+        ):
+            zero["usage"][field] = 0
+            zero["usage"]["iterations"][0][field] = 0
+        zero["usage"]["cache_creation"] = {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0,
+        }
+        zero["usage"]["iterations"][0]["cache_creation"] = {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0,
+        }
+        usage, diagnostic = server.normalize_native_usage(
+            "claude", json.dumps(zero), 1,
+        )
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 0, "cached_input_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 0,
+            "reasoning_tokens": 0, "provider_cost_usd": 0,
+            "wall_seconds": 1.0, "turns_observed": None,
+        })
+
+        missing = self._claude_21250_usage_result()
+        del missing["modelUsage"]
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(missing), 1),
+            (None, "usage_malformed"),
+        )
+
     def test_claude_21250_success_envelope_is_closed_and_typed(self):
         valid = self._claude_21250_usage_result()
         usage, diagnostic = server.normalize_native_usage(
@@ -9433,7 +9660,6 @@ while True:
             ("numeric_uuid", "uuid", 9),
             ("object_denials", "permission_denials", {}),
             ("list_model_usage", "modelUsage", []),
-            ("empty_model_usage", "modelUsage", {}),
         )
         for name, field, value in mutations:
             with self.subTest(case=name):
@@ -9825,6 +10051,15 @@ while True:
                 forged_status["status"] = "error"
                 self.assertEqual(
                     server.authorized_receipt_usage(kind, forged_status),
+                    (None, "usage_authority_mismatch"),
+                )
+                nested = {}
+                for _ in range(1500):
+                    nested = {"provider_extra": nested}
+                forged_deep = dict(receipt)
+                forged_deep["provider_extra"] = nested
+                self.assertEqual(
+                    server.authorized_receipt_usage(kind, forged_deep),
                     (None, "usage_authority_mismatch"),
                 )
                 server.clear_terminal_receipt_authority(kind, receipt["job_id"])
