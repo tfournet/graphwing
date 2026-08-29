@@ -9100,18 +9100,12 @@ func main() {
     if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
     spec, ok := envelope["spec"].(map[string]any); if !ok { panic("missing object spec") }
     result := linter.Lint(spec)
-    errors := 0
-    e517 := 0
     for _, issue := range result.Issues {
-        if issue.Severity == "error" {
-            errors++
-            if issue.Code == "E517_INVALID_TASKS_FIELD" { e517++ }
-            encoded, _ := json.Marshal(issue)
-            fmt.Println(string(encoded))
-        }
+        encoded, _ := json.Marshal(issue)
+        fmt.Println(string(encoded))
     }
-    fmt.Printf("errors=%d E517=%d\n", errors, e517)
-    if errors != 0 { os.Exit(1) }
+    fmt.Printf("issues=%d\n", len(result.Issues))
+    if len(result.Issues) != 0 { os.Exit(1) }
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -9123,7 +9117,7 @@ func main() {
                 capture_output=True, timeout=120, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("errors=0 E517=0", result.stdout)
+        self.assertIn("issues=0", result.stdout)
 
     def test_implement_slice_named_tests_all_emit_bound_async_job_evidence(self):
         graph = json.loads(
@@ -9135,11 +9129,11 @@ func main() {
             for edge in graph["edges"]
         }
         cases = {
-            "test": ("wait_test", "if_test_ok", "join_test_http_fail"),
-            "test2": ("wait_test2", "if_test_ok2", "join_test2_http_fail"),
-            "test3": ("wait_test3", "if_test_ok3", "join_test2_http_fail"),
-            "test_rn1": ("wait_test_rn1", "if_test_rn1", "join_test_http_fail"),
-            "test_rn2": ("wait_test_rn2", "if_test_rn2", "join_test_http_fail"),
+            "test": ("wait_test", "join_test_accept", "if_test_ok", "join_test_http_fail"),
+            "test2": ("wait_test2", "join_test2_accept", "if_test_ok2", "join_test2_http_fail"),
+            "test3": ("wait_test3", "join_test3_accept", "if_test_ok3", "join_test2_http_fail"),
+            "test_rn1": ("wait_test_rn1", "join_test_rn1_accept", "if_test_rn1", "join_test_http_fail"),
+            "test_rn2": ("wait_test_rn2", "join_test_rn2_accept", "if_test_rn2", "join_test_http_fail"),
         }
         def callback_gate_passes(rules, body, accepted_job_id):
             actual = {
@@ -9154,9 +9148,12 @@ func main() {
                     return False
             return True
 
-        for test_id, (wait_id, gate_id, failure_join) in cases.items():
+        for test_id, (wait_id, barrier_id, gate_id, failure_join) in cases.items():
             wait = nodes[wait_id]
+            barrier = nodes[barrier_id]
             self.assertEqual(wait["type"], "action.wait.webhook")
+            self.assertEqual(barrier["type"], "logic.join.all")
+            self.assertEqual(barrier["config"], {})
             self.assertEqual(wait["config"], {
                 "alias": wait_id,
                 "allowedMethods": ["POST"], "authMode": "token",
@@ -9171,7 +9168,10 @@ func main() {
                 f"{{{{ TASKS.{wait_id}.pending.resumeToken }}}}",
             )
             self.assertIn((wait_id, "pending", test_id), triples)
-            self.assertIn((wait_id, "out", gate_id), triples)
+            self.assertIn((wait_id, "out", barrier_id), triples)
+            self.assertIn((test_id, "success", barrier_id), triples)
+            self.assertIn((barrier_id, "out", gate_id), triples)
+            self.assertNotIn((wait_id, "out", gate_id), triples)
             self.assertIn((wait_id, "timeout", failure_join), triples)
             self.assertIn((wait_id, "failure", failure_join), triples)
             self.assertIn((test_id, "failure", failure_join), triples)
@@ -11306,12 +11306,12 @@ func main() {
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        for target, wait_id, filt in (
-            ("test", "wait_test", "if_test_ok"),
-            ("review1", "wait_rev1", "if_review1"),
-            ("review1b", "wait_r1b", "if_review1b"),
-            ("review2", "wait_rev2", "if_review2"),
-            ("review2b", "wait_r2b", "if_review2b"),
+        for target, wait_id, filt, barrier in (
+            ("test", "wait_test", "if_test_ok", "join_test_accept"),
+            ("review1", "wait_rev1", "if_review1", None),
+            ("review1b", "wait_r1b", "if_review1b", None),
+            ("review2", "wait_rev2", "if_review2", None),
+            ("review2b", "wait_r2b", "if_review2b", None),
         ):
             self.assertEqual(nodes[wait_id]["type"], "action.wait.webhook", wait_id)
             cfg = nodes[target]["config"]
@@ -11321,7 +11321,17 @@ func main() {
             self.assertIn({"source": wait_id, "handle": "pending", "target": target},
                           [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges])
             outs = [e["target"] for e in edges if e["source"] == wait_id and e.get("sourceHandle") == "out"]
-            self.assertEqual(outs, [filt], wait_id)
+            self.assertEqual(outs, [barrier or filt], wait_id)
+            if barrier:
+                self.assertEqual(nodes[barrier]["type"], "logic.join.all")
+                self.assertIn(
+                    {"source": target, "handle": "success", "target": barrier},
+                    [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges],
+                )
+                self.assertIn(
+                    {"source": barrier, "handle": "out", "target": filt},
+                    [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges],
+                )
             # nothing may reach the async node except its wait
             feeders = {e["source"] for e in edges if e["target"] == target}
             self.assertEqual(feeders, {wait_id}, target)
@@ -14642,8 +14652,9 @@ func main() {
         self.assertEqual(edges["e_selected_route"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
-        self.assertEqual(edges["e12"]["target"], "join_walk")
-        self.assertEqual(edges["e_join_walk"]["target"], "walk_recovery_input")
+        self.assertEqual(edges["e12"]["target"], "walk_recovery_input")
+        self.assertNotIn("e_join_walk", edges)
+        self.assertNotIn("join_walk", {node["id"] for node in graph["spec"]["nodes"]})
         self.assertEqual(edges["e_walk_recovery_input"]["target"], "walk")
         self.assertEqual(edges["e7h"]["target"], "join_e2e")
         self.assertEqual(edges["e12d"]["target"], "join_e2e")
@@ -17465,7 +17476,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "50a1005103c74a6eea6d0a763123bf10afafa1f9ee0adc53d0057aaebb0127e0")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "5a3f5676d38c70a66864b060c282cd8ff69a05d532ea59cde1a593fc4a378587")
 
 
 class InstallTests(unittest.TestCase):
