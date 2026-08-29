@@ -135,6 +135,10 @@ REVIEW_JOB_FIELDS = frozenset({
     "created_at", "started_at", "finished_at", "receipt", "error", "webhook",
     "review_snapshot_sha256",
 })
+REVIEW_PUBLIC_JOB_FIELDS = frozenset({
+    "ok", "job_id", "kind", "status", "execution_identity", "created_at",
+    "started_at", "finished_at", "receipt", "poll",
+})
 # Native support proven against the installed launcher contracts. Graphwing's
 # closed vocabulary deliberately excludes launcher-only aliases such as xhigh.
 EFFORT_PROFILES = {
@@ -3483,6 +3487,28 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             accepted_launcher = None  # registry owns both sealed descriptors
             try:
                 write_job(job)
+                accepted = public_review_job(job)
+                if (
+                    set(accepted) != REVIEW_PUBLIC_JOB_FIELDS
+                    or accepted.get("ok") is not True
+                    or accepted.get("job_id") != job_id
+                    or accepted.get("kind") != "review"
+                    or accepted.get("status") != "queued"
+                    or accepted.get("execution_identity") != identity
+                    or accepted.get("created_at") != job["created_at"]
+                    or accepted.get("started_at") is not None
+                    or accepted.get("finished_at") is not None
+                    or accepted.get("receipt") is not None
+                    or accepted.get("poll") != f"/v1/review/jobs/{job_id}"
+                ):
+                    release_review_authority(job_id)
+                    return 409, {
+                        "error": "review record is not canonical",
+                        "code": "review_record_invalid",
+                    }
+                # Keep immutable canonical bytes across worker handoff. The worker may
+                # reach terminal state and release queued authority before enqueue returns.
+                accepted_bytes = _review_snapshot_bytes(accepted)
             except Exception:
                 release_review_authority(job_id)
                 raise
@@ -3491,9 +3517,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         except Exception:
             release_review_authority(job_id)
             raise
-        accepted = public_review_job(job)
-        accepted["poll"] = f"/v1/review/jobs/{job_id}"
-        return 202, accepted
+        return 202, json.loads(accepted_bytes)
     finally:
         if accepted_launcher is not None:
             accepted_launcher.close()
