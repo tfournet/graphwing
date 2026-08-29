@@ -10123,36 +10123,79 @@ while True:
                 server.strict_json_object(raw)
 
     def test_openapi_usage_pair_is_an_exact_exclusive_invariant(self):
-        from jsonschema import Draft202012Validator
-
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
+        supported_keywords = {
+            "$ref", "additionalProperties", "const", "enum", "maximum", "minimum",
+            "properties", "required", "type",
+        }
+
+        def matches_test_schema(schema, value):
+            self.assertFalse(set(schema) - supported_keywords, schema)
+            if "$ref" in schema:
+                prefix = "#/components/schemas/"
+                self.assertEqual(set(schema), {"$ref"}, schema)
+                self.assertTrue(schema["$ref"].startswith(prefix), schema)
+                return matches_test_schema(schemas[schema["$ref"][len(prefix):]], value)
+
+            expected_types = schema.get("type")
+            if expected_types is not None:
+                if isinstance(expected_types, str):
+                    expected_types = [expected_types]
+                type_matches = {
+                    "null": value is None,
+                    "object": isinstance(value, dict),
+                    "string": isinstance(value, str),
+                    "integer": isinstance(value, int) and not isinstance(value, bool),
+                    "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+                }
+                self.assertFalse(set(expected_types) - set(type_matches), schema)
+                if not any(type_matches[item] for item in expected_types):
+                    return False
+            if "const" in schema and value != schema["const"]:
+                return False
+            if "enum" in schema and value not in schema["enum"]:
+                return False
+            is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if "minimum" in schema and is_number and value < schema["minimum"]:
+                return False
+            if "maximum" in schema and is_number and value > schema["maximum"]:
+                return False
+            if isinstance(value, dict):
+                required = set(schema.get("required", ()))
+                if not required <= set(value):
+                    return False
+                properties = schema.get("properties", {})
+                if schema.get("additionalProperties") is False and set(value) - set(properties):
+                    return False
+                if any(
+                    key in value and not matches_test_schema(property_schema, value[key])
+                    for key, property_schema in properties.items()
+                ):
+                    return False
+            return True
+
         diagnostic_values = set(schemas["UsageDiagnostic"]["enum"]) - {None}
         for schema_name in ("AgentReceipt", "ReviewReceipt"):
             schema = schemas[schema_name]
             branches = schema.get("oneOf")
             self.assertEqual(len(branches or []), 2, schema_name)
-            pair_validator = Draft202012Validator({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "components": spec["components"],
-                "oneOf": branches,
-            })
             valid_usage, diagnostic = server._closed_usage(
                 1, 0, 0, 1, 0, None, 1, None,
             )
             self.assertIsNone(diagnostic)
-            valid_pairs = (
-                {"usage": valid_usage, "usage_diagnostic": None},
-                {"usage": None, "usage_diagnostic": "usage_malformed"},
+            pair_match_counts = (
+                ({"usage": valid_usage, "usage_diagnostic": None}, 1),
+                ({"usage": None, "usage_diagnostic": "usage_malformed"}, 1),
+                ({"usage": None, "usage_diagnostic": None}, 0),
+                ({"usage": valid_usage, "usage_diagnostic": "usage_malformed"}, 0),
             )
-            invalid_pairs = (
-                {"usage": None, "usage_diagnostic": None},
-                {"usage": valid_usage, "usage_diagnostic": "usage_malformed"},
-            )
-            for pair in valid_pairs:
-                self.assertFalse(list(pair_validator.iter_errors(pair)), (schema_name, pair))
-            for pair in invalid_pairs:
-                self.assertTrue(list(pair_validator.iter_errors(pair)), (schema_name, pair))
+            for pair, expected_match_count in pair_match_counts:
+                self.assertEqual(
+                    sum(matches_test_schema(branch, pair) for branch in branches),
+                    expected_match_count,
+                    (schema_name, pair),
+                )
         self.assertEqual(diagnostic_values, server.USAGE_DIAGNOSTICS)
 
     def test_usage_receipt_is_numeric_and_sanitized(self):
