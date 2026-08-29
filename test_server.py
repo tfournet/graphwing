@@ -17,9 +17,8 @@ from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
-
-from jinja2 import ChainableUndefined, Environment
 
 os.environ["GRAPHWING_HOME"] = str(Path(__file__).resolve().parent)
 os.environ["GRAPHWING_HERDR"] = "0"
@@ -8829,100 +8828,245 @@ while True:
             ):
                 self.assertNotIn(forbidden, dumped, node_id)
 
-    def test_implement_slice_durable_outcome_aggregates_every_unique_writer_and_reviewer_attempt(self):
+    def test_implement_slice_durable_outcome_aggregates_every_unique_accepted_job(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
         )["spec"]
-        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
-        schema = builder["config"]["outputSchema"]
-        for field in ("writer_usage", "reviewer_usage", "slice_usage"):
-            summary = schema["properties"][field]
-            self.assertFalse(summary["additionalProperties"])
-            self.assertEqual(
-                set(summary["required"]),
-                {"attempts", "usage", "usage_diagnostics"},
-            )
-            self.assertEqual(
-                set(summary["properties"]),
-                {"attempts", "usage", "usage_diagnostics"},
-            )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        candidates = json.dumps(nodes["durable_outcome_candidates"]["config"])
+        writer_pairs = {
+            "agent": "wait", "agent_fallback": "wait_fallback",
+            "agent2": "wait2", "agent3": "wait3",
+            "agent_rn1": "wait_rn1", "agent_rn2": "wait_rn2",
+        }
+        reviewer_pairs = {
+            "review1": "wait_rev1", "review1b": "wait_r1b",
+            "review2": "wait_rev2", "review2b": "wait_r2b",
+        }
+        for action_id, wait_id in {**writer_pairs, **reviewer_pairs}.items():
+            with self.subTest(action_id=action_id):
+                accepted = f"TASKS.{action_id}.data.job_id"
+                callback = f"TASKS.{wait_id}.request.body.job_id"
+                self.assertIn(accepted, candidates)
+                self.assertIn(callback, candidates)
 
-        def usage(seed, cost=0.25, turns=1):
+        self.assertEqual(nodes["durable_accepted_attempts"]["type"], "transforms.transformArray")
+        self.assertEqual(nodes["durable_accepted_attempts"]["config"]["operation"], "filter")
+        unique = nodes["durable_unique_attempts"]
+        self.assertEqual(unique["type"], "transforms.transformArray")
+        self.assertEqual(unique["config"]["operation"], "unique")
+        self.assertEqual(unique["config"]["uniqueBy"], "item.job_id")
+        for node_id in ("durable_writer_rollup", "durable_reviewer_rollup", "durable_slice_rollup"):
+            rollup = nodes[node_id]
+            self.assertEqual(rollup["type"], "transforms.groupByAggregate")
+            self.assertEqual(rollup["config"]["groupBy"], "group")
+
+        # Durable projection is a deterministic native-node pipeline. In
+        # particular, it cannot regress to unsupported namespace/dotted-set
+        # Nunjucks or an opaque codeExpression implementation.
+        durable_nodes = [node for node in graph["nodes"] if node["id"].startswith("durable_")]
+        self.assertNotIn("transforms.codeExpression", {node["type"] for node in durable_nodes})
+        durable_dump = json.dumps(durable_nodes)
+        self.assertNotIn("namespace(", durable_dump)
+        self.assertNotRegex(durable_dump, r"{%-?\s*set\s+[A-Za-z_]\w*[.\[]")
+
+    def test_implement_slice_durable_usage_fails_closed_and_never_sums_binary_costs(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        candidates = json.dumps(nodes["durable_outcome_candidates"]["config"])
+        # Every accepted action is represented independently of callback
+        # success, so a timeout remains an attempt with null usage.
+        for action_id in (
+            "agent", "agent_fallback", "agent2", "agent3", "agent_rn1", "agent_rn2",
+            "review1", "review1b", "review2", "review2b",
+        ):
+            self.assertIn(f"TASKS.{action_id}.data.job_id", candidates)
+        outcome = json.dumps(nodes["durable_outcome"]["config"])
+        self.assertIn("usage_not_reported", outcome)
+        self.assertIn("usage_not_spent", outcome)
+        self.assertIn("provider_cost_aggregation_unavailable", outcome)
+        for node_id in ("durable_writer_rollup", "durable_reviewer_rollup", "durable_slice_rollup"):
+            aggregations = nodes[node_id]["config"]["aggregations"]
+            self.assertNotIn("provider_cost_usd", {item["attribute"] for item in aggregations})
+            self.assertIn({"op": "count", "attribute": "usage", "as": "usage_count"}, aggregations)
+        # Exact decimal cost aggregation is deliberately unavailable rather
+        # than exposing JavaScript's false 0.30000000000000004 precision.
+        self.assertNotIn("provider_cost_usd", candidates)
+        self.assertNotIn("0.30000000000000004", outcome)
+
+        # Exercise the saved native AST with a clean-stdlib evaluator. This
+        # proves the production topology's essential data semantics without
+        # treating Python Jinja2 as a Rewst runtime.
+        def by_path(context: Any, path: str) -> Any:
+            value = context
+            for part in path.split("."):
+                if isinstance(value, dict):
+                    value = value.get(part)
+                elif isinstance(value, list) and part.isdigit():
+                    index = int(part)
+                    value = value[index] if index < len(value) else None
+                else:
+                    return None
+            return value
+
+        def evaluate(expression: dict[str, Any], context: dict[str, Any]) -> Any:
+            kind = expression["kind"]
+            if kind == "literal":
+                return expression.get("value")
+            if kind == "getField":
+                return by_path(context, expression["path"])
+            if kind == "array":
+                return [evaluate(item, context) for item in expression["elements"]]
+            if kind == "object":
+                return {
+                    key: evaluate(value, context)
+                    for key, value in expression["properties"].items()
+                }
+            if kind == "conditional":
+                branch = "then" if evaluate(expression["condition"], context) else "else"
+                return evaluate(expression[branch], context)
+            if kind == "coalesce":
+                primary = evaluate(expression["primary"], context)
+                return primary if primary is not None else evaluate(expression["fallback"], context)
+            if kind == "binary":
+                left = evaluate(expression["left"], context)
+                operator = expression["operator"]
+                if operator == "and":
+                    return left and evaluate(expression["right"], context)
+                if operator == "or":
+                    return left or evaluate(expression["right"], context)
+                right = evaluate(expression["right"], context)
+                return {
+                    "==": lambda: left == right,
+                    "!=": lambda: left != right,
+                    ">": lambda: left > right,
+                    "+": lambda: left + right,
+                }[operator]()
+            self.fail(f"unsupported native AST kind {kind}")
+
+        def usage(seed: int, cost: float) -> dict[str, Any]:
             return {
                 "usage_version": "normalized-usage-v1",
                 "fresh_input_tokens": seed,
-                "cached_input_tokens": seed + 1,
-                "cache_write_tokens": seed + 2,
-                "output_tokens": seed + 3,
-                "reasoning_tokens": seed + 4,
+                "cached_input_tokens": seed,
+                "cache_write_tokens": seed,
+                "output_tokens": seed,
+                "reasoning_tokens": seed,
                 "provider_cost_usd": cost,
-                "wall_seconds": seed + 5,
-                "turns_observed": turns,
+                "wall_seconds": seed,
+                "turns_observed": 1,
             }
 
-        writer_sources = {
-            "receipt": {"job_id": "primary", "usage": usage(1), "usage_diagnostic": None},
-            "fallback_receipt": {"job_id": "fallback", "usage": usage(10), "usage_diagnostic": None},
-            "receipt2": {"job_id": "correction", "usage": usage(100), "usage_diagnostic": None},
-            # The same receipt can remain reachable through a later alias. It is one spend.
-            "receipt3": {"job_id": "correction", "usage": usage(100), "usage_diagnostic": None},
+        tasks: dict[str, Any] = {
+            "agent": {"data": {"job_id": "writer-1"}},
+            "wait": {"request": {"body": {
+                "job_id": "writer-1", "usage": usage(1, 0.1), "status": "ok",
+            }}},
+            "agent2": {"data": {"job_id": "writer-2"}},
+            "wait2": {"request": {"body": {
+                "job_id": "writer-2", "usage": usage(10, 0.2), "status": "ok",
+            }}},
+            # A later alias for writer-1 must not double count it.
+            "agent3": {"data": {"job_id": "writer-1"}},
+            "wait3": {"request": {"body": {
+                "job_id": "writer-1", "usage": usage(1, 0.1), "status": "ok",
+            }}},
+            # Accepted review with no callback still counts as an attempt.
+            "review1": {"data": {"job_id": "review-1"}},
+            # A forged named-test callback cannot become evidence.
+            "test": {"data": {"job_id": "named-1"}},
+            "wait_test": {"request": {"body": {
+                "job_id": "forged", "status": "ok", "name": "forged-name",
+            }}},
         }
-        reviewer_sources = {
-            "wait_rev1": {"request": {"body": {"job_id": "review-1", "usage": usage(1000), "usage_diagnostic": None}}},
-            "wait_r1b": {"request": {"body": {"job_id": "review-1b", "usage": usage(10000), "usage_diagnostic": None}}},
-            "wait_rev2": {"request": {"body": {"job_id": "review-2", "usage": usage(100000), "usage_diagnostic": None}}},
+        context: dict[str, Any] = {
+            "TASKS": tasks, "CTX": {"INPUT": {"test": "configured-name"}}
         }
-        env = Environment(undefined=ChainableUndefined)
-        rendered = env.from_string(builder["config"]["code"]["code"]).render(
-            CTX={**writer_sources, "INPUT": {"test": "unit"}},
-            TASKS=reviewer_sources,
-            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
-        )
-        outcome = json.loads(rendered)
-        self.assertEqual(outcome["writer_usage"]["attempts"], 3)
-        self.assertEqual(outcome["reviewer_usage"]["attempts"], 3)
-        self.assertEqual(outcome["slice_usage"]["attempts"], 6)
-        self.assertEqual(outcome["writer_usage"]["usage"]["fresh_input_tokens"], 111)
-        self.assertEqual(outcome["reviewer_usage"]["usage"]["fresh_input_tokens"], 111000)
-        self.assertEqual(outcome["slice_usage"]["usage"]["fresh_input_tokens"], 111111)
-        self.assertEqual(outcome["slice_usage"]["usage"]["provider_cost_usd"], 1.5)
-        self.assertEqual(outcome["slice_usage"]["usage_diagnostics"], [])
+        candidate_mappings = nodes["durable_outcome_candidates"]["config"]["mappings"]
+        built = {
+            mapping["output"]: evaluate(mapping["expression"], context)
+            for mapping in candidate_mappings
+        }
+        accepted = [item for item in built["attempts"] if item["job_id"] is not None]
+        unique: list[dict[str, Any]] = []
+        seen = set()
+        for item in accepted:
+            if item["job_id"] not in seen:
+                seen.add(item["job_id"])
+                unique.append(item)
 
-    def test_implement_slice_durable_usage_totals_fail_closed_on_partial_usage(self):
-        graph = json.loads(
-            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
-        )["spec"]
-        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
-        complete = {
-            "usage_version": "normalized-usage-v1",
-            "fresh_input_tokens": 1, "cached_input_tokens": 2,
-            "cache_write_tokens": 3, "output_tokens": 4,
-            "reasoning_tokens": 5, "provider_cost_usd": None,
-            "wall_seconds": 6, "turns_observed": None,
+        def rollup(items: list[dict[str, Any]]) -> dict[str, Any]:
+            fields = {
+                "fresh": "fresh_input_tokens", "cached": "cached_input_tokens",
+                "cache_write": "cache_write_tokens", "output": "output_tokens",
+                "reasoning": "reasoning_tokens", "wall": "wall_seconds",
+                "turns": "turns_observed",
+            }
+            reported = [item["usage"] for item in items if item["usage"] is not None]
+            row = {alias: sum(value[field] for value in reported) for alias, field in fields.items()}
+            row.update({"usage_count": len(reported), "turns_count": len(reported)})
+            return {"itemCount": len(items), "rows": [row] if items else []}
+
+        writers = [item for item in unique if item["kind"] == "writer"]
+        reviewers = [item for item in unique if item["kind"] == "reviewer"]
+        bound_named = [
+            item for item in built["named_tests"]
+            if item["accepted_job_id"] is not None and item["callback_matches"] is True
+        ]
+        context["CTX"].update({
+            "durable_outcome_candidates": built,
+            "durable_writer_rollup": rollup(writers),
+            "durable_reviewer_rollup": rollup(reviewers),
+            "durable_slice_rollup": rollup(unique),
+            "durable_selected_agent": writers[-1] if writers else None,
+            "durable_selected_named_test": bound_named[-1] if bound_named else None,
+        })
+        projected = {
+            mapping["output"]: evaluate(mapping["expression"], context)
+            for mapping in nodes["durable_outcome"]["config"]["mappings"]
         }
-        env = Environment(undefined=ChainableUndefined)
-        rendered = env.from_string(builder["config"]["code"]["code"]).render(
-            CTX={
-                "INPUT": {"test": "unit"},
-                "receipt": {"job_id": "writer", "usage": complete, "usage_diagnostic": None},
-            },
-            TASKS={
-                "wait_rev1": {"request": {"body": {
-                    "job_id": "review", "usage": None,
-                    "usage_diagnostic": "usage_malformed",
-                }}},
-            },
-            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
+        self.assertEqual(projected["writer_usage"]["attempts"], 2)
+        self.assertEqual(projected["writer_usage"]["usage"]["fresh_input_tokens"], 11)
+        self.assertIsNone(projected["writer_usage"]["usage"]["provider_cost_usd"])
+        self.assertEqual(
+            projected["writer_usage"]["usage_diagnostics"],
+            ["provider_cost_aggregation_unavailable"],
         )
-        outcome = json.loads(rendered)
-        self.assertEqual(outcome["writer_usage"]["usage"]["provider_cost_usd"], None)
-        self.assertEqual(outcome["writer_usage"]["usage"]["turns_observed"], None)
-        self.assertEqual(outcome["reviewer_usage"], {
-            "attempts": 1, "usage": None, "usage_diagnostics": ["usage_malformed"],
-        })
-        self.assertEqual(outcome["slice_usage"], {
-            "attempts": 2, "usage": None, "usage_diagnostics": ["usage_malformed"],
-        })
+        self.assertEqual(projected["reviewer_usage"]["attempts"], 1)
+        self.assertIsNone(projected["reviewer_usage"]["usage"])
+        self.assertIn("usage_not_reported", projected["reviewer_usage"]["usage_diagnostics"])
+        self.assertEqual(projected["slice_usage"]["attempts"], 3)
+        self.assertIsNone(projected["slice_usage"]["usage"])
+        self.assertIsNone(projected["named_test_evidence"])
+        self.assertEqual(projected["named_test_name"], "configured-name")
+
+    def test_implement_slice_actual_riftwing_workflow_lint_when_available(self):
+        """Use Riftwing's real checker locally; keep CI hermetic and stdlib-only."""
+        graph_path = Path(server.__file__).parent / "graphs" / "implement-slice.json"
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            graph = json.loads(graph_path.read_text())["spec"]
+            durable_nodes = [node for node in graph["nodes"] if node["id"].startswith("durable_")]
+            self.assertNotIn("transforms.codeExpression", {node["type"] for node in durable_nodes})
+            dumped = json.dumps(durable_nodes)
+            self.assertNotIn("namespace(", dumped)
+            self.assertNotRegex(dumped, r"{%-?\s*set\s+[A-Za-z_]\w*[.\[]")
+            return
+
+        script = (
+            "import fs from 'node:fs';"
+            "import {lintWorkflow} from './packages/workflow-linter/src/lint.ts';"
+            f"const g=JSON.parse(fs.readFileSync({json.dumps(str(graph_path))},'utf8'));"
+            "const r=lintWorkflow(g.spec,{errorsOnly:true});"
+            "if(r.hasErrors){console.error(JSON.stringify(r.issues));process.exit(1)}"
+        )
+        result = subprocess.run(
+            ["pnpm", "exec", "tsx", "-e", script],
+            cwd=riftwing, text=True, capture_output=True, timeout=60, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_implement_slice_named_tests_all_emit_bound_async_job_evidence(self):
         graph = json.loads(
@@ -8940,6 +9084,19 @@ while True:
             "test_rn1": ("wait_test_rn1", "if_test_rn1", "join_test_http_fail"),
             "test_rn2": ("wait_test_rn2", "if_test_rn2", "join_test_http_fail"),
         }
+        def callback_gate_passes(rules, body, accepted_job_id):
+            actual = {
+                "request.body.status": body.get("status"),
+                "request.body.job_id": body.get("job_id"),
+            }
+            for rule in rules:
+                expected = rule["value"]
+                if isinstance(expected, str) and expected.startswith("{{ TASKS."):
+                    expected = accepted_job_id
+                if rule["op"] != "equals" or actual[rule["path"]] != expected:
+                    return False
+            return True
+
         for test_id, (wait_id, gate_id, failure_join) in cases.items():
             wait = nodes[wait_id]
             self.assertEqual(wait["type"], "action.wait.webhook")
@@ -8962,81 +9119,67 @@ while True:
             self.assertIn((wait_id, "failure", failure_join), triples)
             self.assertIn((test_id, "failure", failure_join), triples)
             self.assertNotIn((test_id, "success", gate_id), triples)
-            self.assertEqual(nodes[gate_id]["config"]["rules"], [
+            rules = nodes[gate_id]["config"]["rules"]
+            self.assertEqual(rules, [
                 {"path": "request.body.status", "op": "equals", "value": "ok"},
+                {
+                    "path": "request.body.job_id", "op": "equals",
+                    "value": f"{{{{ TASKS.{test_id}.data.job_id }}}}",
+                },
             ])
+            accepted = f"accepted-{test_id}"
+            self.assertTrue(callback_gate_passes(
+                rules, {"status": "ok", "job_id": accepted}, accepted
+            ))
+            self.assertFalse(callback_gate_passes(
+                rules, {"status": "ok", "job_id": f"forged-{test_id}"}, accepted
+            ))
 
-        evidence = nodes["durable_outcome"]["config"]["outputSchema"]["properties"]["named_test_evidence"]
-        self.assertEqual(evidence["type"], ["object", "null"])
-        self.assertFalse(evidence["additionalProperties"])
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["durable_outcome"]["config"]["mappings"]
+        }
+        evidence = mappings["named_test_evidence"]
+        self.assertEqual(evidence["kind"], "conditional")
         self.assertEqual(
-            set(evidence["required"]),
+            set(evidence["then"]["properties"]),
             {"evidence_version", "job_id", "name", "status"},
         )
-        self.assertEqual(set(evidence["properties"]), set(evidence["required"]))
 
-    def test_implement_slice_named_test_evidence_selects_exact_latest_terminal_receipt(self):
+    def test_implement_slice_named_test_evidence_uses_acceptance_identity_not_callback_text(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
         )["spec"]
-        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
-        env = Environment(undefined=ChainableUndefined)
-        rendered = env.from_string(builder["config"]["code"]["code"]).render(
-            CTX={"INPUT": {"test": "riftwing-local-gates"}},
-            TASKS={
-                "wait_test": {"request": {"body": {"job_id": "first", "status": "error"}}},
-                "wait_test2": {"request": {"body": {"job_id": "second", "status": "ok"}}},
-            },
-            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
-        )
-        outcome = json.loads(rendered)
-        self.assertEqual(outcome["named_test_evidence"], {
-            "evidence_version": "graphwing-named-test-evidence-v1",
-            "job_id": "second", "name": "riftwing-local-gates", "status": "ok",
-        })
-        self.assertEqual(outcome["named_test_status"], "passed")
-        dumped = json.dumps(outcome["named_test_evidence"]).lower()
-        for forbidden in ("log", "path", "stdout", "stderr", "provider", "token", "secret"):
-            self.assertNotIn(forbidden, dumped)
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        candidates = json.dumps(nodes["durable_outcome_candidates"]["config"])
+        for test_id, wait_id in (
+            ("test", "wait_test"), ("test2", "wait_test2"),
+            ("test3", "wait_test3"), ("test_rn1", "wait_test_rn1"),
+            ("test_rn2", "wait_test_rn2"),
+        ):
+            accepted = f"TASKS.{test_id}.data.job_id"
+            callback = f"TASKS.{wait_id}.request.body.job_id"
+            self.assertIn(accepted, candidates)
+            self.assertIn(callback, candidates)
+        selected = json.dumps(nodes["durable_outcome"]["config"])
+        self.assertIn("CTX.INPUT.test", selected)
+        self.assertIn("CTX.durable_selected_named_test.accepted_job_id", selected)
+        self.assertNotRegex(candidates + selected, r"request\.body\.(?:name|recipe)")
 
     def test_implement_slice_verification_classification_uses_terminal_gates_not_join_presence(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
         )["spec"]
-        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
-        template = Environment(undefined=ChainableUndefined).from_string(
-            builder["config"]["code"]["code"]
-        )
-
-        def project(ctx=None, tasks=None):
-            context = {"INPUT": {"test": "unit"}, **(ctx or {})}
-            return json.loads(template.render(
-                CTX=context,
-                TASKS=tasks or {},
-                WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
-            ))
-
-        cases = [
-            # An initially empty frontier can complete only after its terminal E2E gate.
-            ({}, {"slices_complete": {"data": {}}},
-             ("all_slices_complete", True, "verified")),
-            ({"done": True, "receipt": {"job_id": "writer", "status": "ok"}}, {},
-             ("slice_complete", True, "verified")),
-            # A passed named-test/review join does not verify later commit/push failure.
-            ({"receipt": {"job_id": "writer", "status": "ok"}},
-             {"join_commit": {}, "push_fail": {}},
-             ("push_failed", False, "spent_unverified")),
-            ({}, {"route_fail": {}},
-             ("route_failed", False, "unverified")),
-        ]
-        for ctx, tasks, expected in cases:
-            with self.subTest(expected=expected):
-                outcome = project(ctx, tasks)
-                self.assertEqual(
-                    (outcome["workflow_stage"], outcome["commit_eligible"],
-                     outcome["verified_outcome"]),
-                    expected,
-                )
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        stage = json.dumps(nodes["durable_outcome_candidates"]["config"]["mappings"][-1])
+        outcome = json.dumps(nodes["durable_outcome"]["config"])
+        self.assertIn("TASKS.slices_complete", stage)
+        self.assertIn("CTX.done", stage)
+        self.assertIn("all_slices_complete", stage)
+        self.assertIn("slice_complete", stage)
+        self.assertIn("TASKS.push_fail", stage)
+        self.assertIn("verified", outcome)
+        self.assertNotIn("TASKS.join_commit", stage + outcome)
 
     def test_implement_slice_durable_outcome_uses_exact_datastore_records_contract(self):
         graph = json.loads(
@@ -9045,7 +9188,7 @@ while True:
         nodes = {node["id"]: node for node in graph["nodes"]}
         upsert = nodes["durable_outcome_upsert"]
         readback = nodes["durable_outcome_readback"]
-        record_key = "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"
+        record_key = "{{ CTX.durable_outcome_record_key.value }}"
 
         self.assertEqual(upsert["type"], "action.datastore.records.upsert")
         self.assertEqual(upsert["config"], {
@@ -9067,6 +9210,75 @@ while True:
             "collection": "graphwing_verified_outcomes_v1",
             "recordKey": record_key,
         })
+        key_builder = nodes["durable_outcome_record_key"]
+        self.assertEqual(key_builder["type"], "transforms.objectBuilder")
+        key_expression = json.dumps(key_builder["config"]["mappings"][0]["expression"])
+        self.assertIn("graphwing-outcome-v1:", key_expression)
+        self.assertIn("WORKFLOW.runId", key_expression)
+        self.assertIn(":implement-slice-terminal", key_expression)
+
+    def test_implement_slice_readback_matches_exact_data_and_upsert_version(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        edges = {
+            (edge["source"], edge["sourceHandle"], edge["target"])
+            for edge in graph["edges"]
+        }
+        check = nodes["durable_outcome_readback_check"]
+        self.assertEqual(check["type"], "transforms.objectBuilder")
+        checks = {
+            mapping["output"]: mapping["expression"]
+            for mapping in check["config"]["mappings"]
+        }
+        self.assertEqual(
+            set(checks), {"found_matches", "key_matches", "data_matches", "version_matches"}
+        )
+        expected_hash = nodes["durable_outcome_expected_hash"]
+        returned_hash = nodes["durable_outcome_readback_hash"]
+        for hash_node in (expected_hash, returned_hash):
+            self.assertEqual(hash_node["type"], "transforms.hash")
+            self.assertEqual(hash_node["config"]["algorithm"], "sha256")
+            self.assertEqual(hash_node["config"]["inputKind"], "json_stringify")
+        self.assertEqual(expected_hash["config"]["input"], "{{ CTX.durable_outcome }}")
+        self.assertEqual(
+            returned_hash["config"]["input"],
+            "{{ TASKS.durable_outcome_readback.data.data }}",
+        )
+        check_dump = json.dumps(checks)
+        self.assertIn("TASKS.durable_outcome_readback.data.version", check_dump)
+        self.assertIn("TASKS.durable_outcome_upsert.data.version", check_dump)
+        self.assertIn("CTX.durable_outcome_expected_hash.value", check_dump)
+        self.assertIn("CTX.durable_outcome_readback_hash.value", check_dump)
+        gate = nodes["if_durable_outcome_readback"]
+        self.assertEqual(gate["config"]["rules"], [
+            {"path": "found_matches", "op": "equals", "value": True},
+            {"path": "key_matches", "op": "equals", "value": True},
+            {"path": "data_matches", "op": "equals", "value": True},
+            {"path": "version_matches", "op": "equals", "value": True},
+        ])
+        self.assertIn(("durable_outcome_readback", "success", "durable_outcome_readback_hash"), edges)
+        self.assertIn(("durable_outcome_readback_hash", "out", "durable_outcome_readback_check"), edges)
+        self.assertIn(("durable_outcome_readback_check", "out", "if_durable_outcome_readback"), edges)
+        self.assertIn(("if_durable_outcome_readback", "fail", "durable_outcome_readback_mismatch"), edges)
+        def gate_passes(values):
+            return all(values[rule["path"]] == rule["value"] for rule in gate["config"]["rules"])
+
+        self.assertTrue(gate_passes({
+            "found_matches": True, "key_matches": True,
+            "data_matches": True, "version_matches": True,
+        }))
+        # Same key is insufficient: stale/wrong payload or version takes the
+        # hard-failing mismatch leg.
+        self.assertFalse(gate_passes({
+            "found_matches": True, "key_matches": True,
+            "data_matches": False, "version_matches": True,
+        }))
+        self.assertFalse(gate_passes({
+            "found_matches": True, "key_matches": True,
+            "data_matches": True, "version_matches": False,
+        }))
 
     def test_implement_slice_persistence_failures_hard_fail_with_proven_rewst_regex_contract(self):
         graph = json.loads(
@@ -9108,36 +9320,39 @@ while True:
             "commit_eligible", "verified_outcome", "writer_usage", "reviewer_usage",
             "slice_usage", "diagnostic",
         }
-        self.assertEqual(builder["type"], "transforms.codeExpression")
-        schema = builder["config"]["outputSchema"]
-        self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(set(schema["required"]), expected_fields)
-        self.assertEqual(set(schema["properties"]), expected_fields)
+        self.assertEqual(builder["type"], "transforms.objectBuilder")
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in builder["config"]["mappings"]
+        }
+        self.assertEqual(set(mappings), expected_fields)
         for summary_field in ("writer_usage", "reviewer_usage", "slice_usage"):
-            usage_schema = schema["properties"][summary_field]["properties"]["usage"]
+            summary = mappings[summary_field]
+            self.assertEqual(summary["kind"], "object")
             self.assertEqual(
-                set(usage_schema["properties"]),
-                {
-                    "usage_version", "fresh_input_tokens", "cached_input_tokens",
-                    "cache_write_tokens", "output_tokens", "reasoning_tokens",
-                    "provider_cost_usd", "wall_seconds", "turns_observed",
-                },
+                set(summary["properties"]),
+                {"attempts", "usage", "usage_diagnostics"},
             )
-            self.assertFalse(usage_schema["additionalProperties"])
+            usage_dump = json.dumps(summary["properties"]["usage"])
+            for field in (
+                "usage_version", "fresh_input_tokens", "cached_input_tokens",
+                "cache_write_tokens", "output_tokens", "reasoning_tokens",
+                "provider_cost_usd", "wall_seconds", "turns_observed",
+            ):
+                self.assertIn(field, usage_dump)
         self.assertEqual(
-            set(schema["properties"]["diagnostic"]["properties"]),
+            set(mappings["diagnostic"]["properties"]),
             {"diagnostic_version", "stage", "status", "code", "summary"},
         )
-        self.assertFalse(schema["properties"]["diagnostic"]["additionalProperties"])
-        code = builder["config"]["code"]["code"]
+        projection = json.dumps(builder["config"])
         for identity in ("WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"):
-            self.assertIn(identity, code)
+            self.assertIn(identity, projection)
         for forbidden in (
-            "prompt", "log", "path", "raw", "output_text", "provider_payload",
+            "prompt", "log", "raw", "output_text", "provider_payload",
             "response_webhook_token", "resumetoken", "credential", "secret",
             "webhook", "resumeurl", "/home/",
         ):
-            self.assertNotIn(forbidden, code.lower())
+            self.assertNotIn(forbidden, projection.lower())
 
     def test_implement_slice_every_terminal_branch_converges_on_exactly_one_durable_write(self):
         graph = json.loads(
@@ -9167,8 +9382,8 @@ while True:
         outgoing = {}
         for edge in graph["edges"]:
             outgoing.setdefault(edge["source"], []).append(edge["target"])
-        self.assertEqual(outgoing["join_durable_outcome"], ["durable_outcome"])
-        self.assertEqual(outgoing["durable_outcome"], ["durable_outcome_upsert"])
+        self.assertEqual(outgoing["join_durable_outcome"], ["durable_outcome_candidates"])
+        self.assertEqual(outgoing["durable_outcome"], ["durable_outcome_record_key"])
         self.assertEqual(
             [node["id"] for node in graph["nodes"]
              if node["type"] == "action.datastore.records.upsert"],
@@ -9195,13 +9410,14 @@ while True:
         )["spec"]
         nodes = {node["id"]: node for node in graph["nodes"]}
         key = nodes["durable_outcome_upsert"]["config"]["recordKey"]
-        self.assertEqual(
-            key, "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"
-        )
+        self.assertEqual(key, "{{ CTX.durable_outcome_record_key.value }}")
         self.assertEqual(key, nodes["durable_outcome_readback"]["config"]["recordKey"])
-        self.assertEqual(key.count("{{ WORKFLOW.runId }}"), 1)
-        self.assertNotIn("now", key.lower())
-        self.assertNotIn("uuid", key.lower())
+        key_expression = json.dumps(
+            nodes["durable_outcome_record_key"]["config"]["mappings"][0]["expression"]
+        )
+        self.assertEqual(key_expression.count("WORKFLOW.runId"), 1)
+        self.assertNotIn("now", key_expression.lower())
+        self.assertNotIn("uuid", key_expression.lower())
 
         edges = graph["edges"]
         self.assertIn({
@@ -9210,14 +9426,26 @@ while True:
             "targetHandle": "in",
         }, edges)
         self.assertIn({
-            "id": "e_durable_readback_check", "source": "durable_outcome_readback",
-            "sourceHandle": "success", "target": "if_durable_outcome_readback",
+            "id": "e_durable_readback_hash", "source": "durable_outcome_readback",
+            "sourceHandle": "success", "target": "durable_outcome_readback_hash",
+            "targetHandle": "in",
+        }, edges)
+        self.assertIn({
+            "id": "e_durable_readback_compare", "source": "durable_outcome_readback_hash",
+            "sourceHandle": "out", "target": "durable_outcome_readback_check",
+            "targetHandle": "in",
+        }, edges)
+        self.assertIn({
+            "id": "e_durable_readback_validate", "source": "durable_outcome_readback_check",
+            "sourceHandle": "out", "target": "if_durable_outcome_readback",
             "targetHandle": "in",
         }, edges)
         readback_rules = nodes["if_durable_outcome_readback"]["config"]["rules"]
         self.assertEqual(readback_rules, [
-            {"path": "found", "op": "equals", "value": True},
-            {"path": "recordKey", "op": "equals", "value": key},
+            {"path": "found_matches", "op": "equals", "value": True},
+            {"path": "key_matches", "op": "equals", "value": True},
+            {"path": "data_matches", "op": "equals", "value": True},
+            {"path": "version_matches", "op": "equals", "value": True},
         ])
 
     @staticmethod
@@ -10951,13 +11179,22 @@ while True:
         for node_id, node in nodes.items():
             dumped = json.dumps(node.get("config", {}))
             for alias in sorted(set(task_reference.findall(dumped))):
-                code = node.get("config", {}).get("code", {}).get("code", "")
+                guarded_projection_ref = (
+                    node_id == "durable_outcome_candidates"
+                    # This post-terminal native objectBuilder deliberately
+                    # samples every possible branch. Its AST conditionals
+                    # coalesce missing task fields to null; the actual
+                    # Riftwing checker validates these expressions.
+                )
+                bound_async_gate_ref = {
+                    "if_test_ok": "test",
+                    "if_test_ok2": "test2",
+                    "if_test_ok3": "test3",
+                    "if_test_rn1": "test_rn1",
+                    "if_test_rn2": "test_rn2",
+                }.get(node_id) == alias
                 if alias not in dominators[node_id] and not (
-                    node_id == "durable_outcome"
-                    and (
-                        f"TASKS.{alias} is defined" in code
-                        or f"TASKS.{alias}.request.body | default({{}})" in code
-                    )
+                    guarded_projection_ref or bound_async_gate_ref
                 ):
                     path_errors.append(f"{node_id} references non-dominating TASKS.{alias}")
             if node["type"].startswith("action."):
@@ -11028,8 +11265,15 @@ while True:
             # nothing may reach the async node except its wait
             feeders = {e["source"] for e in edges if e["target"] == target}
             self.assertEqual(feeders, {wait_id}, target)
-            self.assertEqual(nodes[filt]["config"]["rules"],
-                             [{"path": "request.body.status", "op": "equals", "value": "ok"}], filt)
+            expected_rules = [
+                {"path": "request.body.status", "op": "equals", "value": "ok"}
+            ]
+            if target == "test":
+                expected_rules.append({
+                    "path": "request.body.job_id", "op": "equals",
+                    "value": "{{ TASKS.test.data.job_id }}",
+                })
+            self.assertEqual(nodes[filt]["config"]["rules"], expected_rules, filt)
 
     def test_every_writer_receipt_gates_followup_tests(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -17161,7 +17405,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "17363f5ad684b244ce50e1dbfa7d8881c47b9832958ab5fd3d72132c33fe29e1")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "082e871ff388f6d0ef41607a3d5df7be08dc1da7e09632eecad996a0ddd93b8d")
 
 
 class InstallTests(unittest.TestCase):
