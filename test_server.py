@@ -8828,17 +8828,71 @@ while True:
             for token in ("sqlite", "postgres", "dynamodb", "redis")
         ))
 
-    def test_claude_usage_normalization(self):
-        native = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
-            "session_id": "claude-usage-1", "duration_ms": 999999,
-            "num_turns": 2, "total_cost_usd": 0.0125,
+    @staticmethod
+    def _claude_21250_usage_result(cost: object = 0.0125) -> dict:
+        """Sanitized shape observed from Claude Code 2.1.250 JSON output."""
+        return {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "api_error_status": None,
+            "duration_ms": 10,
+            "duration_api_ms": 8,
+            "num_turns": 1,
+            "result": "sanitized fixture result",
+            "stop_reason": "end_turn",
+            "session_id": "claude-usage-fixture",
+            "total_cost_usd": cost,
             "usage": {
-                "input_tokens": 40, "cache_read_input_tokens": 7,
-                "cache_creation_input_tokens": 3, "output_tokens": 11,
+                "input_tokens": 40,
+                "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 11,
+                "server_tool_use": {
+                    "web_search_requests": 0,
+                    "web_fetch_requests": 0,
+                },
+                "service_tier": "standard",
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 3,
+                },
+                "inference_geo": "",
+                "iterations": [{
+                    "input_tokens": 40,
+                    "output_tokens": 11,
+                    "cache_read_input_tokens": 7,
+                    "cache_creation_input_tokens": 3,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 0,
+                        "ephemeral_5m_input_tokens": 3,
+                    },
+                    "type": "message",
+                }],
+                "speed": "standard",
             },
-            "result": "hostile prompt TOKEN_SECRET /home/private response",
-        }) + "\n"
+            "modelUsage": {
+                "claude-opus-5": {
+                    "inputTokens": 40,
+                    "outputTokens": 11,
+                    "cacheReadInputTokens": 7,
+                    "cacheCreationInputTokens": 3,
+                    "webSearchRequests": 0,
+                    "costUSD": cost,
+                    "contextWindow": 200000,
+                    "maxOutputTokens": 32000,
+                },
+            },
+            "permission_denials": [],
+            "terminal_reason": "completed",
+            "fast_mode_state": "off",
+            "uuid": "claude-usage-fixture",
+        }
+
+    def test_claude_usage_normalization(self):
+        event = self._claude_21250_usage_result()
+        event["result"] = "hostile prompt TOKEN_SECRET /home/private response"
+        native = json.dumps(event) + "\n"
         usage, diagnostic = server.normalize_native_usage("claude", native, 1.25)
         self.assertIsNone(diagnostic)
         self.assertEqual(usage, {
@@ -8848,6 +8902,124 @@ while True:
             "reasoning_tokens": 0, "provider_cost_usd": 0.0125,
             "wall_seconds": 1.25, "turns_observed": None,
         })
+
+    def test_claude_21250_success_envelope_is_closed_and_typed(self):
+        valid = self._claude_21250_usage_result()
+        usage, diagnostic = server.normalize_native_usage(
+            "claude", json.dumps(valid), 1,
+        )
+        self.assertIsNone(diagnostic)
+        self.assertIsNotNone(usage)
+
+        missing_fields = (
+            "type", "subtype", "is_error", "api_error_status", "duration_ms",
+            "duration_api_ms", "num_turns", "result", "stop_reason",
+            "session_id", "total_cost_usd", "usage", "modelUsage",
+            "permission_denials", "terminal_reason", "fast_mode_state", "uuid",
+        )
+        for field in missing_fields:
+            with self.subTest(case="missing", field=field):
+                event = deepcopy(valid)
+                del event[field]
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        mutations = (
+            ("bogus_subtype", "subtype", "bogus"),
+            ("error_result", "is_error", True),
+            ("numeric_type", "type", 1),
+            ("string_is_error", "is_error", "false"),
+            ("numeric_session", "session_id", 7),
+            ("float_duration", "duration_ms", 10.0),
+            ("bool_api_duration", "duration_api_ms", True),
+            ("string_turns", "num_turns", "1"),
+            ("numeric_result", "result", 1),
+            ("bad_api_status", "api_error_status", 200),
+            ("bad_stop_reason", "stop_reason", 1),
+            ("bad_terminal_reason", "terminal_reason", "failed"),
+            ("bad_fast_mode", "fast_mode_state", 0),
+            ("numeric_uuid", "uuid", 9),
+            ("object_denials", "permission_denials", {}),
+            ("list_model_usage", "modelUsage", []),
+            ("empty_model_usage", "modelUsage", {}),
+        )
+        for name, field, value in mutations:
+            with self.subTest(case=name):
+                event = deepcopy(valid)
+                event[field] = value
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        extra = deepcopy(valid)
+        extra["unexpected"] = "must reject"
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(extra), 1),
+            (None, "usage_malformed"),
+        )
+
+    def test_non_json_constants_are_rejected_at_every_depth(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            envelope = self._claude_21250_usage_result()
+            envelope["permission_denials"] = ["__CONSTANT__"]
+            nested = self._claude_21250_usage_result()
+            nested["usage"]["iterations"][0]["type"] = "__CONSTANT__"
+            cases = {
+                "top_level": constant,
+                "ignored_envelope": json.dumps(envelope).replace(
+                    '"__CONSTANT__"', constant,
+                ),
+                "nested_usage": json.dumps(nested).replace(
+                    '"__CONSTANT__"', constant,
+                ),
+            }
+            for placement, raw in cases.items():
+                with self.subTest(constant=constant, placement=placement):
+                    with self.assertRaises(ValueError):
+                        server.strict_json_object(raw)
+                    self.assertEqual(
+                        server.normalize_native_usage("claude", raw, 1),
+                        (None, "usage_malformed"),
+                    )
+
+    def test_claude_cost_literals_preserve_zero_and_reject_unsafe_conversion(self):
+        template = json.dumps(self._claude_21250_usage_result("__COST__"))
+        accepted = {
+            "0": 0,
+            "0.0": 0.0,
+            "0.0125": 0.0125,
+            "0.123456789012345678901234567890": float(
+                "0.123456789012345678901234567890"
+            ),
+            "100000": 100000,
+            "100000.0": 100000.0,
+        }
+        for literal, expected in accepted.items():
+            with self.subTest(literal=literal):
+                usage, diagnostic = server.normalize_native_usage(
+                    "claude", template.replace('"__COST__"', literal), 1,
+                )
+                self.assertIsNone(diagnostic)
+                assert isinstance(usage, dict)
+                self.assertEqual(usage["provider_cost_usd"], expected)
+                roundtrip = json.loads(json.dumps(usage, allow_nan=False))
+                self.assertEqual(roundtrip, usage)
+
+        for literal in (
+            "1e-400", "-1e-400", "-1e-3",
+            "1e999999999999999999999999", "1e-999999999999999999999999",
+            "100000.0000000000000000001",
+        ):
+            with self.subTest(literal=literal):
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", template.replace('"__COST__"', literal), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
 
     def test_codex_usage_normalization(self):
         native = "\n".join(json.dumps(event) for event in (
@@ -8892,15 +9064,8 @@ while True:
         self.assertIsNone(server._usage_number(10 ** 20))
         self.assertIsNone(server._usage_number(Decimal("1")))
 
-        event = {
-            "type": "result", "subtype": "success", "is_error": False,
-            "session_id": "bounded-usage", "num_turns": 1,
-            "total_cost_usd": 0.01,
-            "usage": {
-                "input_tokens": huge_integer, "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0, "output_tokens": 1,
-            },
-        }
+        event = self._claude_21250_usage_result(0.01)
+        event["usage"]["input_tokens"] = huge_integer
         usage, diagnostic = server.normalize_native_usage(
             "claude", json.dumps(event), 1,
         )
@@ -8976,15 +9141,9 @@ while True:
         )
 
     def test_turns_observed_never_trusts_provider_authored_turn_counts(self):
-        claude = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
-            "session_id": "hostile-turn-count", "num_turns": 999999999,
-            "total_cost_usd": 0.01,
-            "usage": {
-                "input_tokens": 4, "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0, "output_tokens": 2,
-            },
-        })
+        claude_event = self._claude_21250_usage_result(0.01)
+        claude_event["num_turns"] = 999999999
+        claude = json.dumps(claude_event)
         claude_usage, diagnostic = server.normalize_native_usage("claude", claude, 1)
         self.assertIsNone(diagnostic)
         self.assertIsNone(claude_usage["turns_observed"])
@@ -8999,10 +9158,31 @@ while True:
         self.assertIsNone(codex_usage["turns_observed"])
 
     def test_usage_parsers_reject_duplicate_keys_and_unknown_extras_for_all_providers(self):
+        claude_valid = self._claude_21250_usage_result()
+        claude_raw = json.dumps(claude_valid)
+        claude_usage_extra = deepcopy(claude_valid)
+        claude_usage_extra["usage"]["unexpected"] = 0
+        claude_server_tool_extra = deepcopy(claude_valid)
+        claude_server_tool_extra["usage"]["server_tool_use"]["unexpected"] = 0
+        claude_iteration_extra = deepcopy(claude_valid)
+        claude_iteration_extra["usage"]["iterations"][0]["unexpected"] = 0
+        claude_model_extra = deepcopy(claude_valid)
+        claude_model_extra["modelUsage"]["claude-opus-5"]["unexpected"] = 0
         claude_cases = (
-            '{"type":"result","type":"result","subtype":"success","is_error":false,"session_id":"dup","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}',
-            '{"type":"result","subtype":"success","is_error":false,"session_id":"dup","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}',
-            '{"type":"result","subtype":"success","is_error":false,"session_id":"extra","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1,"unexpected":0}}',
+            claude_raw.replace(
+                '"type": "result"',
+                '"type": "result", "type": "result"',
+                1,
+            ),
+            claude_raw.replace(
+                '"input_tokens": 40',
+                '"input_tokens": 40, "input_tokens": 40',
+                1,
+            ),
+            json.dumps(claude_usage_extra),
+            json.dumps(claude_server_tool_extra),
+            json.dumps(claude_iteration_extra),
+            json.dumps(claude_model_extra),
         )
         codex_cases = (
             '{"type":"turn.completed","type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}',
@@ -9071,18 +9251,13 @@ while True:
 
     def test_usage_receipt_is_numeric_and_sanitized(self):
         hostile = "TOKEN_SECRET /home/private prompt thought response --dangerous"
-        native = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
-            "session_id": "claude-usage-safe", "num_turns": 1,
-            "usage": {
-                "input_tokens": 1, "cache_read_input_tokens": 2,
-                "cache_creation_input_tokens": 3, "output_tokens": 4,
-            },
-            "result": hostile,
-        })
+        event = self._claude_21250_usage_result()
+        event["result"] = hostile
+        native = json.dumps(event)
         usage, diagnostic = server.normalize_native_usage("claude", native, 0)
         self.assertIsNone(diagnostic)
-        self.assertEqual(set(usage or {}), {
+        assert isinstance(usage, dict)
+        self.assertEqual(set(usage), {
             "usage_version", "fresh_input_tokens", "cached_input_tokens",
             "cache_write_tokens", "output_tokens", "reasoning_tokens",
             "provider_cost_usd", "wall_seconds", "turns_observed",
@@ -9096,17 +9271,10 @@ while True:
         ):
             self.assertNotIsInstance(usage[key], bool)
             self.assertIsInstance(usage[key], (int, float))
-        self.assertIsNone(usage["provider_cost_usd"])
+        self.assertEqual(usage["provider_cost_usd"], 0.0125)
 
     def test_usage_normalization_rejects_partial_negative_overflow_bool_nan_and_infinity(self):
-        valid = {
-            "type": "result", "subtype": "success", "is_error": False,
-            "session_id": "claude-usage-bad", "num_turns": 1,
-            "usage": {
-                "input_tokens": 1, "cache_read_input_tokens": 2,
-                "cache_creation_input_tokens": 3, "output_tokens": 4,
-            },
-        }
+        valid = self._claude_21250_usage_result()
         missing, missing_diagnostic = server.normalize_native_usage("claude", "", 1)
         self.assertIsNone(missing)
         self.assertEqual(missing_diagnostic, "usage_not_reported")
