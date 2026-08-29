@@ -9896,6 +9896,131 @@ while True:
             (None, "usage_malformed"),
         )
 
+    def test_grok_105_terminal_contract_accepts_every_stop_reason_and_optional_usage(self):
+        # Sanitized from the installed 1.0.5 static ACP PromptResponse/StopReason
+        # contract; no launcher or provider is invoked by this fixture.
+        valid_stop_reasons = (
+            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled",
+        )
+        native_usage = {
+            "totalTokens": 70, "inputTokens": 50, "outputTokens": 20,
+            "thoughtTokens": 10, "cachedReadTokens": 0,
+            "cachedWriteTokens": 0,
+        }
+        expected = {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 50, "cached_input_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 20,
+            "reasoning_tokens": 10, "provider_cost_usd": None,
+            "wall_seconds": 0.5, "turns_observed": None,
+        }
+        for stop_reason in valid_stop_reasons:
+            for usage_state in ("present", "absent", "null"):
+                envelope: dict[str, object] = {"stopReason": stop_reason}
+                if usage_state == "present":
+                    envelope["usage"] = deepcopy(native_usage)
+                elif usage_state == "null":
+                    envelope["usage"] = None
+                with self.subTest(stop_reason=stop_reason, usage_state=usage_state):
+                    if usage_state == "present":
+                        self.assertEqual(
+                            server.normalize_native_usage("grok", envelope, 0.5),
+                            (expected, None),
+                        )
+                    else:
+                        self.assertEqual(
+                            server.normalize_native_usage("grok", envelope, 0.5),
+                            (None, "usage_not_reported"),
+                        )
+
+    def test_grok_105_terminal_contract_accepts_typed_optional_response_metadata(self):
+        native_usage = {
+            "totalTokens": 2, "inputTokens": 1, "outputTokens": 1,
+            "thoughtTokens": 0, "cachedReadTokens": 0,
+            "cachedWriteTokens": 0,
+        }
+        valid_optional_fields = (
+            {"userMessageId": "fixture-message-id"},
+            {"userMessageId": None},
+            {"_meta": {"fixture-extension": True}},
+            {"_meta": None},
+            {"userMessageId": "fixture-message-id", "_meta": {}},
+        )
+        for optional_fields in valid_optional_fields:
+            envelope = {
+                "stopReason": "end_turn", "usage": deepcopy(native_usage),
+                **optional_fields,
+            }
+            with self.subTest(optional_fields=optional_fields):
+                usage, diagnostic = server.normalize_native_usage("grok", envelope, 1)
+                self.assertIsNone(diagnostic)
+                self.assertIsNotNone(usage)
+
+        for optional_fields in (
+            {"userMessageId": 0}, {"userMessageId": False},
+            {"userMessageId": {}}, {"_meta": "metadata"}, {"_meta": []},
+        ):
+            envelope = {
+                "stopReason": "end_turn", "usage": deepcopy(native_usage),
+                **optional_fields,
+            }
+            with self.subTest(optional_fields=optional_fields):
+                self.assertEqual(
+                    server.normalize_native_usage("grok", envelope, 1),
+                    (None, "usage_malformed"),
+                )
+
+    def test_grok_105_terminal_contract_validates_stop_reason_and_closed_envelope(self):
+        native_usage = {
+            "totalTokens": 2, "inputTokens": 1, "outputTokens": 1,
+            "thoughtTokens": 0, "cachedReadTokens": 0,
+            "cachedWriteTokens": 0,
+        }
+        for stop_reason in (None, 0, False, {}, [], "", "unknown_stop"):
+            with self.subTest(stop_reason=repr(stop_reason)):
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "grok",
+                        {"stopReason": stop_reason, "usage": deepcopy(native_usage)},
+                        1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+
+        for envelope in (
+            {"usage": deepcopy(native_usage)},
+            {"stopReason": "end_turn", "usage": deepcopy(native_usage), "unknown": 0},
+        ):
+            with self.subTest(keys=sorted(envelope)):
+                self.assertEqual(
+                    server.normalize_native_usage("grok", envelope, 1),
+                    (None, "usage_malformed"),
+                )
+
+    def test_grok_105_terminal_contract_distinguishes_absent_incomplete_and_malformed_usage(self):
+        complete = {
+            "totalTokens": 2, "inputTokens": 1, "outputTokens": 1,
+            "thoughtTokens": 0, "cachedReadTokens": 0,
+            "cachedWriteTokens": 0,
+        }
+        incomplete = deepcopy(complete)
+        del incomplete["thoughtTokens"]
+        malformed = deepcopy(complete)
+        malformed["unexpected"] = 0
+        cases = (
+            ({"stopReason": "end_turn"}, "usage_not_reported"),
+            ({"stopReason": "end_turn", "usage": None}, "usage_not_reported"),
+            ({"stopReason": "end_turn", "usage": incomplete}, "usage_incomplete"),
+            ({"stopReason": "end_turn", "usage": malformed}, "usage_malformed"),
+            ({"stopReason": "end_turn", "usage": []}, "usage_malformed"),
+        )
+        for envelope, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic, envelope=envelope):
+                self.assertEqual(
+                    server.normalize_native_usage("grok", envelope, 1),
+                    (None, diagnostic),
+                )
+
     def test_grok_105_usage_does_not_double_count_overlapping_thought_tokens(self):
         native = {
             "stopReason": "end_turn",
