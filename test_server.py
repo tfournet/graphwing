@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -128,6 +129,69 @@ class DispatchTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._scratch_td.cleanup()
+
+    @contextmanager
+    def _native_review_context(
+        self, launcher, provider, model, binary, *, prompt="ticket", diff_text="d",
+        requested_effort="default", effort_source="launcher_default",
+        route_execution_profile=None, job_id=None, resolved=None,
+        run_budget_seconds=server.REVIEW_DEFAULT_BUDGET_SECONDS,
+        max_turns=server.REVIEW_MAX_TURNS,
+    ):
+        """Author a complete direct-review authority for adapter-unit tests."""
+        resolved = (resolved or self.scratch).resolve()
+        branch, head, err = server.current_branch_head(resolved)
+        self.assertIsNone(err)
+        if effort_source == "route":
+            profile, effort_err = server.normalize_effort(
+                launcher, provider, model, requested_effort, effort_source
+            )
+        else:
+            profile, effort_err = server.normalize_review_effort(
+                launcher, provider, model, requested_effort, effort_source
+            )
+        self.assertIsNone(effort_err)
+        self.assertIsNotNone(profile)
+        assert profile is not None and branch is not None and head is not None
+        pinned = server.pin_launcher(binary)
+        identity = {
+            "version": server.REVIEW_EXECUTION_VERSION,
+            "kind": "review",
+            "launcher": launcher,
+            "provider": provider,
+            "model": model,
+            **profile,
+            "launcher_version": pinned.fingerprint,
+            "repo": "scratch",
+            "branch": branch,
+            "starting_head": head,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "diff_sha256": hashlib.sha256(diff_text.encode()).hexdigest(),
+            "run_budget_seconds": run_budget_seconds,
+            "max_turns": max_turns,
+            "permission_profile": server.REVIEW_PERMISSION_PROFILES[launcher],
+        }
+        if route_execution_profile is not None:
+            identity["route_execution_profile"] = route_execution_profile
+        try:
+            context = server.NativeReviewExecutionContext(
+                authority_identity=dict(identity), execution_identity=identity,
+                repo="scratch", resolved=resolved, prompt=prompt, diff_text=diff_text,
+                launcher=launcher, provider=provider, model=model,
+                requested_effort=profile["requested_effort"],
+                effective_effort=profile["effective_effort"],
+                effort_source=profile["effort_source"],
+                route_execution_profile=route_execution_profile,
+                run_budget_seconds=run_budget_seconds, max_turns=max_turns,
+                permission_profile=server.REVIEW_PERMISSION_PROFILES[launcher],
+                pinned_launcher=pinned, job_id=job_id,
+            )
+            with mock.patch.object(
+                server, "current_branch_head", return_value=(branch, head, None)
+            ):
+                yield context
+        finally:
+            pinned.close()
 
     def setUp(self):
         p = mock.patch.object(server, "load_repos", return_value={"scratch": str(self.scratch)})
@@ -727,7 +791,7 @@ class DispatchTests(unittest.TestCase):
             captured = []
 
             def fake_run(command, **kwargs):
-                captured.append(command)
+                captured.append((command, kwargs))
                 output_index = command.index("--output-last-message") + 1
                 Path(command[output_index]).write_text(
                     '{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}'
@@ -735,14 +799,16 @@ class DispatchTests(unittest.TestCase):
                 return FakeCompleted()
 
             with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
-                 mock.patch.object(server.subprocess, "run", fake_run):
-                result = server.native_review_result(
-                    "codex", "openai", "gpt-5.6-sol", "ticket", root
-                )
+                 mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}):
+                binary = server.resolve_launcher_binary_now("codex")
+                with self._native_review_context(
+                    "codex", "openai", "gpt-5.6-sol", binary
+                ) as context, mock.patch.object(server.subprocess, "run", fake_run):
+                    result = server.native_review_result(context)
         self.assertTrue(result["ok"], result)
-        self.assertEqual(captured[0][0], str(codex))
+        command, kwargs = captured[0]
+        self.assertEqual(Path(command[0]).parent, Path("/proc/self/fd"))
+        self.assertEqual(kwargs["pass_fds"], (int(Path(command[0]).name),))
 
     def test_codex_agent_run_records_git_bound_session_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2932,14 +2998,12 @@ class DispatchTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, output, b"")
 
         with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"), \
-             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
-             mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
-             mock.patch.object(server.subprocess, "run", side_effect=fake_run):
-            result = server.native_review_result(
-                "codex", "openai", "gpt-5.6-sol", "ticket", self.scratch,
-                requested_effort="medium", effort_source="explicit",
-            )
+             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", Path(__file__),
+                diff_text="fixture", requested_effort="medium", effort_source="explicit",
+            ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                result = server.native_review_result(context)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["requested_effort"], "medium")
         self.assertEqual(result["effective_effort"], "medium")
@@ -3391,11 +3455,11 @@ while True:
         }
         env["GRAPHWING_GROK_BIN"] = str(fixture)
         with mock.patch.object(server, "JOBS_DIR", jobs), \
-             mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
              mock.patch.dict(os.environ, env, clear=False):
-            result = server.native_review_result(
-                "grok", "xai", "grok-4.6", "ticket", root
-            )
+            with self._native_review_context(
+                "grok", "xai", "grok-4.6", fixture
+            ) as context:
+                result = server.native_review_result(context)
         return result, json.loads(capture.read_text())
 
     def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
@@ -7039,6 +7103,8 @@ while True:
                 "POST", "/v1/review/run", {}, True, body
             )
         self.assertEqual(status, 200, payload)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["summary"], "review passed")
         self.assertEqual(payload["execution_identity"]["requested_effort"], "medium")
@@ -7047,14 +7113,29 @@ while True:
         self.assertNotIn("provider prose", json.dumps(payload))
         review.assert_called_once()
         args, kwargs = review.call_args
-        self.assertEqual(args[:5], (
-            "claude", "anthropic", "claude-sonnet-5", "bounded fixture", self.scratch,
+        self.assertEqual(kwargs, {})
+        self.assertEqual(len(args), 1)
+        context = args[0]
+        self.assertIsInstance(context, server.NativeReviewExecutionContext)
+        self.assertEqual(context.execution_identity, payload["execution_identity"])
+        self.assertEqual(context.authority_identity, payload["execution_identity"])
+        self.assertEqual((context.launcher, context.provider, context.model), (
+            "claude", "anthropic", "claude-sonnet-5",
         ))
-        self.assertEqual(kwargs["run_budget_seconds"], server.REVIEW_DEFAULT_BUDGET_SECONDS)
-        self.assertEqual(kwargs["max_turns"], server.REVIEW_MAX_TURNS)
-        self.assertEqual(kwargs["requested_effort"], "medium")
-        self.assertEqual(kwargs["effort_source"], "explicit")
-        self.assertEqual(kwargs["execution_identity"], payload["execution_identity"])
+        self.assertEqual(context.repo, "scratch")
+        self.assertEqual(context.resolved, self.scratch.resolve())
+        self.assertEqual(context.prompt, "bounded fixture")
+        self.assertEqual(context.run_budget_seconds, server.REVIEW_DEFAULT_BUDGET_SECONDS)
+        self.assertEqual(context.max_turns, server.REVIEW_MAX_TURNS)
+        self.assertEqual(context.requested_effort, "medium")
+        self.assertEqual(context.effective_effort, "medium")
+        self.assertEqual(context.effort_source, "explicit")
+        self.assertEqual(context.permission_profile, "claude-plan")
+        self.assertEqual(context.pinned_launcher.path.parent, Path("/proc/self/fd"))
+        self.assertEqual(
+            context.pinned_launcher.fingerprint,
+            "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        )
 
         root = Path(server.__file__).resolve().parent
         expected_counts = {"implement-slice.json": 10, "pr-drive.json": 1}
@@ -7361,6 +7442,12 @@ while True:
             self.assertIsInstance(accepted, dict)
             assert isinstance(accepted, dict)
             canonical = accepted["execution_identity"]
+            authority = server.review_authority(accepted["job_id"])
+            self.assertIsNotNone(authority)
+            assert authority is not None
+            snapshot = authority.snapshot()
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
             reviewer2 = self._route_execution_profile(route, "reviewer2")
             cases = {
                 "unsealed direct route claim": None,
@@ -7395,16 +7482,31 @@ while True:
                 },
             }
             for name, identity in cases.items():
-                with self.subTest(name=name), mock.patch.object(
-                    server.subprocess, "run",
-                    side_effect=AssertionError("invalid routed review must not spawn"),
-                ) as spawn:
-                    result = server.native_review_result(
-                        evidence["launcher"], evidence["provider"], evidence["model"],
-                        "bounded ticket", repo, requested_effort=evidence["effort"],
-                        effort_source="route", binary=launcher,
-                        execution_identity=identity,
-                    )
+                with self.subTest(name=name), \
+                     mock.patch.object(
+                         server, "current_branch_head",
+                         return_value=(canonical["branch"], canonical["starting_head"], None),
+                     ), \
+                     mock.patch.object(
+                         server.subprocess, "run",
+                         side_effect=AssertionError("invalid routed review must not spawn"),
+                     ) as spawn:
+                    result = server.native_review_result(server.NativeReviewExecutionContext(
+                        authority_identity=canonical,
+                        execution_identity=identity or {},
+                        repo=snapshot["repo"], resolved=repo.resolve(),
+                        prompt=snapshot["prompt"], diff_text="",
+                        launcher=snapshot["launcher"], provider=snapshot["provider"],
+                        model=snapshot["model"],
+                        requested_effort=snapshot["requested_effort"],
+                        effective_effort=snapshot["effective_effort"],
+                        effort_source=snapshot["effort_source"],
+                        route_execution_profile=canonical["route_execution_profile"],
+                        run_budget_seconds=snapshot["run_budget_seconds"],
+                        max_turns=snapshot["max_turns"],
+                        permission_profile=snapshot["permission_profile"],
+                        pinned_launcher=authority.launcher,
+                    ))
                 self.assertFalse(result["ok"], result)
                 self.assertIn(
                     result["code"],
@@ -7412,8 +7514,101 @@ while True:
                         "bad_effort_source",
                         "bad_route_execution_profile",
                         "route_execution_profile_mismatch",
+                        "review_execution_identity_mismatch",
                     },
                 )
+                spawn.assert_not_called()
+
+    def test_native_routed_review_binds_complete_identity_to_invocation_authority(self):
+        route = server.slice_route_lookup("sensitive", "M", work_kind="go_coding")
+        evidence = self._route_execution_profile(route, "reviewer1")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, _jobs, repo, launcher, _enqueue = self._queue_closed_review(
+                root,
+                effort=evidence["effort"],
+                extra={
+                    "launcher": evidence["launcher"],
+                    "provider": evidence["provider"],
+                    "model": evidence["model"],
+                    "route_execution_profile": evidence,
+                },
+            )
+            self.assertEqual(status, 202, accepted)
+            self.assertIsInstance(accepted, dict)
+            assert isinstance(accepted, dict)
+            canonical = accepted["execution_identity"]
+            authority = server.review_authority(accepted["job_id"])
+            self.assertIsNotNone(authority)
+            assert authority is not None
+            snapshot = authority.snapshot()
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            actual_budget = canonical["run_budget_seconds"]
+            actual_turns = canonical["max_turns"]
+            actual_launcher_version = "sha256:" + hashlib.sha256(launcher.read_bytes()).hexdigest()
+            self.assertEqual(canonical["repo"], "scratch")
+            self.assertEqual(canonical["launcher_version"], actual_launcher_version)
+            self.assertEqual(actual_budget, server.REVIEW_DEFAULT_BUDGET_SECONDS)
+            self.assertEqual(actual_turns, server.REVIEW_MAX_TURNS)
+
+            other_budget = (
+                actual_budget + 1
+                if actual_budget < server.REVIEW_MAX_BUDGET_SECONDS
+                else actual_budget - 1
+            )
+            other_turns = (
+                actual_turns + 1
+                if actual_turns < server.REVIEW_MAX_REQUEST_TURNS
+                else actual_turns - 1
+            )
+            different_launcher_version = "sha256:" + (
+                "0" if actual_launcher_version[-1] != "0" else "1"
+            ) * 64
+            cases = {
+                "repo": {**canonical, "repo": "other-repo"},
+                "launcher_version": {
+                    **canonical, "launcher_version": different_launcher_version,
+                },
+                "run_budget_seconds": {
+                    **canonical, "run_budget_seconds": other_budget,
+                },
+                "max_turns": {**canonical, "max_turns": other_turns},
+                "coordinated": {
+                    **canonical,
+                    "repo": "other-repo",
+                    "launcher_version": different_launcher_version,
+                    "run_budget_seconds": other_budget,
+                    "max_turns": other_turns,
+                },
+            }
+            for name, identity in cases.items():
+                with self.subTest(name=name), \
+                     mock.patch.object(
+                         server, "current_branch_head",
+                         return_value=(canonical["branch"], canonical["starting_head"], None),
+                     ), \
+                     mock.patch.object(
+                         server.subprocess, "run",
+                         side_effect=AssertionError("drifted review must not spawn"),
+                     ) as spawn:
+                    result = server.native_review_result(server.NativeReviewExecutionContext(
+                        authority_identity=canonical,
+                        execution_identity=identity,
+                        repo=snapshot["repo"], resolved=repo.resolve(),
+                        prompt=snapshot["prompt"], diff_text="",
+                        launcher=snapshot["launcher"], provider=snapshot["provider"],
+                        model=snapshot["model"],
+                        requested_effort=snapshot["requested_effort"],
+                        effective_effort=snapshot["effective_effort"],
+                        effort_source=snapshot["effort_source"],
+                        route_execution_profile=canonical["route_execution_profile"],
+                        run_budget_seconds=actual_budget, max_turns=actual_turns,
+                        permission_profile=snapshot["permission_profile"],
+                        pinned_launcher=authority.launcher,
+                    ))
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["code"], "review_execution_identity_mismatch")
                 spawn.assert_not_called()
 
     def test_routed_review_requires_exact_closed_route_evidence_before_boundary(self):
@@ -9455,19 +9650,32 @@ while True:
         self.assertEqual(len(captured), 30)
         for receipt, (args, kwargs) in zip(receipts, captured):
             identity = receipt["execution_identity"]
-            self.assertEqual(kwargs["execution_identity"], identity)
-            self.assertEqual(kwargs["requested_effort"], identity["requested_effort"])
-            self.assertEqual(kwargs["effort_source"], identity["effort_source"])
-            self.assertEqual(kwargs["binary"].parent, Path("/proc/self/fd"))
+            self.assertEqual(kwargs, {})
+            self.assertEqual(len(args), 1)
+            context = args[0]
+            self.assertIsInstance(context, server.NativeReviewExecutionContext)
+            self.assertEqual(context.execution_identity, identity)
+            self.assertEqual(context.authority_identity, identity)
+            self.assertEqual(context.requested_effort, identity["requested_effort"])
+            self.assertEqual(context.effective_effort, identity["effective_effort"])
+            self.assertEqual(context.effort_source, identity["effort_source"])
+            self.assertEqual(context.repo, identity["repo"])
+            self.assertEqual(context.resolved, repo.resolve())
+            self.assertEqual(context.run_budget_seconds, identity["run_budget_seconds"])
+            self.assertEqual(context.max_turns, identity["max_turns"])
+            self.assertEqual(context.permission_profile, identity["permission_profile"])
+            self.assertEqual(context.pinned_launcher.path.parent, Path("/proc/self/fd"))
+            self.assertEqual(context.pinned_launcher.fingerprint, identity["launcher_version"])
             adapter_job = {
-                "launcher": args[0], "provider": args[1], "model": args[2],
+                "launcher": context.launcher, "provider": context.provider,
+                "model": context.model,
                 "requested_effort": identity["requested_effort"],
                 "effective_effort": identity["effective_effort"],
                 "effort_source": identity["effort_source"],
                 "max_turns": identity["max_turns"],
             }
             command = server.claude_command(
-                adapter_job, "fixture", str(repo), kwargs["binary"],
+                adapter_job, "fixture", str(repo), context.pinned_launcher.path,
                 permission_mode="plan", output_format="text",
             )
             self.assertEqual(command[command.index("--effort") + 1], "medium")
@@ -9640,15 +9848,37 @@ while True:
                 "GET", f"/v1/review/jobs/{job_id}", {}, True, b""
             )
             self.assertEqual((poll_status, poll["code"]), (409, "review_record_invalid"))
+            authority = server.review_authority(job_id)
+            self.assertIsNotNone(authority)
+            assert authority is not None
+            snapshot = authority.snapshot()
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            canonical = snapshot["execution_identity"]
             with mock.patch.object(
+                server, "current_branch_head",
+                return_value=(canonical["branch"], canonical["starting_head"], None),
+            ), mock.patch.object(
                 server.subprocess, "run", side_effect=AssertionError("route review must not spawn")
             ) as spawn:
-                result = server.native_review_result(
-                    "claude", "anthropic", "claude-sonnet-5", "bounded ticket", repo,
-                    requested_effort="default", effort_source="route", binary=launcher,
-                )
+                result = server.native_review_result(server.NativeReviewExecutionContext(
+                    authority_identity=canonical,
+                    execution_identity=stored["execution_identity"],
+                    repo=snapshot["repo"], resolved=repo.resolve(),
+                    prompt=snapshot["prompt"], diff_text="",
+                    launcher=snapshot["launcher"], provider=snapshot["provider"],
+                    model=snapshot["model"],
+                    requested_effort=snapshot["requested_effort"],
+                    effective_effort=snapshot["effective_effort"],
+                    effort_source=snapshot["effort_source"],
+                    route_execution_profile=None,
+                    run_budget_seconds=snapshot["run_budget_seconds"],
+                    max_turns=snapshot["max_turns"],
+                    permission_profile=snapshot["permission_profile"],
+                    pinned_launcher=authority.launcher,
+                ))
             spawn.assert_not_called()
-            self.assertEqual(result["code"], "bad_effort_source")
+            self.assertEqual(result["code"], "review_execution_identity_mismatch")
 
     def test_review_worker_rejects_every_snapshot_drift_before_spawn(self):
         mutations = (
@@ -9697,10 +9927,15 @@ while True:
             )
             captured_fingerprints = []
 
-            def pass_with_pinned_launcher(*_args, **kwargs):
+            def pass_with_pinned_launcher(context):
+                self.assertIsInstance(context, server.NativeReviewExecutionContext)
                 captured_fingerprints.append(
-                    server.launcher_version_fingerprint(kwargs["binary"])
+                    server.launcher_version_fingerprint(context.pinned_launcher.path)
                 )
+                self.assertEqual(
+                    context.authority_identity["launcher_version"], accepted_fingerprint
+                )
+                self.assertEqual(context.execution_identity, context.authority_identity)
                 return {"ok": True, "verdict": "PASS", "no_verdict": False}
 
             with mock.patch.object(server, "JOBS_DIR", jobs), \
@@ -10304,23 +10539,26 @@ while True:
                 )
             self.assertEqual(invalid_status, 400)
             self.assertNotIn("TOKEN_SECRET", json.dumps(invalid))
+            identity_mismatch = {
+                "ok": False, "verdict": "NACK", "no_verdict": True,
+                "code": "review_execution_identity_mismatch",
+            }
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
                  mock.patch.object(
-                     server, "launcher_version_fingerprint",
-                     return_value="sha256:" + "f" * 64,
-                 ), mock.patch.object(server, "native_review_result") as spawn:
+                     server, "native_review_result", return_value=identity_mismatch
+                 ) as boundary:
                 mismatch_status, mismatch, _ = server.dispatch(
                     "POST", "/v1/review/run", {}, True, body
                 )
-            spawn.assert_not_called()
+            boundary.assert_called_once()
             self.assertEqual(mismatch_status, 409)
             self.assertEqual(set(mismatch), set(server.REVIEW_RECEIPT_FIELDS))
             self.assertEqual(mismatch["code"], "review_execution_identity_mismatch")
 
             with mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server, "launcher_version_fingerprint", return_value=None), \
+                 mock.patch.object(server, "pin_launcher", side_effect=FileNotFoundError), \
                  mock.patch.object(server, "native_review_result") as unavailable_spawn:
                 unavailable_status, unavailable, _ = server.dispatch(
                     "POST", "/v1/review/run", {}, True, body
@@ -10529,15 +10767,30 @@ while True:
             saved = json.loads((jobs / job_id / "job.json").read_text())
         review.assert_called_once()
         args, kwargs = review.call_args
-        self.assertEqual(args[:4], ("claude", "anthropic", "claude-sonnet-5", "bounded ticket"))
-        self.assertEqual(args[4], repo)
-        self.assertEqual(kwargs["job_id"], job_id)
-        self.assertEqual(kwargs["run_budget_seconds"], 600)
-        self.assertEqual(kwargs["max_turns"], 20)
-        self.assertEqual(kwargs["requested_effort"], "high")
-        self.assertEqual(kwargs["effort_source"], "explicit")
-        self.assertEqual(kwargs["execution_identity"], accepted["execution_identity"])
-        self.assertEqual(kwargs["binary"].parent, Path("/proc/self/fd"))
+        self.assertEqual(kwargs, {})
+        self.assertEqual(len(args), 1)
+        context = args[0]
+        self.assertIsInstance(context, server.NativeReviewExecutionContext)
+        self.assertEqual(context.execution_identity, accepted["execution_identity"])
+        self.assertEqual(context.authority_identity, accepted["execution_identity"])
+        self.assertEqual((context.launcher, context.provider, context.model), (
+            "claude", "anthropic", "claude-sonnet-5",
+        ))
+        self.assertEqual(context.repo, "scratch")
+        self.assertEqual(context.resolved, repo.resolve())
+        self.assertEqual(context.prompt, "bounded ticket")
+        self.assertEqual(context.job_id, job_id)
+        self.assertEqual(context.run_budget_seconds, 600)
+        self.assertEqual(context.max_turns, 20)
+        self.assertEqual(context.requested_effort, "high")
+        self.assertEqual(context.effective_effort, "high")
+        self.assertEqual(context.effort_source, "explicit")
+        self.assertEqual(context.permission_profile, "claude-plan")
+        self.assertEqual(context.pinned_launcher.path.parent, Path("/proc/self/fd"))
+        self.assertEqual(
+            context.pinned_launcher.fingerprint,
+            accepted["execution_identity"]["launcher_version"],
+        )
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["receipt"]["status"], "error")
         self.assertEqual(saved["receipt"]["code"], "timeout")
@@ -10584,18 +10837,15 @@ while True:
             claude_bin = Path(td) / "claude"
             codex_bin.write_text("fixture")
             claude_bin.write_text("fixture")
-            with mock.patch.dict(os.environ, {
-                     "GRAPHWING_CODEX_BIN": str(codex_bin),
-                     "GRAPHWING_CLAUDE_BIN": str(claude_bin),
-                 }), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
-                 mock.patch.object(server.subprocess, "run", fake_run):
-                codex = server.native_review_result(
-                    "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
-                )
-                claude = server.native_review_result(
-                    "claude", "anthropic", "claude-sonnet-5", "ticket", Path(td)
-                )
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", codex_bin
+            ) as codex_context, self._native_review_context(
+                "claude", "anthropic", "claude-sonnet-5", claude_bin
+            ) as claude_context, mock.patch.object(
+                server, "JOBS_DIR", Path(td) / "jobs"
+            ), mock.patch.object(server.subprocess, "run", fake_run):
+                codex = server.native_review_result(codex_context)
+                claude = server.native_review_result(claude_context)
         grok, grok_capture = self._run_grok_review_fixture()
         self.assertEqual(
             (codex["verdict"], claude["verdict"], grok["verdict"]),
@@ -10664,26 +10914,39 @@ while True:
             for outcome, code in cases:
                 effect = outcome if isinstance(outcome, BaseException) else None
                 with self.subTest(outcome=type(outcome).__name__, code=code), \
-                     mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
-                     mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
+                     self._native_review_context(
+                         "codex", "openai", "gpt-5.6-sol", codex
+                     ) as context, \
+                     mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"), \
                      mock.patch.object(
                          server.subprocess, "run",
                          side_effect=effect,
                          return_value=None if effect else outcome,
                      ):
-                    result = server.native_review_result(
-                        "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
-                    )
+                    result = server.native_review_result(context)
                 self.assertFalse(result["ok"], result)
                 if code:
                     self.assertEqual(result["code"], code)
-            with mock.patch.dict(
-                os.environ, {"GRAPHWING_CODEX_BIN": str(Path(td) / "missing-codex")}
-            ):
-                missing = server.native_review_result(
-                    "codex", "openai", "gpt-5.6-sol", "ticket", Path(td)
+            missing_binary = Path(td) / "missing-codex"
+            with mock.patch.object(
+                server, "load_repos", return_value={"scratch": str(self.scratch)}
+            ), mock.patch.object(
+                server, "resolve_launcher_binary_now", return_value=missing_binary
+            ), mock.patch.object(
+                server, "native_review_result",
+                side_effect=AssertionError("missing launcher must not reach native review"),
+            ) as spawn:
+                missing_status, missing, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True,
+                    json.dumps({
+                        "repo": "scratch", "launcher": "codex", "provider": "openai",
+                        "model": "gpt-5.6-sol", "prompt": "ticket",
+                    }).encode(),
                 )
-        self.assertFalse(missing["ok"])
+            spawn.assert_not_called()
+        self.assertEqual(missing_status, 501, missing)
+        self.assertIsInstance(missing, dict)
+        assert isinstance(missing, dict)
         self.assertEqual(missing["code"], "not_implemented")
 
     def test_grok_review_reuses_the_direct_acp_launcher(self):
@@ -10695,7 +10958,7 @@ while True:
             (jobs / job_id).mkdir(parents=True)
 
             def fake_acp(job, binary, *, mode):
-                self.assertEqual(binary, grok)
+                self.assertEqual(binary.parent, Path("/proc/self/fd"))
                 self.assertEqual(mode, "review")
                 self.assertEqual(job["response_webhook_url"], "https://example.invalid/resume")
                 path = jobs / job["job_id"]
@@ -10706,16 +10969,15 @@ while True:
                 return 0, False, "grok-review-session", None
 
             with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "d"}), \
                  mock.patch.object(server, "run_grok_acp", fake_acp):
                 server.write_job({
                     "job_id": job_id,
                     "response_webhook_url": "https://example.invalid/resume",
                 })
-                out = server.native_review_result(
-                    "grok", "xai", "grok-4.6", "ticket", Path(td), job_id=job_id
-                )
+                with self._native_review_context(
+                    "grok", "xai", "grok-4.6", grok, job_id=job_id
+                ) as context:
+                    out = server.native_review_result(context)
         self.assertEqual(out["verdict"], "PASS", out)
         self.assertEqual((out["launcher"], out["model"]), ("grok", "grok-4.6"))
 

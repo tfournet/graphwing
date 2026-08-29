@@ -23,6 +23,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2477,6 +2478,30 @@ class PinnedLauncher:
             self.fd = -1
 
 
+@dataclass(frozen=True)
+class NativeReviewExecutionContext:
+    """One server-authored native review invocation and its claimed identity."""
+
+    authority_identity: dict[str, Any]
+    execution_identity: dict[str, Any]
+    repo: str
+    resolved: Path
+    prompt: str
+    diff_text: str
+    launcher: str
+    provider: str
+    model: str
+    requested_effort: str
+    effective_effort: str
+    effort_source: str
+    route_execution_profile: dict[str, str] | None
+    run_budget_seconds: int
+    max_turns: int
+    permission_profile: str
+    pinned_launcher: PinnedLauncher
+    job_id: str | None = None
+
+
 def pin_launcher(binary: Path) -> PinnedLauncher:
     """Copy one opened launcher into a sealed Linux memfd owned by the caller."""
     source_fd = -1
@@ -2998,22 +3023,17 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
-def native_review_result(
-    launcher: str,
-    provider: str,
-    model: str,
-    prompt: str,
-    resolved: Path,
-    job_id: str | None = None,
-    run_budget_seconds: int = REVIEW_DEFAULT_BUDGET_SECONDS,
-    max_turns: int = REVIEW_MAX_TURNS,
-    requested_effort: str = "default",
-    effort_source: str = "launcher_default",
-    *,
-    binary: Path | None = None,
-    execution_identity: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
+    if not review_runtime_matches_identity(context):
+        return {
+            "ok": False, "verdict": "NACK", "no_verdict": True,
+            "error": "review execution identity changed before launch",
+            "code": "review_execution_identity_mismatch",
+        }
+    launcher = context.launcher
+    provider = context.provider
+    model = context.model
     spec = NATIVE_LAUNCHERS.get(launcher)
     if spec is None:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
@@ -3022,27 +3042,21 @@ def native_review_result(
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
     effort_profile, effort_error = normalize_native_review_effort(
-        launcher, provider, model, requested_effort, effort_source, execution_identity
+        launcher, provider, model, context.requested_effort, context.effort_source,
+        context.execution_identity,
     )
     if effort_error is not None or effort_profile is None:
         return {
             "ok": False, "verdict": "NACK", "no_verdict": True,
             **(effort_error or {"error": "unsupported effort profile", "code": "unsupported_effort"}),
         }
-    binary = binary or resolve_launcher_binary_now(launcher)
-    if not binary.is_file():
-        return {"ok": False, "verdict": "NACK", "no_verdict": True,
-                "error": "review launcher is unavailable", "code": "not_implemented"}
-    diff = git_diff(resolved, "HEAD", None)
-    diff_text = str(diff.get("diff") or "")[:12000]
-    if execution_identity is not None and not review_runtime_matches_identity(
-        execution_identity, prompt, resolved, diff_text
-    ):
-        return {
-            "ok": False, "verdict": "NACK", "no_verdict": True,
-            "error": "review execution identity changed before launch",
-            "code": "review_execution_identity_mismatch",
-        }
+    binary = context.pinned_launcher.path
+    resolved = context.resolved
+    prompt = context.prompt
+    diff_text = context.diff_text
+    run_budget_seconds = context.run_budget_seconds
+    max_turns = context.max_turns
+    job_id = context.job_id
     body_prompt = (
         "Spec-review only. Do not edit files, commit, or push.\n"
         "Return exactly:\nVERDICT: PASS\nor\nVERDICT: NACK\n"
@@ -3102,6 +3116,7 @@ def native_review_result(
             proc = subprocess.run(
                 cmd, cwd=str(resolved), env={k: v for k, v in os.environ.items()},
                 input=run_input, capture_output=True, timeout=run_budget_seconds,
+                pass_fds=launcher_pass_fds(binary),
             )
             returncode = proc.returncode
             stdout = (proc.stdout or b"").decode("utf-8", "replace")
@@ -3212,15 +3227,36 @@ def run_review_job(job_id: str) -> None:
                 "code": "review_execution_identity_mismatch",
             }
         else:
-            result = native_review_result(
-                job["launcher"], job["provider"], job["model"], job["prompt"],
-                Path(job["cwd"]), job_id=job["job_id"],
-                run_budget_seconds=job["run_budget_seconds"],
-                max_turns=job["max_turns"],
-                requested_effort=job["requested_effort"],
-                effort_source=job["effort_source"],
-                binary=authority.launcher.path, execution_identity=identity,
-            )
+            sealed_identity = snapshot.get("execution_identity")
+            if not isinstance(sealed_identity, dict):
+                result = {
+                    "ok": False, "verdict": "NACK", "no_verdict": True,
+                    "code": "review_execution_identity_mismatch",
+                }
+            else:
+                diff_text = str(
+                    git_diff(Path(snapshot["cwd"]), "HEAD", None).get("diff") or ""
+                )[:12000]
+                result = native_review_result(NativeReviewExecutionContext(
+                    authority_identity=json.loads(json.dumps(sealed_identity)),
+                    execution_identity=identity,
+                    repo=snapshot["repo"],
+                    resolved=Path(snapshot["cwd"]),
+                    prompt=snapshot["prompt"],
+                    diff_text=diff_text,
+                    launcher=snapshot["launcher"],
+                    provider=snapshot["provider"],
+                    model=snapshot["model"],
+                    requested_effort=snapshot["requested_effort"],
+                    effective_effort=snapshot["effective_effort"],
+                    effort_source=snapshot["effort_source"],
+                    route_execution_profile=sealed_identity.get("route_execution_profile"),
+                    run_budget_seconds=snapshot["run_budget_seconds"],
+                    max_turns=snapshot["max_turns"],
+                    permission_profile=snapshot["permission_profile"],
+                    pinned_launcher=authority.launcher,
+                    job_id=snapshot["job_id"],
+                ))
         receipt = review_receipt(job, result, identity=identity)
         terminal, installed = review_terminal_transition(job_id, snapshot, authority, receipt)
         if terminal is None:
@@ -3308,6 +3344,7 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         safe_code = code if isinstance(code, str) and code in messages else "bad_repo"
         return 400, {"error": messages[safe_code], "code": safe_code}
     assert isinstance(resolved, Path)
+    resolved = resolved.resolve()
     webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
     if webhook_err:
         return 400, webhook_err
@@ -3346,9 +3383,20 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         return 409, {"error": "review repository identity is unavailable", "code": "git_state_unavailable"}
     diff_text = str(git_diff(resolved, "HEAD", None).get("diff") or "")[:12000]
     binary = resolve_launcher_binary_now(launcher)
-    launcher_version = launcher_version_fingerprint(binary)
-    if launcher_version is None:
-        return 501, {"error": "review launcher identity is unavailable", "code": "not_implemented"}
+    accepted_launcher: PinnedLauncher | None = None
+    try:
+        accepted_launcher = pin_launcher(binary)
+    except FileNotFoundError:
+        return 501, {
+            "error": "review launcher identity is unavailable",
+            "code": "not_implemented",
+        }
+    except OSError:
+        return 409, {
+            "error": "review launcher identity changed during acceptance",
+            "code": "review_execution_identity_mismatch",
+        }
+    launcher_version = accepted_launcher.fingerprint
     identity = {
         "version": REVIEW_EXECUTION_VERSION,
         "kind": "review",
@@ -3381,32 +3429,34 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         "receipt": None, "error": None, "webhook": None,
     }
     if not webhook_url and not async_requested:
-        if launcher_version == "missing":
+        try:
+            result = native_review_result(NativeReviewExecutionContext(
+                authority_identity=json.loads(json.dumps(identity)),
+                execution_identity=identity,
+                repo=name,
+                resolved=resolved,
+                prompt=prompt,
+                diff_text=diff_text,
+                launcher=launcher,
+                provider=provider,
+                model=model,
+                requested_effort=effort_profile["requested_effort"],
+                effective_effort=effort_profile["effective_effort"],
+                effort_source=effort_profile["effort_source"],
+                route_execution_profile=route_profile,
+                run_budget_seconds=run_budget_seconds,
+                max_turns=max_turns,
+                permission_profile=REVIEW_PERMISSION_PROFILES[launcher],
+                pinned_launcher=accepted_launcher,
+            ))
+        except OSError:
             result = {
                 "ok": False, "verdict": "NACK", "no_verdict": True,
-                "code": "not_implemented",
+                "code": "review_execution_identity_mismatch",
             }
-        else:
-            try:
-                with pinned_launcher(binary) as pinned:
-                    if pinned.fingerprint != launcher_version:
-                        result = {
-                            "ok": False, "verdict": "NACK", "no_verdict": True,
-                            "code": "review_execution_identity_mismatch",
-                        }
-                    else:
-                        result = native_review_result(
-                            launcher, provider, model, prompt, resolved,
-                            run_budget_seconds=run_budget_seconds, max_turns=max_turns,
-                            requested_effort=effort_profile["requested_effort"],
-                            effort_source=effort_profile["effort_source"], binary=pinned.path,
-                            execution_identity=identity,
-                        )
-            except (FileNotFoundError, OSError):
-                result = {
-                    "ok": False, "verdict": "NACK", "no_verdict": True,
-                    "code": "review_execution_identity_mismatch",
-                }
+        finally:
+            accepted_launcher.close()
+            accepted_launcher = None
         receipt = review_receipt(job, result, identity=identity)
         if result.get("code") == "not_implemented":
             return 501, {
@@ -3419,25 +3469,6 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
             return 409, receipt
         return 200, receipt
 
-    accepted_launcher: PinnedLauncher | None = None
-    try:
-        accepted_launcher = pin_launcher(binary)
-    except FileNotFoundError:
-        return 501, {
-            "error": "review launcher identity is unavailable",
-            "code": "not_implemented",
-        }
-    except OSError:
-        return 409, review_receipt(job, {
-            "ok": False, "verdict": "NACK", "no_verdict": True,
-            "code": "review_execution_identity_mismatch",
-        }, identity=identity)
-    if accepted_launcher.fingerprint != launcher_version:
-        accepted_launcher.close()
-        return 409, {
-            "error": "review launcher identity changed during acceptance",
-            "code": "review_execution_identity_mismatch",
-        }
     try:
         with JOB_LOCK:
             if active_job_count() >= AGENT_MAX_CONCURRENT:
@@ -4697,10 +4728,39 @@ def review_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
         time.sleep(0.2)
 
 
-def review_runtime_matches_identity(
-    identity: dict[str, Any], prompt: str, resolved: Path, diff_text: str
-) -> bool:
-    branch, head, err = current_branch_head(resolved)
+def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bool:
+    """Bind every claimed identity field to the exact invocation authority."""
+    if not (
+        isinstance(context, NativeReviewExecutionContext)
+        and isinstance(context.execution_identity, dict)
+        and isinstance(context.authority_identity, dict)
+        and isinstance(context.repo, str)
+        and isinstance(context.resolved, Path)
+        and isinstance(context.prompt, str)
+        and isinstance(context.diff_text, str)
+        and all(isinstance(value, str) for value in (
+            context.launcher, context.provider, context.model,
+            context.requested_effort, context.effective_effort,
+            context.effort_source, context.permission_profile,
+        ))
+        and (
+            context.route_execution_profile is None
+            or isinstance(context.route_execution_profile, dict)
+        )
+        and type(context.run_budget_seconds) is int
+        and type(context.max_turns) is int
+        and (context.job_id is None or isinstance(context.job_id, str))
+        and isinstance(context.pinned_launcher, PinnedLauncher)
+        and context.pinned_launcher.fd >= 0
+        and context.pinned_launcher.path
+            == Path(f"/proc/self/fd/{context.pinned_launcher.fd}")
+        and isinstance(context.pinned_launcher.fingerprint, str)
+        and LAUNCHER_VERSION_RE.fullmatch(context.pinned_launcher.fingerprint)
+    ):
+        return False
+    identity = context.execution_identity
+    authority = context.authority_identity
+    branch, head, err = current_branch_head(context.resolved)
     source = identity.get("effort_source")
     expected_fields = set(REVIEW_IDENTITY_FIELDS)
     if source == "route":
@@ -4732,16 +4792,33 @@ def review_runtime_matches_identity(
             identity.get("requested_effort"), str(source or ""),
         )
     return bool(
-        set(identity) == expected_fields
+        identity == authority
+        and set(identity) == expected_fields
         and identity.get("version") == REVIEW_EXECUTION_VERSION
         and identity.get("kind") == "review"
+        and identity.get("launcher") == context.launcher
+        and identity.get("provider") == context.provider
+        and identity.get("model") == context.model
+        and identity.get("requested_effort") == context.requested_effort
+        and identity.get("effective_effort") == context.effective_effort
+        and identity.get("effort_source") == context.effort_source
+        and identity.get("route_execution_profile") == context.route_execution_profile
+        and identity.get("launcher_version") == context.pinned_launcher.fingerprint
+        and launcher_version_fingerprint(context.pinned_launcher.path)
+            == context.pinned_launcher.fingerprint
+        and identity.get("repo") == context.repo
+        and context.resolved == context.resolved.resolve()
+        and identity.get("run_budget_seconds") == context.run_budget_seconds
+        and identity.get("max_turns") == context.max_turns
+        and identity.get("permission_profile") == context.permission_profile
+        and context.permission_profile == REVIEW_PERMISSION_PROFILES.get(context.launcher)
         and effort_err is None and normalized is not None
         and identity.get("effective_effort") == normalized["effective_effort"]
         and err is None
         and branch == identity.get("branch")
         and head == identity.get("starting_head")
-        and hashlib.sha256(prompt.encode()).hexdigest() == identity.get("prompt_sha256")
-        and hashlib.sha256(diff_text.encode()).hexdigest() == identity.get("diff_sha256")
+        and hashlib.sha256(context.prompt.encode()).hexdigest() == identity.get("prompt_sha256")
+        and hashlib.sha256(context.diff_text.encode()).hexdigest() == identity.get("diff_sha256")
     )
 
 
