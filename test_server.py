@@ -8861,6 +8861,17 @@ while True:
             self.assertEqual(rollup["type"], "transforms.groupByAggregate")
             self.assertEqual(rollup["config"]["groupBy"], "group")
 
+        # transforms.aggregate stores its native output envelope at CTX; the
+        # selected value is always under .result rather than at the alias root.
+        outcome_dump = json.dumps(nodes["durable_outcome"]["config"])
+        for alias in ("durable_selected_agent", "durable_selected_named_test"):
+            selected_paths = re.findall(rf'CTX\.{alias}[^" ]*', outcome_dump)
+            self.assertTrue(selected_paths, alias)
+            self.assertTrue(
+                all(path.startswith(f"CTX.{alias}.result") for path in selected_paths),
+                selected_paths,
+            )
+
         # Durable projection is a deterministic native-node pipeline. In
         # particular, it cannot regress to unsupported namespace/dotted-set
         # Nunjucks or an opaque codeExpression implementation.
@@ -8980,9 +8991,18 @@ while True:
             "wait_test": {"request": {"body": {
                 "job_id": "forged", "status": "ok", "name": "forged-name",
             }}},
+            "test2": {"data": {"job_id": "named-2"}},
+            "wait_test2": {"request": {"body": {
+                "job_id": "named-2", "status": "ok", "name": "callback-name-is-ignored",
+            }}},
         }
         context: dict[str, Any] = {
-            "TASKS": tasks, "CTX": {"INPUT": {"test": "configured-name"}}
+            "TASKS": tasks, "CTX": {
+                "INPUT": {"test": "configured-name"},
+                "receipt": {"status": "ok"},
+                "receipt2": {"status": "ok"},
+                "receipt3": {"status": "ok"},
+            }
         }
         candidate_mappings = nodes["durable_outcome_candidates"]["config"]["mappings"]
         built = {
@@ -9020,8 +9040,14 @@ while True:
             "durable_writer_rollup": rollup(writers),
             "durable_reviewer_rollup": rollup(reviewers),
             "durable_slice_rollup": rollup(unique),
-            "durable_selected_agent": writers[-1] if writers else None,
-            "durable_selected_named_test": bound_named[-1] if bound_named else None,
+            "durable_selected_agent": {
+                "result": writers[-1] if writers else None,
+                "operation": "last", "field": None, "itemCount": len(writers),
+            },
+            "durable_selected_named_test": {
+                "result": bound_named[-1] if bound_named else None,
+                "operation": "last", "field": None, "itemCount": len(bound_named),
+            },
         })
         projected = {
             mapping["output"]: evaluate(mapping["expression"], context)
@@ -9039,11 +9065,17 @@ while True:
         self.assertIn("usage_not_reported", projected["reviewer_usage"]["usage_diagnostics"])
         self.assertEqual(projected["slice_usage"]["attempts"], 3)
         self.assertIsNone(projected["slice_usage"]["usage"])
-        self.assertIsNone(projected["named_test_evidence"])
+        self.assertEqual(projected["agent_job_id"], "writer-2")
+        self.assertEqual(projected["agent_status"], "ok")
+        self.assertEqual(projected["named_test_status"], "passed")
+        self.assertEqual(projected["named_test_evidence"], {
+            "evidence_version": "graphwing-named-test-evidence-v1",
+            "job_id": "named-2", "name": "configured-name", "status": "ok",
+        })
         self.assertEqual(projected["named_test_name"], "configured-name")
 
     def test_implement_slice_actual_riftwing_workflow_lint_when_available(self):
-        """Use Riftwing's real checker locally; keep CI hermetic and stdlib-only."""
+        """Use Riftwing's authoritative Go checker; keep CI hermetic and stdlib-only."""
         graph_path = Path(server.__file__).parent / "graphs" / "implement-slice.json"
         riftwing = os.environ.get("RIFTWING_CHECKOUT")
         if not riftwing:
@@ -9055,18 +9087,43 @@ while True:
             self.assertNotRegex(dumped, r"{%-?\s*set\s+[A-Za-z_]\w*[.\[]")
             return
 
-        script = (
-            "import fs from 'node:fs';"
-            "import {lintWorkflow} from './packages/workflow-linter/src/lint.ts';"
-            f"const g=JSON.parse(fs.readFileSync({json.dumps(str(graph_path))},'utf8'));"
-            "const r=lintWorkflow(g.spec,{errorsOnly:true});"
-            "if(r.hasErrors){console.error(JSON.stringify(r.issues));process.exit(1)}"
-        )
-        result = subprocess.run(
-            ["pnpm", "exec", "tsx", "-e", script],
-            cwd=riftwing, text=True, capture_output=True, timeout=60, check=False,
-        )
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    raw, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+    spec, ok := envelope["spec"].(map[string]any); if !ok { panic("missing object spec") }
+    result := linter.Lint(spec)
+    errors := 0
+    e517 := 0
+    for _, issue := range result.Issues {
+        if issue.Severity == "error" {
+            errors++
+            if issue.Code == "E517_INVALID_TASKS_FIELD" { e517++ }
+            encoded, _ := json.Marshal(issue)
+            fmt.Println(string(encoded))
+        }
+    }
+    fmt.Printf("errors=%d E517=%d\n", errors, e517)
+    if errors != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "graphwing_workflow_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(
+                ["go", "run", str(checker), str(graph_path)],
+                cwd=Path(riftwing) / "rewst-go", text=True,
+                capture_output=True, timeout=120, check=False,
+            )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("errors=0 E517=0", result.stdout)
 
     def test_implement_slice_named_tests_all_emit_bound_async_job_evidence(self):
         graph = json.loads(
@@ -9163,7 +9220,7 @@ while True:
             self.assertIn(callback, candidates)
         selected = json.dumps(nodes["durable_outcome"]["config"])
         self.assertIn("CTX.INPUT.test", selected)
-        self.assertIn("CTX.durable_selected_named_test.accepted_job_id", selected)
+        self.assertIn("CTX.durable_selected_named_test.result.accepted_job_id", selected)
         self.assertNotRegex(candidates + selected, r"request\.body\.(?:name|recipe)")
 
     def test_implement_slice_verification_classification_uses_terminal_gates_not_join_presence(self):
@@ -9244,11 +9301,14 @@ while True:
         self.assertEqual(expected_hash["config"]["input"], "{{ CTX.durable_outcome }}")
         self.assertEqual(
             returned_hash["config"]["input"],
-            "{{ TASKS.durable_outcome_readback.data.data }}",
+            "{{ TASKS.durable_outcome_readback.data }}",
         )
         check_dump = json.dumps(checks)
-        self.assertIn("TASKS.durable_outcome_readback.data.version", check_dump)
-        self.assertIn("TASKS.durable_outcome_upsert.data.version", check_dump)
+        for field in ("found", "recordKey", "version"):
+            self.assertIn(f"TASKS.durable_outcome_readback.{field}", check_dump)
+            self.assertNotIn(f"TASKS.durable_outcome_readback.data.{field}", check_dump)
+        self.assertIn("TASKS.durable_outcome_upsert.version", check_dump)
+        self.assertNotIn("TASKS.durable_outcome_upsert.data.version", check_dump)
         self.assertIn("CTX.durable_outcome_expected_hash.value", check_dump)
         self.assertIn("CTX.durable_outcome_readback_hash.value", check_dump)
         gate = nodes["if_durable_outcome_readback"]
@@ -17405,7 +17465,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "082e871ff388f6d0ef41607a3d5df7be08dc1da7e09632eecad996a0ddd93b8d")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "50a1005103c74a6eea6d0a763123bf10afafa1f9ee0adc53d0057aaebb0127e0")
 
 
 class InstallTests(unittest.TestCase):
