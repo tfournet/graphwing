@@ -1567,7 +1567,13 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(parsed, identity)
         schema = json.loads(server.openapi_bytes())["components"]["schemas"]["SessionIdentity"]
         self.assertEqual(set(schema["required"]), set(identity))
-        self.assertEqual(set(schema["properties"]), set(identity))
+        self.assertEqual(
+            set(schema["properties"]), set(identity) | {"route_execution_profile"}
+        )
+        self.assertEqual(
+            schema["properties"]["route_execution_profile"]["$ref"],
+            "#/components/schemas/RouteExecutionProfile",
+        )
 
     def test_session_identity_provenance_has_closed_bounded_formats(self):
         profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol")
@@ -6671,7 +6677,7 @@ while True:
         encoded = json.dumps(routes, separators=(",", ":"), ensure_ascii=True).encode()
         self.assertEqual(
             hashlib.sha256(encoded).hexdigest(),
-            "ee0d6e700b8664c66282034a58048f9ef6435dac173382dbc4cc86f59e4c3450",
+            "f173c6543685d38a1cf67c2e1c7ffe01ccb54f98b5eba00e9e8a8d2ae5e234ed",
         )
 
     def test_slice_route_current_matrix_is_frozen(self):
@@ -6731,7 +6737,7 @@ while True:
             selected.extend([("none", "none", "none", "none")] * (2 - len(selected)))
             reviewer1, reviewer2 = selected
             turns, wall = budgets[(class_name, effective_size)]
-            return {
+            expected = {
                 "ok": True,
                 "route_version": "normal-v1",
                 "class": class_name,
@@ -6775,6 +6781,26 @@ while True:
                     )
                 ),
             }
+            for role, profile in (
+                ("writer", writer),
+                ("reviewer1", reviewer1),
+                ("reviewer2", reviewer2),
+            ):
+                if profile[0] == "none":
+                    continue
+                expected[f"{role}_execution_profile"] = {
+                    "version": "route-execution-profile-v1",
+                    "route_version": "normal-v1",
+                    "role": role,
+                    "work_kind": work_kind,
+                    "class": class_name,
+                    "size": effective_size,
+                    "launcher": profile[0],
+                    "provider": profile[1],
+                    "model": profile[2],
+                    "effort": profile[3],
+                }
+            return expected
 
         # With seams omitted, normal-v1 treats every visual floor below L as a
         # one-step bump. All 27 cases cross the public parsing/dispatch boundary.
@@ -6852,11 +6878,18 @@ while True:
         self.assertEqual(set(request["properties"]), {
             "repo", "launcher", "provider", "model", "prompt", "effort", "async",
             "run_budget_seconds", "max_turns", "response_webhook_url",
-            "response_webhook_token",
+            "response_webhook_token", "route_execution_profile",
         })
         identity = schemas["ReviewExecutionIdentity"]
         self.assertFalse(identity["additionalProperties"])
-        self.assertEqual(set(identity["required"]), set(identity["properties"]))
+        self.assertEqual(
+            set(identity["properties"]),
+            set(identity["required"]) | {"route_execution_profile"},
+        )
+        self.assertEqual(
+            identity["properties"]["route_execution_profile"]["$ref"],
+            "#/components/schemas/RouteExecutionProfile",
+        )
         self.assertEqual(identity["properties"]["version"]["const"], "review-execution-v1")
         self.assertEqual(identity["properties"]["kind"]["const"], "review")
         receipt = schemas["ReviewReceipt"]
@@ -7035,6 +7068,224 @@ while True:
             for node in model_nodes:
                 self.assertIn("effort", node.get("config", {}), (graph_name, node["id"]))
 
+    @staticmethod
+    def _route_execution_profile(route, role):
+        prefix = "" if role == "writer" else f"{role}_"
+        return {
+            "version": "route-execution-profile-v1",
+            "route_version": route["route_version"],
+            "role": role,
+            "work_kind": route["work_kind"],
+            "class": route["class"],
+            "size": route["size"],
+            "launcher": route[f"{prefix}launcher"],
+            "provider": route[f"{prefix}provider"],
+            "model": route[f"{prefix}model"],
+            "effort": route[f"{prefix}effort"],
+        }
+
+    def test_routed_agent_acceptance_missing_binary_fallback_and_resume_are_closed(self):
+        contracts = {
+            "go_coding": ("codex", "openai", "gpt-5.6-sol"),
+            "typescript_coding": ("claude", "anthropic", "claude-opus-5"),
+            "research_ops": ("grok", "xai", "grok-4.6"),
+        }
+        for work_kind, primary in contracts.items():
+            with self.subTest(work_kind=work_kind), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                jobs = root / "jobs"
+                missing = root / f"missing-{primary[0]}"
+                route = server.slice_route_lookup("sensitive", "M", work_kind=work_kind)
+                evidence = self._route_execution_profile(route, "writer")
+                self.assertEqual(route["writer_execution_profile"], evidence)
+                request = {
+                    "prompt": "provider-free routed fixture", "cwd": "scratch",
+                    "launcher": primary[0], "provider": primary[1], "model": primary[2],
+                    "effort": route["effort"], "route_execution_profile": evidence,
+                    "response_webhook_url": "https://callback.invalid/fixture",
+                }
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", return_value=missing), \
+                     mock.patch.object(server, "enqueue_agent", lambda job: None), \
+                     mock.patch.object(server, "deliver_webhook", return_value=None):
+                    status, accepted, _ = server.dispatch(
+                        "POST", "/v1/agent/run", {}, True, json.dumps(request).encode()
+                    )
+                    self.assertEqual(status, 202, accepted)
+                    self.assertEqual(accepted["effort_source"], "route")
+                    self.assertEqual(accepted["session_identity"]["route_execution_profile"], evidence)
+                    server.run_agent_job(accepted["job_id"])
+                    failed_job = server.read_job(accepted["job_id"])
+                    self.assertEqual(failed_job["receipt"]["failure_code"], "missing_binary")
+                    primary_receipt = {**failed_job["receipt"], "role": "primary"}
+                    fallback_status, fallback_route = server.slice_route_fallback(json.dumps({
+                        "class": "sensitive", "size": "M", "work_kind": work_kind,
+                        "primary_route": route, "primary_receipt": primary_receipt,
+                    }).encode())
+                    self.assertEqual(fallback_status, 200, fallback_route)
+                    fallback_evidence = self._route_execution_profile(fallback_route, "writer")
+                    self.assertEqual(fallback_route["writer_execution_profile"], fallback_evidence)
+
+                    fallback_binary = root / f"fixture-{fallback_route['launcher']}"
+                    fallback_binary.write_text("provider-free fixture")
+                    fallback_request = {
+                        "prompt": "fallback fixture", "cwd": "scratch",
+                        "launcher": fallback_route["launcher"],
+                        "provider": fallback_route["provider"],
+                        "model": fallback_route["model"],
+                        "effort": fallback_route["effort"],
+                        "route_execution_profile": fallback_evidence,
+                    }
+                    with mock.patch.object(
+                        server, "resolve_launcher_binary_now", return_value=fallback_binary
+                    ):
+                        fallback_accept_status, fallback_accept, _ = server.dispatch(
+                            "POST", "/v1/agent/run", {}, True,
+                            json.dumps(fallback_request).encode(),
+                        )
+                    self.assertEqual(fallback_accept_status, 202, fallback_accept)
+                    self.assertEqual(fallback_accept["effort_source"], "route")
+                    self.assertEqual(
+                        fallback_accept["session_identity"]["route_execution_profile"],
+                        fallback_evidence,
+                    )
+
+                    fallback_job = server.read_job(fallback_accept["job_id"])
+                    self.assertIsInstance(fallback_job, dict)
+                    assert fallback_job is not None
+                    identity = deepcopy(fallback_job["session_identity"])
+                    identity["native_session_id"] = f"fixture-{work_kind}"
+                    fallback_job.update({
+                        "status": "completed", "session_identity": identity,
+                        "started_at": fallback_job["created_at"],
+                        "finished_at": fallback_job["created_at"],
+                    })
+                    fallback_job["receipt"] = {
+                        "status": "ok", "job_id": fallback_job["job_id"],
+                        "launcher": fallback_job["launcher"],
+                        "provider": fallback_job["provider"],
+                        "model": fallback_job["model"],
+                        **{key: fallback_job[key] for key in server.AGENT_PROFILE_FIELDS},
+                        "session_identity": identity, "failure_class": "none",
+                        "failure_code": "none", "failover_eligible": False,
+                    }
+                    _replace_persisted_job_fixture(fallback_job["job_id"], fallback_job)
+                    recovery_status, recovery = server.derive_slice_recovery_route({
+                        "class": "sensitive", "size": "M", "work_kind": work_kind,
+                        "primary_route": route, "primary_receipt": primary_receipt,
+                        "fallback_route": fallback_route,
+                        "fallback_receipt": {
+                            **fallback_job["receipt"], "role": "availability_fallback",
+                        },
+                    })
+                    self.assertEqual(recovery_status, 200, recovery)
+                    self.assertEqual(recovery["decision"], "fallback_retained")
+                    self.assertEqual(
+                        recovery["selected_route"]["writer_execution_profile"],
+                        fallback_evidence,
+                    )
+                    correction = {
+                        **fallback_request, "prompt": "same-session correction",
+                        "session_identity": identity,
+                        "resume_job_id": fallback_job["job_id"],
+                    }
+                    with mock.patch.object(
+                        server, "resolve_launcher_binary_now", return_value=fallback_binary
+                    ):
+                        resume_status, resumed, _ = server.dispatch(
+                            "POST", "/v1/agent/run", {}, True, json.dumps(correction).encode()
+                        )
+                    self.assertEqual(resume_status, 202, resumed)
+                    self.assertEqual(resumed["effort_source"], "route")
+                    self.assertEqual(resumed["session_identity"], identity)
+
+                    for mutation in (
+                        {"effort": "low" if fallback_route["effort"] != "low" else "medium"},
+                        {"route_execution_profile": {**fallback_evidence, "route_version": "normal-v1"}},
+                        {"route_execution_profile": {**fallback_evidence, "role": "reviewer1"}},
+                    ):
+                        with mock.patch.object(server, "enqueue_agent") as spawn:
+                            rejected_status, rejected, _ = server.dispatch(
+                                "POST", "/v1/agent/run", {}, True,
+                                json.dumps({**correction, **mutation}).encode(),
+                            )
+                        self.assertEqual(rejected_status, 400, rejected)
+                        spawn.assert_not_called()
+
+    def test_routed_review_requires_exact_closed_route_evidence_before_boundary(self):
+        route = server.slice_route_lookup("sensitive", "M", work_kind="go_coding")
+        evidence = self._route_execution_profile(route, "reviewer1")
+        self.assertEqual(route["reviewer1_execution_profile"], evidence)
+        request = {
+            "repo": "scratch", "launcher": evidence["launcher"],
+            "provider": evidence["provider"], "model": evidence["model"],
+            "effort": evidence["effort"], "route_execution_profile": evidence,
+            "prompt": "closed routed review fixture",
+        }
+        result = {"ok": True, "verdict": "PASS", "no_verdict": False, "returncode": 0}
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "native_review_result", return_value=result) as boundary:
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["execution_identity"]["effort_source"], "route")
+        self.assertEqual(payload["execution_identity"]["route_execution_profile"], evidence)
+        boundary.assert_called_once()
+
+        with tempfile.TemporaryDirectory() as td:
+            async_status, accepted, _jobs, _repo, _launcher, _enqueue = (
+                self._queue_closed_review(
+                    Path(td),
+                    effort=evidence["effort"],
+                    extra={
+                        "launcher": evidence["launcher"],
+                        "provider": evidence["provider"],
+                        "model": evidence["model"],
+                        "route_execution_profile": evidence,
+                    },
+                )
+            )
+            self.assertEqual(async_status, 202, accepted)
+            self.assertIsInstance(accepted, dict)
+            assert isinstance(accepted, dict)
+            poll_status, polled, _ = server.dispatch(
+                "GET", accepted["poll"], {}, True, b""
+            )
+            self.assertIsInstance(polled, dict)
+            assert isinstance(polled, dict)
+            self.assertEqual((poll_status, polled["status"]), (200, "queued"))
+            self.assertEqual(polled["execution_identity"]["effort_source"], "route")
+            self.assertEqual(
+                polled["execution_identity"]["route_execution_profile"], evidence
+            )
+
+        mutations = (
+            {**evidence, "role": "writer"},
+            {**evidence, "route_version": "availability-fallback-v1"},
+            {**evidence, "model": "claude-opus-5"},
+            {**evidence, "version": "route-execution-profile-v2"},
+        )
+        for changed in mutations:
+            with self.subTest(changed=changed), \
+                 mock.patch.object(server, "native_review_result") as boundary, \
+                 mock.patch.object(server, "enqueue_review") as spawn:
+                rejected_status, rejected, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True,
+                    json.dumps({**request, "route_execution_profile": changed}).encode(),
+                )
+            self.assertEqual(rejected_status, 400, rejected)
+            boundary.assert_not_called()
+            spawn.assert_not_called()
+
+        with mock.patch.object(server, "native_review_result") as boundary:
+            claim_status, claim, _ = server.dispatch(
+                "POST", "/v1/review/run", {}, True,
+                json.dumps({**request, "route_execution_profile": {"effort_source": "route"}}).encode(),
+            )
+        self.assertEqual(claim_status, 400, claim)
+        boundary.assert_not_called()
+
     def test_fallback_receipt_binds_execution_profile(self):
         route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         base_identity = {
@@ -7171,6 +7422,7 @@ while True:
                 "launcher": primary[0], "provider": primary[1], "model": primary[2],
                 **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
                 "starting_head": "a" * 40, "native_session_id": None,
+                "route_execution_profile": primary_route["writer_execution_profile"],
             }
             receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": primary[0], "provider": primary[1], "model": primary[2], **profile, "failure_class": "provider_availability", "failure_code": "provider_rate_limit", "failover_eligible": True, "session_identity": identity}
             stored_job = {
@@ -7204,6 +7456,7 @@ while True:
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
             **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
             "starting_head": "a" * 40, "native_session_id": None,
+            "route_execution_profile": primary_route["writer_execution_profile"],
         }
         receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         base = {"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}
@@ -7236,6 +7489,7 @@ while True:
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
             **_fixture_identity_profile(profile), "repo": "scratch", "branch": "main",
             "starting_head": "a" * 40, "native_session_id": None,
+            "route_execution_profile": primary_route["writer_execution_profile"],
         }
         receipt = {"status": "error", "job_id": "a" * 32, "role": "primary", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", **profile, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True, "session_identity": identity}
         body = json.dumps({"class": "mechanical", "size": "M", "work_kind": "go_coding", "primary_route": primary_route, "primary_receipt": receipt}).encode()
@@ -7318,6 +7572,7 @@ while True:
                 "branch": "main",
                 "starting_head": starting_head,
                 "native_session_id": native_session_id,
+                "route_execution_profile": route["writer_execution_profile"],
             }
 
         primary_identity = identity(
@@ -7536,6 +7791,12 @@ while True:
                 stored["session_identity"].update(mutation)
                 stored["receipt"].update(mutation)
                 stored["receipt"]["session_identity"].update(mutation)
+                if mutation.get("effort_source") == "explicit":
+                    receipt["session_identity"].pop("route_execution_profile", None)
+                    stored["session_identity"].pop("route_execution_profile", None)
+                    stored["receipt"]["session_identity"].pop(
+                        "route_execution_profile", None
+                    )
                 stored_path.write_text(json.dumps(stored) + "\n")
                 with mock.patch.object(server, "JOBS_DIR", jobs), \
                      mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("remote recovery cannot inspect binaries")):
@@ -7847,6 +8108,18 @@ while True:
             "review2": "{{ CTX.active_route.reviewer2_effort }}",
             "review2b": "{{ CTX.active_route.reviewer2_effort }}",
         }
+        expected_profile = {
+            "agent": "{{ CTX.selected_route.writer_execution_profile }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.writer_execution_profile }}",
+            "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
+            "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
+            "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
+            "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
+            "review1": "{{ CTX.active_route.reviewer1_execution_profile }}",
+            "review1b": "{{ CTX.active_route.reviewer1_execution_profile }}",
+            "review2": "{{ CTX.active_route.reviewer2_execution_profile }}",
+            "review2b": "{{ CTX.active_route.reviewer2_execution_profile }}",
+        }
         actual_model_nodes = {
             node_id for node_id, node in nodes.items()
             if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
@@ -7854,6 +8127,10 @@ while True:
         self.assertEqual(actual_model_nodes, set(expected_effort))
         for node_id, expression in expected_effort.items():
             self.assertEqual(nodes[node_id]["config"].get("effort"), expression, node_id)
+            self.assertEqual(
+                nodes[node_id]["config"].get("route_execution_profile"),
+                expected_profile[node_id], node_id,
+            )
 
         # Initial, fallback, and recovered launches consume the selected route;
         # active-session corrections consume the immutable receipt identity.
@@ -7906,6 +8183,10 @@ while True:
         self.assertEqual([node["id"] for node in model_nodes], ["agent"])
         self.assertEqual(nodes["agent"]["config"].get("effort"), "{{ TASKS.route.data.effort }}")
         self.assertEqual(
+            nodes["agent"]["config"].get("route_execution_profile"),
+            "{{ TASKS.route.data.writer_execution_profile }}",
+        )
+        self.assertEqual(
             [node["id"] for node in graph["nodes"] if "/v1/slice/route" in node["type"]],
             ["route"],
         )
@@ -7949,10 +8230,23 @@ while True:
                     "review2": "{{ CTX.active_route.reviewer2_effort }}",
                     "review2b": "{{ CTX.active_route.reviewer2_effort }}",
                 },
+                "profiles": {
+                    "agent": "{{ CTX.selected_route.writer_execution_profile }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.writer_execution_profile }}",
+                    "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
+                    "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
+                    "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
+                    "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
+                    "review1": "{{ CTX.active_route.reviewer1_execution_profile }}",
+                    "review1b": "{{ CTX.active_route.reviewer1_execution_profile }}",
+                    "review2": "{{ CTX.active_route.reviewer2_execution_profile }}",
+                    "review2b": "{{ CTX.active_route.reviewer2_execution_profile }}",
+                },
             },
             "pr-drive.json": {
                 "route_nodes": {"route"},
                 "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
+                "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
             },
         }
         graphs = {
@@ -7979,13 +8273,29 @@ while True:
             for node_id, expression in contract["consumers"].items():
                 self.assertEqual(nodes[node_id]["config"].get("effort"), expression, (graph_name, node_id))
                 self.assertRegex(expression, r"^\{\{ (?:TASKS|CTX)\.")
+                self.assertEqual(
+                    nodes[node_id]["config"].get("route_execution_profile"),
+                    contract["profiles"][node_id], (graph_name, node_id),
+                )
+                self.assertRegex(contract["profiles"][node_id], r"^\{\{ (?:TASKS|CTX)\.")
 
         spec = json.loads((root / "openapi.json").read_text())
         closed_effort = ["default", "low", "medium", "high", "max"]
         for schema_name in ("AgentRunRequest", "ReviewRunRequest"):
             properties = spec["components"]["schemas"][schema_name]["properties"]
             self.assertEqual(properties["effort"]["enum"], closed_effort)
+            self.assertEqual(
+                properties["route_execution_profile"]["$ref"],
+                "#/components/schemas/RouteExecutionProfile",
+            )
             self.assertNotIn("reasoning_effort", properties)
+        evidence_schema = spec["components"]["schemas"]["RouteExecutionProfile"]
+        self.assertFalse(evidence_schema["additionalProperties"])
+        self.assertEqual(set(evidence_schema["required"]), server.ROUTE_EXECUTION_PROFILE_FIELDS)
+        self.assertEqual(
+            evidence_schema["properties"]["role"]["enum"],
+            ["writer", "reviewer1", "reviewer2"],
+        )
         route_properties = spec["components"]["schemas"]["SliceRoute"]["properties"]
         self.assertEqual(route_properties["effort"]["enum"], ["high", "default"])
         self.assertEqual(route_properties["reviewer1_effort"]["enum"], ["none", "high", "default"])
@@ -11572,7 +11882,11 @@ while True:
             self.assertNotIn("TOKEN_SECRET", json.dumps(error))
 
         route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
-        fallback_identity = {**identity, "native_session_id": None}
+        fallback_identity = {
+            **identity,
+            "native_session_id": None,
+            "route_execution_profile": route["writer_execution_profile"],
+        }
         fallback_receipt = {
             "status": "error", "job_id": "a3" * 16, "role": "primary",
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
@@ -14052,7 +14366,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "7400b0ca57c190ecc17e79484fbaa8eaee6f7eeaef209053615f8672a2dcb833")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "24128275db20e045a8580bd119324ae8b123ff89218653f461f993f8777f86fb")
 
 
 class InstallTests(unittest.TestCase):

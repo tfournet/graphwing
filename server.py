@@ -114,7 +114,7 @@ REVIEW_PERMISSION_PROFILES = {
 REVIEW_REQUEST_FIELDS = frozenset({
     "repo", "launcher", "provider", "model", "prompt", "effort", "async",
     "run_budget_seconds", "max_turns", "response_webhook_url",
-    "response_webhook_token",
+    "response_webhook_token", "route_execution_profile",
 })
 REVIEW_IDENTITY_FIELDS = (
     "version", "kind", "launcher", "provider", "model", "requested_effort",
@@ -389,6 +389,12 @@ SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
 ROUTE_VERSION = "normal-v1"
 FALLBACK_ROUTE_VERSION = "availability-fallback-v1"
+ROUTE_EXECUTION_PROFILE_VERSION = "route-execution-profile-v1"
+ROUTE_EXECUTION_ROLES = frozenset({"writer", "reviewer1", "reviewer2"})
+ROUTE_EXECUTION_PROFILE_FIELDS = frozenset({
+    "version", "route_version", "role", "work_kind", "class", "size",
+    "launcher", "provider", "model", "effort",
+})
 RECOVERY_VERSION = "provider-recovery-v1"
 NORMAL_WRITER_ROUTES = {
     "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
@@ -2066,6 +2072,85 @@ def slice_route_lookup(
     )
 
 
+def route_execution_profile(route: dict[str, Any], role: str) -> dict[str, str] | None:
+    """Project one exact, closed execution profile from a server-selected route."""
+    if role not in ROUTE_EXECUTION_ROLES:
+        return None
+    prefix = "" if role == "writer" else f"{role}_"
+    values = {
+        "launcher": route.get(f"{prefix}launcher"),
+        "provider": route.get(f"{prefix}provider"),
+        "model": route.get(f"{prefix}model"),
+        "effort": route.get(f"{prefix}effort"),
+    }
+    if any(not isinstance(value, str) or value == "none" for value in values.values()):
+        return None
+    return {
+        "version": ROUTE_EXECUTION_PROFILE_VERSION,
+        "route_version": str(route.get("route_version") or ""),
+        "role": role,
+        "work_kind": str(route.get("work_kind") or ""),
+        "class": str(route.get("class") or ""),
+        "size": str(route.get("size") or ""),
+        **values,
+    }
+
+
+def parse_route_execution_profile(
+    raw: Any, *, expected_role: str, launcher: str, provider: str, model: str,
+    effort: Any,
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Corroborate route provenance against the versioned server route catalog."""
+    if not isinstance(raw, dict) or set(raw) != ROUTE_EXECUTION_PROFILE_FIELDS:
+        return None, {
+            "error": "route_execution_profile must be one exact closed object",
+            "code": "bad_route_execution_profile",
+        }
+    if (
+        raw.get("version") != ROUTE_EXECUTION_PROFILE_VERSION
+        or raw.get("route_version") not in {ROUTE_VERSION, FALLBACK_ROUTE_VERSION}
+        or raw.get("role") != expected_role
+        or raw.get("work_kind") not in SLICE_WORK_KINDS
+        or raw.get("class") not in SLICE_CLASSES
+        or raw.get("size") not in SLICE_SIZES
+        or any(not isinstance(raw.get(key), str) for key in ROUTE_EXECUTION_PROFILE_FIELDS)
+    ):
+        return None, {
+            "error": "route_execution_profile is not a supported route selection",
+            "code": "bad_route_execution_profile",
+        }
+    work_kind = str(raw["work_kind"])
+    route_version = str(raw["route_version"])
+    if route_version == ROUTE_VERSION:
+        writer = NORMAL_WRITER_ROUTES[work_kind]
+        unavailable_provider = None
+        reason = f"work_kind={work_kind}"
+    else:
+        writer = AVAILABILITY_FALLBACK_WRITER_ROUTES[work_kind]
+        unavailable_provider = NORMAL_WRITER_ROUTES[work_kind][1]
+        reason = "availability_fallback:validated"
+    expected_route = build_slice_route(
+        str(raw["class"]), str(raw["size"]), None, 0, work_kind, writer,
+        route_version, reason, unavailable_provider,
+    )
+    expected = route_execution_profile(expected_route, expected_role)
+    if (
+        expected is None or raw != expected
+        or (raw["launcher"], raw["provider"], raw["model"], raw["effort"])
+        != (launcher, provider, model, effort)
+    ):
+        return None, {
+            "error": "route_execution_profile does not match the request and route catalog",
+            "code": "route_execution_profile_mismatch",
+        }
+    profile, profile_error = normalize_effort(launcher, provider, model, effort, "route")
+    if profile_error is not None or profile is None:
+        return None, profile_error or {
+            "error": "route effort is unsupported", "code": "unsupported_effort"
+        }
+    return dict(raw), None
+
+
 def build_slice_route(
     class_name: str,
     size_floor: str,
@@ -2093,7 +2178,7 @@ def build_slice_route(
     while len(reviewers) < 2:
         reviewers.append(("none", "none", "none", "none"))
     reviewer1, reviewer2 = reviewers
-    return {
+    route = {
         "ok": True,
         "route_version": route_version,
         "class": class_name,
@@ -2123,6 +2208,11 @@ def build_slice_route(
             f"{reviewer1[2]}_{reviewer2[2]}" if reviewer2[0] != "none" else reviewer1[2]
         ),
     }
+    for role in ("writer", "reviewer1", "reviewer2"):
+        profile = route_execution_profile(route, role)
+        if profile is not None:
+            route[f"{role}_execution_profile"] = profile
+    return route
 
 
 def parse_slice_route_common(data: dict[str, Any]) -> tuple[str, str, str, int | None, int | None, dict[str, Any] | None]:
@@ -3095,10 +3185,32 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     if provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
     requested_effort = data.get("effort", "default")
-    effort_source = "explicit" if "effort" in data else "launcher_default"
-    effort_profile, effort_error = normalize_review_effort(
-        launcher, provider, model, requested_effort, effort_source
-    )
+    route_profile: dict[str, str] | None = None
+    if "route_execution_profile" in data:
+        raw_route = data.get("route_execution_profile")
+        role = raw_route.get("role") if isinstance(raw_route, dict) else None
+        if role not in {"reviewer1", "reviewer2"}:
+            return 400, {
+                "error": "routed review role must be reviewer1 or reviewer2",
+                "code": "bad_route_execution_profile",
+            }
+        route_profile, route_error = parse_route_execution_profile(
+            raw_route, expected_role=str(role), launcher=launcher, provider=provider,
+            model=model, effort=requested_effort,
+        )
+        if route_error is not None or route_profile is None:
+            return 400, route_error or {
+                "error": "invalid route execution profile", "code": "bad_route_execution_profile"
+            }
+        effort_source = "route"
+        effort_profile, effort_error = normalize_effort(
+            launcher, provider, model, requested_effort, effort_source
+        )
+    else:
+        effort_source = "explicit" if "effort" in data else "launcher_default"
+        effort_profile, effort_error = normalize_review_effort(
+            launcher, provider, model, requested_effort, effort_source
+        )
     if effort_error is not None or effort_profile is None:
         return 400, effort_error or {
             "error": "unsupported effort profile", "code": "unsupported_effort"
@@ -3180,6 +3292,8 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         "max_turns": max_turns,
         "permission_profile": REVIEW_PERMISSION_PROFILES[launcher],
     }
+    if route_profile is not None:
+        identity["route_execution_profile"] = route_profile
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id, "kind": "review", "status": "queued",
@@ -3995,7 +4109,13 @@ def trusted_review_identity(job: Any) -> dict[str, Any] | None:
     if not isinstance(job, dict) or job.get("kind") != "review":
         return None
     identity = job.get("execution_identity")
-    if not isinstance(identity, dict) or set(identity) != set(REVIEW_IDENTITY_FIELDS):
+    if not isinstance(identity, dict):
+        return None
+    source = identity.get("effort_source")
+    expected_identity_fields = set(REVIEW_IDENTITY_FIELDS)
+    if source == "route":
+        expected_identity_fields.add("route_execution_profile")
+    if set(identity) != expected_identity_fields:
         return None
     if (
         identity.get("version") != REVIEW_EXECUTION_VERSION
@@ -4010,10 +4130,27 @@ def trusted_review_identity(job: Any) -> dict[str, Any] | None:
     provider = identity.get("provider")
     model = identity.get("model")
     spec = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
-    normalized, effort_err = normalize_review_effort(
-        str(launcher or ""), str(provider or ""), str(model or ""),
-        identity.get("requested_effort"), str(identity.get("effort_source") or ""),
-    )
+    if source == "route":
+        route_raw = identity.get("route_execution_profile")
+        route_role = route_raw.get("role") if isinstance(route_raw, dict) else None
+        if route_role not in {"reviewer1", "reviewer2"}:
+            return None
+        parsed_route, route_err = parse_route_execution_profile(
+            route_raw, expected_role=str(route_role), launcher=str(launcher or ""),
+            provider=str(provider or ""), model=str(model or ""),
+            effort=identity.get("requested_effort"),
+        )
+        if route_err is not None or parsed_route != route_raw:
+            return None
+        normalized, effort_err = normalize_effort(
+            str(launcher or ""), str(provider or ""), str(model or ""),
+            identity.get("requested_effort"), "route",
+        )
+    else:
+        normalized, effort_err = normalize_review_effort(
+            str(launcher or ""), str(provider or ""), str(model or ""),
+            identity.get("requested_effort"), str(source or ""),
+        )
     if (
         spec is None or provider != spec["provider"] or model not in spec["models"]
         or effort_err or normalized is None
@@ -4490,15 +4627,38 @@ def review_runtime_matches_identity(
     identity: dict[str, Any], prompt: str, resolved: Path, diff_text: str
 ) -> bool:
     branch, head, err = current_branch_head(resolved)
-    normalized, effort_err = normalize_review_effort(
-        str(identity.get("launcher") or ""),
-        str(identity.get("provider") or ""),
-        str(identity.get("model") or ""),
-        identity.get("requested_effort"),
-        str(identity.get("effort_source") or ""),
-    )
+    source = identity.get("effort_source")
+    expected_fields = set(REVIEW_IDENTITY_FIELDS)
+    if source == "route":
+        expected_fields.add("route_execution_profile")
+        route_raw = identity.get("route_execution_profile")
+        route_role = route_raw.get("role") if isinstance(route_raw, dict) else None
+        if route_role not in {"reviewer1", "reviewer2"}:
+            return False
+        parsed_route, route_err = parse_route_execution_profile(
+            route_raw, expected_role=str(route_role),
+            launcher=str(identity.get("launcher") or ""),
+            provider=str(identity.get("provider") or ""),
+            model=str(identity.get("model") or ""),
+            effort=identity.get("requested_effort"),
+        )
+        if route_err is not None or parsed_route != route_raw:
+            return False
+        normalized, effort_err = normalize_effort(
+            str(identity.get("launcher") or ""),
+            str(identity.get("provider") or ""),
+            str(identity.get("model") or ""),
+            identity.get("requested_effort"), "route",
+        )
+    else:
+        normalized, effort_err = normalize_review_effort(
+            str(identity.get("launcher") or ""),
+            str(identity.get("provider") or ""),
+            str(identity.get("model") or ""),
+            identity.get("requested_effort"), str(source or ""),
+        )
     return bool(
-        set(identity) == set(REVIEW_IDENTITY_FIELDS)
+        set(identity) == expected_fields
         and identity.get("version") == REVIEW_EXECUTION_VERSION
         and identity.get("kind") == "review"
         and effort_err is None and normalized is not None
@@ -5270,6 +5430,9 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
         "effort_source", "launcher_version", "repo", "branch", "starting_head",
         "native_session_id",
     }
+    source = raw.get("effort_source")
+    if source == "route":
+        allowed.add("route_execution_profile")
     if set(raw) != allowed:
         return None, {"error": "session_identity has missing or unsupported fields", "code": "bad_session_identity"}
     out: dict[str, Any] = {}
@@ -5295,6 +5458,19 @@ def parse_session_identity(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     session_id = out["native_session_id"]
     if session_id is not None and not NATIVE_SESSION_RE.fullmatch(session_id):
         return None, {"error": "session_identity.native_session_id is invalid", "code": "bad_session_identity"}
+    if source == "route":
+        route_raw = raw.get("route_execution_profile")
+        parsed_route, route_err = parse_route_execution_profile(
+            route_raw, expected_role="writer", launcher=out["launcher"],
+            provider=out["provider"], model=out["model"],
+            effort=out["requested_effort"],
+        )
+        if route_err is not None or parsed_route != route_raw:
+            return None, {
+                "error": "session_identity route execution profile is invalid",
+                "code": "bad_session_identity",
+            }
+        out["route_execution_profile"] = parsed_route
     normalized, effort_err = normalize_effort(
         out["launcher"], out["provider"], out["model"],
         out["requested_effort"], out["effort_source"],
@@ -8134,6 +8310,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
         "session_identity", "resume_job_id", "cwd", "response_webhook_url",
         "response_webhook_token", "resume_url", "codeoff_workspace", "effort",
+        "route_execution_profile",
     }
     unexpected = sorted(set(data) - allowed)
     if unexpected:
@@ -8188,13 +8365,58 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             return 400, {"error": "code-off identity differs from the immutable snapshot; fallback/substitution is forbidden", "code": "codeoff_identity_mismatch"}
     elif provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} launcher", "code": "bad_model_identity"}
-    effort, effort_err = normalize_effort(
-        launcher,
-        provider,
-        model,
-        data.get("effort", "default"),
-        "explicit" if "effort" in data else "launcher_default",
-    )
+    requested_identity, identity_err = parse_session_identity(data.get("session_identity"))
+    if identity_err:
+        return 400, identity_err
+    route_profile: dict[str, str] | None = None
+    requested_effort = data.get("effort", "default")
+    if requested_identity is not None:
+        requested_effort = requested_identity["requested_effort"]
+        if "effort" in data and data.get("effort") != requested_effort:
+            return 400, {
+                "error": "resume effort must equal the pinned session identity",
+                "code": "session_identity_mismatch",
+            }
+        source = requested_identity["effort_source"]
+        if source == "route":
+            if data.get("route_execution_profile") != requested_identity.get("route_execution_profile"):
+                return 400, {
+                    "error": "resume route evidence must equal the pinned session identity",
+                    "code": "session_identity_mismatch",
+                }
+            route_profile, route_error = parse_route_execution_profile(
+                data.get("route_execution_profile"), expected_role="writer",
+                launcher=launcher, provider=provider, model=model, effort=requested_effort,
+            )
+            if route_error is not None or route_profile is None:
+                return 400, route_error or {
+                    "error": "invalid route execution profile", "code": "bad_route_execution_profile"
+                }
+        elif "route_execution_profile" in data:
+            return 400, {
+                "error": "direct resume cannot add route attribution",
+                "code": "session_identity_mismatch",
+            }
+        effort, effort_err = normalize_effort(
+            launcher, provider, model, requested_effort, source
+        )
+    elif "route_execution_profile" in data:
+        route_profile, route_error = parse_route_execution_profile(
+            data.get("route_execution_profile"), expected_role="writer",
+            launcher=launcher, provider=provider, model=model, effort=requested_effort,
+        )
+        if route_error is not None or route_profile is None:
+            return 400, route_error or {
+                "error": "invalid route execution profile", "code": "bad_route_execution_profile"
+            }
+        effort, effort_err = normalize_effort(
+            launcher, provider, model, requested_effort, "route"
+        )
+    else:
+        effort, effort_err = normalize_effort(
+            launcher, provider, model, requested_effort,
+            "explicit" if "effort" in data else "launcher_default",
+        )
     if effort_err:
         return 400, effort_err
     assert effort is not None
@@ -8225,9 +8447,6 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     branch, head, git_err = current_branch_head(resolved)
     if git_err:
         return 400, git_err
-    requested_identity, identity_err = parse_session_identity(data.get("session_identity"))
-    if identity_err:
-        return 400, identity_err
     session_identity = {
         "launcher": launcher, "provider": provider, "model": model,
         "requested_effort": effort["requested_effort"],
@@ -8236,6 +8455,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "launcher_version": launcher_version,
         "repo": repo_name, "branch": branch, "starting_head": head, "native_session_id": None,
     }
+    if route_profile is not None:
+        session_identity["route_execution_profile"] = route_profile
     resume_parent: dict[str, Any] | None = None
     if requested_identity is not None:
         if requested_identity.get("native_session_id") is None:
