@@ -4535,6 +4535,8 @@ def review_terminal_transition(
             _write_job_unlocked(terminal)
             seal_terminal_receipt_authority("review", receipt)
             return terminal, True
+        except (RecursionError, MemoryError):
+            return None, False
         finally:
             transition_keys.discard(key)
 
@@ -4611,14 +4613,17 @@ def sanitized_review_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
         and stored.get("code") == "review_execution_identity_mismatch"
     ):
         return None
-    projected = {
-        key: json.loads(json.dumps(stored[key]))
-        for key in REVIEW_RECEIPT_FIELDS
-        if key not in {"usage", "usage_diagnostic"}
-    }
-    usage, diagnostic = authorized_receipt_usage("review", stored)
-    projected.update({"usage": usage, "usage_diagnostic": diagnostic})
-    return projected
+    try:
+        projected = {
+            key: json.loads(json.dumps(stored[key]))
+            for key in REVIEW_RECEIPT_FIELDS
+            if key not in {"usage", "usage_diagnostic"}
+        }
+        usage, diagnostic = authorized_receipt_usage("review", stored)
+        projected.update({"usage": usage, "usage_diagnostic": diagnostic})
+        return projected
+    except (RecursionError, MemoryError):
+        return None
 
 
 def valid_review_timestamps(job: Any) -> bool:
@@ -4744,7 +4749,11 @@ def review_job_response(job_id: str) -> tuple[int, dict[str, Any]]:
             "error": "review process authority is unavailable after restart",
             "code": "review_authority_unavailable",
         }
-    if not is_review_job_record(job):
+    try:
+        canonical = is_review_job_record(job)
+    except (RecursionError, MemoryError):
+        canonical = False
+    if not canonical:
         code = (
             "review_authority_unavailable"
             if job.get("status") in ("queued", "running") and review_authority(job_id) is None
@@ -4758,7 +4767,13 @@ def review_job_response(job_id: str) -> tuple[int, dict[str, Any]]:
             ),
             "code": code,
         }
-    return 200, public_review_job(job)
+    try:
+        return 200, public_review_job(job)
+    except (RecursionError, MemoryError):
+        return 409, {
+            "error": "review record is not canonical",
+            "code": "review_record_invalid",
+        }
 
 
 def review_job_wait(body: bytes) -> tuple[int, dict[str, Any]]:
@@ -6000,8 +6015,10 @@ def strict_json_object(raw: str | bytes) -> dict[str, Any]:
 
 
 def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
-    if not isinstance(text, str):
+    if text is None:
         return None, "usage_not_reported"
+    if not isinstance(text, str):
+        return None, "usage_malformed"
     if (
         len(text) > _PROVIDER_JSON_MAX_RAW_BYTES
         or len(text.encode("utf-8", "replace")) > _PROVIDER_JSON_MAX_RAW_BYTES
@@ -6029,6 +6046,7 @@ _CLAUDE_RESULT_REQUIRED_FIELDS = {
     "total_cost_usd", "usage", "modelUsage", "permission_denials",
     "uuid",
 }
+_CLAUDE_RESULT_NULLABLE_REQUIRED_FIELDS = {"stop_reason"}
 _CLAUDE_RESULT_OPTIONAL_FIELDS = {
     "ttft_ms", "ttft_stream_ms", "time_to_request_ms", "user_message_uuid",
     "request_sent_wall_ms", "time_to_request_from_spawn_ms",
@@ -6327,6 +6345,7 @@ def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
             for field in integer_telemetry
         )
         and isinstance(result.get("result"), str)
+        and _usage_number(result.get("total_cost_usd")) is not None
         and (
             result.get("stop_reason") is None
             or _claude_metadata_string_is_valid(result["stop_reason"])
@@ -6819,7 +6838,10 @@ def post_receipt(url: str, receipt: dict[str, Any], token: str | None = None) ->
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Rewst-Token"] = token
-    data = json.dumps(receipt).encode()
+    try:
+        data = json.dumps(receipt).encode()
+    except (RecursionError, MemoryError, TypeError, ValueError, OverflowError):
+        return {"ok": False, "error": "receipt serialization failed"}
     req = Request(url, data=data, method="POST", headers=headers)
     try:
         with urlopen(req, timeout=15) as resp:
