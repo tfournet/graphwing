@@ -9464,6 +9464,82 @@ func main() {
             },
         )
 
+    def test_implement_slice_terminal_sources_use_node_type_correct_handles(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        terminal_edges = {
+            edge["source"]: edge
+            for edge in graph["edges"]
+            if edge["target"] == "join_durable_outcome"
+        }
+        # Keep this ledger hard-coded. It is deliberately independent of the
+        # graph so changing a terminal node type without its runtime handle
+        # cannot make the fixture agree with the same defect.
+        expected = {
+            "recovery_route_fail": ("transforms.objectBuilder", "out"),
+            "fallback_route_fail": ("transforms.objectBuilder", "out"),
+            "fallback_wait_timeout": ("transforms.objectBuilder", "out"),
+            "fallback_wait_fail": ("transforms.objectBuilder", "out"),
+            "fallback_action_fail": ("transforms.objectBuilder", "out"),
+            "fallback_receipt_fail": ("transforms.objectBuilder", "out"),
+            "human_ack": ("transforms.objectBuilder", "out"),
+            "commit_fail": ("action.noop", "success"),
+            "push_fail": ("action.noop", "success"),
+            "done": ("transforms.objectBuilder", "out"),
+            "primary_action_fail": ("transforms.objectBuilder", "out"),
+            "timeout": ("transforms.objectBuilder", "out"),
+            "fail": ("transforms.objectBuilder", "out"),
+            "receipt_fail": ("transforms.objectBuilder", "out"),
+            "checkout_fail": ("action.noop", "success"),
+            "ticket_fail": ("action.noop", "success"),
+            "frontier_fail": ("action.noop", "success"),
+            "complete_fail": ("action.noop", "success"),
+            "walk_fail": ("action.noop", "success"),
+            "slices_complete": ("action.noop", "success"),
+            "route_fail": ("action.noop", "success"),
+            "review_fail": ("action.noop", "success"),
+            "e2e_fail": ("action.noop", "success"),
+            "test_http_fail": ("action.noop", "success"),
+            "correction_action_fail": ("transforms.objectBuilder", "out"),
+            "wait2_timeout": ("transforms.objectBuilder", "out"),
+            "wait2_fail": ("transforms.objectBuilder", "out"),
+            "test2_http_fail": ("action.noop", "success"),
+            "nack_timeout": ("action.noop", "success"),
+        }
+        self.assertEqual(set(terminal_edges), set(expected))
+        for source, (node_type, source_handle) in expected.items():
+            with self.subTest(source=source):
+                self.assertEqual(nodes[source]["type"], node_type)
+                self.assertEqual(terminal_edges[source]["sourceHandle"], source_handle)
+                self.assertEqual(terminal_edges[source]["targetHandle"], "in")
+
+    def test_implement_slice_every_terminal_emission_can_route_to_durable_join(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        emitted_handle = {
+            "action.noop": "success",
+            "transforms.objectBuilder": "out",
+        }
+        terminal_edges = [
+            edge for edge in graph["edges"]
+            if edge["target"] == "join_durable_outcome"
+        ]
+        self.assertEqual(len(terminal_edges), 29)
+        for edge in terminal_edges:
+            with self.subTest(source=edge["source"]):
+                node_type = nodes[edge["source"]]["type"]
+                self.assertIn(node_type, emitted_handle)
+                routed_targets = [
+                    candidate["target"] for candidate in graph["edges"]
+                    if candidate["source"] == edge["source"]
+                    and candidate.get("sourceHandle") == emitted_handle[node_type]
+                ]
+                self.assertEqual(routed_targets, ["join_durable_outcome"])
+
     def test_implement_slice_durable_outcome_key_is_replay_idempotent_and_run_scoped(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
@@ -17476,7 +17552,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "5a3f5676d38c70a66864b060c282cd8ff69a05d532ea59cde1a593fc4a378587")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "39dec0226eb462b20e363c365a00cfb6a05ed492d88bb50d9b401e43fb567b3a")
 
 
 class InstallTests(unittest.TestCase):
