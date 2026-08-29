@@ -6969,7 +6969,7 @@ while True:
                     self.assertFalse(valid(invalid), missing)
                 self.assertFalse(valid({**expected, "detail": "must stay closed"}))
 
-    def test_agent_and_review_effort_are_real_while_graph_effort_remains_unwired(self):
+    def test_agent_review_and_routed_graph_effort_are_real(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
         agent_request = schemas["AgentRunRequest"]
@@ -7024,14 +7024,16 @@ while True:
         self.assertEqual(kwargs["execution_identity"], payload["execution_identity"])
 
         root = Path(server.__file__).resolve().parent
-        checked_nodes = []
-        for graph_path in sorted((root / "graphs").glob("*.json")):
-            graph = json.loads(graph_path.read_text())
-            for node in graph["spec"]["nodes"]:
-                if node["type"].endswith(("/v1/agent/run", "/v1/review/run")):
-                    checked_nodes.append((graph_path.name, node["id"]))
-                    self.assertNotIn("effort", node.get("config", {}), (graph_path.name, node["id"]))
-        self.assertTrue(checked_nodes)
+        expected_counts = {"implement-slice.json": 10, "pr-drive.json": 1}
+        for graph_name, expected_count in expected_counts.items():
+            graph = json.loads((root / "graphs" / graph_name).read_text())
+            model_nodes = [
+                node for node in graph["spec"]["nodes"]
+                if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
+            ]
+            self.assertEqual(len(model_nodes), expected_count, graph_name)
+            for node in model_nodes:
+                self.assertIn("effort", node.get("config", {}), (graph_name, node["id"]))
 
     def test_fallback_receipt_binds_execution_profile(self):
         route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
@@ -7827,6 +7829,167 @@ while True:
             for cls in ("mechanical", "visual", "sensitive"):
                 route = server.slice_route_lookup(cls, "M", work_kind=work_kind)
                 self.assertTrue(banned.isdisjoint({route["reviewer1"], route["reviewer2"]}))
+
+    def test_implement_slice_wires_writer_and_reviewer_effort(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        expected_effort = {
+            "agent": "{{ CTX.selected_route.effort }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.effort }}",
+            "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
+            "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
+            "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
+            "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
+            "review1": "{{ CTX.active_route.reviewer1_effort }}",
+            "review1b": "{{ CTX.active_route.reviewer1_effort }}",
+            "review2": "{{ CTX.active_route.reviewer2_effort }}",
+            "review2b": "{{ CTX.active_route.reviewer2_effort }}",
+        }
+        actual_model_nodes = {
+            node_id for node_id, node in nodes.items()
+            if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
+        }
+        self.assertEqual(actual_model_nodes, set(expected_effort))
+        for node_id, expression in expected_effort.items():
+            self.assertEqual(nodes[node_id]["config"].get("effort"), expression, node_id)
+
+        # Initial, fallback, and recovered launches consume the selected route;
+        # active-session corrections consume the immutable receipt identity.
+        self.assertEqual(
+            nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
+            "TASKS.route.data",
+        )
+        self.assertEqual(
+            nodes["selected_route"]["config"]["code"]["code"],
+            "{{ CTX.recovery_selection.route | default(CTX.normal_primary_candidate.route) | tojson }}",
+        )
+        self.assertEqual(
+            nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
+            "TASKS.fallback_route.data",
+        )
+        self.assertEqual(
+            nodes["fallback_route_choice"]["config"]["code"]["code"],
+            "{{ CTX.normal_fallback_candidate.route | default(CTX.recovery_selection.route) | tojson }}",
+        )
+        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            self.assertNotIn("TASKS.route", nodes[node_id]["config"]["effort"], node_id)
+            self.assertIn("session_identity.requested_effort", nodes[node_id]["config"]["effort"], node_id)
+
+        # reviewer2 remains optional: its effort expression is evaluated only
+        # behind the existing reviewer2-present switch default path.
+        triples = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["edges"]
+        }
+        self.assertIn(("switch_rev2", "case-0", "join_commit"), triples)
+        self.assertIn(("switch_rev2", "default", "wait_rev2"), triples)
+        self.assertEqual(
+            {edge["source"] for edge in graph["edges"] if edge["target"] == "review2"},
+            {"wait_rev2"},
+        )
+        self.assertEqual(
+            {edge["source"] for edge in graph["edges"] if edge["target"] == "review2b"},
+            {"wait_r2b"},
+        )
+
+    def test_pr_drive_wires_and_pins_effort(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        model_nodes = [
+            node for node in graph["nodes"]
+            if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
+        ]
+        self.assertEqual([node["id"] for node in model_nodes], ["agent"])
+        self.assertEqual(nodes["agent"]["config"].get("effort"), "{{ TASKS.route.data.effort }}")
+        self.assertEqual(
+            [node["id"] for node in graph["nodes"] if "/v1/slice/route" in node["type"]],
+            ["route"],
+        )
+        self.assertNotIn("session_identity", nodes["agent"]["config"])
+        self.assertNotIn("resume_job_id", nodes["agent"]["config"])
+
+        # One API invocation is one bounded attempt: there is no graph cycle,
+        # same-session correction, or second route/writer that can change effort.
+        outgoing = {}
+        for edge in graph["edges"]:
+            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        seen, pending = set(), ["continue"]
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(outgoing.get(current, ()))
+        self.assertTrue({"route", "agent"}.isdisjoint(seen))
+        self.assertEqual(
+            {edge["source"] for edge in graph["edges"] if edge["target"] == "route"},
+            {"findings"},
+        )
+
+    def test_catalog_has_no_dead_effort_fields(self):
+        root = Path(server.__file__).parent
+        # This is an independent, hard-coded catalog contract. Never derive
+        # expected consumers from whichever fields the graph happens to have.
+        expected = {
+            "implement-slice.json": {
+                "route_nodes": {"route", "fallback_route", "recovery_route"},
+                "consumers": {
+                    "agent": "{{ CTX.selected_route.effort }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.effort }}",
+                    "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
+                    "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
+                    "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
+                    "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
+                    "review1": "{{ CTX.active_route.reviewer1_effort }}",
+                    "review1b": "{{ CTX.active_route.reviewer1_effort }}",
+                    "review2": "{{ CTX.active_route.reviewer2_effort }}",
+                    "review2b": "{{ CTX.active_route.reviewer2_effort }}",
+                },
+            },
+            "pr-drive.json": {
+                "route_nodes": {"route"},
+                "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
+            },
+        }
+        graphs = {
+            path.name: json.loads(path.read_text())["spec"]
+            for path in sorted((root / "graphs").glob("*.json"))
+        }
+        actual_routed_graphs = {
+            name for name, graph in graphs.items()
+            if any("/v1/slice/route" in node["type"] for node in graph["nodes"])
+        }
+        self.assertEqual(actual_routed_graphs, set(expected))
+        for graph_name, contract in expected.items():
+            nodes = {node["id"]: node for node in graphs[graph_name]["nodes"]}
+            self.assertEqual(
+                {node_id for node_id, node in nodes.items() if "/v1/slice/route" in node["type"]},
+                contract["route_nodes"],
+                graph_name,
+            )
+            actual_consumers = {
+                node_id for node_id, node in nodes.items()
+                if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
+            }
+            self.assertEqual(actual_consumers, set(contract["consumers"]), graph_name)
+            for node_id, expression in contract["consumers"].items():
+                self.assertEqual(nodes[node_id]["config"].get("effort"), expression, (graph_name, node_id))
+                self.assertRegex(expression, r"^\{\{ (?:TASKS|CTX)\.")
+
+        spec = json.loads((root / "openapi.json").read_text())
+        closed_effort = ["default", "low", "medium", "high", "max"]
+        for schema_name in ("AgentRunRequest", "ReviewRunRequest"):
+            properties = spec["components"]["schemas"][schema_name]["properties"]
+            self.assertEqual(properties["effort"]["enum"], closed_effort)
+            self.assertNotIn("reasoning_effort", properties)
+        route_properties = spec["components"]["schemas"]["SliceRoute"]["properties"]
+        self.assertEqual(route_properties["effort"]["enum"], ["high", "default"])
+        self.assertEqual(route_properties["reviewer1_effort"]["enum"], ["none", "high", "default"])
+        self.assertEqual(route_properties["reviewer2_effort"]["enum"], ["none", "high", "default"])
 
     def test_pr_drive_gates_wait_for_results_too(self):
         # implement-slice got wait nodes for every async op; pr-drive did not.
@@ -13889,7 +14052,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "997f74581247a933abf1fe4b41cfa248d2e5dcdae81318d12d7b7a95882d76dc")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "7400b0ca57c190ecc17e79484fbaa8eaee6f7eeaef209053615f8672a2dcb833")
 
 
 class InstallTests(unittest.TestCase):
