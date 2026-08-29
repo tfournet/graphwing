@@ -8889,6 +8889,179 @@ while True:
             "uuid": "claude-usage-fixture",
         }
 
+    def test_claude_21250_contract_optional_variants_are_validation_only(self):
+        base = self._claude_21250_usage_result()
+        for field in ("api_error_status", "terminal_reason", "fast_mode_state"):
+            del base[field]
+
+        expected, diagnostic = server.normalize_native_usage(
+            "claude", json.dumps(base), 1,
+        )
+        self.assertIsNone(diagnostic)
+        self.assertIsNotNone(expected)
+
+        variants = {}
+        variants["omitted_optionals"] = deepcopy(base)
+
+        null_stop_reason = deepcopy(base)
+        null_stop_reason["stop_reason"] = None
+        variants["null_stop_reason"] = null_stop_reason
+
+        ttft = deepcopy(base)
+        ttft["ttft_ms"] = 3
+        variants["ttft_ms"] = ttft
+
+        canonical_model = deepcopy(base)
+        canonical_model["modelUsage"]["claude-opus-5"]["canonicalModel"] = (
+            "claude-opus-5"
+        )
+        variants["canonicalModel"] = canonical_model
+
+        provider = deepcopy(base)
+        provider["modelUsage"]["claude-opus-5"]["provider"] = "firstParty"
+        variants["provider"] = provider
+
+        cost_basis = deepcopy(base)
+        cost_basis["modelUsage"]["claude-opus-5"]["costBasis"] = "managed"
+        variants["costBasis"] = cost_basis
+
+        combined = self._claude_21250_usage_result()
+        combined["stop_reason"] = None
+        combined["ttft_ms"] = 3
+        combined["modelUsage"]["claude-opus-5"].update({
+            "canonicalModel": "claude-opus-5",
+            "provider": "firstParty",
+            "costBasis": "list",
+        })
+        combined["modelUsage"]["claude-sonnet-5"] = {
+            **combined["modelUsage"]["claude-opus-5"],
+            "canonicalModel": "claude-sonnet-5",
+            "provider": "bedrock",
+            "costBasis": "unknown",
+        }
+        variants["combined_multiple_models"] = combined
+
+        self.assertEqual(len(variants), 7)
+        for name, event in variants.items():
+            with self.subTest(case=name):
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (expected, None),
+                )
+
+    def test_claude_21250_contract_optionals_remain_closed_and_typed(self):
+        top_level_wrong = {
+            "api_error_status": "none",
+            "terminal_reason": 1,
+            "fast_mode_state": [],
+            "ttft_ms": 1.5,
+        }
+        for field, value in top_level_wrong.items():
+            with self.subTest(location="result", field=field, case="wrong_value"):
+                event = self._claude_21250_usage_result()
+                event[field] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+            with self.subTest(location="result", field=field, case="unknown_mirror"):
+                event = self._claude_21250_usage_result()
+                event.pop(field, None)
+                event[f"{field}_unexpected"] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+
+        model_wrong = {
+            "canonicalModel": 1,
+            "provider": [],
+            "costBasis": {},
+        }
+        for field, value in model_wrong.items():
+            with self.subTest(location="modelUsage", field=field, case="wrong_value"):
+                event = self._claude_21250_usage_result()
+                event["modelUsage"]["claude-opus-5"][field] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+            with self.subTest(location="modelUsage", field=field, case="unknown_mirror"):
+                event = self._claude_21250_usage_result()
+                event["modelUsage"]["claude-opus-5"][f"{field}Unexpected"] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+
+        for field, value in {
+            "terminal_reason": "not-a-terminal-reason",
+            "fast_mode_state": "turbo",
+        }.items():
+            with self.subTest(location="result", field=field, case="unknown_value"):
+                event = self._claude_21250_usage_result()
+                event[field] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+
+        event = self._claude_21250_usage_result()
+        event["modelUsage"]["claude-opus-5"]["costBasis"] = "retail"
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(event), 1),
+            (None, "usage_malformed"),
+        )
+
+        combined = self._claude_21250_usage_result()
+        combined["ttft_ms"] = 3
+        combined["modelUsage"]["claude-opus-5"].update({
+            "canonicalModel": "claude-opus-5",
+            "provider": "firstParty",
+            "costBasis": "list",
+        })
+        combined["modelUsage"]["claude-sonnet-5"] = deepcopy(
+            combined["modelUsage"]["claude-opus-5"]
+        )
+        combined["modelUsage"]["claude-sonnet-5"]["unexpected"] = 1
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(combined), 1),
+            (None, "usage_malformed"),
+        )
+
+        duplicate_optional = json.dumps(event).replace(
+            '"costBasis": "retail"',
+            '"costBasis": "list", "costBasis": "managed"',
+        )
+        self.assertEqual(duplicate_optional.count('"costBasis"'), 2)
+        self.assertEqual(
+            server.normalize_native_usage("claude", duplicate_optional, 1),
+            (None, "usage_malformed"),
+        )
+
+        for value in (True, -1, "3"):
+            with self.subTest(location="result", field="ttft_ms", value=value):
+                event = self._claude_21250_usage_result()
+                event["ttft_ms"] = value
+                self.assertEqual(
+                    server.normalize_native_usage(
+                        "claude", json.dumps(event), 1,
+                    ),
+                    (None, "usage_malformed"),
+                )
+
     def test_claude_usage_normalization(self):
         event = self._claude_21250_usage_result()
         event["result"] = "hostile prompt TOKEN_SECRET /home/private response"
@@ -8912,10 +9085,10 @@ while True:
         self.assertIsNotNone(usage)
 
         missing_fields = (
-            "type", "subtype", "is_error", "api_error_status", "duration_ms",
+            "type", "subtype", "is_error", "duration_ms",
             "duration_api_ms", "num_turns", "result", "stop_reason",
             "session_id", "total_cost_usd", "usage", "modelUsage",
-            "permission_denials", "terminal_reason", "fast_mode_state", "uuid",
+            "permission_denials", "uuid",
         )
         for field in missing_fields:
             with self.subTest(case="missing", field=field):
