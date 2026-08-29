@@ -9743,7 +9743,12 @@ while True:
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
-            with mock.patch.object(server, "JOBS_DIR", jobs), \
+            launcher = Path(td) / "claude-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            launcher_version = "sha256:" + hashlib.sha256(launcher.read_bytes()).hexdigest()
+            with mock.patch.dict(os.environ, {"GRAPHWING_CLAUDE_BIN": str(launcher)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
@@ -9758,6 +9763,7 @@ while True:
             tuple(payload["execution_identity"][key] for key in ("launcher", "provider", "model")),
             ("claude", "anthropic", "claude-sonnet-5"),
         )
+        self.assertEqual(payload["execution_identity"]["launcher_version"], launcher_version)
         self.assertTrue(payload["job_id"])
         queued = enq.call_args.args[0]
         self.assertNotIn("reviewer", queued)
@@ -9777,7 +9783,12 @@ while True:
         with tempfile.TemporaryDirectory() as td:
             repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
-            with mock.patch.object(server, "JOBS_DIR", jobs), \
+            launcher = Path(td) / "claude-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            launcher_version = "sha256:" + hashlib.sha256(launcher.read_bytes()).hexdigest()
+            with mock.patch.dict(os.environ, {"GRAPHWING_CLAUDE_BIN": str(launcher)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "enqueue_review") as enq:
@@ -9792,6 +9803,7 @@ while True:
         self.assertEqual(saved["run_budget_seconds"], 600)
         self.assertEqual(saved["max_turns"], 20)
         self.assertEqual(saved["effective_effort"], "default")
+        self.assertEqual(saved["launcher_version"], launcher_version)
         self.assertIsNone(saved["response_webhook_url"])
         enq.assert_called_once()
 
