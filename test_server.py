@@ -8889,6 +8889,79 @@ while True:
             "uuid": "claude-usage-fixture",
         }
 
+    def test_claude_21250_result_schema_snapshot_matches_parser_sets(self):
+        """Sanitized field inventory derived from the installed 2.1.250 schema."""
+        snapshot = {
+            "result_required": {
+                "type", "subtype", "duration_ms", "duration_api_ms", "is_error",
+                "num_turns", "result", "stop_reason", "total_cost_usd", "usage",
+                "modelUsage", "permission_denials", "uuid", "session_id",
+            },
+            "result_optional": {
+                "ttft_ms", "ttft_stream_ms", "time_to_request_ms",
+                "user_message_uuid", "request_sent_wall_ms",
+                "time_to_request_from_spawn_ms", "warm_spare_claimed",
+                "time_origin_ms", "api_error_status", "subagent_stats",
+                "queued_turn_count", "structured_output", "deferred_tool_use",
+                "terminal_reason", "fast_mode_state", "fast_mode_disabled_reason",
+                "origin",
+            },
+            "model_usage_required": {
+                "inputTokens", "outputTokens", "cacheReadInputTokens",
+                "cacheCreationInputTokens", "webSearchRequests", "costUSD",
+                "contextWindow", "maxOutputTokens",
+            },
+            "model_usage_optional": {"canonicalModel", "provider", "costBasis"},
+            "terminal_reasons": {
+                "blocking_limit", "rapid_refill_breaker", "prompt_too_long",
+                "image_error", "model_error", "api_error",
+                "malformed_tool_use_exhausted", "aborted_streaming",
+                "aborted_tools", "stop_hook_prevented", "hook_stopped",
+                "tool_deferred", "max_turns", "background_requested", "completed",
+                "budget_exhausted", "structured_output_retry_exhausted",
+                "tool_deferred_unavailable", "turn_setup_failed",
+            },
+            "fast_mode_states": {"off", "cooldown", "on"},
+            "fast_mode_disabled_reasons": {
+                "free", "preference", "extra_usage_disabled", "network_error",
+                "unknown", "not_first_party", "disabled_by_env",
+                "model_not_allowed", "sdk_opt_in_required", "pending",
+            },
+            "origin_kinds": {
+                "human", "channel", "peer", "task-notification", "coordinator",
+                "unclassified", "observer", "auto-continuation",
+                "observer-activity",
+            },
+            "subagent_fields": {
+                "spawned", "requested", "started_in_background", "by_type",
+                "max_depth", "spawned_by_subagents", "completed", "failed",
+                "killed", "refused",
+            },
+        }
+        self.assertEqual(server._CLAUDE_RESULT_REQUIRED_FIELDS, snapshot["result_required"])
+        self.assertEqual(server._CLAUDE_RESULT_OPTIONAL_FIELDS, snapshot["result_optional"])
+        self.assertEqual(
+            server._CLAUDE_MODEL_USAGE_REQUIRED_FIELDS,
+            snapshot["model_usage_required"],
+        )
+        self.assertEqual(
+            server._CLAUDE_MODEL_USAGE_OPTIONAL_FIELDS,
+            snapshot["model_usage_optional"],
+        )
+        self.assertEqual(server._CLAUDE_TERMINAL_REASONS, snapshot["terminal_reasons"])
+        self.assertEqual(server._CLAUDE_FAST_MODE_STATES, snapshot["fast_mode_states"])
+        self.assertEqual(
+            server._CLAUDE_FAST_MODE_DISABLED_REASONS,
+            snapshot["fast_mode_disabled_reasons"],
+        )
+        self.assertEqual(server._CLAUDE_ORIGIN_KINDS, snapshot["origin_kinds"])
+        self.assertEqual(server._CLAUDE_SUBAGENT_FIELDS, snapshot["subagent_fields"])
+        self.assertEqual(
+            server._CLAUDE_RESULT_REQUIRED_FIELDS
+            & server._CLAUDE_RESULT_OPTIONAL_FIELDS,
+            set(),
+        )
+
     def test_claude_21250_contract_optional_variants_are_validation_only(self):
         base = self._claude_21250_usage_result()
         for field in ("api_error_status", "terminal_reason", "fast_mode_state"):
@@ -8925,9 +8998,47 @@ while True:
         cost_basis["modelUsage"]["claude-opus-5"]["costBasis"] = "managed"
         variants["costBasis"] = cost_basis
 
+        optional_values = {
+            "ttft_stream_ms": 4,
+            "time_to_request_ms": 5,
+            "user_message_uuid": "user-message-fixture",
+            "request_sent_wall_ms": 1_787_000_000_000.5,
+            "time_to_request_from_spawn_ms": 6,
+            "warm_spare_claimed": True,
+            "time_origin_ms": 1_787_000_000_000,
+            "api_error_status": 429,
+            "subagent_stats": {
+                "spawned": 1,
+                "requested": {"background": 1, "foreground": 0, "unset": 0},
+                "started_in_background": 1,
+                "by_type": {"Explore": 1},
+                "max_depth": 1,
+                "spawned_by_subagents": 0,
+                "completed": 1,
+                "failed": 0,
+                "killed": {"parent": 0, "user": 0, "system": 0},
+                "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+            },
+            "queued_turn_count": 2,
+            "structured_output": {"ok": True, "items": [1, None, "value"]},
+            "deferred_tool_use": {
+                "id": "tool-use-fixture",
+                "name": "ExampleTool",
+                "input": {"safe": True},
+            },
+            "fast_mode_disabled_reason": "preference",
+            "origin": {"kind": "channel", "server": "fixture-channel"},
+        }
+        for field, value in optional_values.items():
+            event = deepcopy(base)
+            event[field] = value
+            variants[field] = event
+
         combined = self._claude_21250_usage_result()
         combined["stop_reason"] = None
         combined["ttft_ms"] = 3
+        for field, value in optional_values.items():
+            combined[field] = deepcopy(value)
         combined["modelUsage"]["claude-opus-5"].update({
             "canonicalModel": "claude-opus-5",
             "provider": "firstParty",
@@ -8941,7 +9052,7 @@ while True:
         }
         variants["combined_multiple_models"] = combined
 
-        self.assertEqual(len(variants), 7)
+        self.assertEqual(len(variants), 21)
         for name, event in variants.items():
             with self.subTest(case=name):
                 self.assertEqual(
@@ -9062,6 +9173,212 @@ while True:
                     (None, "usage_malformed"),
                 )
 
+    def test_claude_21250_optional_telemetry_is_bounded_and_exactly_typed(self):
+        integer_fields = (
+            "ttft_ms", "ttft_stream_ms", "time_to_request_ms",
+            "time_to_request_from_spawn_ms", "queued_turn_count",
+        )
+        for field in integer_fields:
+            for value in (True, 1.5, -1, 10 ** 100):
+                with self.subTest(field=field, value=repr(value)):
+                    event = self._claude_21250_usage_result()
+                    event[field] = value
+                    self.assertEqual(
+                        server.normalize_native_usage("claude", json.dumps(event), 1),
+                        (None, "usage_malformed"),
+                    )
+            event = self._claude_21250_usage_result()
+            event[f"{field}_unexpected"] = 1
+            self.assertEqual(
+                server.normalize_native_usage("claude", json.dumps(event), 1),
+                (None, "usage_malformed"),
+            )
+
+        for field in ("request_sent_wall_ms", "time_origin_ms"):
+            for value in (True, "1", -1, 10 ** 100, 1e308):
+                with self.subTest(field=field, value=repr(value)):
+                    event = self._claude_21250_usage_result()
+                    event[field] = value
+                    self.assertEqual(
+                        server.normalize_native_usage("claude", json.dumps(event), 1),
+                        (None, "usage_malformed"),
+                    )
+
+        baseline = server.normalize_native_usage(
+            "claude", json.dumps(self._claude_21250_usage_result()), 1,
+        )
+        for value in (False, True):
+            event = self._claude_21250_usage_result()
+            event["warm_spare_claimed"] = value
+            self.assertEqual(
+                server.normalize_native_usage("claude", json.dumps(event), 1),
+                baseline,
+            )
+        for value in (1, "true", None):
+            event = self._claude_21250_usage_result()
+            event["warm_spare_claimed"] = value
+            self.assertEqual(
+                server.normalize_native_usage("claude", json.dumps(event), 1),
+                (None, "usage_malformed"),
+            )
+
+        for value in (-1, 10 ** 100, True, 1.5, "429"):
+            event = self._claude_21250_usage_result()
+            event["api_error_status"] = value
+            self.assertEqual(
+                server.normalize_native_usage("claude", json.dumps(event), 1),
+                (None, "usage_malformed"),
+            )
+
+        valid_stats = {
+            "spawned": 1,
+            "requested": {"background": 1, "foreground": 0, "unset": 0},
+            "started_in_background": 1,
+            "by_type": {"Explore": 1},
+            "max_depth": 1,
+            "spawned_by_subagents": 0,
+            "completed": 1,
+            "failed": 0,
+            "killed": {"parent": 0, "user": 0, "system": 0},
+            "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+        }
+        for location in ("requested", "killed", "refused"):
+            event = self._claude_21250_usage_result()
+            event["subagent_stats"] = deepcopy(valid_stats)
+            event["subagent_stats"][location]["unexpected"] = 1
+            with self.subTest(field="subagent_stats", location=location):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+        event = self._claude_21250_usage_result()
+        event["subagent_stats"] = deepcopy(valid_stats)
+        event["subagent_stats"]["by_type"]["bad\nagent"] = 1
+        self.assertEqual(
+            server.normalize_native_usage("claude", json.dumps(event), 1),
+            (None, "usage_malformed"),
+        )
+        for value in (-1, True, 10 ** 100):
+            event = self._claude_21250_usage_result()
+            event["subagent_stats"] = deepcopy(valid_stats)
+            event["subagent_stats"]["spawned"] = value
+            with self.subTest(field="subagent_stats.spawned", value=repr(value)):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        event = self._claude_21250_usage_result()
+        event.update({
+            "ttft_stream_ms": 4,
+            "time_to_request_ms": 5,
+            "request_sent_wall_ms": 1_787_000_000_000,
+            "time_to_request_from_spawn_ms": 6,
+            "time_origin_ms": 1_787_000_000_000,
+        })
+        duplicate = json.dumps(event).replace(
+            '"ttft_stream_ms": 4',
+            '"ttft_stream_ms": 4, "ttft_stream_ms": 5',
+        )
+        self.assertEqual(
+            server.normalize_native_usage("claude", duplicate, 1),
+            (None, "usage_malformed"),
+        )
+        nonfinite = json.dumps(event).replace(
+            '"time_origin_ms": 1787000000000', '"time_origin_ms": Infinity',
+        )
+        self.assertEqual(
+            server.normalize_native_usage("claude", nonfinite, 1),
+            (None, "usage_malformed"),
+        )
+
+    def test_claude_21250_optional_metadata_is_bounded_control_free_and_closed(self):
+        for field in (
+            "ttft_ms", "ttft_stream_ms", "time_to_request_ms",
+            "user_message_uuid", "request_sent_wall_ms",
+            "time_to_request_from_spawn_ms", "warm_spare_claimed",
+            "time_origin_ms", "api_error_status", "subagent_stats",
+            "queued_turn_count", "structured_output", "deferred_tool_use",
+            "terminal_reason", "fast_mode_state", "fast_mode_disabled_reason",
+            "origin",
+        ):
+            event = self._claude_21250_usage_result()
+            event[f"{field}_unexpected"] = None
+            with self.subTest(field=field, case="unknown_mirror"):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        for value in ("", "bad\nvalue", "x" * 1025, 7, None):
+            event = self._claude_21250_usage_result()
+            event["user_message_uuid"] = value
+            with self.subTest(field="user_message_uuid", value_type=type(value).__name__):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        for field, value in {
+            "deferred_tool_use": {"id": "id", "name": "name", "input": {}, "extra": 1},
+            "origin": {"kind": "channel", "server": "fixture", "extra": 1},
+            "subagent_stats": {},
+        }.items():
+            event = self._claude_21250_usage_result()
+            event[field] = value
+            with self.subTest(field=field, case="closed"):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+        for field, values in {
+            "fast_mode_disabled_reason": ("free", "pending", "invalid"),
+            "terminal_reason": ("completed", "api_error", "invalid"),
+        }.items():
+            for value in values:
+                event = self._claude_21250_usage_result()
+                event[field] = value
+                usage, diagnostic = server.normalize_native_usage(
+                    "claude", json.dumps(event), 1,
+                )
+                with self.subTest(field=field, value=value):
+                    if value == "invalid":
+                        self.assertIsNone(usage)
+                        self.assertEqual(diagnostic, "usage_malformed")
+                    else:
+                        self.assertIsNotNone(usage)
+                        self.assertIsNone(diagnostic)
+
+    def test_claude_21250_origin_union_variants_are_validation_only(self):
+        origins = (
+            {"kind": "human"},
+            {"kind": "channel", "server": "fixture"},
+            {
+                "kind": "peer", "from": "peer-fixture", "fromMode": "prompting",
+                "name": "Peer", "fromSession": "session-fixture",
+                "inbound_origin": "socket", "senderTaskId": "task-fixture",
+                "body": "line one\nline two", "verifiedPeerPid": 1234,
+            },
+            {"kind": "task-notification", "subkind": "scheduled-trigger"},
+            {"kind": "coordinator"},
+            {"kind": "unclassified"},
+            {"kind": "observer", "from": "observer-fixture", "senderTaskId": "task"},
+            {"kind": "auto-continuation"},
+            {"kind": "observer-activity"},
+        )
+        expected = server.normalize_native_usage(
+            "claude", json.dumps(self._claude_21250_usage_result()), 1,
+        )
+        for origin in origins:
+            event = self._claude_21250_usage_result()
+            event["origin"] = origin
+            with self.subTest(kind=origin["kind"]):
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    expected,
+                )
+
     def test_claude_usage_normalization(self):
         event = self._claude_21250_usage_result()
         event["result"] = "hostile prompt TOKEN_SECRET /home/private response"
@@ -9109,7 +9426,7 @@ while True:
             ("bool_api_duration", "duration_api_ms", True),
             ("string_turns", "num_turns", "1"),
             ("numeric_result", "result", 1),
-            ("bad_api_status", "api_error_status", 200),
+            ("bad_api_status", "api_error_status", "200"),
             ("bad_stop_reason", "stop_reason", 1),
             ("bad_terminal_reason", "terminal_reason", "failed"),
             ("bad_fast_mode", "fast_mode_state", 0),
