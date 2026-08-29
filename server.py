@@ -6463,7 +6463,24 @@ def _normalize_native_usage(
             return None, "usage_not_reported"
         if not _provider_json_is_bounded(native):
             return None, "usage_malformed"
-        if not isinstance(native, dict) or set(native) != {"stopReason", "usage"}:
+        if not isinstance(native, dict):
+            return None, "usage_malformed"
+        keys = set(native)
+        allowed = {"stopReason", "usage", "userMessageId", "_meta"}
+        if "stopReason" not in keys or not keys <= allowed:
+            return None, "usage_malformed"
+        stop_reason = native["stopReason"]
+        if not isinstance(stop_reason, str) or stop_reason not in {
+            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled",
+        }:
+            return None, "usage_malformed"
+        user_message_id = native.get("userMessageId")
+        if "userMessageId" in native and user_message_id is not None and not isinstance(
+            user_message_id, str,
+        ):
+            return None, "usage_malformed"
+        meta = native.get("_meta")
+        if "_meta" in native and meta is not None and not isinstance(meta, dict):
             return None, "usage_malformed"
         detail = native.get("usage")
         if detail is None:
