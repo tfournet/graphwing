@@ -73,7 +73,7 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
-### Native effort contract (Phase 2)
+### Native effort contract (Phases 2–3)
 
 Direct `POST /v1/agent/run` and `POST /v1/review/run` accept optional `effort` with the closed values `default`, `low`, `medium`, `high`, and `max`. A supplied value records `effort_source: explicit`; omission records `requested_effort: default` and `effort_source: launcher_default`. Direct calls do not claim `route` provenance. Unknown text returns `400 bad_effort`; a known value outside the selected native profile returns `400 unsupported_effort` before process launch.
 
@@ -83,7 +83,7 @@ Direct `POST /v1/agent/run` and `POST /v1/review/run` accept optional `effort` w
 | Claude `claude-opus-5`, `claude-sonnet-5` (and code-off-only `claude-fable-5`) | `default`, `low`, `medium`, `high`, `max` | unchanged; `default` emits no flag |
 | Grok `grok-4.6` | `default`, `low`, `medium`, `high` | `default` → `high`; explicit values unchanged |
 
-Installed non-inference probes established Codex CLI 0.150.1 config syntax `-c model_reasoning_effort=<value>`, Claude Code 2.1.250 session syntax `--effort <low|medium|high|xhigh|max>`, and Grok 1.0.5 ACP placement `grok agent --reasoning-effort <none|minimal|low|medium|high|xhigh|max> ... stdio`. The embedded `grok-4.6` catalog declares default `high` and advertises `low`, `medium`, `high`, and `xhigh`. Graphwing therefore maps requested Grok `default` to native `high`, exposes `low | medium | high`, omits vocabulary-external `xhigh`, and rejects parser-only/model-unproven `max`. Writer and reviewer commands share the same profile validation while preserving `workspace-write`/`read-only`, `acceptEdits`/`plan`, and ACP always-approve/read-only differences. Rewst graph-node configs remain intentionally unwired until Phase 3; no graph topology changed in Phase 2.
+Installed non-inference probes established Codex CLI 0.150.1 config syntax `-c model_reasoning_effort=<value>`, Claude Code 2.1.250 session syntax `--effort <low|medium|high|xhigh|max>`, and Grok 1.0.5 ACP placement `grok agent --reasoning-effort <none|minimal|low|medium|high|xhigh|max> ... stdio`. The embedded `grok-4.6` catalog declares default `high` and advertises `low`, `medium`, `high`, and `xhigh`. Graphwing therefore maps requested Grok `default` to native `high`, exposes `low | medium | high`, omits vocabulary-external `xhigh`, and rejects parser-only/model-unproven `max`. Writer and reviewer commands share the same profile validation while preserving `workspace-write`/`read-only`, `acceptEdits`/`plan`, and ACP always-approve/read-only differences. Phase 3 maps selected route effort into implement-slice and PR-drive initial writers, fallback writers, and routed reviews; same-session corrections take requested effort from their pinned receipt identity. These local graph fixtures do not prove tenant import, publication, or live execution.
 
 ### Closed async review contract
 
