@@ -5936,7 +5936,12 @@ _CLAUDE_RESULT_REQUIRED_FIELDS = {
     "uuid",
 }
 _CLAUDE_RESULT_OPTIONAL_FIELDS = {
-    "api_error_status", "terminal_reason", "fast_mode_state", "ttft_ms",
+    "ttft_ms", "ttft_stream_ms", "time_to_request_ms", "user_message_uuid",
+    "request_sent_wall_ms", "time_to_request_from_spawn_ms",
+    "warm_spare_claimed", "time_origin_ms", "api_error_status",
+    "subagent_stats", "queued_turn_count", "structured_output",
+    "deferred_tool_use", "terminal_reason", "fast_mode_state",
+    "fast_mode_disabled_reason", "origin",
 }
 _CLAUDE_USAGE_FIELDS = {
     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
@@ -5960,6 +5965,174 @@ _CLAUDE_MODEL_USAGE_OPTIONAL_FIELDS = {
 }
 _CLAUDE_COST_BASES = {"list", "managed", "unknown"}
 _CLAUDE_FAST_MODE_STATES = {"off", "cooldown", "on"}
+_CLAUDE_FAST_MODE_DISABLED_REASONS = {
+    "free", "preference", "extra_usage_disabled", "network_error", "unknown",
+    "not_first_party", "disabled_by_env", "model_not_allowed",
+    "sdk_opt_in_required", "pending",
+}
+_CLAUDE_TERMINAL_REASONS = {
+    "blocking_limit", "rapid_refill_breaker", "prompt_too_long", "image_error",
+    "model_error", "api_error", "malformed_tool_use_exhausted",
+    "aborted_streaming", "aborted_tools", "stop_hook_prevented", "hook_stopped",
+    "tool_deferred", "max_turns", "background_requested", "completed",
+    "budget_exhausted", "structured_output_retry_exhausted",
+    "tool_deferred_unavailable", "turn_setup_failed",
+}
+_CLAUDE_SUBAGENT_FIELDS = {
+    "spawned", "requested", "started_in_background", "by_type", "max_depth",
+    "spawned_by_subagents", "completed", "failed", "killed", "refused",
+}
+_CLAUDE_ORIGIN_KINDS = {
+    "human", "channel", "peer", "task-notification", "coordinator",
+    "unclassified", "observer", "auto-continuation", "observer-activity",
+}
+# Claude emits duration counters and epoch-millisecond correlation timestamps in
+# the same optional telemetry envelope. Ten trillion accepts dates well beyond
+# the supported runtime horizon while remaining finite, safely integral where
+# the contract says integer, and decisively rejects unbounded provider values.
+_CLAUDE_TELEMETRY_MAX = 10_000_000_000_000
+_CLAUDE_METADATA_MAX_CHARS = 1024
+
+
+def _claude_metadata_string_is_valid(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _CLAUDE_METADATA_MAX_CHARS
+        and value.isprintable()
+    )
+
+
+def _claude_telemetry_integer_is_valid(value: Any) -> bool:
+    return _usage_count(value, _CLAUDE_TELEMETRY_MAX) is not None
+
+
+def _claude_telemetry_number_is_valid(value: Any) -> bool:
+    return _usage_number(value, _CLAUDE_TELEMETRY_MAX) is not None
+
+
+def _claude_subagent_stats_is_valid(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != _CLAUDE_SUBAGENT_FIELDS:
+        return False
+    scalar_fields = _CLAUDE_SUBAGENT_FIELDS - {"requested", "by_type", "killed", "refused"}
+    if not all(_claude_telemetry_integer_is_valid(value.get(field)) for field in scalar_fields):
+        return False
+    requested = value.get("requested")
+    killed = value.get("killed")
+    refused = value.get("refused")
+    by_type = value.get("by_type")
+    return (
+        isinstance(requested, dict)
+        and set(requested) == {"background", "foreground", "unset"}
+        and all(_claude_telemetry_integer_is_valid(item) for item in requested.values())
+        and isinstance(killed, dict)
+        and set(killed) == {"parent", "user", "system"}
+        and all(_claude_telemetry_integer_is_valid(item) for item in killed.values())
+        and isinstance(refused, dict)
+        and set(refused) == {"depth_limit", "concurrency_limit", "budget"}
+        and all(_claude_telemetry_integer_is_valid(item) for item in refused.values())
+        and isinstance(by_type, dict)
+        and all(
+            _claude_metadata_string_is_valid(kind)
+            and _claude_telemetry_integer_is_valid(count)
+            for kind, count in by_type.items()
+        )
+    )
+
+
+def _claude_json_record_is_valid(value: Any) -> bool:
+    # JSON object keys are strings by construction; values remain arbitrary JSON
+    # exactly as in the native record schema and are never projected.
+    return isinstance(value, dict)
+
+
+def _claude_deferred_tool_use_is_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"id", "name", "input"}
+        and _claude_metadata_string_is_valid(value.get("id"))
+        and _claude_metadata_string_is_valid(value.get("name"))
+        and _claude_json_record_is_valid(value.get("input"))
+    )
+
+
+def _claude_origin_is_valid(value: Any) -> bool:
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("kind"), str)
+        or value["kind"] not in _CLAUDE_ORIGIN_KINDS
+    ):
+        return False
+    kind = value["kind"]
+    if kind in {"human", "coordinator", "unclassified", "auto-continuation", "observer-activity"}:
+        return set(value) == {"kind"}
+    if kind == "channel":
+        return set(value) == {"kind", "server"} and _claude_metadata_string_is_valid(
+            value.get("server")
+        )
+    if kind == "observer":
+        return (
+            set(value) == {"kind", "from", "senderTaskId"}
+            and _claude_metadata_string_is_valid(value.get("from"))
+            and _claude_metadata_string_is_valid(value.get("senderTaskId"))
+        )
+    if kind == "task-notification":
+        return (
+            set(value) <= {"kind", "subkind"}
+            and (
+                "subkind" not in value
+                or (
+                    isinstance(value["subkind"], str)
+                    and value["subkind"] in {
+                        "scheduled-trigger", "peer-send-message", "projects-relay",
+                    }
+                )
+            )
+        )
+    allowed = {
+        "kind", "from", "fromMode", "name", "fromSession", "inbound_origin",
+        "senderTaskId", "body", "verifiedPeerPid",
+    }
+    if not ({"kind", "from"} <= set(value) <= allowed):
+        return False
+    metadata_fields = {
+        "from", "name", "fromSession", "inbound_origin", "senderTaskId",
+    }
+    if not all(
+        field not in value or _claude_metadata_string_is_valid(value[field])
+        for field in metadata_fields
+    ):
+        return False
+    return (
+        (
+            "fromMode" not in value
+            or (
+                isinstance(value["fromMode"], str)
+                and value["fromMode"] in {"bypass", "prompting"}
+            )
+        )
+        and (
+            "body" not in value
+            or isinstance(value["body"], str)
+        )
+        and (
+            "verifiedPeerPid" not in value
+            or _claude_telemetry_number_is_valid(value["verifiedPeerPid"])
+        )
+    )
+
+
+def _claude_permission_denials_is_valid(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, dict)
+        and set(item) == {"tool_name", "tool_use_id", "tool_input"}
+        and _claude_metadata_string_is_valid(item.get("tool_name"))
+        and _claude_metadata_string_is_valid(item.get("tool_use_id"))
+        and _claude_json_record_is_valid(item.get("tool_input"))
+        for item in value
+    )
 
 
 def _claude_cache_creation_is_valid(value: Any) -> bool:
@@ -6008,7 +6181,8 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
         return False
     for model, detail in value.items():
         if not (
-            isinstance(model, str) and model
+            isinstance(model, str)
+            and _claude_metadata_string_is_valid(model)
             and isinstance(detail, dict)
             and _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS <= set(detail)
             and set(detail) <= (
@@ -6022,11 +6196,11 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
             and _usage_number(detail.get("costUSD")) is not None
             and (
                 "canonicalModel" not in detail
-                or isinstance(detail["canonicalModel"], str)
+                or _claude_metadata_string_is_valid(detail["canonicalModel"])
             )
             and (
                 "provider" not in detail
-                or isinstance(detail["provider"], str)
+                or _claude_metadata_string_is_valid(detail["provider"])
             )
             and (
                 "costBasis" not in detail
@@ -6041,7 +6215,12 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
 
 
 def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
-    return (
+    integer_telemetry = {
+        "duration_ms", "duration_api_ms", "num_turns", "ttft_ms",
+        "ttft_stream_ms", "time_to_request_ms", "time_to_request_from_spawn_ms",
+        "queued_turn_count",
+    }
+    if not (
         _CLAUDE_RESULT_REQUIRED_FIELDS <= set(result)
         and set(result) <= (
             _CLAUDE_RESULT_REQUIRED_FIELDS | _CLAUDE_RESULT_OPTIONAL_FIELDS
@@ -6049,24 +6228,53 @@ def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
         and result.get("type") == "result"
         and result.get("subtype") == "success"
         and result.get("is_error") is False
-        and (
-            "api_error_status" not in result
-            or result["api_error_status"] is None
-        )
         and all(
-            type(result.get(field)) is int and result[field] >= 0
-            for field in ("duration_ms", "duration_api_ms", "num_turns")
+            field not in result or _claude_telemetry_integer_is_valid(result[field])
+            for field in integer_telemetry
         )
         and isinstance(result.get("result"), str)
         and (
             result.get("stop_reason") is None
-            or isinstance(result["stop_reason"], str)
+            or _claude_metadata_string_is_valid(result["stop_reason"])
         )
-        and isinstance(result.get("session_id"), str) and bool(result["session_id"])
-        and isinstance(result.get("permission_denials"), list)
+        and _claude_metadata_string_is_valid(result.get("session_id"))
+        and _claude_metadata_string_is_valid(result.get("uuid"))
+        and _claude_permission_denials_is_valid(result.get("permission_denials"))
+        and _claude_model_usage_is_valid(result.get("modelUsage"))
+    ):
+        return False
+    return (
+        (
+            "api_error_status" not in result
+            or result["api_error_status"] is None
+            or _claude_telemetry_integer_is_valid(result["api_error_status"])
+        )
+        and (
+            "user_message_uuid" not in result
+            or _claude_metadata_string_is_valid(result["user_message_uuid"])
+        )
+        and all(
+            field not in result or _claude_telemetry_number_is_valid(result[field])
+            for field in ("request_sent_wall_ms", "time_origin_ms")
+        )
+        and (
+            "warm_spare_claimed" not in result
+            or type(result["warm_spare_claimed"]) is bool
+        )
+        and (
+            "subagent_stats" not in result
+            or _claude_subagent_stats_is_valid(result["subagent_stats"])
+        )
+        and (
+            "deferred_tool_use" not in result
+            or _claude_deferred_tool_use_is_valid(result["deferred_tool_use"])
+        )
         and (
             "terminal_reason" not in result
-            or result["terminal_reason"] == "completed"
+            or (
+                isinstance(result["terminal_reason"], str)
+                and result["terminal_reason"] in _CLAUDE_TERMINAL_REASONS
+            )
         )
         and (
             "fast_mode_state" not in result
@@ -6076,14 +6284,17 @@ def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
             )
         )
         and (
-            "ttft_ms" not in result
+            "fast_mode_disabled_reason" not in result
             or (
-                type(result["ttft_ms"]) is int
-                and result["ttft_ms"] >= 0
+                isinstance(result["fast_mode_disabled_reason"], str)
+                and result["fast_mode_disabled_reason"]
+                in _CLAUDE_FAST_MODE_DISABLED_REASONS
             )
         )
-        and isinstance(result.get("uuid"), str) and bool(result["uuid"])
-        and _claude_model_usage_is_valid(result.get("modelUsage"))
+        and (
+            "origin" not in result
+            or _claude_origin_is_valid(result["origin"])
+        )
     )
 
 
