@@ -2010,6 +2010,8 @@ class DispatchTests(unittest.TestCase):
                 body = json.dumps({
                     "prompt": "x", "cwd": "scratch", "launcher": launcher,
                     "provider": provider, "model": model,
+                    "effort": primary_route["effort"],
+                    "route_execution_profile": primary_route["writer_execution_profile"],
                     "response_webhook_url": "https://example.invalid/resume",
                 }).encode()
 
@@ -7776,6 +7778,65 @@ while True:
                     payload,
                 )
 
+    def test_fallback_rejects_cross_route_profile_substitution(self):
+        primary = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
+        expected = primary["writer_execution_profile"]
+        substitutions = {
+            "class": server.slice_route_lookup(
+                "sensitive", "M", work_kind="go_coding"
+            )["writer_execution_profile"],
+            "size": server.slice_route_lookup(
+                "mechanical", "L", work_kind="go_coding"
+            )["writer_execution_profile"],
+            "work_kind": {**expected, "work_kind": "typescript_coding"},
+            "role": {**expected, "role": "reviewer1"},
+            "profile_version": {
+                **expected, "version": "route-execution-profile-v2"
+            },
+            "route_version": {
+                **expected, "route_version": "availability-fallback-v1"
+            },
+        }
+        for dimension, substituted in substitutions.items():
+            with self.subTest(dimension=dimension), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(jobs, "provider_rate_limit")
+                self.assertNotEqual(substituted, expected)
+                if dimension in {"class", "size"}:
+                    self.assertEqual(
+                        tuple(
+                            substituted[key]
+                            for key in ("launcher", "provider", "model", "effort")
+                        ),
+                        tuple(
+                            expected[key]
+                            for key in ("launcher", "provider", "model", "effort")
+                        ),
+                    )
+
+                receipt = body["primary_receipt"]
+                receipt["session_identity"]["route_execution_profile"] = substituted
+                stored_path = jobs / receipt["job_id"] / "job.json"
+                stored = json.loads(stored_path.read_text())
+                stored["session_identity"]["route_execution_profile"] = substituted
+                stored["receipt"]["session_identity"]["route_execution_profile"] = substituted
+                stored_path.write_text(json.dumps(stored) + "\n")
+
+                with mock.patch.object(server, "JOBS_DIR", jobs):
+                    status, payload = server.derive_slice_fallback_route({
+                        key: body[key]
+                        for key in (
+                            "class", "size", "work_kind", "primary_route",
+                            "primary_receipt",
+                        )
+                    })
+
+                self.assertEqual(
+                    (status, payload.get("code")),
+                    (400, "primary_execution_profile_mismatch"),
+                    payload,
+                )
+
     def test_fallback_rejects_unvalidated_session_provenance(self):
         route = server.slice_route_lookup("mechanical", "M", work_kind="go_coding")
         profile = _fixture_execution_profile(
@@ -8210,6 +8271,73 @@ while True:
                     else "malformed_recovery_evidence"
                 )
                 self.assertEqual(payload["code"], expected_code, payload)
+
+    def test_provider_recovery_rejects_cross_route_profile_substitution(self):
+        for target in ("fallback_receipt", "fresh_primary_receipt"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs"
+                body = self._provider_recovery_fixture(
+                    jobs, "provider_network", fresh_primary=True
+                )
+                receipt = body[target]
+                expected_route = (
+                    body["fallback_route"]
+                    if target == "fallback_receipt"
+                    else body["primary_route"]
+                )
+                expected = expected_route["writer_execution_profile"]
+                substituted_route = server.build_slice_route(
+                    "sensitive",
+                    "M",
+                    None,
+                    None,
+                    "go_coding",
+                    (
+                        server.AVAILABILITY_FALLBACK_WRITER_ROUTES["go_coding"]
+                        if target == "fallback_receipt"
+                        else server.NORMAL_WRITER_ROUTES["go_coding"]
+                    ),
+                    expected_route["route_version"],
+                    (
+                        "availability_fallback:validated"
+                        if target == "fallback_receipt"
+                        else "work_kind=go_coding"
+                    ),
+                    "openai" if target == "fallback_receipt" else None,
+                )
+                substituted = substituted_route["writer_execution_profile"]
+                self.assertNotEqual(substituted, expected)
+                self.assertEqual(
+                    tuple(
+                        substituted[key]
+                        for key in ("launcher", "provider", "model", "effort")
+                    ),
+                    tuple(
+                        expected[key]
+                        for key in ("launcher", "provider", "model", "effort")
+                    ),
+                )
+
+                receipt["session_identity"]["route_execution_profile"] = substituted
+                stored_path = jobs / receipt["job_id"] / "job.json"
+                stored = json.loads(stored_path.read_text())
+                stored["session_identity"]["route_execution_profile"] = substituted
+                stored["receipt"]["session_identity"]["route_execution_profile"] = substituted
+                stored_path.write_text(json.dumps(stored) + "\n")
+
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(
+                         server,
+                         "resolve_launcher_binary_now",
+                         side_effect=AssertionError("remote recovery cannot inspect binaries"),
+                     ):
+                    status, payload = server.derive_slice_recovery_route(body)
+
+                self.assertEqual(
+                    (status, payload.get("code")),
+                    (400, "recovery_evidence_mismatch"),
+                    payload,
+                )
 
     def test_provider_recovery_rejects_own_job_head_mismatch_and_out_of_order_fallback(self):
         cases = ("own_job_head_mismatch", "out_of_order")

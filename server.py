@@ -2361,7 +2361,12 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
     ):
         return 400, {"error": "receipt session_identity does not match normal route", "code": "primary_provider_mismatch"}
     parsed_identity, identity_err = parse_session_identity(session_identity)
-    if identity_err or parsed_identity != session_identity:
+    if (
+        identity_err
+        or parsed_identity != session_identity
+        or session_identity.get("route_execution_profile")
+        != primary_route.get("writer_execution_profile")
+    ):
         code = "primary_execution_profile_mismatch"
         return 400, {
             "error": "primary receipt execution profile does not match normal route",
@@ -2587,7 +2592,11 @@ def recovery_job_evidence(
     parsed_identity, identity_err = parse_session_identity(identity)
     if identity_err or parsed_identity != identity or (receipt_status == "ok" and not identity.get("native_session_id")):
         return None, {"error": "recovery session identity is malformed", "code": "malformed_recovery_evidence"}
-    if any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model")):
+    if (
+        any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
+        or identity.get("route_execution_profile")
+        != route.get("writer_execution_profile")
+    ):
         return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
     source = receipt.get("effort_source")
     route_profiles = authoritative_route_effort_profiles(
