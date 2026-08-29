@@ -2343,7 +2343,7 @@ class DispatchTests(unittest.TestCase):
                         + '{"type":"turn.started"}\n'
                         + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
                         + '\n'
-                        + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 25, "cached_input_tokens": 5, "output_tokens": 8}})
+                        + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 25, "cached_input_tokens": 5, "cache_write_input_tokens": 2, "output_tokens": 8, "reasoning_output_tokens": 3}})
                     )
                     return 0
 
@@ -2360,14 +2360,14 @@ class DispatchTests(unittest.TestCase):
             self.assertNotIn("private detail", json.dumps(saved["receipt"]))
             self.assertEqual(saved["receipt"]["usage"], {
                 "usage_version": "normalized-usage-v1",
-                "fresh_input_tokens": 20,
+                "fresh_input_tokens": 18,
                 "cached_input_tokens": 5,
-                "cache_write_tokens": 0,
+                "cache_write_tokens": 2,
                 "output_tokens": 8,
-                "reasoning_tokens": 0,
+                "reasoning_tokens": 3,
                 "provider_cost_usd": None,
                 "wall_seconds": saved["receipt"]["usage"]["wall_seconds"],
-                "turns_observed": 1,
+                "turns_observed": None,
             })
             self.assertIsNone(saved["receipt"]["usage_diagnostic"])
             self.assertNotIn("turn.completed", json.dumps(saved["receipt"]))
@@ -3485,8 +3485,8 @@ while True:
 
     def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
         saved, capture, jdir = self._run_grok_fixture({"usage": {
-            "totalTokens": 27, "inputTokens": 18, "outputTokens": 6,
-            "thoughtTokens": 3, "cachedReadTokens": 4, "cachedWriteTokens": 2,
+            "totalTokens": 24, "inputTokens": 18, "outputTokens": 6,
+            "thoughtTokens": 3, "cachedReadTokens": 0, "cachedWriteTokens": 0,
         }})
         self.assertEqual(capture["argv"], [
             "agent", "--always-approve", "--model", "grok-4.6",
@@ -3521,14 +3521,14 @@ while True:
         self.assertFalse(saved["receipt"]["failover_eligible"])
         self.assertEqual(saved["receipt"]["usage"], {
             "usage_version": "normalized-usage-v1",
-            "fresh_input_tokens": 12,
-            "cached_input_tokens": 4,
-            "cache_write_tokens": 2,
+            "fresh_input_tokens": 18,
+            "cached_input_tokens": 0,
+            "cache_write_tokens": 0,
             "output_tokens": 6,
             "reasoning_tokens": 3,
             "provider_cost_usd": None,
             "wall_seconds": saved["receipt"]["usage"]["wall_seconds"],
-            "turns_observed": 1,
+            "turns_observed": None,
         })
         self.assertIsInstance(saved["receipt"]["usage"]["wall_seconds"], float)
         self.assertGreaterEqual(saved["receipt"]["usage"]["wall_seconds"], 0)
@@ -8846,7 +8846,7 @@ while True:
             "fresh_input_tokens": 40, "cached_input_tokens": 7,
             "cache_write_tokens": 3, "output_tokens": 11,
             "reasoning_tokens": 0, "provider_cost_usd": 0.0125,
-            "wall_seconds": 1.25, "turns_observed": 2,
+            "wall_seconds": 1.25, "turns_observed": None,
         })
 
     def test_codex_usage_normalization(self):
@@ -8855,38 +8855,219 @@ while True:
             {"type": "turn.started"},
             {"type": "turn.completed", "usage": {
                 "input_tokens": 120, "cached_input_tokens": 20,
-                "output_tokens": 35,
+                "cache_write_input_tokens": 5, "output_tokens": 35,
+                "reasoning_output_tokens": 7,
             }},
         )) + "\n"
         usage, diagnostic = server.normalize_native_usage("codex", native, 2)
         self.assertIsNone(diagnostic)
         self.assertEqual(usage, {
             "usage_version": "normalized-usage-v1",
-            "fresh_input_tokens": 100, "cached_input_tokens": 20,
-            "cache_write_tokens": 0, "output_tokens": 35,
-            "reasoning_tokens": 0, "provider_cost_usd": None,
-            "wall_seconds": 2.0, "turns_observed": 1,
+            "fresh_input_tokens": 95, "cached_input_tokens": 20,
+            "cache_write_tokens": 5, "output_tokens": 35,
+            "reasoning_tokens": 7, "provider_cost_usd": None,
+            "wall_seconds": 2.0, "turns_observed": None,
         })
 
     def test_grok_usage_normalization(self):
         native = {
             "stopReason": "end_turn",
             "usage": {
-                "totalTokens": 80, "inputTokens": 50, "outputTokens": 20,
+                "totalTokens": 70, "inputTokens": 50, "outputTokens": 20,
                 "thoughtTokens": 10, "cachedReadTokens": 15,
                 "cachedWriteTokens": 5,
             },
             "cost": {"amount": 99, "currency": "hostile-not-api-dollars"},
         }
         usage, diagnostic = server.normalize_native_usage("grok", native, 0.5)
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, "usage_malformed")
+
+    def test_usage_numeric_bounds_are_exception_safe_and_closed(self):
+        from decimal import Decimal
+
+        huge_integer = 10 ** 4000
+        self.assertIsNone(server._usage_number(huge_integer))
+        self.assertIsNone(server._usage_number(1e308))
+        self.assertIsNone(server._usage_number(10 ** 20))
+        self.assertIsNone(server._usage_number(Decimal("1")))
+
+        event = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "bounded-usage", "num_turns": 1,
+            "total_cost_usd": 0.01,
+            "usage": {
+                "input_tokens": huge_integer, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 1,
+            },
+        }
+        usage, diagnostic = server.normalize_native_usage(
+            "claude", json.dumps(event), 1,
+        )
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, "usage_malformed")
+
+        event["usage"]["input_tokens"] = 1
+        for field, value in (("total_cost_usd", 1e308), ("total_cost_usd", 10 ** 20)):
+            with self.subTest(field=field, value_type=type(value).__name__):
+                event[field] = value
+                self.assertEqual(
+                    server.normalize_native_usage("claude", json.dumps(event), 1),
+                    (None, "usage_malformed"),
+                )
+
+    def test_codex_01501_complete_usage_event_maps_every_reported_counter(self):
+        native = "\n".join(json.dumps(event) for event in (
+            {"type": "thread.started", "thread_id": "codex-supported-shape"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 120, "cached_input_tokens": 20,
+                "cache_write_input_tokens": 10, "output_tokens": 35,
+                "reasoning_output_tokens": 7,
+            }},
+        )) + "\n"
+        usage, diagnostic = server.normalize_native_usage("codex", native, 2)
         self.assertIsNone(diagnostic)
         self.assertEqual(usage, {
             "usage_version": "normalized-usage-v1",
-            "fresh_input_tokens": 30, "cached_input_tokens": 15,
-            "cache_write_tokens": 5, "output_tokens": 20,
-            "reasoning_tokens": 10, "provider_cost_usd": None,
-            "wall_seconds": 0.5, "turns_observed": 1,
+            "fresh_input_tokens": 90, "cached_input_tokens": 20,
+            "cache_write_tokens": 10, "output_tokens": 35,
+            "reasoning_tokens": 7, "provider_cost_usd": None,
+            "wall_seconds": 2.0, "turns_observed": None,
         })
+
+        incomplete = native.replace(', "reasoning_output_tokens": 7', "")
+        self.assertEqual(
+            server.normalize_native_usage("codex", incomplete, 2),
+            (None, "usage_incomplete"),
+        )
+
+        contradictory = native.replace(
+            '"cached_input_tokens": 20', '"cached_input_tokens": 111',
+        )
+        self.assertEqual(
+            server.normalize_native_usage("codex", contradictory, 2),
+            (None, "usage_malformed"),
+        )
+
+    def test_grok_105_usage_does_not_double_count_overlapping_thought_tokens(self):
+        native = {
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 70, "inputTokens": 50, "outputTokens": 20,
+                "thoughtTokens": 10, "cachedReadTokens": 0,
+                "cachedWriteTokens": 0,
+            },
+        }
+        usage, diagnostic = server.normalize_native_usage("grok", native, 0.5)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(usage, {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 50, "cached_input_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 20,
+            "reasoning_tokens": 10, "provider_cost_usd": None,
+            "wall_seconds": 0.5, "turns_observed": None,
+        })
+
+        native["usage"]["cachedReadTokens"] = 5
+        self.assertEqual(
+            server.normalize_native_usage("grok", native, 0.5),
+            (None, "usage_incomplete"),
+        )
+
+    def test_turns_observed_never_trusts_provider_authored_turn_counts(self):
+        claude = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "session_id": "hostile-turn-count", "num_turns": 999999999,
+            "total_cost_usd": 0.01,
+            "usage": {
+                "input_tokens": 4, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 2,
+            },
+        })
+        claude_usage, diagnostic = server.normalize_native_usage("claude", claude, 1)
+        self.assertIsNone(diagnostic)
+        self.assertIsNone(claude_usage["turns_observed"])
+
+        codex = "\n".join((
+            '{"type":"thread.started","thread_id":"observed-boundaries"}',
+            '{"type":"turn.started"}',
+            '{"type":"turn.completed","usage":{"input_tokens":4,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1}}',
+        ))
+        codex_usage, diagnostic = server.normalize_native_usage("codex", codex, 1)
+        self.assertIsNone(diagnostic)
+        self.assertIsNone(codex_usage["turns_observed"])
+
+    def test_usage_parsers_reject_duplicate_keys_and_unknown_extras_for_all_providers(self):
+        claude_cases = (
+            '{"type":"result","type":"result","subtype":"success","is_error":false,"session_id":"dup","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}',
+            '{"type":"result","subtype":"success","is_error":false,"session_id":"dup","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}',
+            '{"type":"result","subtype":"success","is_error":false,"session_id":"extra","num_turns":1,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1,"unexpected":0}}',
+        )
+        codex_cases = (
+            '{"type":"turn.completed","type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}',
+            '{"type":"turn.completed","usage":{"input_tokens":1,"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}',
+            '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"unexpected":0}}',
+        )
+        for launcher, cases in (("claude", claude_cases), ("codex", codex_cases)):
+            for index, raw in enumerate(cases):
+                with self.subTest(launcher=launcher, case=index):
+                    self.assertEqual(
+                        server.normalize_native_usage(launcher, raw, 1),
+                        (None, "usage_malformed"),
+                    )
+
+        grok_extra = {
+            "stopReason": "end_turn", "unexpected": 0,
+            "usage": {
+                "totalTokens": 2, "inputTokens": 1, "outputTokens": 1,
+                "thoughtTokens": 0, "cachedReadTokens": 0,
+                "cachedWriteTokens": 0,
+            },
+        }
+        self.assertEqual(
+            server.normalize_native_usage("grok", grok_extra, 1),
+            (None, "usage_malformed"),
+        )
+        for raw in (
+            '{"stopReason":"end_turn","stopReason":"end_turn","usage":{"totalTokens":2,"inputTokens":1,"outputTokens":1,"thoughtTokens":0,"cachedReadTokens":0,"cachedWriteTokens":0}}',
+            '{"stopReason":"end_turn","usage":{"totalTokens":2,"inputTokens":1,"inputTokens":1,"outputTokens":1,"thoughtTokens":0,"cachedReadTokens":0,"cachedWriteTokens":0}}',
+        ):
+            with self.assertRaises(ValueError):
+                server.strict_json_object(raw)
+
+    def test_openapi_usage_pair_is_an_exact_exclusive_invariant(self):
+        from jsonschema import Draft202012Validator
+
+        spec = json.loads(server.openapi_bytes())
+        schemas = spec["components"]["schemas"]
+        diagnostic_values = set(schemas["UsageDiagnostic"]["enum"]) - {None}
+        for schema_name in ("AgentReceipt", "ReviewReceipt"):
+            schema = schemas[schema_name]
+            branches = schema.get("oneOf")
+            self.assertEqual(len(branches or []), 2, schema_name)
+            pair_validator = Draft202012Validator({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "components": spec["components"],
+                "oneOf": branches,
+            })
+            valid_usage, diagnostic = server._closed_usage(
+                1, 0, 0, 1, 0, None, 1, None,
+            )
+            self.assertIsNone(diagnostic)
+            valid_pairs = (
+                {"usage": valid_usage, "usage_diagnostic": None},
+                {"usage": None, "usage_diagnostic": "usage_malformed"},
+            )
+            invalid_pairs = (
+                {"usage": None, "usage_diagnostic": None},
+                {"usage": valid_usage, "usage_diagnostic": "usage_malformed"},
+            )
+            for pair in valid_pairs:
+                self.assertFalse(list(pair_validator.iter_errors(pair)), (schema_name, pair))
+            for pair in invalid_pairs:
+                self.assertTrue(list(pair_validator.iter_errors(pair)), (schema_name, pair))
+        self.assertEqual(diagnostic_values, server.USAGE_DIAGNOSTICS)
 
     def test_usage_receipt_is_numeric_and_sanitized(self):
         hostile = "TOKEN_SECRET /home/private prompt thought response --dangerous"
@@ -8897,7 +9078,7 @@ while True:
                 "input_tokens": 1, "cache_read_input_tokens": 2,
                 "cache_creation_input_tokens": 3, "output_tokens": 4,
             },
-            "result": hostile, "private_path": hostile, "provider_payload": {"raw": hostile},
+            "result": hostile,
         })
         usage, diagnostic = server.normalize_native_usage("claude", native, 0)
         self.assertIsNone(diagnostic)
@@ -11354,8 +11535,8 @@ while True:
                 codex = server.native_review_result(codex_context)
                 claude = server.native_review_result(claude_context)
         grok, grok_capture = self._run_grok_review_fixture({"usage": {
-            "totalTokens": 15, "inputTokens": 10, "outputTokens": 4,
-            "thoughtTokens": 1, "cachedReadTokens": 2, "cachedWriteTokens": 0,
+            "totalTokens": 14, "inputTokens": 10, "outputTokens": 4,
+            "thoughtTokens": 1, "cachedReadTokens": 0, "cachedWriteTokens": 0,
         }})
         self.assertEqual(
             (codex["verdict"], claude["verdict"], grok["verdict"]),
@@ -11363,14 +11544,14 @@ while True:
         )
         self.assertEqual(grok["usage"], {
             "usage_version": "normalized-usage-v1",
-            "fresh_input_tokens": 8,
-            "cached_input_tokens": 2,
+            "fresh_input_tokens": 10,
+            "cached_input_tokens": 0,
             "cache_write_tokens": 0,
             "output_tokens": 4,
             "reasoning_tokens": 1,
             "provider_cost_usd": None,
             "wall_seconds": grok["usage"]["wall_seconds"],
-            "turns_observed": 1,
+            "turns_observed": None,
         })
         self.assertIsNone(grok["usage_diagnostic"])
         self.assertNotIn("totalTokens", json.dumps(grok))

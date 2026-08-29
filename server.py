@@ -5754,7 +5754,14 @@ def parse_native_session_id(text: str, launcher: str = "codex") -> str | None:
 
 
 USAGE_VERSION = "normalized-usage-v1"
-USAGE_MAX_COUNT = (1 << 63) - 1
+# One bounded Graphwing job is limited to 80 turns and 1,200 execution
+# seconds. One billion tokens, USD 100,000, and 1,800 wall seconds are closed
+# safety ceilings far above any supported job while preventing absurd provider
+# numbers from entering receipts or numeric conversions.
+USAGE_MAX_COUNT = 1_000_000_000
+USAGE_MAX_COST_USD = 100_000
+USAGE_MAX_WALL_SECONDS = 1_800
+USAGE_MAX_TURNS = 80
 USAGE_FIELDS = frozenset({
     "usage_version", "fresh_input_tokens", "cached_input_tokens",
     "cache_write_tokens", "output_tokens", "reasoning_tokens",
@@ -5781,9 +5788,9 @@ def valid_normalized_usage(usage: Any) -> bool:
     cost = usage.get("provider_cost_usd")
     turns = usage.get("turns_observed")
     return bool(
-        _usage_number(usage.get("wall_seconds")) is not None
-        and (cost is None or _usage_number(cost) is not None)
-        and (turns is None or _usage_count(turns) is not None)
+        _usage_number(usage.get("wall_seconds"), USAGE_MAX_WALL_SECONDS) is not None
+        and (cost is None or _usage_number(cost, USAGE_MAX_COST_USD) is not None)
+        and (turns is None or _usage_count(turns, USAGE_MAX_TURNS) is not None)
     )
 
 
@@ -5848,13 +5855,38 @@ def authorized_receipt_usage(
     return None, "usage_authority_mismatch"
 
 
-def _usage_count(value: Any) -> int | None:
-    return value if type(value) is int and 0 <= value <= USAGE_MAX_COUNT else None
+def _usage_count(value: Any, maximum: int = USAGE_MAX_COUNT) -> int | None:
+    return value if type(value) is int and 0 <= value <= maximum else None
 
 
-def _usage_number(value: Any) -> float | int | None:
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-        return None
+def _usage_number(
+    value: Any, maximum: int | float = USAGE_MAX_COST_USD,
+) -> float | int | None:
+    """Validate exact built-in JSON numbers before any lossy conversion."""
+    if type(value) is int:
+        return value if 0 <= value <= maximum else None
+    if type(value) is float:
+        return value if math.isfinite(value) and 0 <= value <= maximum else None
+    return None
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def strict_json_object(raw: str | bytes) -> dict[str, Any]:
+    """Parse one JSON object while rejecting duplicate keys at every depth."""
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("malformed JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON value is not an object")
     return value
 
 
@@ -5868,10 +5900,8 @@ def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            return None, "usage_malformed"
-        if not isinstance(event, dict):
+            event = strict_json_object(line)
+        except ValueError:
             return None, "usage_malformed"
         events.append(event)
     return (events, None) if events else (None, "usage_not_reported")
@@ -5886,13 +5916,15 @@ def _closed_usage(
     ))
     if any(value is None for value in counts):
         return None, "usage_malformed"
-    wall = _usage_number(wall_seconds)
+    wall = _usage_number(wall_seconds, USAGE_MAX_WALL_SECONDS)
     if wall is None:
         return None, "usage_malformed"
-    cost = None if provider_cost is None else _usage_number(provider_cost)
+    cost = None if provider_cost is None else _usage_number(
+        provider_cost, USAGE_MAX_COST_USD,
+    )
     if provider_cost is not None and cost is None:
         return None, "usage_malformed"
-    observed = None if turns is None else _usage_count(turns)
+    observed = None if turns is None else _usage_count(turns, USAGE_MAX_TURNS)
     if turns is not None and observed is None:
         return None, "usage_malformed"
     return {
@@ -5911,45 +5943,55 @@ def _closed_usage(
 def normalize_native_usage(
     launcher: str, native: Any, wall_seconds: Any,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Normalize one complete native usage report without retaining native data.
+    """Normalize one complete supported native report without retaining it.
 
-    Claude result usage does not separately expose reasoning. Codex exec JSON does
-    not separately expose reasoning or cache writes. Those unexposed counters are
-    therefore zero counters of separately reported tokens, not inferred model
-    behavior. Grok ACP exposes thought/cache counters but no trusted API dollars.
-    Missing or malformed reports never become partial or all-zero usage.
+    Claude 2.1.250 result usage has no separate reasoning counter. Codex 0.150.1
+    reports cache-write and reasoning counters explicitly. Grok 1.0.5 returns
+    the ACP Usage shape, but its observed total is input plus output and the ACP
+    schema does not establish that cache counters are subsets of input. Nonzero
+    Grok cache counters therefore cannot be completely normalized. No adapter
+    trusts provider-authored turn counts or infers API-dollar cost.
     """
-    if _usage_number(wall_seconds) is None:
+    if _usage_number(wall_seconds, USAGE_MAX_WALL_SECONDS) is None:
         return None, "usage_malformed"
     if launcher == "grok":
         if native is None:
             return None, "usage_not_reported"
-        if not isinstance(native, dict):
+        if not isinstance(native, dict) or set(native) != {"stopReason", "usage"}:
             return None, "usage_malformed"
         detail = native.get("usage")
         if detail is None:
             return None, "usage_not_reported"
         if not isinstance(detail, dict):
             return None, "usage_malformed"
-        required = (
+        required = {
             "totalTokens", "inputTokens", "outputTokens", "thoughtTokens",
             "cachedReadTokens", "cachedWriteTokens",
-        )
-        if any(key not in detail for key in required):
+        }
+        if set(detail) != required:
+            return None, "usage_incomplete" if set(detail) < required else "usage_malformed"
+        values = {key: _usage_count(detail[key]) for key in required}
+        if any(value is None for value in values.values()):
+            return None, "usage_malformed"
+        total = values["totalTokens"]
+        input_tokens = values["inputTokens"]
+        output = values["outputTokens"]
+        thought = values["thoughtTokens"]
+        cached = values["cachedReadTokens"]
+        cache_write = values["cachedWriteTokens"]
+        if any(value is None for value in (
+            total, input_tokens, output, thought, cached, cache_write,
+        )):
+            return None, "usage_malformed"
+        assert total is not None and input_tokens is not None and output is not None
+        assert thought is not None and cached is not None and cache_write is not None
+        if total != input_tokens + output:
+            return None, "usage_malformed"
+        if cached or cache_write:
             return None, "usage_incomplete"
-        values = [_usage_count(detail[key]) for key in required]
-        if any(value is None for value in values):
-            return None, "usage_malformed"
-        total, input_tokens, output, thought, cached, cache_write = values
-        assert all(value is not None for value in values)
-        if (
-            total != input_tokens + output + thought
-            or cached + cache_write > input_tokens
-        ):
-            return None, "usage_malformed"
         return _closed_usage(
-            input_tokens - cached - cache_write, cached, cache_write,
-            output, thought, None, wall_seconds, 1,
+            input_tokens, cached, cache_write, output, thought, None,
+            wall_seconds, None,
         )
 
     events, event_error = _usage_events(native)
@@ -5962,21 +6004,28 @@ def normalize_native_usage(
         if len(results) != 1:
             return None, "usage_malformed"
         result = results[0]
+        allowed_result_fields = {
+            "type", "subtype", "is_error", "session_id", "duration_ms",
+            "duration_api_ms", "num_turns", "total_cost_usd", "usage",
+            "result", "modelUsage", "permission_denials", "uuid",
+        }
+        if not set(result) <= allowed_result_fields:
+            return None, "usage_malformed"
         detail = result.get("usage")
         if detail is None:
             return None, "usage_not_reported"
         if not isinstance(detail, dict):
             return None, "usage_malformed"
-        fields = (
+        fields = {
             "input_tokens", "cache_read_input_tokens",
             "cache_creation_input_tokens", "output_tokens",
-        )
-        if any(key not in detail for key in fields):
-            return None, "usage_incomplete"
+        }
+        if set(detail) != fields:
+            return None, "usage_incomplete" if set(detail) < fields else "usage_malformed"
         return _closed_usage(
             detail["input_tokens"], detail["cache_read_input_tokens"],
             detail["cache_creation_input_tokens"], detail["output_tokens"], 0,
-            result.get("total_cost_usd"), wall_seconds, result.get("num_turns"),
+            result.get("total_cost_usd"), wall_seconds, None,
         )
     if launcher == "codex":
         completed = [event for event in events if event.get("type") == "turn.completed"]
@@ -5984,21 +6033,30 @@ def normalize_native_usage(
             return None, "usage_not_reported"
         if len(completed) != 1:
             return None, "usage_malformed"
-        detail = completed[0].get("usage")
-        if detail is None:
-            return None, "usage_not_reported"
-        if not isinstance(detail, dict):
+        event = completed[0]
+        if set(event) != {"type", "usage"}:
             return None, "usage_malformed"
-        fields = ("input_tokens", "cached_input_tokens", "output_tokens")
-        if any(key not in detail for key in fields):
-            return None, "usage_incomplete"
+        detail = event.get("usage")
+        if not isinstance(detail, dict):
+            return (None, "usage_not_reported") if detail is None else (None, "usage_malformed")
+        fields = {
+            "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+            "output_tokens", "reasoning_output_tokens",
+        }
+        if set(detail) != fields:
+            return None, "usage_incomplete" if set(detail) < fields else "usage_malformed"
         input_tokens = _usage_count(detail["input_tokens"])
         cached = _usage_count(detail["cached_input_tokens"])
-        if input_tokens is None or cached is None or cached > input_tokens:
+        cache_write = _usage_count(detail["cache_write_input_tokens"])
+        if (
+            input_tokens is None or cached is None or cache_write is None
+            or cached + cache_write > input_tokens
+        ):
             return None, "usage_malformed"
         return _closed_usage(
-            input_tokens - cached, cached, 0, detail["output_tokens"], 0,
-            None, wall_seconds, 1,
+            input_tokens - cached - cache_write, cached, cache_write,
+            detail["output_tokens"], detail["reasoning_output_tokens"],
+            None, wall_seconds, None,
         )
     return None, "usage_malformed"
 
@@ -6564,10 +6622,10 @@ def run_grok_acp(
             log.flush()
             logged_bytes += len(entry)
         try:
-            message = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            message = strict_json_object(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
             raise ValueError("malformed Grok ACP wire") from exc
-        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        if message.get("jsonrpc") != "2.0":
             raise ValueError("malformed Grok ACP wire")
         return message
 

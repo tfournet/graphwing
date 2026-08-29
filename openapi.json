@@ -1498,14 +1498,14 @@
         "required": ["usage_version", "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "provider_cost_usd", "wall_seconds", "turns_observed"],
         "properties": {
           "usage_version": { "type": "string", "const": "normalized-usage-v1" },
-          "fresh_input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
-          "cached_input_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
-          "cache_write_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
-          "output_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
-          "reasoning_tokens": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
-          "provider_cost_usd": { "type": ["number", "null"], "minimum": 0 },
-          "wall_seconds": { "type": "number", "minimum": 0 },
-          "turns_observed": { "type": ["integer", "null"], "minimum": 0, "maximum": 9223372036854775807 }
+          "fresh_input_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+          "cached_input_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+          "cache_write_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+          "output_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+          "reasoning_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+          "provider_cost_usd": { "type": ["number", "null"], "minimum": 0, "maximum": 100000 },
+          "wall_seconds": { "type": "number", "minimum": 0, "maximum": 1800 },
+          "turns_observed": { "type": ["integer", "null"], "minimum": 0, "maximum": 80 }
         }
       },
       "UsageDiagnostic": {
@@ -1528,7 +1528,23 @@
           "code": { "type": ["string", "null"], "enum": ["timeout", "not_implemented", "review_failed", "review_execution_identity_mismatch", null] },
           "usage": { "anyOf": [{ "$ref": "#/components/schemas/NormalizedUsage" }, { "type": "null" }] },
           "usage_diagnostic": { "$ref": "#/components/schemas/UsageDiagnostic" }
-        }
+        },
+        "oneOf": [
+          {
+            "required": ["usage", "usage_diagnostic"],
+            "properties": {
+              "usage": { "$ref": "#/components/schemas/NormalizedUsage" },
+              "usage_diagnostic": { "type": "null", "const": null }
+            }
+          },
+          {
+            "required": ["usage", "usage_diagnostic"],
+            "properties": {
+              "usage": { "type": "null", "const": null },
+              "usage_diagnostic": { "type": "string", "enum": ["usage_not_reported", "usage_incomplete", "usage_malformed", "usage_authority_unavailable", "usage_authority_mismatch"] }
+            }
+          }
+        ]
       },
       "ReviewJob": {
         "type": "object",
@@ -1724,7 +1740,23 @@
           "diagnostic": { "$ref": "#/components/schemas/Diagnostic" },
           "usage": { "anyOf": [{ "$ref": "#/components/schemas/NormalizedUsage" }, { "type": "null" }], "description": "Closed numeric native aggregate; never raw provider events or inferred list-price cost." },
           "usage_diagnostic": { "$ref": "#/components/schemas/UsageDiagnostic" }
-        }
+        },
+        "oneOf": [
+          {
+            "required": ["usage", "usage_diagnostic"],
+            "properties": {
+              "usage": { "$ref": "#/components/schemas/NormalizedUsage" },
+              "usage_diagnostic": { "type": "null", "const": null }
+            }
+          },
+          {
+            "required": ["usage", "usage_diagnostic"],
+            "properties": {
+              "usage": { "type": "null", "const": null },
+              "usage_diagnostic": { "type": "string", "enum": ["usage_not_reported", "usage_incomplete", "usage_malformed", "usage_authority_unavailable", "usage_authority_mismatch"] }
+            }
+          }
+        ]
       },
       "AgentJob": {
         "type": "object",
