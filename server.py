@@ -26,6 +26,7 @@ from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, DecimalException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal
@@ -5859,6 +5860,10 @@ def _usage_count(value: Any, maximum: int = USAGE_MAX_COUNT) -> int | None:
     return value if type(value) is int and 0 <= value <= maximum else None
 
 
+class _ExactJSONDecimal(Decimal):
+    """Marker for non-integer numbers parsed from provider-authored JSON."""
+
+
 def _usage_number(
     value: Any, maximum: int | float = USAGE_MAX_COST_USD,
 ) -> float | int | None:
@@ -5867,6 +5872,14 @@ def _usage_number(
         return value if 0 <= value <= maximum else None
     if type(value) is float:
         return value if math.isfinite(value) and 0 <= value <= maximum else None
+    if type(value) is _ExactJSONDecimal:
+        upper = Decimal(str(maximum))
+        if not value.is_finite() or value < 0 or value > upper:
+            return None
+        converted = float(value)
+        if not math.isfinite(converted) or (value != 0 and converted == 0):
+            return None
+        return converted
     return None
 
 
@@ -5879,11 +5892,20 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant: {value}")
+
+
 def strict_json_object(raw: str | bytes) -> dict[str, Any]:
     """Parse one JSON object while rejecting duplicate keys at every depth."""
     try:
-        value = json.loads(raw, object_pairs_hook=_unique_json_object)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_float=_ExactJSONDecimal,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, DecimalException) as exc:
         raise ValueError("malformed JSON object") from exc
     if not isinstance(value, dict):
         raise ValueError("JSON value is not an object")
@@ -5905,6 +5927,112 @@ def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
             return None, "usage_malformed"
         events.append(event)
     return (events, None) if events else (None, "usage_not_reported")
+
+
+_CLAUDE_RESULT_FIELDS = {
+    "type", "subtype", "is_error", "api_error_status", "duration_ms",
+    "duration_api_ms", "num_turns", "result", "stop_reason", "session_id",
+    "total_cost_usd", "usage", "modelUsage", "permission_denials",
+    "terminal_reason", "fast_mode_state", "uuid",
+}
+_CLAUDE_USAGE_FIELDS = {
+    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+    "output_tokens", "server_tool_use", "service_tier", "cache_creation",
+    "inference_geo", "iterations", "speed",
+}
+_CLAUDE_CACHE_CREATION_FIELDS = {
+    "ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens",
+}
+_CLAUDE_ITERATION_FIELDS = {
+    "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "cache_creation", "type",
+}
+_CLAUDE_MODEL_USAGE_FIELDS = {
+    "inputTokens", "outputTokens", "cacheReadInputTokens",
+    "cacheCreationInputTokens", "webSearchRequests", "costUSD",
+    "contextWindow", "maxOutputTokens",
+}
+
+
+def _claude_cache_creation_is_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _CLAUDE_CACHE_CREATION_FIELDS
+        and all(_usage_count(item) is not None for item in value.values())
+    )
+
+
+def _claude_usage_envelope_is_valid(detail: dict[str, Any]) -> bool:
+    server_tools = detail.get("server_tool_use")
+    if not (
+        set(detail) == _CLAUDE_USAGE_FIELDS
+        and isinstance(server_tools, dict)
+        and set(server_tools) == {"web_search_requests", "web_fetch_requests"}
+        and all(_usage_count(item) is not None for item in server_tools.values())
+        and _claude_cache_creation_is_valid(detail.get("cache_creation"))
+        and all(
+            isinstance(detail.get(field), str)
+            for field in ("service_tier", "inference_geo", "speed")
+        )
+        and isinstance(detail.get("iterations"), list)
+    ):
+        return False
+    for iteration in detail["iterations"]:
+        if not (
+            isinstance(iteration, dict)
+            and set(iteration) == _CLAUDE_ITERATION_FIELDS
+            and isinstance(iteration.get("type"), str)
+            and all(
+                _usage_count(iteration.get(field)) is not None
+                for field in (
+                    "input_tokens", "output_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            )
+            and _claude_cache_creation_is_valid(iteration.get("cache_creation"))
+        ):
+            return False
+    return True
+
+
+def _claude_model_usage_is_valid(value: Any) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    for model, detail in value.items():
+        if not (
+            isinstance(model, str) and model
+            and isinstance(detail, dict)
+            and set(detail) == _CLAUDE_MODEL_USAGE_FIELDS
+            and all(
+                _usage_count(detail.get(field)) is not None
+                for field in _CLAUDE_MODEL_USAGE_FIELDS - {"costUSD"}
+            )
+            and _usage_number(detail.get("costUSD")) is not None
+        ):
+            return False
+    return True
+
+
+def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
+    return (
+        set(result) == _CLAUDE_RESULT_FIELDS
+        and result.get("type") == "result"
+        and result.get("subtype") == "success"
+        and result.get("is_error") is False
+        and result.get("api_error_status") is None
+        and all(
+            type(result.get(field)) is int and result[field] >= 0
+            for field in ("duration_ms", "duration_api_ms", "num_turns")
+        )
+        and isinstance(result.get("result"), str)
+        and isinstance(result.get("stop_reason"), str)
+        and isinstance(result.get("session_id"), str) and bool(result["session_id"])
+        and isinstance(result.get("permission_denials"), list)
+        and result.get("terminal_reason") == "completed"
+        and isinstance(result.get("fast_mode_state"), str)
+        and isinstance(result.get("uuid"), str) and bool(result["uuid"])
+        and _claude_model_usage_is_valid(result.get("modelUsage"))
+    )
 
 
 def _closed_usage(
@@ -5998,30 +6126,22 @@ def normalize_native_usage(
     if event_error is not None or events is None:
         return None, event_error
     if launcher == "claude":
-        results = [event for event in events if event.get("type") == "result"]
-        if not results:
-            return None, "usage_not_reported"
-        if len(results) != 1:
+        if len(events) != 1:
             return None, "usage_malformed"
-        result = results[0]
-        allowed_result_fields = {
-            "type", "subtype", "is_error", "session_id", "duration_ms",
-            "duration_api_ms", "num_turns", "total_cost_usd", "usage",
-            "result", "modelUsage", "permission_denials", "uuid",
-        }
-        if not set(result) <= allowed_result_fields:
+        result = events[0]
+        if not _claude_success_result_is_valid(result):
             return None, "usage_malformed"
         detail = result.get("usage")
-        if detail is None:
-            return None, "usage_not_reported"
         if not isinstance(detail, dict):
             return None, "usage_malformed"
-        fields = {
+        token_fields = {
             "input_tokens", "cache_read_input_tokens",
             "cache_creation_input_tokens", "output_tokens",
         }
-        if set(detail) != fields:
-            return None, "usage_incomplete" if set(detail) < fields else "usage_malformed"
+        if not token_fields <= set(detail):
+            return None, "usage_incomplete"
+        if not _claude_usage_envelope_is_valid(detail):
+            return None, "usage_malformed"
         return _closed_usage(
             detail["input_tokens"], detail["cache_read_input_tokens"],
             detail["cache_creation_input_tokens"], detail["output_tokens"], 0,
