@@ -202,6 +202,80 @@ def normalize_review_effort(
     return normalize_effort(launcher, provider, model, requested, source)
 
 
+def normalize_native_review_effort(
+    launcher: str,
+    provider: str,
+    model: str,
+    requested: Any,
+    source: str,
+    execution_identity: dict[str, Any] | None,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Accept route provenance only from one canonical sealed review identity."""
+    if source != "route":
+        return normalize_review_effort(launcher, provider, model, requested, source)
+    if not isinstance(execution_identity, dict):
+        return None, {
+            "error": (
+                "review effort source must be explicit or launcher_default "
+                "without canonical route evidence"
+            ),
+            "code": "bad_effort_source",
+        }
+    route_raw = execution_identity.get("route_execution_profile")
+    role = route_raw.get("role") if isinstance(route_raw, dict) else None
+    parsed_route, route_error = parse_route_execution_profile(
+        route_raw, expected_role=str(role or ""), launcher=launcher, provider=provider,
+        model=model, effort=requested,
+    )
+    profile, effort_error = normalize_effort(
+        launcher, provider, model, requested, "route"
+    )
+    expected_fields = {*REVIEW_IDENTITY_FIELDS, "route_execution_profile"}
+    if (
+        role not in {"reviewer1", "reviewer2"}
+        or route_error is not None or parsed_route != route_raw
+        or effort_error is not None or profile is None
+        or set(execution_identity) != expected_fields
+        or execution_identity.get("version") != REVIEW_EXECUTION_VERSION
+        or execution_identity.get("kind") != "review"
+        or execution_identity.get("launcher") != launcher
+        or execution_identity.get("provider") != provider
+        or execution_identity.get("model") != model
+        or execution_identity.get("requested_effort") != requested
+        or any(execution_identity.get(key) != value for key, value in profile.items())
+        or not isinstance(execution_identity.get("launcher_version"), str)
+        or not LAUNCHER_VERSION_RE.fullmatch(execution_identity["launcher_version"])
+        or not isinstance(execution_identity.get("repo"), str)
+        or not SESSION_REPO_RE.fullmatch(execution_identity["repo"])
+        or not isinstance(execution_identity.get("branch"), str)
+        or not valid_branch(execution_identity["branch"])
+        or not isinstance(execution_identity.get("starting_head"), str)
+        or not GIT_SHA_RE.fullmatch(execution_identity["starting_head"])
+        or not isinstance(execution_identity.get("prompt_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", execution_identity["prompt_sha256"])
+        or not isinstance(execution_identity.get("diff_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", execution_identity["diff_sha256"])
+        or type(execution_identity.get("run_budget_seconds")) is not int
+        or not (
+            REVIEW_MIN_BUDGET_SECONDS
+            <= execution_identity["run_budget_seconds"]
+            <= REVIEW_MAX_BUDGET_SECONDS
+        )
+        or type(execution_identity.get("max_turns")) is not int
+        or not (
+            REVIEW_MIN_REQUEST_TURNS
+            <= execution_identity["max_turns"]
+            <= REVIEW_MAX_REQUEST_TURNS
+        )
+        or execution_identity.get("permission_profile") != REVIEW_PERMISSION_PROFILES[launcher]
+    ):
+        return None, route_error or effort_error or {
+            "error": "routed review effort does not match its canonical execution identity",
+            "code": "route_execution_profile_mismatch",
+        }
+    return profile, None
+
+
 def native_effort_value(job: dict[str, Any]) -> tuple[bool, str | None]:
     """Revalidate persisted profile evidence at the command boundary."""
     profile, error = normalize_effort(
@@ -2947,8 +3021,8 @@ def native_review_result(
     if provider != spec["provider"] or model not in spec["models"]:
         return {"ok": False, "verdict": "NACK", "no_verdict": True,
                 "error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
-    effort_profile, effort_error = normalize_review_effort(
-        launcher, provider, model, requested_effort, effort_source
+    effort_profile, effort_error = normalize_native_review_effort(
+        launcher, provider, model, requested_effort, effort_source, execution_identity
     )
     if effort_error is not None or effort_profile is None:
         return {

@@ -7212,6 +7212,210 @@ while True:
                         self.assertEqual(rejected_status, 400, rejected)
                         spawn.assert_not_called()
 
+    def test_routed_reviewer1_sync_reaches_real_native_effort_boundary_once(self):
+        route = server.slice_route_lookup("sensitive", "M", work_kind="research_ops")
+        evidence = self._route_execution_profile(route, "reviewer1")
+        request = {
+            "repo": "scratch", "launcher": evidence["launcher"],
+            "provider": evidence["provider"], "model": evidence["model"],
+            "effort": evidence["effort"], "route_execution_profile": evidence,
+            "prompt": "real routed reviewer1 boundary fixture",
+        }
+        commands = []
+        real_run = subprocess.run
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return real_run(command, **kwargs)
+            commands.append((list(command), kwargs))
+            output_index = command.index("--output-last-message") + 1
+            Path(command[output_index]).write_text(json.dumps({
+                "status": "ok", "sha": None, "pr_url": None,
+                "summary": "VERDICT: PASS",
+            }))
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            launcher = root / "codex-review-wrapper"
+            launcher.write_text("#!/bin/sh\nexit 0\n")
+            launcher.chmod(0o755)
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                )
+
+        self.assertEqual((status, payload["status"]), (200, "ok"), payload)
+        self.assertEqual(payload["execution_identity"]["effort_source"], "route")
+        self.assertEqual(
+            payload["execution_identity"]["route_execution_profile"], evidence
+        )
+        self.assertEqual(len(commands), 1)
+        command, kwargs = commands[0]
+        self.assertEqual(command[command.index("--model") + 1], evidence["model"])
+        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertEqual(
+            [value for value in command if value.startswith("model_reasoning_effort=")],
+            [f"model_reasoning_effort={evidence['effort']}"],
+        )
+        self.assertIn("input", kwargs)
+
+    def test_routed_reviewer2_async_reaches_real_native_effort_boundary_once(self):
+        route = server.slice_route_lookup("sensitive", "M", work_kind="typescript_coding")
+        evidence = self._route_execution_profile(route, "reviewer2")
+        request = {
+            "repo": "scratch", "launcher": evidence["launcher"],
+            "provider": evidence["provider"], "model": evidence["model"],
+            "effort": evidence["effort"], "route_execution_profile": evidence,
+            "prompt": "real routed reviewer2 boundary fixture", "async": True,
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            launcher = self._write_grok_acp_fixture(root)
+            capture = root / "capture.json"
+            launches = []
+            real_popen = subprocess.Popen
+
+            def counted_popen(command, **kwargs):
+                if len(command) > 1 and command[1] == "agent":
+                    launches.append((list(command), kwargs))
+                return real_popen(command, **kwargs)
+
+            env = {
+                "ACP_TEST_FIXTURE": json.dumps({
+                    "chunks": [json.dumps({
+                        "status": "ok", "sha": None, "pr_url": None,
+                        "summary": "VERDICT: PASS",
+                    })],
+                }),
+                "ACP_TEST_CAPTURE": str(capture),
+                "XAI_API_KEY": "fixture-key",
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(server, "enqueue_review") as enqueue, \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=counted_popen), \
+                 mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(server, "herdr_job_done"):
+                status, accepted, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
+                )
+                self.assertEqual(status, 202, accepted)
+                self.assertIsInstance(accepted, dict)
+                assert isinstance(accepted, dict)
+                enqueue.assert_called_once()
+                authority = server.review_authority(accepted["job_id"])
+                self.assertIsNotNone(authority)
+                assert authority is not None
+                sealed = authority.snapshot()
+                self.assertIsNotNone(sealed)
+                assert sealed is not None
+                self.assertEqual(
+                    sealed["execution_identity"]["route_execution_profile"], evidence
+                )
+                server.run_review_job(accepted["job_id"])
+                self.assertIsNone(server.review_authority(accepted["job_id"]))
+                poll_status, polled, _ = server.dispatch(
+                    "GET", accepted["poll"], {}, True, b""
+                )
+
+            self.assertEqual((poll_status, polled["status"]), (200, "completed"), polled)
+            self.assertEqual(polled["receipt"]["status"], "ok")
+            self.assertEqual(polled["execution_identity"]["effort_source"], "route")
+            self.assertEqual(
+                polled["execution_identity"]["route_execution_profile"], evidence
+            )
+            self.assertEqual(len(launches), 1)
+            native = json.loads(capture.read_text())
+            self.assertEqual(native["argv"], [
+                "agent", "--model", evidence["model"],
+                "--reasoning-effort", "high", "stdio",
+            ])
+
+    def test_native_routed_review_rejects_unsealed_or_drifted_evidence_before_spawn(self):
+        route = server.slice_route_lookup("sensitive", "M", work_kind="go_coding")
+        evidence = self._route_execution_profile(route, "reviewer1")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, _jobs, repo, launcher, _enqueue = self._queue_closed_review(
+                root,
+                effort=evidence["effort"],
+                extra={
+                    "launcher": evidence["launcher"],
+                    "provider": evidence["provider"],
+                    "model": evidence["model"],
+                    "route_execution_profile": evidence,
+                },
+            )
+            self.assertEqual(status, 202, accepted)
+            self.assertIsInstance(accepted, dict)
+            assert isinstance(accepted, dict)
+            canonical = accepted["execution_identity"]
+            reviewer2 = self._route_execution_profile(route, "reviewer2")
+            cases = {
+                "unsealed direct route claim": None,
+                "missing evidence": {
+                    key: value for key, value in canonical.items()
+                    if key != "route_execution_profile"
+                },
+                "wrong role": {
+                    **canonical,
+                    "route_execution_profile": self._route_execution_profile(route, "writer"),
+                },
+                "wrong version": {
+                    **canonical,
+                    "route_execution_profile": {**evidence, "version": "route-execution-profile-v2"},
+                },
+                "profile mismatch": {
+                    **canonical,
+                    "route_execution_profile": {**evidence, "model": "claude-opus-5"},
+                },
+                "native permission profile drift": {
+                    **canonical,
+                    "permission_profile": "codex-read-only",
+                },
+                "coordinated identity and evidence drift": {
+                    **canonical,
+                    "launcher": reviewer2["launcher"],
+                    "provider": reviewer2["provider"],
+                    "model": reviewer2["model"],
+                    "requested_effort": reviewer2["effort"],
+                    "effective_effort": "high",
+                    "route_execution_profile": reviewer2,
+                },
+            }
+            for name, identity in cases.items():
+                with self.subTest(name=name), mock.patch.object(
+                    server.subprocess, "run",
+                    side_effect=AssertionError("invalid routed review must not spawn"),
+                ) as spawn:
+                    result = server.native_review_result(
+                        evidence["launcher"], evidence["provider"], evidence["model"],
+                        "bounded ticket", repo, requested_effort=evidence["effort"],
+                        effort_source="route", binary=launcher,
+                        execution_identity=identity,
+                    )
+                self.assertFalse(result["ok"], result)
+                self.assertIn(
+                    result["code"],
+                    {
+                        "bad_effort_source",
+                        "bad_route_execution_profile",
+                        "route_execution_profile_mismatch",
+                    },
+                )
+                spawn.assert_not_called()
+
     def test_routed_review_requires_exact_closed_route_evidence_before_boundary(self):
         route = server.slice_route_lookup("sensitive", "M", work_kind="go_coding")
         evidence = self._route_execution_profile(route, "reviewer1")
