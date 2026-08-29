@@ -9038,6 +9038,76 @@ while True:
                 self.assertNotEqual(poll.get("status"), "completed", poll)
                 self.assertNotEqual((poll.get("receipt") or {}).get("status"), "ok", poll)
 
+    def test_review_ordinary_equal_writes_are_rejected_without_touching_queued_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            path = jobs / accepted["job_id"] / "job.json"
+            queued = json.loads(path.read_text())
+            original_bytes = path.read_bytes()
+            original_stat = path.stat()
+
+            with mock.patch.object(
+                server, "_write_job_unlocked", wraps=server._write_job_unlocked
+            ) as atomic_write:
+                for candidate in (queued, dict(reversed(list(queued.items())))):
+                    with self.subTest(order=list(candidate)):
+                        self.assertFalse(server.write_job(candidate))
+                        self.assertEqual(path.read_bytes(), original_bytes)
+                        current_stat = path.stat()
+                        self.assertEqual(current_stat.st_ino, original_stat.st_ino)
+                        self.assertEqual(current_stat.st_mtime_ns, original_stat.st_mtime_ns)
+                atomic_write.assert_not_called()
+
+    def test_review_reordered_running_write_is_noop_and_completion_callback_stays_consistent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(
+                root, extra={"response_webhook_url": "https://example.invalid/review"}
+            )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            path = jobs / job_id / "job.json"
+            write_results = []
+            callback_receipts = []
+
+            def attempt_equal_writes(*_args, **_kwargs):
+                running = json.loads(path.read_text())
+                self.assertEqual(running["status"], "running")
+                original_bytes = path.read_bytes()
+                original_stat = path.stat()
+                authority = server.review_authority(job_id)
+                self.assertIsNotNone(authority)
+                sealed_bytes = authority.running_record_bytes
+                sealed_hash = authority.running_record_hash
+                for candidate in (running, dict(reversed(list(running.items())))):
+                    write_results.append(server.write_job(candidate))
+                    self.assertEqual(path.read_bytes(), original_bytes)
+                    current_stat = path.stat()
+                    self.assertEqual(current_stat.st_ino, original_stat.st_ino)
+                    self.assertEqual(current_stat.st_mtime_ns, original_stat.st_mtime_ns)
+                    self.assertEqual(authority.running_record_bytes, sealed_bytes)
+                    self.assertEqual(authority.running_record_hash, sealed_hash)
+                return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+            with mock.patch.object(
+                server, "native_review_result", side_effect=attempt_equal_writes
+            ), mock.patch.object(
+                server, "deliver_webhook",
+                side_effect=lambda _job, receipt: callback_receipts.append(deepcopy(receipt))
+                or {"ok": True, "status": 204},
+            ) as callback, mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+
+            self.assertEqual(write_results, [False, False])
+            callback.assert_called_once()
+            self.assertEqual(len(callback_receipts), 1)
+            saved = json.loads(path.read_text())
+            self.assertEqual((saved["kind"], saved["status"]), ("review", "completed"))
+            self.assertEqual(saved["receipt"], callback_receipts[0])
+            self.assertEqual(saved["webhook"], {"ok": True, "status": 204})
+
     def test_review_ordinary_write_rejects_immutable_drift_and_guarded_lifecycle_works(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -9046,12 +9116,31 @@ while True:
             job_id = accepted["job_id"]
             path = jobs / job_id / "job.json"
             original = json.loads(path.read_text())
-            drift = deepcopy(original)
-            drift["prompt"] = "coordinated trusted drift"
-            drift["prompt_sha256"] = hashlib.sha256(drift["prompt"].encode()).hexdigest()
-            drift["execution_identity"]["prompt_sha256"] = drift["prompt_sha256"]
-            self.assertFalse(server.write_job(drift))
-            self.assertEqual(json.loads(path.read_text()), original)
+            original_bytes = path.read_bytes()
+            original_stat = path.stat()
+            identity_drift = deepcopy(original)
+            identity_drift["prompt"] = "coordinated trusted drift"
+            identity_drift["prompt_sha256"] = hashlib.sha256(
+                identity_drift["prompt"].encode()
+            ).hexdigest()
+            identity_drift["execution_identity"]["prompt_sha256"] = identity_drift[
+                "prompt_sha256"
+            ]
+            operational_drift = deepcopy(original)
+            operational_drift["error"] = "trusted operational drift"
+            unknown_drift = deepcopy(original)
+            unknown_drift["provider_output"] = "trusted unknown drift"
+            for label, drift in (
+                ("identity", identity_drift),
+                ("operational", operational_drift),
+                ("unknown", unknown_drift),
+            ):
+                with self.subTest(mutation=label):
+                    self.assertFalse(server.write_job(drift))
+                    self.assertEqual(path.read_bytes(), original_bytes)
+                    current_stat = path.stat()
+                    self.assertEqual(current_stat.st_ino, original_stat.st_ino)
+                    self.assertEqual(current_stat.st_mtime_ns, original_stat.st_mtime_ns)
 
             with mock.patch.object(server, "native_review_result", return_value={
                 "ok": True, "verdict": "PASS", "no_verdict": False,
@@ -9163,8 +9252,18 @@ while True:
             ), mock.patch.object(server, "deliver_webhook", return_value=None), \
                  mock.patch.object(server, "herdr_job_done"):
                 server.run_review_job(job_id)
-            terminal = json.loads((jobs / job_id / "job.json").read_text())
+            path = jobs / job_id / "job.json"
+            terminal = json.loads(path.read_text())
             receipt = deepcopy(terminal["receipt"])
+            terminal_bytes = path.read_bytes()
+            terminal_stat = path.stat()
+            for candidate in (terminal, dict(reversed(list(terminal.items())))):
+                with self.subTest(order=list(candidate)):
+                    self.assertFalse(server.write_job(candidate))
+                    self.assertEqual(path.read_bytes(), terminal_bytes)
+                    current_stat = path.stat()
+                    self.assertEqual(current_stat.st_ino, terminal_stat.st_ino)
+                    self.assertEqual(current_stat.st_mtime_ns, terminal_stat.st_mtime_ns)
             hostile = deepcopy(terminal)
             hostile.update({
                 "prompt": "TOKEN_SECRET", "cwd": "/private/path", "status": "failed",

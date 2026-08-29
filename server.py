@@ -3850,10 +3850,12 @@ def _job_terminal_transition_keys() -> set[str]:
 
 
 def write_job(job: dict[str, Any]) -> bool:
-    """Write ordinary records, never mutate an accepted/running/terminal review.
+    """Write ordinary records, never touch an existing review record.
 
     Review lifecycle and callback bookkeeping use narrow guarded APIs below.
-    Returning False makes queued and same-thread reentrant replacement attempts explicit.
+    Returning False makes every ordinary write to an accepted review, including
+    a value-equal idempotency attempt, an explicit no-op under the per-job lock
+    that never invokes the atomic writer.
     """
     job_id = job["job_id"]
     key = str(job_path(job_id).resolve())
@@ -3861,11 +3863,11 @@ def write_job(job: dict[str, Any]) -> bool:
         return False
     with job_record_lock(job_id):
         current = _read_job_unlocked(job_id)
-        if current != job and isinstance(current, dict) and current.get("kind") == "review":
+        if isinstance(current, dict) and current.get("kind") == "review":
             return False
         if (
             current != job and isinstance(current, dict)
-            and current.get("kind") in ("agent", "review")
+            and current.get("kind") == "agent"
             and current.get("status") in ("completed", "failed")
         ):
             return False
