@@ -6896,6 +6896,79 @@ while True:
         wait = spec["paths"]["/v1/review/jobs/wait"]["post"]
         self.assertEqual(set(wait["responses"]), {"200", "400", "401", "404", "408", "409"})
 
+    def test_review_401_runtime_bodies_match_exact_draft_2020_12_schemas(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:  # catalog CI intentionally installs no third-party packages
+            Draft202012Validator = None
+
+        spec = json.loads(server.openapi_bytes())
+
+        def dereference(value):
+            if isinstance(value, dict):
+                if set(value) == {"$ref"} and value["$ref"].startswith("#/"):
+                    target = spec
+                    for part in value["$ref"][2:].split("/"):
+                        target = target[part.replace("~1", "/").replace("~0", "~")]
+                    return dereference(target)
+                return {key: dereference(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [dereference(item) for item in value]
+            return value
+
+        cases = (
+            ("POST", "/v1/review/run", "/v1/review/run", "post", b"{}"),
+            (
+                "GET",
+                "/v1/review/jobs/" + "a" * 32,
+                "/v1/review/jobs/{job_id}",
+                "get",
+                b"",
+            ),
+            ("POST", "/v1/review/jobs/wait", "/v1/review/jobs/wait", "post", b"{}"),
+        )
+        expected = {
+            "error": "invalid or missing X-Graphwing-Key",
+            "code": "unauthorized",
+        }
+        for method, runtime_path, spec_path, operation, body in cases:
+            with self.subTest(path=spec_path):
+                status, payload, _ = server.dispatch(
+                    method, runtime_path, {}, False, body
+                )
+                self.assertEqual((status, payload), (401, expected))
+                response = dereference(
+                    spec["paths"][spec_path][operation]["responses"]["401"]
+                )
+                schema = dereference(response["content"]["application/json"]["schema"])
+                self.assertEqual(schema["type"], "object")
+                self.assertFalse(schema["additionalProperties"])
+                self.assertEqual(set(schema["required"]), {"error", "code"})
+                self.assertEqual(set(schema["properties"]), {"error", "code"})
+
+                def valid(instance):
+                    if Draft202012Validator is not None:
+                        return not list(Draft202012Validator(schema).iter_errors(instance))
+                    if set(instance) != set(schema["required"]):
+                        return False
+                    return all(
+                        isinstance(instance[field], str)
+                        and len(instance[field]) >= rules.get("minLength", 0)
+                        and len(instance[field]) <= rules.get("maxLength", len(instance[field]))
+                        and (
+                            "pattern" not in rules
+                            or re.search(rules["pattern"], instance[field]) is not None
+                        )
+                        for field, rules in schema["properties"].items()
+                    )
+
+                self.assertTrue(valid(expected))
+                for missing in ("error", "code"):
+                    invalid = dict(expected)
+                    invalid.pop(missing)
+                    self.assertFalse(valid(invalid), missing)
+                self.assertFalse(valid({**expected, "detail": "must stay closed"}))
+
     def test_agent_and_review_effort_are_real_while_graph_effort_remains_unwired(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
