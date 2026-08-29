@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from jinja2 import ChainableUndefined, Environment
+
 os.environ["GRAPHWING_HOME"] = str(Path(__file__).resolve().parent)
 os.environ["GRAPHWING_HERDR"] = "0"
 
@@ -8827,6 +8829,215 @@ while True:
             ):
                 self.assertNotIn(forbidden, dumped, node_id)
 
+    def test_implement_slice_durable_outcome_aggregates_every_unique_writer_and_reviewer_attempt(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
+        schema = builder["config"]["outputSchema"]
+        for field in ("writer_usage", "reviewer_usage", "slice_usage"):
+            summary = schema["properties"][field]
+            self.assertFalse(summary["additionalProperties"])
+            self.assertEqual(
+                set(summary["required"]),
+                {"attempts", "usage", "usage_diagnostics"},
+            )
+            self.assertEqual(
+                set(summary["properties"]),
+                {"attempts", "usage", "usage_diagnostics"},
+            )
+
+        def usage(seed, cost=0.25, turns=1):
+            return {
+                "usage_version": "normalized-usage-v1",
+                "fresh_input_tokens": seed,
+                "cached_input_tokens": seed + 1,
+                "cache_write_tokens": seed + 2,
+                "output_tokens": seed + 3,
+                "reasoning_tokens": seed + 4,
+                "provider_cost_usd": cost,
+                "wall_seconds": seed + 5,
+                "turns_observed": turns,
+            }
+
+        writer_sources = {
+            "receipt": {"job_id": "primary", "usage": usage(1), "usage_diagnostic": None},
+            "fallback_receipt": {"job_id": "fallback", "usage": usage(10), "usage_diagnostic": None},
+            "receipt2": {"job_id": "correction", "usage": usage(100), "usage_diagnostic": None},
+            # The same receipt can remain reachable through a later alias. It is one spend.
+            "receipt3": {"job_id": "correction", "usage": usage(100), "usage_diagnostic": None},
+        }
+        reviewer_sources = {
+            "wait_rev1": {"request": {"body": {"job_id": "review-1", "usage": usage(1000), "usage_diagnostic": None}}},
+            "wait_r1b": {"request": {"body": {"job_id": "review-1b", "usage": usage(10000), "usage_diagnostic": None}}},
+            "wait_rev2": {"request": {"body": {"job_id": "review-2", "usage": usage(100000), "usage_diagnostic": None}}},
+        }
+        env = Environment(undefined=ChainableUndefined)
+        rendered = env.from_string(builder["config"]["code"]["code"]).render(
+            CTX={**writer_sources, "INPUT": {"test": "unit"}},
+            TASKS=reviewer_sources,
+            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
+        )
+        outcome = json.loads(rendered)
+        self.assertEqual(outcome["writer_usage"]["attempts"], 3)
+        self.assertEqual(outcome["reviewer_usage"]["attempts"], 3)
+        self.assertEqual(outcome["slice_usage"]["attempts"], 6)
+        self.assertEqual(outcome["writer_usage"]["usage"]["fresh_input_tokens"], 111)
+        self.assertEqual(outcome["reviewer_usage"]["usage"]["fresh_input_tokens"], 111000)
+        self.assertEqual(outcome["slice_usage"]["usage"]["fresh_input_tokens"], 111111)
+        self.assertEqual(outcome["slice_usage"]["usage"]["provider_cost_usd"], 1.5)
+        self.assertEqual(outcome["slice_usage"]["usage_diagnostics"], [])
+
+    def test_implement_slice_durable_usage_totals_fail_closed_on_partial_usage(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
+        complete = {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 1, "cached_input_tokens": 2,
+            "cache_write_tokens": 3, "output_tokens": 4,
+            "reasoning_tokens": 5, "provider_cost_usd": None,
+            "wall_seconds": 6, "turns_observed": None,
+        }
+        env = Environment(undefined=ChainableUndefined)
+        rendered = env.from_string(builder["config"]["code"]["code"]).render(
+            CTX={
+                "INPUT": {"test": "unit"},
+                "receipt": {"job_id": "writer", "usage": complete, "usage_diagnostic": None},
+            },
+            TASKS={
+                "wait_rev1": {"request": {"body": {
+                    "job_id": "review", "usage": None,
+                    "usage_diagnostic": "usage_malformed",
+                }}},
+            },
+            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
+        )
+        outcome = json.loads(rendered)
+        self.assertEqual(outcome["writer_usage"]["usage"]["provider_cost_usd"], None)
+        self.assertEqual(outcome["writer_usage"]["usage"]["turns_observed"], None)
+        self.assertEqual(outcome["reviewer_usage"], {
+            "attempts": 1, "usage": None, "usage_diagnostics": ["usage_malformed"],
+        })
+        self.assertEqual(outcome["slice_usage"], {
+            "attempts": 2, "usage": None, "usage_diagnostics": ["usage_malformed"],
+        })
+
+    def test_implement_slice_named_tests_all_emit_bound_async_job_evidence(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        triples = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["edges"]
+        }
+        cases = {
+            "test": ("wait_test", "if_test_ok", "join_test_http_fail"),
+            "test2": ("wait_test2", "if_test_ok2", "join_test2_http_fail"),
+            "test3": ("wait_test3", "if_test_ok3", "join_test2_http_fail"),
+            "test_rn1": ("wait_test_rn1", "if_test_rn1", "join_test_http_fail"),
+            "test_rn2": ("wait_test_rn2", "if_test_rn2", "join_test_http_fail"),
+        }
+        for test_id, (wait_id, gate_id, failure_join) in cases.items():
+            wait = nodes[wait_id]
+            self.assertEqual(wait["type"], "action.wait.webhook")
+            self.assertEqual(wait["config"], {
+                "alias": wait_id,
+                "allowedMethods": ["POST"], "authMode": "token",
+                "responseStatus": 200, "timeoutSeconds": 960,
+            })
+            self.assertEqual(
+                nodes[test_id]["config"]["response_webhook_url"],
+                f"{{{{ TASKS.{wait_id}.pending.resumeUrl }}}}",
+            )
+            self.assertEqual(
+                nodes[test_id]["config"]["response_webhook_token"],
+                f"{{{{ TASKS.{wait_id}.pending.resumeToken }}}}",
+            )
+            self.assertIn((wait_id, "pending", test_id), triples)
+            self.assertIn((wait_id, "out", gate_id), triples)
+            self.assertIn((wait_id, "timeout", failure_join), triples)
+            self.assertIn((wait_id, "failure", failure_join), triples)
+            self.assertIn((test_id, "failure", failure_join), triples)
+            self.assertNotIn((test_id, "success", gate_id), triples)
+            self.assertEqual(nodes[gate_id]["config"]["rules"], [
+                {"path": "request.body.status", "op": "equals", "value": "ok"},
+            ])
+
+        evidence = nodes["durable_outcome"]["config"]["outputSchema"]["properties"]["named_test_evidence"]
+        self.assertEqual(evidence["type"], ["object", "null"])
+        self.assertFalse(evidence["additionalProperties"])
+        self.assertEqual(
+            set(evidence["required"]),
+            {"evidence_version", "job_id", "name", "status"},
+        )
+        self.assertEqual(set(evidence["properties"]), set(evidence["required"]))
+
+    def test_implement_slice_named_test_evidence_selects_exact_latest_terminal_receipt(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
+        env = Environment(undefined=ChainableUndefined)
+        rendered = env.from_string(builder["config"]["code"]["code"]).render(
+            CTX={"INPUT": {"test": "riftwing-local-gates"}},
+            TASKS={
+                "wait_test": {"request": {"body": {"job_id": "first", "status": "error"}}},
+                "wait_test2": {"request": {"body": {"job_id": "second", "status": "ok"}}},
+            },
+            WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
+        )
+        outcome = json.loads(rendered)
+        self.assertEqual(outcome["named_test_evidence"], {
+            "evidence_version": "graphwing-named-test-evidence-v1",
+            "job_id": "second", "name": "riftwing-local-gates", "status": "ok",
+        })
+        self.assertEqual(outcome["named_test_status"], "passed")
+        dumped = json.dumps(outcome["named_test_evidence"]).lower()
+        for forbidden in ("log", "path", "stdout", "stderr", "provider", "token", "secret"):
+            self.assertNotIn(forbidden, dumped)
+
+    def test_implement_slice_verification_classification_uses_terminal_gates_not_join_presence(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        builder = {node["id"]: node for node in graph["nodes"]}["durable_outcome"]
+        template = Environment(undefined=ChainableUndefined).from_string(
+            builder["config"]["code"]["code"]
+        )
+
+        def project(ctx=None, tasks=None):
+            context = {"INPUT": {"test": "unit"}, **(ctx or {})}
+            return json.loads(template.render(
+                CTX=context,
+                TASKS=tasks or {},
+                WORKFLOW={"id": "wf", "version": 1, "runId": "run"},
+            ))
+
+        cases = [
+            # An initially empty frontier can complete only after its terminal E2E gate.
+            ({}, {"slices_complete": {"data": {}}},
+             ("all_slices_complete", True, "verified")),
+            ({"done": True, "receipt": {"job_id": "writer", "status": "ok"}}, {},
+             ("slice_complete", True, "verified")),
+            # A passed named-test/review join does not verify later commit/push failure.
+            ({"receipt": {"job_id": "writer", "status": "ok"}},
+             {"join_commit": {}, "push_fail": {}},
+             ("push_failed", False, "spent_unverified")),
+            ({}, {"route_fail": {}},
+             ("route_failed", False, "unverified")),
+        ]
+        for ctx, tasks, expected in cases:
+            with self.subTest(expected=expected):
+                outcome = project(ctx, tasks)
+                self.assertEqual(
+                    (outcome["workflow_stage"], outcome["commit_eligible"],
+                     outcome["verified_outcome"]),
+                    expected,
+                )
+
     def test_implement_slice_durable_outcome_uses_exact_datastore_records_contract(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
@@ -8857,6 +9068,29 @@ while True:
             "recordKey": record_key,
         })
 
+    def test_implement_slice_persistence_failures_hard_fail_with_proven_rewst_regex_contract(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        outgoing = {edge["source"] for edge in graph["edges"]}
+        failure_nodes = {
+            "durable_outcome_write_failed": "graphwing_durable_outcome_write_failed",
+            "durable_outcome_readback_failed": "graphwing_durable_outcome_readback_failed",
+            "durable_outcome_readback_mismatch": "graphwing_durable_outcome_readback_mismatch",
+        }
+        # Local Rewst's transforms.regexReplace contract explicitly hard-fails invalid
+        # RE2 patterns. Lookahead is intentionally unsupported by RE2.
+        for node_id, failure_code in failure_nodes.items():
+            node = nodes[node_id]
+            self.assertEqual(node["type"], "transforms.regexReplace")
+            self.assertEqual(node["config"], {
+                "input": failure_code,
+                "pattern": "(?=graphwing)",
+                "replacement": "",
+            })
+            self.assertNotIn(node_id, outgoing)
+
     def test_implement_slice_durable_outcome_has_closed_sanitized_record_allowlist(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
@@ -8870,23 +9104,26 @@ while True:
             "effective_size", "agent_job_id", "agent_status",
             "agent_failure_class", "agent_failure_code", "launcher", "provider",
             "model", "requested_effort", "effective_effort", "effort_source",
-            "named_test_name", "named_test_status", "commit_eligible",
-            "verified_outcome", "usage", "usage_diagnostic", "diagnostic",
+            "named_test_name", "named_test_status", "named_test_evidence",
+            "commit_eligible", "verified_outcome", "writer_usage", "reviewer_usage",
+            "slice_usage", "diagnostic",
         }
         self.assertEqual(builder["type"], "transforms.codeExpression")
         schema = builder["config"]["outputSchema"]
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(set(schema["required"]), expected_fields)
         self.assertEqual(set(schema["properties"]), expected_fields)
-        self.assertEqual(
-            set(schema["properties"]["usage"]["properties"]),
-            {
-                "usage_version", "fresh_input_tokens", "cached_input_tokens",
-                "cache_write_tokens", "output_tokens", "reasoning_tokens",
-                "provider_cost_usd", "wall_seconds", "turns_observed",
-            },
-        )
-        self.assertFalse(schema["properties"]["usage"]["additionalProperties"])
+        for summary_field in ("writer_usage", "reviewer_usage", "slice_usage"):
+            usage_schema = schema["properties"][summary_field]["properties"]["usage"]
+            self.assertEqual(
+                set(usage_schema["properties"]),
+                {
+                    "usage_version", "fresh_input_tokens", "cached_input_tokens",
+                    "cache_write_tokens", "output_tokens", "reasoning_tokens",
+                    "provider_cost_usd", "wall_seconds", "turns_observed",
+                },
+            )
+            self.assertFalse(usage_schema["additionalProperties"])
         self.assertEqual(
             set(schema["properties"]["diagnostic"]["properties"]),
             {"diagnostic_version", "stage", "status", "code", "summary"},
@@ -8897,7 +9134,8 @@ while True:
             self.assertIn(identity, code)
         for forbidden in (
             "prompt", "log", "path", "raw", "output_text", "provider_payload",
-            "token", "credential", "secret", "webhook", "resumeUrl", "/home/",
+            "response_webhook_token", "resumetoken", "credential", "secret",
+            "webhook", "resumeurl", "/home/",
         ):
             self.assertNotIn(forbidden, code.lower())
 
@@ -10716,7 +10954,10 @@ while True:
                 code = node.get("config", {}).get("code", {}).get("code", "")
                 if alias not in dominators[node_id] and not (
                     node_id == "durable_outcome"
-                    and f"TASKS.{alias} is defined" in code
+                    and (
+                        f"TASKS.{alias} is defined" in code
+                        or f"TASKS.{alias}.request.body | default({{}})" in code
+                    )
                 ):
                     path_errors.append(f"{node_id} references non-dominating TASKS.{alias}")
             if node["type"].startswith("action."):
@@ -10794,7 +11035,7 @@ while True:
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "test2"), "record3": ("if_receipt_ok3", "test3"), "record_rn1": ("if_receipt_ok_rn1", "test_rn1"), "record_rn2": ("if_receipt_ok_rn2", "test_rn2")}
+        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "wait_test2"), "record3": ("if_receipt_ok3", "wait_test3"), "record_rn1": ("if_receipt_ok_rn1", "wait_test_rn1"), "record_rn2": ("if_receipt_ok_rn2", "wait_test_rn2")}
         for source, (gate, target) in cases.items():
             self.assertEqual(nodes[gate]["type"], "logic.filter")
             self.assertTrue(any(e["source"] == source and e["target"] == gate for e in edges), source)
@@ -16920,7 +17161,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9c73976d3782e9550d31a86417a12c4619f445c009b845b4c3ff5fafc2ae26a7")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "17363f5ad684b244ce50e1dbfa7d8881c47b9832958ab5fd3d72132c33fe29e1")
 
 
 class InstallTests(unittest.TestCase):

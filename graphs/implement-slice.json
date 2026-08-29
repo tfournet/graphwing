@@ -212,6 +212,13 @@
       },
       {"id": "agent_rn1", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review1 nack", "position": {"x": 1300, "y": 200}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt3.session_identity | default(CTX.receipt2.session_identity) | default(CTX.fallback_receipt.session_identity) | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.receipt3.resume_job_id | default(CTX.receipt2.resume_job_id) | default(CTX.fallback_receipt.resume_job_id) | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.receipt3.session_identity.launcher | default(CTX.receipt2.session_identity.launcher) | default(CTX.fallback_receipt.session_identity.launcher) | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.receipt3.session_identity.provider | default(CTX.receipt2.session_identity.provider) | default(CTX.fallback_receipt.session_identity.provider) | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.receipt3.session_identity.model | default(CTX.receipt2.session_identity.model) | default(CTX.fallback_receipt.session_identity.model) | default(CTX.receipt.session_identity.model) }}", "effort": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}", "route_execution_profile": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev1.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn1.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn1.pending.resumeToken }}"}},
       {
+        "id": "wait_test_rn1",
+        "type": "action.wait.webhook",
+        "label": "Wait test after review1 nack",
+        "position": { "x": 1360, "y": 160 },
+        "config": {"alias": "wait_test_rn1", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960}
+      },
+      {
         "id": "test_rn1",
         "type": "action.graphwing.POST:/v1/test/run",
         "label": "test after review1 nack",
@@ -219,7 +226,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_test_rn1.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_test_rn1.pending.resumeToken }}"
         }
       },
       {
@@ -229,7 +238,7 @@
         "position": { "x": 1420, "y": 200 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }]
         }
       },
       {
@@ -273,6 +282,13 @@
       },
       {"id": "agent_rn2", "type": "action.graphwing.POST:/v1/agent/run", "label": "resume after review2 nack", "position": {"x": 1420, "y": 280}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt_rn1.session_identity | default(CTX.receipt3.session_identity) | default(CTX.receipt2.session_identity) | default(CTX.fallback_receipt.session_identity) | default(CTX.receipt.session_identity) }}", "resume_job_id": "{{ CTX.receipt_rn1.resume_job_id | default(CTX.receipt3.resume_job_id) | default(CTX.receipt2.resume_job_id) | default(CTX.fallback_receipt.resume_job_id) | default(CTX.receipt.resume_job_id) }}", "launcher": "{{ CTX.receipt_rn1.session_identity.launcher | default(CTX.receipt3.session_identity.launcher) | default(CTX.receipt2.session_identity.launcher) | default(CTX.fallback_receipt.session_identity.launcher) | default(CTX.receipt.session_identity.launcher) }}", "provider": "{{ CTX.receipt_rn1.session_identity.provider | default(CTX.receipt3.session_identity.provider) | default(CTX.receipt2.session_identity.provider) | default(CTX.fallback_receipt.session_identity.provider) | default(CTX.receipt.session_identity.provider) }}", "model": "{{ CTX.receipt_rn1.session_identity.model | default(CTX.receipt3.session_identity.model) | default(CTX.receipt2.session_identity.model) | default(CTX.fallback_receipt.session_identity.model) | default(CTX.receipt.session_identity.model) }}", "effort": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}", "route_execution_profile": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}", "max_turns": "{{ CTX.active_route.max_turns }}", "run_budget_seconds": "{{ CTX.active_route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nSPEC-REVIEW NACK. Compact signal:\n{{ TASKS.wait_rev2.request.body.compact }}\nFiles are on disk. Continue this slice. Do not start over.", "response_webhook_url": "{{ TASKS.wait_rn2.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait_rn2.pending.resumeToken }}"}},
       {
+        "id": "wait_test_rn2",
+        "type": "action.wait.webhook",
+        "label": "Wait test after review2 nack",
+        "position": { "x": 1480, "y": 240 },
+        "config": {"alias": "wait_test_rn2", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960}
+      },
+      {
         "id": "test_rn2",
         "type": "action.graphwing.POST:/v1/test/run",
         "label": "test after review2 nack",
@@ -280,7 +296,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_test_rn2.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_test_rn2.pending.resumeToken }}"
         }
       },
       {
@@ -290,7 +308,7 @@
         "position": { "x": 1540, "y": 280 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }]
         }
       },
       {
@@ -488,6 +506,13 @@
         "config": { "group": "AND", "rules": [{ "path": "status", "op": "equals", "value": "ok" }] }
       },
       {
+        "id": "wait_test2",
+        "type": "action.wait.webhook",
+        "label": "Wait retry test",
+        "position": { "x": 2060, "y": 280 },
+        "config": {"alias": "wait_test2", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960}
+      },
+      {
         "id": "test2",
         "type": "action.graphwing.POST:/v1/test/run",
         "label": "retry testRun",
@@ -495,7 +520,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_test2.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_test2.pending.resumeToken }}"
         }
       },
       {
@@ -505,7 +532,7 @@
         "position": { "x": 2280, "y": 320 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }]
         }
       },
       {
@@ -521,7 +548,14 @@
           "timeoutSeconds": 960
         }
       },
-      {"id": "agent3", "type": "action.graphwing.POST:/v1/agent/run", "label": "second retry agentRun", "position": {"x": 2520, "y": 440}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt2.session_identity }}", "resume_job_id": "{{ CTX.receipt2.resume_job_id }}", "launcher": "{{ CTX.receipt2.session_identity.launcher }}", "provider": "{{ CTX.receipt2.session_identity.provider }}", "model": "{{ CTX.receipt2.session_identity.model }}", "effort": "{{ CTX.receipt2.session_identity.requested_effort }}", "route_execution_profile": "{{ CTX.receipt2.session_identity.route_execution_profile }}", "max_turns": "{{ CTX.receipt2.route.max_turns }}", "run_budget_seconds": "{{ CTX.receipt2.route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.test2.data.compact }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.", "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"}},
+      {"id": "agent3", "type": "action.graphwing.POST:/v1/agent/run", "label": "second retry agentRun", "position": {"x": 2520, "y": 440}, "config": {"integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 60, "cwd": "{{ CTX.INPUT.repo }}", "session_identity": "{{ CTX.receipt2.session_identity }}", "resume_job_id": "{{ CTX.receipt2.resume_job_id }}", "launcher": "{{ CTX.receipt2.session_identity.launcher }}", "provider": "{{ CTX.receipt2.session_identity.provider }}", "model": "{{ CTX.receipt2.session_identity.model }}", "effort": "{{ CTX.receipt2.session_identity.requested_effort }}", "route_execution_profile": "{{ CTX.receipt2.session_identity.route_execution_profile }}", "max_turns": "{{ CTX.receipt2.route.max_turns }}", "run_budget_seconds": "{{ CTX.receipt2.route.run_budget_seconds }}", "prompt": "{{ TASKS.ticket_head.data.text }}\n\nNAMED TESTS FAILED. Compact signal:\n{{ TASKS.wait_test2.request.body.summary }}\nFiles are on disk. Continue this slice in the same native session. Do not restart from a blank plan.", "response_webhook_url": "{{ TASKS.wait3.pending.resumeUrl }}", "response_webhook_token": "{{ TASKS.wait3.pending.resumeToken }}"}},
+      {
+        "id": "wait_test3",
+        "type": "action.wait.webhook",
+        "label": "Wait second retry test",
+        "position": { "x": 2640, "y": 280 },
+        "config": {"alias": "wait_test3", "allowedMethods": ["POST"], "authMode": "token", "responseStatus": 200, "timeoutSeconds": 960}
+      },
       {
         "id": "test3",
         "type": "action.graphwing.POST:/v1/test/run",
@@ -530,7 +564,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}"
+          "name": "{{ CTX.INPUT.test }}",
+          "response_webhook_url": "{{ TASKS.wait_test3.pending.resumeUrl }}",
+          "response_webhook_token": "{{ TASKS.wait_test3.pending.resumeToken }}"
         }
       },
       {
@@ -540,7 +576,7 @@
         "position": { "x": 2760, "y": 320 },
         "config": {
           "group": "AND",
-          "rules": [{ "path": "data.ok", "op": "equals", "value": true }]
+          "rules": [{ "path": "request.body.status", "op": "equals", "value": "ok" }]
         }
       },
       {
@@ -814,7 +850,7 @@
           "outputSchema": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["schema_version", "workflow_slug", "workflow_id", "workflow_version", "workflow_run_id", "workflow_stage", "route_version", "route_profile_version", "role", "work_kind", "work_class", "effective_size", "agent_job_id", "agent_status", "agent_failure_class", "agent_failure_code", "launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "named_test_name", "named_test_status", "commit_eligible", "verified_outcome", "usage", "usage_diagnostic", "diagnostic"],
+            "required": ["schema_version", "workflow_slug", "workflow_id", "workflow_version", "workflow_run_id", "workflow_stage", "route_version", "route_profile_version", "role", "work_kind", "work_class", "effective_size", "agent_job_id", "agent_status", "agent_failure_class", "agent_failure_code", "launcher", "provider", "model", "requested_effort", "effective_effort", "effort_source", "named_test_name", "named_test_status", "named_test_evidence", "commit_eligible", "verified_outcome", "writer_usage", "reviewer_usage", "slice_usage", "diagnostic"],
             "properties": {
               "schema_version": {"type": "string"},
               "workflow_slug": {"type": "string"},
@@ -840,24 +876,76 @@
               "effort_source": {"type": ["string", "null"]},
               "named_test_name": {"type": ["string", "null"]},
               "named_test_status": {"type": "string"},
-              "commit_eligible": {"type": "boolean"},
-              "verified_outcome": {"type": "string", "enum": ["verified", "spent_unverified", "unverified"]},
-              "usage": {
+              "named_test_evidence": {
                 "type": ["object", "null"],
                 "additionalProperties": false,
+                "required": ["evidence_version", "job_id", "name", "status"],
                 "properties": {
-                  "usage_version": {"type": "string"},
-                  "fresh_input_tokens": {"type": "number"},
-                  "cached_input_tokens": {"type": "number"},
-                  "cache_write_tokens": {"type": "number"},
-                  "output_tokens": {"type": "number"},
-                  "reasoning_tokens": {"type": "number"},
-                  "provider_cost_usd": {"type": ["number", "null"]},
-                  "wall_seconds": {"type": "number"},
-                  "turns_observed": {"type": ["number", "null"]}
+                  "evidence_version": {"type": "string", "const": "graphwing-named-test-evidence-v1"},
+                  "job_id": {"type": "string"},
+                  "name": {"type": "string"},
+                  "status": {"type": "string"}
                 }
               },
-              "usage_diagnostic": {"type": ["string", "null"]},
+              "commit_eligible": {"type": "boolean"},
+              "verified_outcome": {"type": "string", "enum": ["verified", "spent_unverified", "unverified"]},
+              "writer_usage": {
+                "type": "object", "additionalProperties": false,
+                "required": ["attempts", "usage", "usage_diagnostics"],
+                "properties": {
+                  "attempts": {"type": "integer", "minimum": 0},
+                  "usage": {
+                    "type": ["object", "null"], "additionalProperties": false,
+                    "required": ["usage_version", "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "provider_cost_usd", "wall_seconds", "turns_observed"],
+                    "properties": {
+                      "usage_version": {"type": "string"}, "fresh_input_tokens": {"type": "number"},
+                      "cached_input_tokens": {"type": "number"}, "cache_write_tokens": {"type": "number"},
+                      "output_tokens": {"type": "number"}, "reasoning_tokens": {"type": "number"},
+                      "provider_cost_usd": {"type": ["number", "null"]}, "wall_seconds": {"type": "number"},
+                      "turns_observed": {"type": ["number", "null"]}
+                    }
+                  },
+                  "usage_diagnostics": {"type": "array", "items": {"type": "string"}}
+                }
+              },
+              "reviewer_usage": {
+                "type": "object", "additionalProperties": false,
+                "required": ["attempts", "usage", "usage_diagnostics"],
+                "properties": {
+                  "attempts": {"type": "integer", "minimum": 0},
+                  "usage": {
+                    "type": ["object", "null"], "additionalProperties": false,
+                    "required": ["usage_version", "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "provider_cost_usd", "wall_seconds", "turns_observed"],
+                    "properties": {
+                      "usage_version": {"type": "string"}, "fresh_input_tokens": {"type": "number"},
+                      "cached_input_tokens": {"type": "number"}, "cache_write_tokens": {"type": "number"},
+                      "output_tokens": {"type": "number"}, "reasoning_tokens": {"type": "number"},
+                      "provider_cost_usd": {"type": ["number", "null"]}, "wall_seconds": {"type": "number"},
+                      "turns_observed": {"type": ["number", "null"]}
+                    }
+                  },
+                  "usage_diagnostics": {"type": "array", "items": {"type": "string"}}
+                }
+              },
+              "slice_usage": {
+                "type": "object", "additionalProperties": false,
+                "required": ["attempts", "usage", "usage_diagnostics"],
+                "properties": {
+                  "attempts": {"type": "integer", "minimum": 0},
+                  "usage": {
+                    "type": ["object", "null"], "additionalProperties": false,
+                    "required": ["usage_version", "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "provider_cost_usd", "wall_seconds", "turns_observed"],
+                    "properties": {
+                      "usage_version": {"type": "string"}, "fresh_input_tokens": {"type": "number"},
+                      "cached_input_tokens": {"type": "number"}, "cache_write_tokens": {"type": "number"},
+                      "output_tokens": {"type": "number"}, "reasoning_tokens": {"type": "number"},
+                      "provider_cost_usd": {"type": ["number", "null"]}, "wall_seconds": {"type": "number"},
+                      "turns_observed": {"type": ["number", "null"]}
+                    }
+                  },
+                  "usage_diagnostics": {"type": "array", "items": {"type": "string"}}
+                }
+              },
               "diagnostic": {
                 "type": "object",
                 "additionalProperties": false,
@@ -875,7 +963,7 @@
           "code": {
             "inputKind": "code",
             "language": "jinja",
-            "code": "{% set stage = 'unknown_terminal' %}{% if CTX.recovery_route_diagnostic is defined %}{% set stage = 'provider_recovery' %}{% elif CTX.fallback_route_diagnostic is defined %}{% set stage = 'fallback_route' %}{% elif CTX.fallback_wait_timeout_diagnostic is defined %}{% set stage = 'fallback_wait_timeout' %}{% elif CTX.fallback_wait_failure_diagnostic is defined %}{% set stage = 'fallback_wait_failure' %}{% elif CTX.fallback_action_diagnostic is defined %}{% set stage = 'fallback_action' %}{% elif CTX.fallback_receipt_diagnostic is defined %}{% set stage = 'fallback_receipt' %}{% elif CTX.primary_action_diagnostic is defined %}{% set stage = 'primary_action' %}{% elif CTX.primary_wait_timeout is defined %}{% set stage = 'primary_wait_timeout' %}{% elif CTX.primary_wait_failure is defined %}{% set stage = 'primary_wait_failure' %}{% elif CTX.writer_receipt_diagnostic is defined %}{% set stage = 'writer_receipt' %}{% elif CTX.correction_writer_action_failure is defined %}{% set stage = 'correction_action' %}{% elif CTX.correction_writer_wait_timeout is defined %}{% set stage = 'correction_wait_timeout' %}{% elif CTX.correction_writer_wait_failure is defined %}{% set stage = 'correction_wait_failure' %}{% elif CTX.human_ack is defined %}{% set stage = 'human_ack' %}{% elif CTX.done is defined %}{% set stage = 'slice_complete' %}{% elif TASKS.commit_fail is defined %}{% set stage = 'commit_failed' %}{% elif TASKS.push_fail is defined %}{% set stage = 'push_failed' %}{% elif TASKS.checkout_fail is defined %}{% set stage = 'checkout_failed' %}{% elif TASKS.ticket_fail is defined %}{% set stage = 'ticket_failed' %}{% elif TASKS.frontier_fail is defined %}{% set stage = 'frontier_failed' %}{% elif TASKS.complete_fail is defined %}{% set stage = 'completion_failed' %}{% elif TASKS.walk_fail is defined %}{% set stage = 'continuation_failed' %}{% elif TASKS.slices_complete is defined %}{% set stage = 'all_slices_complete' %}{% elif TASKS.route_fail is defined %}{% set stage = 'route_failed' %}{% elif TASKS.review_fail is defined %}{% set stage = 'review_failed' %}{% elif TASKS.e2e_fail is defined %}{% set stage = 'e2e_failed' %}{% elif TASKS.test_http_fail is defined %}{% set stage = 'named_test_transport_failed' %}{% elif TASKS.test2_http_fail is defined %}{% set stage = 'retry_test_transport_failed' %}{% elif TASKS.nack_timeout is defined %}{% set stage = 'human_timeout' %}{% endif %}{% set agent = CTX.receipt_rn2 | default(CTX.receipt_rn1) | default(CTX.receipt3) | default(CTX.receipt2) | default(CTX.fallback_receipt) | default(CTX.receipt) | default({}) %}{% set identity = agent.session_identity | default({}) %}{% set route = agent.route | default(CTX.active_route) | default(CTX.selected_route) | default({}) %}{% set profile = identity.route_execution_profile | default(route.writer_execution_profile) | default({}) %}{% set named_status = 'not_run' %}{% if TASKS.test3 is defined %}{% if TASKS.test3.data.ok %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% elif TASKS.test_rn2 is defined %}{% if TASKS.test_rn2.data.ok %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% elif TASKS.test_rn1 is defined %}{% if TASKS.test_rn1.data.ok %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% elif TASKS.test2 is defined %}{% if TASKS.test2.data.ok %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% elif TASKS.wait_test is defined %}{% if TASKS.wait_test.request.body.status == 'ok' %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% endif %}{% set commit_eligible = TASKS.join_commit is defined %}{% if commit_eligible %}{% set verified = 'verified' %}{% elif agent.job_id is defined %}{% set verified = 'spent_unverified' %}{% else %}{% set verified = 'unverified' %}{% endif %}{% set terminal_status = agent.status | default('error') %}{% set terminal_code = agent.failure_code | default(stage) %}{{ {'schema_version': 'graphwing-verified-outcome-v1', 'workflow_slug': 'graphwing-implement-slice', 'workflow_id': WORKFLOW.id, 'workflow_version': WORKFLOW.version, 'workflow_run_id': WORKFLOW.runId, 'workflow_stage': stage, 'route_version': profile.route_version | default(route.route_version) | default(none), 'route_profile_version': profile.version | default(none), 'role': agent.role | default(profile.role) | default(none), 'work_kind': profile.work_kind | default(route.work_kind) | default(none), 'work_class': profile.class | default(route.class) | default(none), 'effective_size': profile.size | default(route.effective_size) | default(none), 'agent_job_id': agent.job_id | default(none), 'agent_status': terminal_status, 'agent_failure_class': agent.failure_class | default(none), 'agent_failure_code': agent.failure_code | default(none), 'launcher': identity.launcher | default(agent.launcher) | default(none), 'provider': identity.provider | default(agent.provider) | default(none), 'model': identity.model | default(agent.model) | default(none), 'requested_effort': identity.requested_effort | default(agent.requested_effort) | default(none), 'effective_effort': identity.effective_effort | default(agent.effective_effort) | default(none), 'effort_source': identity.effort_source | default(agent.effort_source) | default(none), 'named_test_name': CTX.INPUT.test | default(none), 'named_test_status': named_status, 'commit_eligible': commit_eligible, 'verified_outcome': verified, 'usage': agent.usage | default(none), 'usage_diagnostic': agent.usage_diagnostic | default('usage_not_reported'), 'diagnostic': {'diagnostic_version': 'diagnostic-v1', 'stage': stage, 'status': terminal_status, 'code': terminal_code, 'summary': agent.diagnostic.summary | default('sanitized workflow terminal outcome')}} | tojson }}"
+            "code": "{% set writer_attempts = namespace(items=[], ids=[]) %}{% for attempt in [CTX.receipt | default({}), CTX.fallback_receipt | default({}), CTX.receipt2 | default({}), CTX.receipt3 | default({}), CTX.receipt_rn1 | default({}), CTX.receipt_rn2 | default({})] %}{% set job_id = attempt.job_id | default('') %}{% if job_id and job_id not in writer_attempts.ids %}{% set writer_attempts.items = writer_attempts.items + [attempt] %}{% set writer_attempts.ids = writer_attempts.ids + [job_id] %}{% endif %}{% endfor %}{% set reviewer_attempts = namespace(items=[], ids=[]) %}{% for attempt in [TASKS.wait_rev1.request.body | default({}), TASKS.wait_r1b.request.body | default({}), TASKS.wait_rev2.request.body | default({}), TASKS.wait_r2b.request.body | default({})] %}{% set job_id = attempt.job_id | default('') %}{% if job_id and job_id not in reviewer_attempts.ids %}{% set reviewer_attempts.items = reviewer_attempts.items + [attempt] %}{% set reviewer_attempts.ids = reviewer_attempts.ids + [job_id] %}{% endif %}{% endfor %}{% set slice_attempts = namespace(items=[], ids=[]) %}{% for attempt in writer_attempts.items + reviewer_attempts.items %}{% set job_id = attempt.job_id | default('') %}{% if job_id and job_id not in slice_attempts.ids %}{% set slice_attempts.items = slice_attempts.items + [attempt] %}{% set slice_attempts.ids = slice_attempts.ids + [job_id] %}{% endif %}{% endfor %}{% set writer_sum = namespace(complete=(writer_attempts.items | length > 0), fresh=0, cached=0, cache_write=0, output=0, reasoning=0, cost=0, cost_known=true, wall=0, turns=0, turns_known=true, diagnostics=[]) %}{% for attempt in writer_attempts.items %}{% set u = attempt.usage | default(none) %}{% if u is none %}{% set writer_sum.complete = false %}{% set d = attempt.usage_diagnostic | default('usage_not_reported', true) %}{% if d not in writer_sum.diagnostics %}{% set writer_sum.diagnostics = writer_sum.diagnostics + [d] %}{% endif %}{% else %}{% set writer_sum.fresh = writer_sum.fresh + u.fresh_input_tokens %}{% set writer_sum.cached = writer_sum.cached + u.cached_input_tokens %}{% set writer_sum.cache_write = writer_sum.cache_write + u.cache_write_tokens %}{% set writer_sum.output = writer_sum.output + u.output_tokens %}{% set writer_sum.reasoning = writer_sum.reasoning + u.reasoning_tokens %}{% set writer_sum.wall = writer_sum.wall + u.wall_seconds %}{% if u.provider_cost_usd is none %}{% set writer_sum.cost_known = false %}{% else %}{% set writer_sum.cost = writer_sum.cost + u.provider_cost_usd %}{% endif %}{% if u.turns_observed is none %}{% set writer_sum.turns_known = false %}{% else %}{% set writer_sum.turns = writer_sum.turns + u.turns_observed %}{% endif %}{% endif %}{% endfor %}{% if writer_attempts.items | length == 0 %}{% set writer_sum.diagnostics = ['usage_not_spent'] %}{% endif %}{% set writer_sum_total = {'attempts': writer_attempts.items | length, 'usage': {'usage_version': 'normalized-usage-v1', 'fresh_input_tokens': writer_sum.fresh, 'cached_input_tokens': writer_sum.cached, 'cache_write_tokens': writer_sum.cache_write, 'output_tokens': writer_sum.output, 'reasoning_tokens': writer_sum.reasoning, 'provider_cost_usd': (writer_sum.cost if writer_sum.cost_known else none), 'wall_seconds': writer_sum.wall, 'turns_observed': (writer_sum.turns if writer_sum.turns_known else none)} if writer_sum.complete else none, 'usage_diagnostics': writer_sum.diagnostics} %}{% set reviewer_sum = namespace(complete=(reviewer_attempts.items | length > 0), fresh=0, cached=0, cache_write=0, output=0, reasoning=0, cost=0, cost_known=true, wall=0, turns=0, turns_known=true, diagnostics=[]) %}{% for attempt in reviewer_attempts.items %}{% set u = attempt.usage | default(none) %}{% if u is none %}{% set reviewer_sum.complete = false %}{% set d = attempt.usage_diagnostic | default('usage_not_reported', true) %}{% if d not in reviewer_sum.diagnostics %}{% set reviewer_sum.diagnostics = reviewer_sum.diagnostics + [d] %}{% endif %}{% else %}{% set reviewer_sum.fresh = reviewer_sum.fresh + u.fresh_input_tokens %}{% set reviewer_sum.cached = reviewer_sum.cached + u.cached_input_tokens %}{% set reviewer_sum.cache_write = reviewer_sum.cache_write + u.cache_write_tokens %}{% set reviewer_sum.output = reviewer_sum.output + u.output_tokens %}{% set reviewer_sum.reasoning = reviewer_sum.reasoning + u.reasoning_tokens %}{% set reviewer_sum.wall = reviewer_sum.wall + u.wall_seconds %}{% if u.provider_cost_usd is none %}{% set reviewer_sum.cost_known = false %}{% else %}{% set reviewer_sum.cost = reviewer_sum.cost + u.provider_cost_usd %}{% endif %}{% if u.turns_observed is none %}{% set reviewer_sum.turns_known = false %}{% else %}{% set reviewer_sum.turns = reviewer_sum.turns + u.turns_observed %}{% endif %}{% endif %}{% endfor %}{% if reviewer_attempts.items | length == 0 %}{% set reviewer_sum.diagnostics = ['usage_not_spent'] %}{% endif %}{% set reviewer_sum_total = {'attempts': reviewer_attempts.items | length, 'usage': {'usage_version': 'normalized-usage-v1', 'fresh_input_tokens': reviewer_sum.fresh, 'cached_input_tokens': reviewer_sum.cached, 'cache_write_tokens': reviewer_sum.cache_write, 'output_tokens': reviewer_sum.output, 'reasoning_tokens': reviewer_sum.reasoning, 'provider_cost_usd': (reviewer_sum.cost if reviewer_sum.cost_known else none), 'wall_seconds': reviewer_sum.wall, 'turns_observed': (reviewer_sum.turns if reviewer_sum.turns_known else none)} if reviewer_sum.complete else none, 'usage_diagnostics': reviewer_sum.diagnostics} %}{% set slice_sum = namespace(complete=(slice_attempts.items | length > 0), fresh=0, cached=0, cache_write=0, output=0, reasoning=0, cost=0, cost_known=true, wall=0, turns=0, turns_known=true, diagnostics=[]) %}{% for attempt in slice_attempts.items %}{% set u = attempt.usage | default(none) %}{% if u is none %}{% set slice_sum.complete = false %}{% set d = attempt.usage_diagnostic | default('usage_not_reported', true) %}{% if d not in slice_sum.diagnostics %}{% set slice_sum.diagnostics = slice_sum.diagnostics + [d] %}{% endif %}{% else %}{% set slice_sum.fresh = slice_sum.fresh + u.fresh_input_tokens %}{% set slice_sum.cached = slice_sum.cached + u.cached_input_tokens %}{% set slice_sum.cache_write = slice_sum.cache_write + u.cache_write_tokens %}{% set slice_sum.output = slice_sum.output + u.output_tokens %}{% set slice_sum.reasoning = slice_sum.reasoning + u.reasoning_tokens %}{% set slice_sum.wall = slice_sum.wall + u.wall_seconds %}{% if u.provider_cost_usd is none %}{% set slice_sum.cost_known = false %}{% else %}{% set slice_sum.cost = slice_sum.cost + u.provider_cost_usd %}{% endif %}{% if u.turns_observed is none %}{% set slice_sum.turns_known = false %}{% else %}{% set slice_sum.turns = slice_sum.turns + u.turns_observed %}{% endif %}{% endif %}{% endfor %}{% if slice_attempts.items | length == 0 %}{% set slice_sum.diagnostics = ['usage_not_spent'] %}{% endif %}{% set slice_sum_total = {'attempts': slice_attempts.items | length, 'usage': {'usage_version': 'normalized-usage-v1', 'fresh_input_tokens': slice_sum.fresh, 'cached_input_tokens': slice_sum.cached, 'cache_write_tokens': slice_sum.cache_write, 'output_tokens': slice_sum.output, 'reasoning_tokens': slice_sum.reasoning, 'provider_cost_usd': (slice_sum.cost if slice_sum.cost_known else none), 'wall_seconds': slice_sum.wall, 'turns_observed': (slice_sum.turns if slice_sum.turns_known else none)} if slice_sum.complete else none, 'usage_diagnostics': slice_sum.diagnostics} %}{% set stage = 'unknown_terminal' %}{% if CTX.recovery_route_diagnostic is defined %}{% set stage = 'provider_recovery' %}{% elif CTX.fallback_route_diagnostic is defined %}{% set stage = 'fallback_route' %}{% elif CTX.fallback_wait_timeout_diagnostic is defined %}{% set stage = 'fallback_wait_timeout' %}{% elif CTX.fallback_wait_failure_diagnostic is defined %}{% set stage = 'fallback_wait_failure' %}{% elif CTX.fallback_action_diagnostic is defined %}{% set stage = 'fallback_action' %}{% elif CTX.fallback_receipt_diagnostic is defined %}{% set stage = 'fallback_receipt' %}{% elif CTX.primary_action_diagnostic is defined %}{% set stage = 'primary_action' %}{% elif CTX.primary_wait_timeout is defined %}{% set stage = 'primary_wait_timeout' %}{% elif CTX.primary_wait_failure is defined %}{% set stage = 'primary_wait_failure' %}{% elif CTX.writer_receipt_diagnostic is defined %}{% set stage = 'writer_receipt' %}{% elif CTX.correction_writer_action_failure is defined %}{% set stage = 'correction_action' %}{% elif CTX.correction_writer_wait_timeout is defined %}{% set stage = 'correction_wait_timeout' %}{% elif CTX.correction_writer_wait_failure is defined %}{% set stage = 'correction_wait_failure' %}{% elif CTX.human_ack is defined %}{% set stage = 'human_ack' %}{% elif CTX.done is defined %}{% set stage = 'slice_complete' %}{% elif TASKS.commit_fail is defined %}{% set stage = 'commit_failed' %}{% elif TASKS.push_fail is defined %}{% set stage = 'push_failed' %}{% elif TASKS.checkout_fail is defined %}{% set stage = 'checkout_failed' %}{% elif TASKS.ticket_fail is defined %}{% set stage = 'ticket_failed' %}{% elif TASKS.frontier_fail is defined %}{% set stage = 'frontier_failed' %}{% elif TASKS.complete_fail is defined %}{% set stage = 'completion_failed' %}{% elif TASKS.walk_fail is defined %}{% set stage = 'continuation_failed' %}{% elif TASKS.slices_complete is defined %}{% set stage = 'all_slices_complete' %}{% elif TASKS.route_fail is defined %}{% set stage = 'route_failed' %}{% elif TASKS.review_fail is defined %}{% set stage = 'review_failed' %}{% elif TASKS.e2e_fail is defined %}{% set stage = 'e2e_failed' %}{% elif TASKS.test_http_fail is defined %}{% set stage = 'named_test_transport_failed' %}{% elif TASKS.test2_http_fail is defined %}{% set stage = 'retry_test_transport_failed' %}{% elif TASKS.nack_timeout is defined %}{% set stage = 'human_timeout' %}{% endif %}{% set agent = CTX.receipt_rn2 | default(CTX.receipt_rn1) | default(CTX.receipt3) | default(CTX.receipt2) | default(CTX.fallback_receipt) | default(CTX.receipt) | default({}) %}{% set identity = agent.session_identity | default({}) %}{% set route = agent.route | default(CTX.active_route) | default(CTX.selected_route) | default({}) %}{% set profile = identity.route_execution_profile | default(route.writer_execution_profile) | default({}) %}{% set named_receipt = namespace(value={}) %}{% if TASKS.wait_test_rn2 is defined %}{% set named_receipt.value = TASKS.wait_test_rn2.request.body %}{% elif TASKS.wait_test_rn1 is defined %}{% set named_receipt.value = TASKS.wait_test_rn1.request.body %}{% elif TASKS.wait_test3 is defined %}{% set named_receipt.value = TASKS.wait_test3.request.body %}{% elif TASKS.wait_test2 is defined %}{% set named_receipt.value = TASKS.wait_test2.request.body %}{% elif TASKS.wait_test is defined %}{% set named_receipt.value = TASKS.wait_test.request.body %}{% endif %}{% set named_status = 'not_run' %}{% set named_evidence = none %}{% if named_receipt.value.job_id is defined %}{% if named_receipt.value.status == 'ok' %}{% set named_status = 'passed' %}{% else %}{% set named_status = 'failed' %}{% endif %}{% set named_evidence = {'evidence_version': 'graphwing-named-test-evidence-v1', 'job_id': named_receipt.value.job_id, 'name': CTX.INPUT.test, 'status': named_receipt.value.status} %}{% endif %}{% set commit_eligible = stage == 'slice_complete' or stage == 'all_slices_complete' %}{% if commit_eligible %}{% set verified = 'verified' %}{% elif slice_sum_total.attempts > 0 %}{% set verified = 'spent_unverified' %}{% else %}{% set verified = 'unverified' %}{% endif %}{% set terminal_status = agent.status | default('error') %}{% set terminal_code = agent.failure_code | default(stage) %}{{ {'schema_version': 'graphwing-verified-outcome-v1', 'workflow_slug': 'graphwing-implement-slice', 'workflow_id': WORKFLOW.id, 'workflow_version': WORKFLOW.version, 'workflow_run_id': WORKFLOW.runId, 'workflow_stage': stage, 'route_version': profile.route_version | default(route.route_version) | default(none), 'route_profile_version': profile.version | default(none), 'role': agent.role | default(profile.role) | default(none), 'work_kind': profile.work_kind | default(route.work_kind) | default(none), 'work_class': profile.class | default(route.class) | default(none), 'effective_size': profile.size | default(route.effective_size) | default(none), 'agent_job_id': agent.job_id | default(none), 'agent_status': terminal_status, 'agent_failure_class': agent.failure_class | default(none), 'agent_failure_code': agent.failure_code | default(none), 'launcher': identity.launcher | default(agent.launcher) | default(none), 'provider': identity.provider | default(agent.provider) | default(none), 'model': identity.model | default(agent.model) | default(none), 'requested_effort': identity.requested_effort | default(agent.requested_effort) | default(none), 'effective_effort': identity.effective_effort | default(agent.effective_effort) | default(none), 'effort_source': identity.effort_source | default(agent.effort_source) | default(none), 'named_test_name': CTX.INPUT.test | default(none), 'named_test_status': named_status, 'named_test_evidence': named_evidence, 'commit_eligible': commit_eligible, 'verified_outcome': verified, 'writer_usage': writer_sum_total, 'reviewer_usage': reviewer_sum_total, 'slice_usage': slice_sum_total, 'diagnostic': {'diagnostic_version': 'diagnostic-v1', 'stage': stage, 'status': terminal_status, 'code': terminal_code, 'summary': agent.diagnostic.summary | default('sanitized workflow terminal outcome')}} | tojson }}"
           }
         }
       },
@@ -883,9 +971,9 @@
       {"id": "durable_outcome_readback", "type": "action.datastore.records.get", "label": "Read back durable outcome", "position": {"x": 3340, "y": 640}, "config": {"alias": "durable_outcome_readback", "scope": "tenant", "collection": "graphwing_verified_outcomes_v1", "recordKey": "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"}},
       {"id": "if_durable_outcome_readback", "type": "logic.filter", "label": "Durable outcome found?", "position": {"x": 3480, "y": 640}, "config": {"group": "AND", "rules": [{"path": "found", "op": "equals", "value": true}, {"path": "recordKey", "op": "equals", "value": "graphwing-outcome-v1:{{ WORKFLOW.runId }}:implement-slice-terminal"}]}},
       {"id": "durable_outcome_written", "type": "action.noop", "label": "Durable outcome acknowledged", "position": {"x": 3620, "y": 600}, "config": {}},
-      {"id": "durable_outcome_write_failed", "type": "action.noop", "label": "Durable outcome write failed", "position": {"x": 3340, "y": 760}, "config": {}},
-      {"id": "durable_outcome_readback_failed", "type": "action.noop", "label": "Durable outcome readback failed", "position": {"x": 3480, "y": 760}, "config": {}},
-      {"id": "durable_outcome_readback_mismatch", "type": "action.noop", "label": "Durable outcome readback mismatch", "position": {"x": 3620, "y": 760}, "config": {}}
+      {"id": "durable_outcome_write_failed", "type": "transforms.regexReplace", "label": "FAIL: durable outcome write", "position": {"x": 3340, "y": 760}, "config": {"input": "graphwing_durable_outcome_write_failed", "pattern": "(?=graphwing)", "replacement": ""}},
+      {"id": "durable_outcome_readback_failed", "type": "transforms.regexReplace", "label": "FAIL: durable outcome readback", "position": {"x": 3480, "y": 760}, "config": {"input": "graphwing_durable_outcome_readback_failed", "pattern": "(?=graphwing)", "replacement": ""}},
+      {"id": "durable_outcome_readback_mismatch", "type": "transforms.regexReplace", "label": "FAIL: durable outcome readback mismatch", "position": {"x": 3620, "y": 760}, "config": {"input": "graphwing_durable_outcome_readback_mismatch", "pattern": "(?=graphwing)", "replacement": ""}}
     ],
     "edges": [
       { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
@@ -958,12 +1046,15 @@
       { "id": "e_rn1_pend", "source": "wait_rn1", "sourceHandle": "pending", "target": "agent_rn1", "targetHandle": "in" },
       { "id": "e_rn1_out", "source": "wait_rn1", "sourceHandle": "out", "target": "record_rn1", "targetHandle": "in" },
       { "id": "e_rn1_record", "source": "record_rn1", "sourceHandle": "out", "target": "if_receipt_ok_rn1", "targetHandle": "in" },
-      { "id": "e_rn1_receipt_ok", "source": "if_receipt_ok_rn1", "sourceHandle": "pass", "target": "test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_receipt_ok", "source": "if_receipt_ok_rn1", "sourceHandle": "pass", "target": "wait_test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_test_pending", "source": "wait_test_rn1", "sourceHandle": "pending", "target": "test_rn1", "targetHandle": "in" },
       { "id": "e_rn1_receipt_bad", "source": "if_receipt_ok_rn1", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn1_to", "source": "wait_rn1", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn1_fail", "source": "wait_rn1", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_agent_rn1_fail", "source": "agent_rn1", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
-      { "id": "e_rn1_th", "source": "test_rn1", "sourceHandle": "success", "target": "if_test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_th", "source": "wait_test_rn1", "sourceHandle": "out", "target": "if_test_rn1", "targetHandle": "in" },
+      { "id": "e_rn1_test_timeout", "source": "wait_test_rn1", "sourceHandle": "timeout", "target": "join_test_http_fail", "targetHandle": "in" },
+      { "id": "e_rn1_test_fail", "source": "wait_test_rn1", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn1_tf", "source": "test_rn1", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn1_tok", "source": "if_test_rn1", "sourceHandle": "pass", "target": "wait_r1b", "targetHandle": "in" },
       { "id": "e_rn1_tbad", "source": "if_test_rn1", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
@@ -980,12 +1071,15 @@
       { "id": "e_rn2_pend", "source": "wait_rn2", "sourceHandle": "pending", "target": "agent_rn2", "targetHandle": "in" },
       { "id": "e_rn2_out", "source": "wait_rn2", "sourceHandle": "out", "target": "record_rn2", "targetHandle": "in" },
       { "id": "e_rn2_record", "source": "record_rn2", "sourceHandle": "out", "target": "if_receipt_ok_rn2", "targetHandle": "in" },
-      { "id": "e_rn2_receipt_ok", "source": "if_receipt_ok_rn2", "sourceHandle": "pass", "target": "test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_receipt_ok", "source": "if_receipt_ok_rn2", "sourceHandle": "pass", "target": "wait_test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_test_pending", "source": "wait_test_rn2", "sourceHandle": "pending", "target": "test_rn2", "targetHandle": "in" },
       { "id": "e_rn2_receipt_bad", "source": "if_receipt_ok_rn2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e_rn2_to", "source": "wait_rn2", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e_rn2_fail", "source": "wait_rn2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_agent_rn2_fail", "source": "agent_rn2", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
-      { "id": "e_rn2_th", "source": "test_rn2", "sourceHandle": "success", "target": "if_test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_th", "source": "wait_test_rn2", "sourceHandle": "out", "target": "if_test_rn2", "targetHandle": "in" },
+      { "id": "e_rn2_test_timeout", "source": "wait_test_rn2", "sourceHandle": "timeout", "target": "join_test_http_fail", "targetHandle": "in" },
+      { "id": "e_rn2_test_fail", "source": "wait_test_rn2", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn2_tf", "source": "test_rn2", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_rn2_tok", "source": "if_test_rn2", "sourceHandle": "pass", "target": "wait_r2b", "targetHandle": "in" },
       { "id": "e_rn2_tbad", "source": "if_test_rn2", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
@@ -1000,9 +1094,12 @@
       { "id": "e26", "source": "wait2", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_agent2_fail", "source": "agent2", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e27", "source": "record2", "sourceHandle": "out", "target": "if_receipt_ok2", "targetHandle": "in" },
-      { "id": "e27a", "source": "if_receipt_ok2", "sourceHandle": "pass", "target": "test2", "targetHandle": "in" },
+      { "id": "e27a", "source": "if_receipt_ok2", "sourceHandle": "pass", "target": "wait_test2", "targetHandle": "in" },
+      { "id": "e_test2_pending", "source": "wait_test2", "sourceHandle": "pending", "target": "test2", "targetHandle": "in" },
       { "id": "e27b", "source": "if_receipt_ok2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
-      { "id": "e28", "source": "test2", "sourceHandle": "success", "target": "if_test_ok2", "targetHandle": "in" },
+      { "id": "e28", "source": "wait_test2", "sourceHandle": "out", "target": "if_test_ok2", "targetHandle": "in" },
+      { "id": "e_test2_timeout", "source": "wait_test2", "sourceHandle": "timeout", "target": "join_test2_http_fail", "targetHandle": "in" },
+      { "id": "e_test2_fail", "source": "wait_test2", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e_commit_retry", "source": "if_test_ok2", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
       { "id": "e_commit_out", "source": "join_commit", "sourceHandle": "out", "target": "complete", "targetHandle": "in" },
@@ -1012,12 +1109,15 @@
       { "id": "e31b", "source": "wait3", "sourceHandle": "pending", "target": "agent3", "targetHandle": "in" },
       { "id": "e31c", "source": "wait3", "sourceHandle": "out", "target": "record3", "targetHandle": "in" },
       { "id": "e31c_record", "source": "record3", "sourceHandle": "out", "target": "if_receipt_ok3", "targetHandle": "in" },
-      { "id": "e31c_ok", "source": "if_receipt_ok3", "sourceHandle": "pass", "target": "test3", "targetHandle": "in" },
+      { "id": "e31c_ok", "source": "if_receipt_ok3", "sourceHandle": "pass", "target": "wait_test3", "targetHandle": "in" },
+      { "id": "e_test3_pending", "source": "wait_test3", "sourceHandle": "pending", "target": "test3", "targetHandle": "in" },
       { "id": "e31c_bad", "source": "if_receipt_ok3", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e31d", "source": "wait3", "sourceHandle": "timeout", "target": "join_wait2_timeout", "targetHandle": "in" },
       { "id": "e31e", "source": "wait3", "sourceHandle": "failure", "target": "join_wait2_fail", "targetHandle": "in" },
       { "id": "e_agent3_fail", "source": "agent3", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
-      { "id": "e31f", "source": "test3", "sourceHandle": "success", "target": "if_test_ok3", "targetHandle": "in" },
+      { "id": "e31f", "source": "wait_test3", "sourceHandle": "out", "target": "if_test_ok3", "targetHandle": "in" },
+      { "id": "e_test3_timeout", "source": "wait_test3", "sourceHandle": "timeout", "target": "join_test2_http_fail", "targetHandle": "in" },
+      { "id": "e_test3_fail", "source": "wait_test3", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e31g", "source": "test3", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e31h", "source": "if_test_ok3", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
       { "id": "e31i", "source": "if_test_ok3", "sourceHandle": "fail", "target": "join_wait_human", "targetHandle": "in" },
