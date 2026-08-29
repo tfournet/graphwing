@@ -5929,11 +5929,14 @@ def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
     return (events, None) if events else (None, "usage_not_reported")
 
 
-_CLAUDE_RESULT_FIELDS = {
-    "type", "subtype", "is_error", "api_error_status", "duration_ms",
+_CLAUDE_RESULT_REQUIRED_FIELDS = {
+    "type", "subtype", "is_error", "duration_ms",
     "duration_api_ms", "num_turns", "result", "stop_reason", "session_id",
     "total_cost_usd", "usage", "modelUsage", "permission_denials",
-    "terminal_reason", "fast_mode_state", "uuid",
+    "uuid",
+}
+_CLAUDE_RESULT_OPTIONAL_FIELDS = {
+    "api_error_status", "terminal_reason", "fast_mode_state", "ttft_ms",
 }
 _CLAUDE_USAGE_FIELDS = {
     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
@@ -5947,11 +5950,16 @@ _CLAUDE_ITERATION_FIELDS = {
     "input_tokens", "output_tokens", "cache_read_input_tokens",
     "cache_creation_input_tokens", "cache_creation", "type",
 }
-_CLAUDE_MODEL_USAGE_FIELDS = {
+_CLAUDE_MODEL_USAGE_REQUIRED_FIELDS = {
     "inputTokens", "outputTokens", "cacheReadInputTokens",
     "cacheCreationInputTokens", "webSearchRequests", "costUSD",
     "contextWindow", "maxOutputTokens",
 }
+_CLAUDE_MODEL_USAGE_OPTIONAL_FIELDS = {
+    "canonicalModel", "provider", "costBasis",
+}
+_CLAUDE_COST_BASES = {"list", "managed", "unknown"}
+_CLAUDE_FAST_MODE_STATES = {"off", "cooldown", "on"}
 
 
 def _claude_cache_creation_is_valid(value: Any) -> bool:
@@ -6002,12 +6010,31 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
         if not (
             isinstance(model, str) and model
             and isinstance(detail, dict)
-            and set(detail) == _CLAUDE_MODEL_USAGE_FIELDS
+            and _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS <= set(detail)
+            and set(detail) <= (
+                _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS
+                | _CLAUDE_MODEL_USAGE_OPTIONAL_FIELDS
+            )
             and all(
                 _usage_count(detail.get(field)) is not None
-                for field in _CLAUDE_MODEL_USAGE_FIELDS - {"costUSD"}
+                for field in _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS - {"costUSD"}
             )
             and _usage_number(detail.get("costUSD")) is not None
+            and (
+                "canonicalModel" not in detail
+                or isinstance(detail["canonicalModel"], str)
+            )
+            and (
+                "provider" not in detail
+                or isinstance(detail["provider"], str)
+            )
+            and (
+                "costBasis" not in detail
+                or (
+                    isinstance(detail["costBasis"], str)
+                    and detail["costBasis"] in _CLAUDE_COST_BASES
+                )
+            )
         ):
             return False
     return True
@@ -6015,21 +6042,46 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
 
 def _claude_success_result_is_valid(result: dict[str, Any]) -> bool:
     return (
-        set(result) == _CLAUDE_RESULT_FIELDS
+        _CLAUDE_RESULT_REQUIRED_FIELDS <= set(result)
+        and set(result) <= (
+            _CLAUDE_RESULT_REQUIRED_FIELDS | _CLAUDE_RESULT_OPTIONAL_FIELDS
+        )
         and result.get("type") == "result"
         and result.get("subtype") == "success"
         and result.get("is_error") is False
-        and result.get("api_error_status") is None
+        and (
+            "api_error_status" not in result
+            or result["api_error_status"] is None
+        )
         and all(
             type(result.get(field)) is int and result[field] >= 0
             for field in ("duration_ms", "duration_api_ms", "num_turns")
         )
         and isinstance(result.get("result"), str)
-        and isinstance(result.get("stop_reason"), str)
+        and (
+            result.get("stop_reason") is None
+            or isinstance(result["stop_reason"], str)
+        )
         and isinstance(result.get("session_id"), str) and bool(result["session_id"])
         and isinstance(result.get("permission_denials"), list)
-        and result.get("terminal_reason") == "completed"
-        and isinstance(result.get("fast_mode_state"), str)
+        and (
+            "terminal_reason" not in result
+            or result["terminal_reason"] == "completed"
+        )
+        and (
+            "fast_mode_state" not in result
+            or (
+                isinstance(result["fast_mode_state"], str)
+                and result["fast_mode_state"] in _CLAUDE_FAST_MODE_STATES
+            )
+        )
+        and (
+            "ttft_ms" not in result
+            or (
+                type(result["ttft_ms"]) is int
+                and result["ttft_ms"] >= 0
+            )
+        )
         and isinstance(result.get("uuid"), str) and bool(result["uuid"])
         and _claude_model_usage_is_valid(result.get("modelUsage"))
     )
