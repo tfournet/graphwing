@@ -9230,11 +9230,11 @@ func main() {
         nodes = {node["id"]: node for node in graph["nodes"]}
         stage = json.dumps(nodes["durable_outcome_candidates"]["config"]["mappings"][-1])
         outcome = json.dumps(nodes["durable_outcome"]["config"])
-        self.assertIn("TASKS.slices_complete", stage)
+        self.assertIn("CTX.slices_complete_terminal.terminal_stage", stage)
         self.assertIn("CTX.done", stage)
         self.assertIn("all_slices_complete", stage)
         self.assertIn("slice_complete", stage)
-        self.assertIn("TASKS.push_fail", stage)
+        self.assertIn("CTX.push_fail_terminal.terminal_stage", stage)
         self.assertIn("verified", outcome)
         self.assertNotIn("TASKS.join_commit", stage + outcome)
 
@@ -9464,7 +9464,7 @@ func main() {
             },
         )
 
-    def test_implement_slice_terminal_sources_use_node_type_correct_handles(self):
+    def test_implement_slice_all_terminal_sources_classify_with_runtime_handles(self):
         graph = json.loads(
             (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
         )["spec"]
@@ -9474,46 +9474,108 @@ func main() {
             for edge in graph["edges"]
             if edge["target"] == "join_durable_outcome"
         }
-        # Keep this ledger hard-coded. It is deliberately independent of the
-        # graph so changing a terminal node type without its runtime handle
-        # cannot make the fixture agree with the same defect.
+        # Keep this ledger hard-coded. It is deliberately independent of the graph,
+        # so neither a changed node type/handle nor a changed stage can silently make
+        # the fixture agree with the same runtime defect.
         expected = {
-            "recovery_route_fail": ("transforms.objectBuilder", "out"),
-            "fallback_route_fail": ("transforms.objectBuilder", "out"),
-            "fallback_wait_timeout": ("transforms.objectBuilder", "out"),
-            "fallback_wait_fail": ("transforms.objectBuilder", "out"),
-            "fallback_action_fail": ("transforms.objectBuilder", "out"),
-            "fallback_receipt_fail": ("transforms.objectBuilder", "out"),
-            "human_ack": ("transforms.objectBuilder", "out"),
-            "commit_fail": ("action.noop", "success"),
-            "push_fail": ("action.noop", "success"),
-            "done": ("transforms.objectBuilder", "out"),
-            "primary_action_fail": ("transforms.objectBuilder", "out"),
-            "timeout": ("transforms.objectBuilder", "out"),
-            "fail": ("transforms.objectBuilder", "out"),
-            "receipt_fail": ("transforms.objectBuilder", "out"),
-            "checkout_fail": ("action.noop", "success"),
-            "ticket_fail": ("action.noop", "success"),
-            "frontier_fail": ("action.noop", "success"),
-            "complete_fail": ("action.noop", "success"),
-            "walk_fail": ("action.noop", "success"),
-            "slices_complete": ("action.noop", "success"),
-            "route_fail": ("action.noop", "success"),
-            "review_fail": ("action.noop", "success"),
-            "e2e_fail": ("action.noop", "success"),
-            "test_http_fail": ("action.noop", "success"),
-            "correction_action_fail": ("transforms.objectBuilder", "out"),
-            "wait2_timeout": ("transforms.objectBuilder", "out"),
-            "wait2_fail": ("transforms.objectBuilder", "out"),
-            "test2_http_fail": ("action.noop", "success"),
-            "nack_timeout": ("action.noop", "success"),
+            "recovery_route_fail": ("provider_recovery", "recovery_route_diagnostic"),
+            "fallback_route_fail": ("fallback_route", "fallback_route_diagnostic"),
+            "fallback_wait_timeout": ("fallback_wait_timeout", "fallback_wait_timeout_diagnostic"),
+            "fallback_wait_fail": ("fallback_wait_failure", "fallback_wait_failure_diagnostic"),
+            "fallback_action_fail": ("fallback_action", "fallback_action_diagnostic"),
+            "fallback_receipt_fail": ("fallback_receipt", "fallback_receipt_diagnostic"),
+            "human_ack": ("human_ack", "human_ack"),
+            "commit_fail": ("commit_failed", "commit_fail_terminal"),
+            "push_fail": ("push_failed", "push_fail_terminal"),
+            "done": ("slice_complete", "done"),
+            "primary_action_fail": ("primary_action", "primary_action_diagnostic"),
+            "timeout": ("primary_wait_timeout", "primary_wait_timeout"),
+            "fail": ("primary_wait_failure", "primary_wait_failure"),
+            "receipt_fail": ("writer_receipt", "writer_receipt_diagnostic"),
+            "checkout_fail": ("checkout_failed", "checkout_fail_terminal"),
+            "ticket_fail": ("ticket_failed", "ticket_fail_terminal"),
+            "frontier_fail": ("frontier_failed", "frontier_fail_terminal"),
+            "complete_fail": ("completion_failed", "complete_fail_terminal"),
+            "walk_fail": ("continuation_failed", "walk_fail_terminal"),
+            "slices_complete": ("all_slices_complete", "slices_complete_terminal"),
+            "route_fail": ("route_failed", "route_fail_terminal"),
+            "review_fail": ("review_failed", "review_fail_terminal"),
+            "e2e_fail": ("e2e_failed", "e2e_fail_terminal"),
+            "test_http_fail": ("named_test_transport_failed", "test_http_fail_terminal"),
+            "correction_action_fail": ("correction_action", "correction_writer_action_failure"),
+            "wait2_timeout": ("correction_wait_timeout", "correction_writer_wait_timeout"),
+            "wait2_fail": ("correction_wait_failure", "correction_writer_wait_failure"),
+            "test2_http_fail": ("retry_test_transport_failed", "test2_http_fail_terminal"),
+            "nack_timeout": ("human_timeout", "nack_timeout_terminal"),
         }
+        terminal_marker_sources = {
+            "commit_fail", "push_fail", "checkout_fail", "ticket_fail", "frontier_fail",
+            "complete_fail", "walk_fail", "slices_complete", "route_fail", "review_fail",
+            "e2e_fail", "test_http_fail", "test2_http_fail", "nack_timeout",
+        }
+
+        def resolve(path, values):
+            value = values
+            for part in path.split("."):
+                if not isinstance(value, dict) or part not in value:
+                    return None
+                value = value[part]
+            return value
+
+        def evaluate(expression, values):
+            kind = expression["kind"]
+            if kind == "literal":
+                return expression["value"]
+            if kind == "getField":
+                return resolve(expression["path"], values)
+            if kind == "binary":
+                left = evaluate(expression["left"], values)
+                right = evaluate(expression["right"], values)
+                if expression["operator"] == "!=":
+                    return left != right
+                self.fail(f"unsupported stage operator {expression['operator']}")
+            if kind == "conditional":
+                branch = "then" if evaluate(expression["condition"], values) else "else"
+                return evaluate(expression[branch], values)
+            self.fail(f"unsupported stage expression {kind}")
+
+        stage_expression = next(
+            mapping["expression"]
+            for mapping in nodes["durable_outcome_candidates"]["config"]["mappings"]
+            if mapping["output"] == "stage"
+        )
         self.assertEqual(set(terminal_edges), set(expected))
-        for source, (node_type, source_handle) in expected.items():
+        self.assertEqual(len(expected), 29)
+        for source, (expected_stage, alias) in expected.items():
             with self.subTest(source=source):
-                self.assertEqual(nodes[source]["type"], node_type)
-                self.assertEqual(terminal_edges[source]["sourceHandle"], source_handle)
+                node = nodes[source]
+                self.assertEqual(node["type"], "transforms.objectBuilder")
+                self.assertEqual(node["config"]["alias"], alias)
+                self.assertEqual(terminal_edges[source]["sourceHandle"], "out")
                 self.assertEqual(terminal_edges[source]["targetHandle"], "in")
+                marker = {"terminal_stage": expected_stage} if source in terminal_marker_sources else {"emitted": True}
+                values = {"CTX": {alias: marker}, "TASKS": {source: None}}
+                self.assertEqual(evaluate(stage_expression, values), expected_stage)
+
+        for source in terminal_marker_sources:
+            with self.subTest(terminal_marker=source):
+                expected_stage, alias = expected[source]
+                self.assertEqual(nodes[source]["config"], {
+                    "alias": alias,
+                    "version": 1,
+                    "mappings": [{
+                        "id": "m1",
+                        "output": "terminal_stage",
+                        "expression": {"kind": "literal", "value": expected_stage},
+                    }],
+                })
+
+        # Exact live regression: action.noop emitted null TASKS.frontier_fail in run
+        # 80277f03-4198-46bb-9259-474c9ab49099. The native marker must classify it.
+        self.assertEqual(evaluate(stage_expression, {
+            "CTX": {"frontier_fail_terminal": {"terminal_stage": "frontier_failed"}},
+            "TASKS": {"frontier_fail": None},
+        }), "frontier_failed")
 
     def test_implement_slice_every_terminal_emission_can_route_to_durable_join(self):
         graph = json.loads(
@@ -17552,7 +17614,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "39dec0226eb462b20e363c365a00cfb6a05ed492d88bb50d9b401e43fb567b3a")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "f5ebdd51a46a33f3bb129612e301b4d12f46d3d48aa1545d35349194e7bf8db9")
 
 
 class InstallTests(unittest.TestCase):
