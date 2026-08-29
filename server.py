@@ -5736,12 +5736,12 @@ def validate_native_resume_provenance(
 
 
 def parse_native_session_id(text: str, launcher: str = "codex") -> str | None:
+    if not isinstance(text, str) or len(text) > _PROVIDER_OUTPUT_MAX_CHARS:
+        return None
     for line in (text or "").splitlines():
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
+            event = strict_json_object(line)
+        except ValueError:
             continue
         if launcher == "codex" and event.get("type") == "thread.started":
             session_id = event.get("thread_id")
@@ -5796,10 +5796,16 @@ def valid_normalized_usage(usage: Any) -> bool:
 
 
 def _terminal_receipt_digest(kind: str, receipt: dict[str, Any]) -> str:
-    payload = json.dumps(
-        {"kind": kind, "receipt": receipt}, sort_keys=True,
-        separators=(",", ":"), ensure_ascii=True, allow_nan=False,
-    ).encode()
+    canonical = {"kind": kind, "receipt": receipt}
+    if not _provider_json_is_bounded(canonical):
+        raise ValueError("terminal receipt exceeds canonical resource limits")
+    try:
+        payload = json.dumps(
+            canonical, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        ).encode()
+    except RecursionError as exc:
+        raise ValueError("terminal receipt exceeds canonical depth") from exc
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -5896,8 +5902,89 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-JSON numeric constant: {value}")
 
 
+_PROVIDER_JSON_MAX_RAW_BYTES = CMD_MAX_BYTES + FILE_MAX_BYTES
+_PROVIDER_JSON_MAX_DEPTH = 32
+_PROVIDER_JSON_MAX_NODES = 8192
+_PROVIDER_JSON_MAX_CONTAINERS = 2048
+_PROVIDER_JSON_MAX_ARRAY_ITEMS = 1024
+_PROVIDER_JSON_MAX_OBJECT_ITEMS = 1024
+_PROVIDER_JSON_MAX_TOTAL_ARRAY_ITEMS = 4096
+_PROVIDER_JSON_MAX_TOTAL_OBJECT_ITEMS = 4096
+_PROVIDER_JSON_MAX_KEY_CHARS = 1024
+_PROVIDER_JSON_MAX_STRING_CHARS = CMD_MAX_BYTES
+_PROVIDER_JSON_MAX_TOTAL_STRING_CHARS = _PROVIDER_JSON_MAX_RAW_BYTES
+_PROVIDER_JSON_MAX_EVENTS = 4096
+_PROVIDER_OUTPUT_MAX_CHARS = _PROVIDER_JSON_MAX_RAW_BYTES + 1
+
+
+def _provider_json_is_bounded(value: Any) -> bool:
+    """Iteratively validate a finite, explicitly bounded built-in JSON tree."""
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    nodes = containers = array_items = object_items = string_chars = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > _PROVIDER_JSON_MAX_NODES or depth > _PROVIDER_JSON_MAX_DEPTH:
+            return False
+        if type(item) is dict:
+            containers += 1
+            size = len(item)
+            object_items += size
+            if (
+                containers > _PROVIDER_JSON_MAX_CONTAINERS
+                or size > _PROVIDER_JSON_MAX_OBJECT_ITEMS
+                or object_items > _PROVIDER_JSON_MAX_TOTAL_OBJECT_ITEMS
+            ):
+                return False
+            for key, child in item.items():
+                if type(key) is not str or len(key) > _PROVIDER_JSON_MAX_KEY_CHARS:
+                    return False
+                string_chars += len(key)
+                if string_chars > _PROVIDER_JSON_MAX_TOTAL_STRING_CHARS:
+                    return False
+                pending.append((child, depth + 1))
+            continue
+        if type(item) is list:
+            containers += 1
+            size = len(item)
+            array_items += size
+            if (
+                containers > _PROVIDER_JSON_MAX_CONTAINERS
+                or size > _PROVIDER_JSON_MAX_ARRAY_ITEMS
+                or array_items > _PROVIDER_JSON_MAX_TOTAL_ARRAY_ITEMS
+            ):
+                return False
+            pending.extend((child, depth + 1) for child in item)
+            continue
+        if type(item) is str:
+            size = len(item)
+            string_chars += size
+            if (
+                size > _PROVIDER_JSON_MAX_STRING_CHARS
+                or string_chars > _PROVIDER_JSON_MAX_TOTAL_STRING_CHARS
+            ):
+                return False
+            continue
+        if item is None or type(item) in {bool, int}:
+            continue
+        if type(item) is float:
+            if math.isfinite(item):
+                continue
+            return False
+        if type(item) is _ExactJSONDecimal:
+            if item.is_finite():
+                continue
+            return False
+        return False
+    return True
+
+
 def strict_json_object(raw: str | bytes) -> dict[str, Any]:
-    """Parse one JSON object while rejecting duplicate keys at every depth."""
+    """Parse one resource-bounded JSON object, rejecting duplicate keys."""
+    if not isinstance(raw, (str, bytes)) or len(raw) > _PROVIDER_JSON_MAX_RAW_BYTES:
+        raise ValueError("malformed JSON object")
+    if isinstance(raw, str) and len(raw.encode("utf-8", "replace")) > _PROVIDER_JSON_MAX_RAW_BYTES:
+        raise ValueError("malformed JSON object")
     try:
         value = json.loads(
             raw,
@@ -5905,22 +5992,29 @@ def strict_json_object(raw: str | bytes) -> dict[str, Any]:
             parse_float=_ExactJSONDecimal,
             parse_constant=_reject_json_constant,
         )
-    except (json.JSONDecodeError, UnicodeDecodeError, DecimalException) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, DecimalException, RecursionError) as exc:
         raise ValueError("malformed JSON object") from exc
-    if not isinstance(value, dict):
+    if type(value) is not dict or not _provider_json_is_bounded(value):
         raise ValueError("JSON value is not an object")
     return value
 
 
 def _usage_events(text: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str):
         return None, "usage_not_reported"
-    if len(text.encode("utf-8", "replace")) > CMD_MAX_BYTES + FILE_MAX_BYTES:
+    if (
+        len(text) > _PROVIDER_JSON_MAX_RAW_BYTES
+        or len(text.encode("utf-8", "replace")) > _PROVIDER_JSON_MAX_RAW_BYTES
+    ):
         return None, "usage_malformed"
+    if not text.strip():
+        return None, "usage_not_reported"
     events: list[dict[str, Any]] = []
     for line in text.splitlines():
         if not line.strip():
             continue
+        if len(events) >= _PROVIDER_JSON_MAX_EVENTS:
+            return None, "usage_malformed"
         try:
             event = strict_json_object(line)
         except ValueError:
@@ -6177,7 +6271,7 @@ def _claude_usage_envelope_is_valid(detail: dict[str, Any]) -> bool:
 
 
 def _claude_model_usage_is_valid(value: Any) -> bool:
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         return False
     for model, detail in value.items():
         if not (
@@ -6331,7 +6425,7 @@ def _closed_usage(
     }, None
 
 
-def normalize_native_usage(
+def _normalize_native_usage(
     launcher: str, native: Any, wall_seconds: Any,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Normalize one complete supported native report without retaining it.
@@ -6348,6 +6442,8 @@ def normalize_native_usage(
     if launcher == "grok":
         if native is None:
             return None, "usage_not_reported"
+        if not _provider_json_is_bounded(native):
+            return None, "usage_malformed"
         if not isinstance(native, dict) or set(native) != {"stopReason", "usage"}:
             return None, "usage_malformed"
         detail = native.get("usage")
@@ -6444,6 +6540,16 @@ def normalize_native_usage(
     return None, "usage_malformed"
 
 
+def normalize_native_usage(
+    launcher: str, native: Any, wall_seconds: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Fail closed if a recursive provider/library path exceeds its stack."""
+    try:
+        return _normalize_native_usage(launcher, native, wall_seconds)
+    except RecursionError:
+        return None, "usage_malformed"
+
+
 def record_native_session(job: dict[str, Any], session_id: str | None) -> str | None:
     launcher = str(job.get("launcher") or "")
     if launcher not in NATIVE_LAUNCHERS:
@@ -6501,14 +6607,16 @@ def wrap_prompt(job_id: str, prompt: str, cwd: str) -> str:
 
 
 def parse_receipt_text(text: str) -> dict[str, Any] | None:
+    if not isinstance(text, str) or len(text) > _PROVIDER_OUTPUT_MAX_CHARS:
+        return None
     raw = (text or "").strip()
     if not raw:
         return None
     candidates: list[str] = [raw]
     for line in raw.splitlines():
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            event = strict_json_object(line)
+        except ValueError:
             continue
         item = event.get("item") if isinstance(event, dict) and event.get("type") == "item.completed" else None
         if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
@@ -6542,22 +6650,22 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
                         break
     for candidate in reversed(candidates):
         try:
-            obj = json.loads(candidate)
-        except json.JSONDecodeError:
+            obj = strict_json_object(candidate)
+        except ValueError:
             continue
-        if isinstance(obj, dict) and obj.get("status") in ("ok", "error", "timeout"):
+        if obj.get("status") in ("ok", "error", "timeout"):
             return obj
     return None
 
 
 def structured_provider_failure(text: str) -> str | None:
     """Return an allowlisted provider code from adapter-owned JSON, never prose."""
+    if not isinstance(text, str) or len(text) > _PROVIDER_OUTPUT_MAX_CHARS:
+        return None
     for line in (text or "").splitlines():
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
+            event = strict_json_object(line)
+        except ValueError:
             continue
         roots: list[dict[str, Any]] = []
         error = event.get("error")
@@ -7263,10 +7371,8 @@ def _codeoff_jsonl(path: Path) -> list[dict[str, Any]] | None:
                 if total > CODEOFF_PROVENANCE_MAX_BYTES or len(events) >= CODEOFF_PROVENANCE_MAX_EVENTS:
                     return None
                 try:
-                    event = json.loads(raw)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    return None
-                if not isinstance(event, dict):
+                    event = strict_json_object(raw)
+                except ValueError:
                     return None
                 events.append(event)
         return events
