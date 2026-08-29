@@ -4548,6 +4548,23 @@ while True:
         headers = {k.lower(): v for k, v in captured["headers"].items()}
         self.assertEqual(headers.get("x-rewst-token"), "tok_secret")
 
+    def test_post_receipt_encoder_recursion_fails_closed_without_network(self):
+        receipt = {
+            "status": "ok", "job_id": "ab" * 16,
+            "provider_output": "TOKEN_SECRET /private/provider/output",
+        }
+        with mock.patch.object(
+            server.json, "dumps", side_effect=RecursionError("provider recursion")
+        ), mock.patch.object(server, "urlopen") as posted:
+            outcome = server.post_receipt("https://example.invalid/callback", receipt)
+        self.assertEqual(
+            outcome,
+            {"ok": False, "error": "receipt serialization failed"},
+        )
+        posted.assert_not_called()
+        self.assertNotIn("TOKEN_SECRET", str(outcome))
+        self.assertNotIn("/private", str(outcome))
+
     def test_active_runtime_has_no_retired_model_runtime(self):
         root = Path(__file__).resolve().parent
         retired = "her" + "mes"
@@ -8962,6 +8979,27 @@ while True:
             set(),
         )
 
+    def test_claude_21250_required_field_nullability_matches_static_schema(self):
+        nullable_required = {"stop_reason"}
+        self.assertEqual(
+            nullable_required,
+            server._CLAUDE_RESULT_NULLABLE_REQUIRED_FIELDS,
+        )
+        baseline = self._claude_21250_usage_result()
+        for field in sorted(server._CLAUDE_RESULT_REQUIRED_FIELDS):
+            event = deepcopy(baseline)
+            event[field] = None
+            with self.subTest(field=field):
+                usage, diagnostic = server.normalize_native_usage(
+                    "claude", json.dumps(event), 1,
+                )
+                if field in nullable_required:
+                    self.assertIsNotNone(usage)
+                    self.assertIsNone(diagnostic)
+                else:
+                    self.assertIsNone(usage)
+                    self.assertEqual(diagnostic, "usage_malformed")
+
     def test_claude_21250_contract_optional_variants_are_validation_only(self):
         base = self._claude_21250_usage_result()
         for field in ("api_error_status", "terminal_reason", "fast_mode_state"):
@@ -9770,6 +9808,33 @@ while True:
         usage, diagnostic = server.normalize_native_usage("grok", native, 0.5)
         self.assertIsNone(usage)
         self.assertEqual(diagnostic, "usage_malformed")
+
+    def test_native_usage_absence_and_wrong_type_provider_matrix(self):
+        for launcher in ("claude", "codex", "grok"):
+            with self.subTest(launcher=launcher, case="absent"):
+                self.assertEqual(
+                    server.normalize_native_usage(launcher, None, 1),
+                    (None, "usage_not_reported"),
+                )
+        for launcher in ("claude", "codex"):
+            for native in (b"{}", {}, [], 0, False):
+                with self.subTest(
+                    launcher=launcher, case="present_wrong_type",
+                    native_type=type(native).__name__,
+                ):
+                    self.assertEqual(
+                        server.normalize_native_usage(launcher, native, 1),
+                        (None, "usage_malformed"),
+                    )
+        for native in (b"{}", [], 0, False):
+            with self.subTest(
+                launcher="grok", case="present_wrong_type",
+                native_type=type(native).__name__,
+            ):
+                self.assertEqual(
+                    server.normalize_native_usage("grok", native, 1),
+                    (None, "usage_malformed"),
+                )
 
     def test_usage_numeric_bounds_are_exception_safe_and_closed(self):
         from decimal import Decimal
@@ -11231,6 +11296,96 @@ while True:
             self.assertNotIn("/private", public)
             self.assertNotIn("raw provider text", public)
             self.assertEqual(terminal["receipt"]["summary"], "review passed")
+
+    def test_review_terminal_encoder_recursion_preserves_running_cas_and_suppresses_callback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(
+                root, extra={"response_webhook_url": "https://example.invalid/review"}
+            )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            path = jobs / job_id / "job.json"
+            encoder_patch = mock.patch.object(
+                server.json, "dumps", side_effect=RecursionError("provider recursion")
+            )
+            observed = {}
+
+            def inject_after_launch(*_args, **_kwargs):
+                observed["running_bytes"] = path.read_bytes()
+                authority = server.review_authority(job_id)
+                self.assertIsNotNone(authority)
+                assert authority is not None
+                observed["sealed_bytes"] = authority.running_record_bytes
+                observed["sealed_hash"] = authority.running_record_hash
+                encoder_patch.start()
+                return {
+                    "ok": True, "verdict": "PASS", "no_verdict": False,
+                    "summary": "TOKEN_SECRET /private/provider/output",
+                }
+
+            try:
+                with mock.patch.object(
+                    server, "native_review_result", side_effect=inject_after_launch
+                ), mock.patch.object(server, "deliver_webhook") as callback, \
+                     mock.patch.object(server, "herdr_job_done"):
+                    server.run_review_job(job_id)
+            finally:
+                encoder_patch.stop()
+            callback.assert_not_called()
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["status"], "running")
+            self.assertIsNone(saved["receipt"])
+            self.assertNotIn("TOKEN_SECRET", path.read_text())
+            self.assertEqual(path.read_bytes(), observed["running_bytes"])
+            self.assertEqual(
+                server._review_snapshot_bytes(saved), observed["sealed_bytes"],
+            )
+            self.assertEqual(
+                hashlib.sha256(observed["sealed_bytes"]).hexdigest(),
+                observed["sealed_hash"],
+            )
+            self.assertIsNone(server.review_authority(job_id))
+            response_status, payload = server.review_job_response(job_id)
+            self.assertEqual(
+                (response_status, payload["code"]),
+                (409, "review_authority_unavailable"),
+            )
+
+    def test_sanitized_review_receipt_encoder_recursion_returns_no_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            with mock.patch.object(server, "native_review_result", return_value={
+                "ok": True, "verdict": "PASS", "no_verdict": False,
+            }), mock.patch.object(server, "deliver_webhook", return_value=None), \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            stored = json.loads((jobs / job_id / "job.json").read_text())
+            with mock.patch.object(
+                server.json, "dumps", side_effect=RecursionError("provider recursion")
+            ):
+                projected = server.sanitized_review_receipt(stored)
+            self.assertIsNone(projected)
+
+    def test_review_job_response_encoder_recursion_is_stable_sanitized_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status, accepted, _jobs, _repo, _launcher, _ = self._queue_closed_review(root)
+            self.assertEqual(status, 202, accepted)
+            with mock.patch.object(
+                server, "_review_snapshot_bytes",
+                side_effect=RecursionError("provider recursion"),
+            ):
+                response_status, payload = server.review_job_response(accepted["job_id"])
+            self.assertEqual(response_status, 409)
+            self.assertEqual(payload, {
+                "error": "review record is not canonical",
+                "code": "review_record_invalid",
+            })
+            self.assertNotIn("provider recursion", str(payload))
 
     def test_review_async_returns_accepted_snapshot_when_worker_finishes_during_enqueue(self):
         with tempfile.TemporaryDirectory() as td:
