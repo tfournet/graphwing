@@ -336,6 +336,8 @@ GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/sessions/changed",
     "_x.ai/settings/update",
 })
+GROK_ACP_API_KEY_AUTH_METHOD = "xai.api_key"
+GROK_ACP_CACHED_OAUTH_AUTH_METHODS = frozenset({"cached_token", "grok.com"})
 CODEOFF_PROTOCOL_VERSION = "code-off-v1"
 CODEOFF_CATEGORY_VERSION = "code-category-v1"
 CODEOFF_DRAW_VERSION = "code-off-draw-v1"
@@ -7553,7 +7555,21 @@ def run_grok_acp(
                     raise ValueError("malformed Grok ACP authentication methods")
                 method_by_id[method_id] = method
             if auth_methods:
-                method_id = "xai.api_key" if os.environ.get("XAI_API_KEY") else "cached_token"
+                supported_ids = GROK_ACP_CACHED_OAUTH_AUTH_METHODS | {GROK_ACP_API_KEY_AUTH_METHOD}
+                if not set(method_by_id).issubset(supported_ids):
+                    job["_adapter_failure_code"] = "adapter_contract_invalid"
+                    raise RuntimeError("unsupported Grok ACP authentication")
+                if os.environ.get("XAI_API_KEY"):
+                    method_id = GROK_ACP_API_KEY_AUTH_METHOD
+                else:
+                    cached_ids = [
+                        method_id for method_id in method_by_id
+                        if method_id in GROK_ACP_CACHED_OAUTH_AUTH_METHODS
+                    ]
+                    if len(cached_ids) != 1:
+                        job["_adapter_failure_code"] = "adapter_contract_invalid"
+                        raise RuntimeError("unsupported Grok ACP authentication")
+                    method_id = cached_ids[0]
                 selected = method_by_id.get(method_id)
                 if selected is None or selected.get("type", "agent") != "agent":
                     job["_adapter_failure_code"] = "adapter_contract_invalid"

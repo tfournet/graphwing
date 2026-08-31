@@ -4036,6 +4036,76 @@ while True:
         self.assertEqual(auth["params"]["methodId"], "cached_token")
         self.assertEqual(saved["status"], "completed")
 
+    def test_grok_acp_uses_grok_com_cached_oauth_without_api_key(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "auth_methods": [{"id": "grok.com", "name": "Grok", "description": "Sign in with Grok"}],
+        }, api_key=False)
+        requests = capture["requests"]
+        self.assertEqual([r["method"] for r in requests], [
+            "initialize", "authenticate", "session/new", "session/prompt",
+        ])
+        self.assertEqual(requests[1]["params"], {
+            "methodId": "grok.com", "_meta": {"headless": True},
+        })
+        self.assertEqual(saved["status"], "completed")
+        self.assertNotIn("cached_token", json.dumps(requests))
+
+    def test_grok_acp_api_key_mode_selects_xai_api_key_exactly(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "auth_methods": [
+                {"id": "grok.com", "name": "Grok", "description": "Sign in with Grok"},
+                {"id": "xai.api_key"},
+                {"id": "cached_token"},
+            ],
+        })
+        auth = next(r for r in capture["requests"] if r["method"] == "authenticate")
+        self.assertEqual(auth["params"], {"methodId": "xai.api_key", "_meta": {"headless": True}})
+        self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_uses_legacy_cached_token_when_installed(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "auth_methods": [{"id": "cached_token"}],
+        }, api_key=False)
+        auth = next(r for r in capture["requests"] if r["method"] == "authenticate")
+        self.assertEqual(auth["params"], {"methodId": "cached_token", "_meta": {"headless": True}})
+        self.assertEqual(saved["status"], "completed")
+
+    def test_grok_acp_rejects_ambiguous_unknown_duplicate_and_malformed_cached_auth(self):
+        cases = {
+            "ambiguous": [{"id": "grok.com"}, {"id": "cached_token"}],
+            "unknown": [{"id": "other"}],
+            "supported plus unknown": [{"id": "grok.com"}, {"id": "other"}],
+            "duplicate": [{"id": "grok.com"}, {"id": "grok.com"}],
+            "malformed": [{"id": ""}],
+            "terminal": [{"id": "grok.com", "type": "terminal"}],
+        }
+        for name, auth_methods in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture(
+                    {"auth_methods": auth_methods}, api_key=False,
+                )
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["failure_code"], "adapter_contract_invalid")
+                self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
+                self.assertNotIn("unsupported Grok ACP authentication", json.dumps(saved["receipt"]))
+                self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+                self.assertNotIn("session/new", [r["method"] for r in capture["requests"]])
+
+    def test_grok_acp_authenticate_failure_does_not_open_session(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "auth_methods": [{"id": "grok.com", "name": "Grok", "description": "Sign in with Grok"}],
+            "error_method": "authenticate",
+        }, api_key=False)
+        methods = [r["method"] for r in capture["requests"]]
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
+        self.assertIn("authenticate", methods)
+        self.assertEqual(capture["requests"][1]["params"], {
+            "methodId": "grok.com", "_meta": {"headless": True},
+        })
+        self.assertNotIn("session/new", methods)
+        self.assertNotIn("session/prompt", methods)
+
     def test_grok_acp_allows_omitted_auth_methods_without_authenticate(self):
         saved, capture, _ = self._run_grok_fixture({"omit_auth_methods": True})
         self.assertEqual(saved["status"], "completed")
@@ -14419,24 +14489,27 @@ func main() {
     # MAX_ARG_STRLEN, under the current maximum. It is a fixture dimension, not a
     # measurement of the patch under review, so it never goes stale.
     _LARGE_CANDIDATE_DIFF_BYTES = 224 * 1024
-    # The Phase 6 candidate diff is part of this patch, so its size changes with
-    # every follow-up commit. Pinning that size in a test would make the test
-    # invalidate itself, so the coverage claim is measured live against this base
-    # and skipped wherever the base is not reachable.
+    # The merged Phase 6 candidate remains fixed at this reviewed boundary.
+    # Follow-up patches are measured independently from the landed commit rather
+    # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
+    _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
 
-    def _cumulative_candidate_diff_bytes(self):
-        """Measure `git diff <phase 6 base>` now, or None when unmeasurable."""
+    def _candidate_diff_bytes(self, base, head=None):
+        """Measure a reachable candidate range, or None when unmeasurable."""
         repo = str(Path(__file__).resolve().parent)
-        reachable = subprocess.run(
-            ["git", "-C", repo, "cat-file", "-e", f"{self._PHASE6_BASE_COMMIT}^{{commit}}"],
-            capture_output=True,
-        )
-        if reachable.returncode != 0:
-            return None
-        measured = subprocess.run(
-            ["git", "-C", repo, "diff", self._PHASE6_BASE_COMMIT], capture_output=True
-        )
+        revisions = (base,) if head is None else (base, head)
+        for revision in revisions:
+            reachable = subprocess.run(
+                ["git", "-C", repo, "cat-file", "-e", f"{revision}^{{commit}}"],
+                capture_output=True,
+            )
+            if reachable.returncode != 0:
+                return None
+        command = ["git", "-C", repo, "diff", base]
+        if head is not None:
+            command.append(head)
+        measured = subprocess.run(command, capture_output=True)
         if measured.returncode != 0:
             return None
         return len(measured.stdout)
@@ -14714,15 +14787,16 @@ func main() {
                 self.assertNotIn("223,401", text)
                 self.assertNotIn("241,008", text)
 
-    def test_cumulative_phase6_candidate_still_fits_the_review_maximum(self):
-        # Measured now rather than pinned: this patch is part of the diff it
-        # measures, so any recorded figure would invalidate itself on the next
-        # commit. Skipped where the base commit is not reachable.
-        measured = self._cumulative_candidate_diff_bytes()
-        if not measured:
-            self.skipTest("phase 6 base commit is not reachable from this checkout")
-        self.assertGreater(measured, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
-        self.assertLessEqual(measured, server.REVIEW_MAX_DIFF_BYTES)
+    def test_landed_phase6_and_followup_candidates_fit_the_review_maximum(self):
+        landed = self._candidate_diff_bytes(
+            self._PHASE6_BASE_COMMIT, self._PHASE6_LANDED_COMMIT
+        )
+        followup = self._candidate_diff_bytes(self._PHASE6_LANDED_COMMIT)
+        if landed is None or followup is None:
+            self.skipTest("phase 6 review boundaries are not reachable from this checkout")
+        self.assertGreater(landed, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(landed, server.REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(followup, server.REVIEW_MAX_DIFF_BYTES)
 
     def test_large_review_diff_launches_with_the_prompt_off_argv(self):
         # A 224-KiB diff: far past the superseded maximum and past the single
