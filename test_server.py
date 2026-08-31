@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +54,13 @@ def _fixture_identity_profile(profile):
         "effort_source": profile["effort_source"],
         "launcher_version": profile["launcher_version"],
     }
+
+
+def _grok_node_fixture_version(script: bytes, node: bytes) -> str:
+    return "sha256:" + hashlib.sha256(
+        b"graphwing/grok-node-launcher/v1\0"
+        + hashlib.sha256(script).digest() + hashlib.sha256(node).digest()
+    ).hexdigest()
 
 
 def _stamp_fixture_execution_profile(job, binary=None, requested="default", source="launcher_default"):
@@ -881,8 +888,14 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             grok = root / "grok"
-            grok.write_text("fixture")
+            node = root / "node"
+            script_bytes, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"node-initial"
+            grok.write_bytes(script_bytes)
+            node.write_bytes(node_bytes)
+            grok.chmod(0o755)
+            node.chmod(0o755)
             expected_profile = _fixture_execution_profile("grok", "xai", "grok-4.6", grok)
+            expected_profile["launcher_version"] = _grok_node_fixture_version(script_bytes, node_bytes)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
                 check=True, capture_output=True, text=True,
@@ -895,7 +908,9 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "ping", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6",
             }).encode()
-            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
+            with mock.patch.dict(os.environ, {
+                     "GRAPHWING_GROK_BIN": str(grok), "GRAPHWING_NODE_BIN": str(node)
+                 }), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -917,7 +932,12 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             grok = root / "grok"
-            grok.write_text("fixture")
+            node = root / "node"
+            script_bytes, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"node-resume"
+            grok.write_bytes(script_bytes)
+            node.write_bytes(node_bytes)
+            grok.chmod(0o755)
+            node.chmod(0o755)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
                 check=True, capture_output=True, text=True,
@@ -927,6 +947,7 @@ class DispatchTests(unittest.TestCase):
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
             profile = _fixture_execution_profile("grok", "xai", "grok-4.6", grok)
+            profile["launcher_version"] = _grok_node_fixture_version(script_bytes, node_bytes)
             identity = {
                 "launcher": "grok", "provider": "xai", "model": "grok-4.6",
                 **_fixture_identity_profile(profile),
@@ -953,7 +974,9 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "continue", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6", "resume_job_id": prior_job_id,
             }
-            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
+            with mock.patch.dict(os.environ, {
+                     "GRAPHWING_GROK_BIN": str(grok), "GRAPHWING_NODE_BIN": str(node)
+                 }), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -3232,6 +3255,106 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result, (1, False, None, "unsupported effort profile"))
         self.assertEqual(job["_adapter_failure_code"], "unsupported_effort")
         popen.assert_not_called()
+
+    def test_grok_node_composite_pin_shebang_argv_and_cleanup(self):
+        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "high", "high")
+        domain = b"graphwing/grok-node-launcher/v1\0"
+        matrix = ((b"#!/usr/bin/env node\n", True), (b"#!/usr/bin/env -S node\r\n", True),
+                  (b"#!/usr/bin/node", True), (b"#!/usr/bin/env  node\n", False),
+                  (b"#!/usr/bin/env node --flag\n", False), (b"#!/usr/bin/env node\r", False),
+                  (b"#!/usr/bin/env node\r\r\n", False), (b"#!/usr/bin/env nodejs\n", False))
+        with tempfile.TemporaryDirectory() as td:
+            root, captured = Path(td), []
+            grok, node = Path(td)/"grok", Path(td)/"node"
+            for raw, expected in matrix:
+                grok.write_bytes(raw)
+                self.assertEqual(server.grok_node_shebang(grok), expected, raw)
+            script, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"exact-node"
+            grok.write_bytes(script); node.write_bytes(node_bytes)
+            grok.chmod(0o755); node.chmod(0o755)
+            (root/"jobs"/job["job_id"]).mkdir(parents=True)
+            expected = "sha256:" + hashlib.sha256(
+                domain + hashlib.sha256(script).digest() + hashlib.sha256(node_bytes).digest()
+            ).hexdigest()
+            with mock.patch.object(server, "JOBS_DIR", root/"jobs"), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN": str(node)}), \
+                 server.pinned_native_launcher(grok, "grok") as accepted:
+                accepted_fds = (accepted.fd, accepted.companion.fd)
+                self.assertEqual(accepted.fingerprint, expected)
+                for mode in ("writer", "review"):
+                    with server.repin_native_launcher(accepted, "grok") as execution:
+                        execution_fds = (execution.fd, execution.companion.fd)
+                        def stop(command, **kwargs):
+                            captured.append((mode, command, kwargs["pass_fds"])); raise AssertionError("stop")
+                        with mock.patch.object(server.subprocess, "Popen", side_effect=stop), \
+                             self.assertRaises(AssertionError):
+                            server.run_grok_acp(dict(job), execution.path, mode=mode,
+                                                interpreter=execution.companion.path)
+                    self.assertTrue(all(self._fd_is_closed(fd) for fd in execution_fds))
+            self.assertTrue(all(self._fd_is_closed(fd) for fd in accepted_fds))
+            for mode, command, fds in captured:
+                self.assertEqual(command[:4], [f"/proc/self/fd/{fds[1]}", "--preserve-symlinks-main",
+                                               f"/proc/self/fd/{fds[0]}", "agent"])
+                self.assertEqual(tuple(fds), tuple(sorted(set(fds))))
+                self.assertEqual("--always-approve" in command, mode == "writer")
+                self.assertNotIn("node", command)
+            node.write_bytes(b"changed-node")
+            with mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN": str(node)}), \
+                 server.pinned_native_launcher(grok, "grok") as changed:
+                self.assertNotEqual(changed.fingerprint, expected)
+            for launcher in ("codex", "claude"):
+                with server.pinned_native_launcher(grok, launcher) as unchanged:
+                    self.assertEqual(unchanged.fingerprint,
+                                     "sha256:" + hashlib.sha256(script).hexdigest())
+                    self.assertIsNone(unchanged.companion)
+
+    @staticmethod
+    def _fd_is_closed(fd):
+        try:
+            os.fstat(fd)
+        except OSError:
+            return True
+        return False
+
+    def test_grok_node_acceptance_reviews_and_failures_are_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, grok, node = Path(td), Path(td)/"grok", Path(td)/"node"
+            grok.write_bytes(b"#!/usr/bin/env node\nfixture\n"); node.write_bytes(b"node")
+            grok.chmod(0o755); node.chmod(0o755)
+            body = json.dumps({"repo":"scratch", "launcher":"grok", "provider":"xai",
+                               "model":"grok-4.6", "prompt":"fixture"}).encode()
+            raw = {"ok":True, "verdict":"PASS", "no_verdict":False, "returncode":0,
+                   "usage":None, "usage_diagnostic":"usage_not_reported"}
+            common = (mock.patch.object(server, "resolve_launcher_binary_now", return_value=grok),
+                      mock.patch.object(server, "git_diff", return_value={"ok":True,"diff":"x","truncated":False}),
+                      mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN":str(node)}),
+                      mock.patch.object(server, "JOBS_DIR", root/"jobs"),
+                      mock.patch.object(server, "active_job_count", return_value=0))
+            with common[0], common[1], common[2], common[3], common[4], mock.patch.object(
+                    server, "_native_review_result_pinned", return_value=raw) as boundary:
+                status, sync, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+            self.assertEqual((status, sync["status"]), (200, "ok"))
+            context = boundary.call_args.args[0]
+            self.assertEqual(context.pinned_launcher.fingerprint,
+                             sync["execution_identity"]["launcher_version"])
+            with common[0], common[1], common[2], common[3], common[4], mock.patch.object(server, "enqueue_review") as enqueue:
+                status, queued, _ = server.dispatch("POST", "/v1/review/run", {}, True,
+                                                    json.dumps({**json.loads(body), "async":True}).encode())
+            self.assertEqual(status, 202); enqueue.assert_called_once()
+            authority = server.review_authority(queued["job_id"])
+            self.assertEqual(authority.launcher.fingerprint,
+                             queued["execution_identity"]["launcher_version"])
+            server.release_review_authority(queued["job_id"])
+            for failure, expected_status in ((root/"missing-node", 501), (node, 409)):
+                side = (None if expected_status == 501 else OSError("/secret TOKEN"))
+                with mock.patch.dict(os.environ, {
+                         "GRAPHWING_GROK_BIN":str(grok), "GRAPHWING_NODE_BIN":str(failure)
+                     }), \
+                     mock.patch.object(server, "grok_node_shebang", side_effect=side) if side else nullcontext(), \
+                     mock.patch.object(server, "native_review_result") as spawn:
+                    status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+                self.assertEqual(status, expected_status); spawn.assert_not_called()
+                self.assertNotIn("TOKEN", json.dumps(payload))
 
     def test_all_native_adapters_bind_execution_profile(self):
         # Independent contract: do not derive expected rows from implementation tables.

@@ -24,7 +24,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,27 +109,9 @@ EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
 REVIEW_EFFORT_SOURCES = frozenset({"explicit", "launcher_default"})
 REVIEW_EXECUTION_VERSION = "review-execution-v1"
-# One review authority binds the complete diff, hashed byte-exact. A prefix hash
-# would give two candidates sharing that prefix the same diff_sha256 and the same
-# review authority, so an oversized diff is rejected before launch instead of
-# truncated.
-#
-# The maximum has to cover the candidates this bound exists to review, and the
-# previous 64-KiB maximum rejected the cumulative Phase 6 candidate outright. It
-# is deliberately not derived from that candidate's measured size: the candidate
-# is this patch, so every follow-up commit changes it and any figure recorded
-# here would invalidate itself. The bound comes from the one host limit left
-# instead. CMD_MAX_BYTES is the 256-KiB cap `run_cmd` applies to captured
-# `git diff` output, and a diff at or over that cap comes back flagged
-# truncated, which is a prefix and never reviewable. 252 KiB is the largest
-# round maximum that stays clear of the capture cap, leaving 4,096 bytes of
-# headroom, so an accepted diff is always the complete bytes git produced.
-#
-# Linux MAX_ARG_STRLEN no longer bounds this. It rejects a single argv string of
-# 131,072 bytes or more, so a maximum-sized prompt cannot ride in argv; every
-# review launcher transports its prompt off argv instead. Codex and Claude write
-# the prompt to the child's stdin, and Grok sends it as an ACP `session/prompt`
-# text block read from the job's prompt file.
+# Complete git diff bytes, never a prefix. 252 KiB is the largest round maximum
+# under the 256-KiB capture cap (4,096 bytes of headroom). Prompt text travels
+# off argv (stdin or ACP), so MAX_ARG_STRLEN does not bound this.
 REVIEW_MAX_DIFF_BYTES = 252 * 1024
 REVIEW_PERMISSION_PROFILES = {
     "codex": "codex-read-only",
@@ -2620,8 +2602,13 @@ class PinnedLauncher:
         self.fd = fd
         self.path = Path(f"/proc/self/fd/{fd}")
         self.fingerprint = fingerprint
+        self.companion: PinnedLauncher | None = None
 
     def close(self) -> None:
+        companion = self.companion
+        self.companion = None
+        if companion is not None:
+            companion.close()
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
@@ -2699,11 +2686,90 @@ def pinned_launcher(binary: Path):
             pinned.close()
 
 
-def launcher_version_fingerprint(binary: Path) -> str | None:
+GROK_NODE_SHEBANGS = frozenset({
+    b"#!/usr/bin/env node", b"#!/usr/bin/env -S node", b"#!/usr/bin/node",
+})
+GROK_NODE_FINGERPRINT_DOMAIN = b"graphwing/grok-node-launcher/v1\0"
+
+
+class GrokNodeUnavailable(FileNotFoundError):
+    """The exact Node companion required by a Grok script could not be pinned."""
+
+
+def grok_node_shebang(binary: Path) -> bool:
+    """Recognize only the exact closed Node shebang forms Graphwing supports."""
+    with binary.open("rb") as fh:
+        line = fh.readline(128)
+    if line.endswith(b"\r\n"):
+        line = line[:-2]
+    elif line.endswith(b"\n"):
+        line = line[:-1]
+    return line in GROK_NODE_SHEBANGS
+
+
+def _grok_composite_fingerprint(script: str, node: str) -> str:
+    digest = hashlib.sha256(GROK_NODE_FINGERPRINT_DOMAIN
+                            + bytes.fromhex(script[7:]) + bytes.fromhex(node[7:]))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _attach_grok_node(pinned: PinnedLauncher, node_binary: Path | None = None) -> None:
+    if not grok_node_shebang(pinned.path):
+        return
+    try:
+        pinned.companion = pin_launcher(node_binary or resolve_executable(
+            "node", "GRAPHWING_NODE_BIN", Path.home() / ".local" / "bin" / "node"))
+    except FileNotFoundError as exc:
+        raise GrokNodeUnavailable("Grok Node companion is unavailable") from exc
+    pinned.fingerprint = _grok_composite_fingerprint(
+        pinned.fingerprint, pinned.companion.fingerprint)
+
+
+def pin_native_launcher(binary: Path, launcher: str) -> PinnedLauncher:
+    """Pin every executable artifact consumed by one supported launcher."""
+    pinned = pin_launcher(binary)
+    try:
+        if launcher == "grok":
+            _attach_grok_node(pinned)
+        return pinned
+    except BaseException:
+        pinned.close()
+        raise
+
+
+@contextmanager
+def pinned_native_launcher(binary: Path, launcher: str):
+    pinned = pin_native_launcher(binary, launcher)
+    try:
+        yield pinned
+    finally:
+        pinned.close()
+
+
+@contextmanager
+def repin_native_launcher(accepted: PinnedLauncher, launcher: str):
+    """Copy accepted sealed artifacts into fresh execution-only descriptors."""
+    execution = pin_launcher(accepted.path)
+    try:
+        if launcher == "grok":
+            node_script = grok_node_shebang(execution.path)
+            if node_script != (accepted.companion is not None):
+                raise OSError("accepted Grok launcher shape changed")
+            if node_script:
+                assert accepted.companion is not None
+                _attach_grok_node(execution, accepted.companion.path)
+        yield execution
+    finally:
+        execution.close()
+
+
+def launcher_version_fingerprint(binary: Path, launcher: str | None = None) -> str | None:
     """Return a path-free immutable launcher artifact identity without executing it."""
     try:
-        with pinned_launcher(binary) as pinned:
+        with pinned_native_launcher(binary, launcher or "") as pinned:
             return pinned.fingerprint
+    except GrokNodeUnavailable:
+        return "missing_companion"
     except FileNotFoundError:
         return "missing"
     except OSError:
@@ -3211,6 +3277,24 @@ def review_diff_rejection(code: str) -> dict[str, str]:
 
 
 def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
+    """Re-pin accepted Grok artifacts into one execution authority."""
+    if context.launcher != "grok":
+        return _native_review_result_pinned(context)
+    mismatch = {
+        "ok": False, "verdict": "NACK", "no_verdict": True,
+        "error": "review execution identity changed before launch",
+        "code": "review_execution_identity_mismatch",
+    }
+    try:
+        with repin_native_launcher(context.pinned_launcher, "grok") as execution:
+            if execution.fingerprint != context.execution_identity.get("launcher_version"):
+                return mismatch
+            return _native_review_result_pinned(replace(context, pinned_launcher=execution))
+    except OSError:
+        return mismatch
+
+
+def _native_review_result_pinned(context: NativeReviewExecutionContext) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     usage_started = time.monotonic()
     if not review_runtime_matches_identity(context):
@@ -3282,8 +3366,10 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
             "run_budget_seconds": run_budget_seconds,
             "session_identity": None,
         })
+        companion = context.pinned_launcher.companion
         returncode, timed_out, _session_id, error = run_grok_acp(
-            grok_job, binary, mode="review"
+            grok_job, binary, mode="review",
+            **({} if companion is None else {"interpreter": companion.path}),
         )
         native_usage = grok_job.pop("_native_usage", None)
         text = read_bounded_output(path / "last-message.txt")
@@ -3598,13 +3684,15 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     binary = resolve_launcher_binary_now(launcher)
     accepted_launcher: PinnedLauncher | None = None
     try:
-        accepted_launcher = pin_launcher(binary)
-    except FileNotFoundError:
-        return 501, {
-            "error": "review launcher identity is unavailable",
-            "code": "not_implemented",
-        }
-    except OSError:
+        accepted_launcher = pin_native_launcher(binary, launcher)
+    except (FileNotFoundError, OSError) as exc:
+        if accepted_launcher is not None:
+            accepted_launcher.close()
+        if isinstance(exc, FileNotFoundError):
+            return 501, {
+                "error": "review launcher identity is unavailable",
+                "code": "not_implemented",
+            }
         return 409, {
             "error": "review launcher identity changed during acceptance",
             "code": "review_execution_identity_mismatch",
@@ -5061,8 +5149,11 @@ def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bo
         and identity.get("effort_source") == context.effort_source
         and identity.get("route_execution_profile") == context.route_execution_profile
         and identity.get("launcher_version") == context.pinned_launcher.fingerprint
-        and launcher_version_fingerprint(context.pinned_launcher.path)
-            == context.pinned_launcher.fingerprint
+        and (
+            context.launcher == "grok"
+            or launcher_version_fingerprint(context.pinned_launcher.path)
+                == context.pinned_launcher.fingerprint
+        )
         and identity.get("repo") == context.repo
         and context.resolved == context.resolved.resolve()
         and identity.get("run_budget_seconds") == context.run_budget_seconds
@@ -7227,6 +7318,7 @@ def spawn_codex(
 def grok_acp_command(
     job: dict[str, Any], binary: Path | None = None, *,
     mode: Literal["writer", "review"],
+    interpreter: Path | None = None,
 ) -> list[str]:
     if mode not in ("writer", "review"):
         raise ValueError("invalid Grok ACP mode")
@@ -7235,6 +7327,8 @@ def grok_acp_command(
     if not valid or effort is None:
         raise ValueError("unsupported effort profile")
     command = [str(binary), "agent"]
+    if interpreter is not None:
+        command[:0] = [str(interpreter), "--preserve-symlinks-main"]
     if mode == "writer":
         command.append("--always-approve")
     command.extend([
@@ -7246,6 +7340,7 @@ def grok_acp_command(
 def run_grok_acp(
     job: dict[str, Any], binary: Path | None = None, *,
     mode: Literal["writer", "review"],
+    interpreter: Path | None = None,
 ) -> tuple[int, bool, str | None, str | None]:
     """Run one bounded ACP writer or read-only review turn."""
     if mode not in ("writer", "review"):
@@ -7259,7 +7354,9 @@ def run_grok_acp(
     env = native_job_env(job)
     env["GROK_DISABLE_AUTOUPDATER"] = "1"
     try:
-        command = grok_acp_command(job, binary, mode=mode)
+        command = grok_acp_command(
+            job, binary, mode=mode, interpreter=interpreter
+        )
     except ValueError as exc:
         job["_adapter_failure_code"] = (
             "adapter_contract_invalid" if str(exc) == "invalid Grok ACP mode" else "unsupported_effort"
@@ -7270,7 +7367,10 @@ def run_grok_acp(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, env=env, start_new_session=True, bufsize=0,
-            pass_fds=launcher_pass_fds(binary),
+            pass_fds=tuple(sorted(set(
+                launcher_pass_fds(binary)
+                + (() if interpreter is None else launcher_pass_fds(interpreter))
+            ))),
         )
     except OSError as exc:
         job["_adapter_failure_code"] = "spawn_failed"
@@ -7783,15 +7883,17 @@ def run_agent_job(job_id: str) -> None:
     usage_started = time.monotonic()
     binary = resolve_launcher_binary_now(str(job["launcher"]))
     try:
-        with pinned_launcher(binary) as pinned:
+        with pinned_native_launcher(binary, str(job["launcher"])) as pinned:
             if pinned.fingerprint != job.get("launcher_version"):
                 proc, err = None, {
                     "error": "launcher version changed after request validation",
                     "code": "launcher_version_mismatch",
                 }
             elif job.get("launcher") == "grok":
+                companion = pinned.companion
                 returncode, timed_out, session_id, protocol_error = run_grok_acp(
-                    job, pinned.path, mode="writer"
+                    job, pinned.path, mode="writer",
+                    **({} if companion is None else {"interpreter": companion.path}),
                 )
                 proc, err = None, None
             else:
@@ -9070,7 +9172,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             launcher = identity["launcher"]
             if launcher not in fingerprints:
                 fingerprints[launcher] = (
-                    launcher_version_fingerprint(resolve_launcher_binary_now(launcher))
+                    launcher_version_fingerprint(resolve_launcher_binary_now(launcher), launcher)
                     if launcher in NATIVE_LAUNCHERS else None
                 )
             profile, effort_err = normalize_effort(
@@ -10051,12 +10153,20 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
         return 400, {"error": "code-off job must use the immutable turn and time budgets", "code": "codeoff_budget_mismatch"}
     binary = resolve_launcher_binary_now(launcher)
-    launcher_version = launcher_version_fingerprint(binary)
-    if launcher_version is None:
-        classified = classify_agent_failure("launcher_version_mismatch")
+    launcher_version = launcher_version_fingerprint(binary, launcher)
+    if launcher_version in (None, "missing_companion"):
+        failure_code = (
+            "missing_binary" if launcher_version == "missing_companion"
+            else "launcher_version_mismatch"
+        )
+        classified = classify_agent_failure(failure_code)
         return 501, {
-            "error": "launcher version is unavailable",
-            "code": "launcher_version_mismatch",
+            "error": (
+                "Grok Node interpreter is unavailable"
+                if launcher_version == "missing_companion"
+                else "launcher version is unavailable"
+            ),
+            "code": failure_code,
             **classified,
         }
     if codeoff is not None and launcher_version != codeoff["identity"].get("launcher_version"):
