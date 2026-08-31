@@ -3045,6 +3045,7 @@ class DispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(cmd[cmd.index("--effort") + 1], effort)
                 self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "acceptEdits")
+                self.assertEqual(cmd[cmd.index("--allowedTools") + 1], "Bash")
         default_job = self._adapter_contract_job(
             "claude", "anthropic", "claude-opus-5", "default", "default"
         )
@@ -3065,6 +3066,7 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(cmd[cmd.index("--effort") + 1], "high")
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("--allowedTools", cmd)
 
     def test_grok_acp_command_uses_effective_effort(self):
         job = self._adapter_contract_job(
