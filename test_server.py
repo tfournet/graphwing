@@ -6807,11 +6807,15 @@ while True:
             "Red test state is never a routing input",
             "Normal review effort is `medium`; sensitive review effort is `high`",
             "12 turns and 200 seconds",
+            "non-production",
         ):
             self.assertIn(statement, note)
         self.assertIn("routing-policy-v2 candidate is not active", human_loop)
         self.assertIn("normal reviews request `medium`", human_loop)
         self.assertIn("sensitive reviews request `high`", human_loop)
+        self.assertIn("benchmark-only and non-production", human_loop)
+        baseline = (Path(__file__).parent / "docs/notes/routing-v1-baseline.md").read_text()
+        self.assertIn("superseded by Phase 5", baseline)
 
     def test_writer_and_reviewer_effort_policies_are_separate_and_bounded(self):
         for work_kind in server.SLICE_WORK_KINDS:
@@ -6941,6 +6945,595 @@ while True:
             "920ca44787092da31c5277ca31a8fa77cc44c96b35703df8fcc2f6581a28a430",
         )
 
+    # Hard-coded candidate expectations. Every value below is written out by
+    # hand from docs/notes/routing-policy-v2.md and must never be recomputed
+    # from server.py tables or helpers.
+    CANDIDATE_MATRIX = {
+        ("go_coding", "mechanical", "S"): (
+            "claude", "anthropic", "claude-sonnet-5", "medium",
+            "Candidate routing-policy-v2: go_coding, mechanical effective size S"
+            " selects claude-sonnet-5 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "mechanical", "M"): (
+            "claude", "anthropic", "claude-sonnet-5", "medium",
+            "Candidate routing-policy-v2: go_coding, mechanical effective size M"
+            " selects claude-sonnet-5 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "mechanical", "L"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, mechanical effective size L"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "visual", "S"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, visual effective size S"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "visual", "M"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, visual effective size M"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "visual", "L"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, visual effective size L"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "sensitive", "S"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, sensitive effective size S"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "sensitive", "M"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, sensitive effective size M"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("go_coding", "sensitive", "L"): (
+            "codex", "openai", "gpt-5.6-sol", "high",
+            "Candidate routing-policy-v2: go_coding, sensitive effective size L"
+            " selects gpt-5.6-sol at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("typescript_coding", "mechanical", "S"): (
+            "claude", "anthropic", "claude-sonnet-5", "medium",
+            "Candidate routing-policy-v2: typescript_coding, mechanical effective"
+            " size S selects claude-sonnet-5 at medium effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "mechanical", "M"): (
+            "claude", "anthropic", "claude-sonnet-5", "medium",
+            "Candidate routing-policy-v2: typescript_coding, mechanical effective"
+            " size M selects claude-sonnet-5 at medium effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "mechanical", "L"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, mechanical effective"
+            " size L selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "visual", "S"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, visual effective"
+            " size S selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "visual", "M"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, visual effective"
+            " size M selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "visual", "L"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, visual effective"
+            " size L selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "sensitive", "S"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, sensitive effective"
+            " size S selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "sensitive", "M"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, sensitive effective"
+            " size M selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("typescript_coding", "sensitive", "L"): (
+            "claude", "anthropic", "claude-opus-5", "high",
+            "Candidate routing-policy-v2: typescript_coding, sensitive effective"
+            " size L selects claude-opus-5 at high effort; benchmark evidence"
+            " is required before activation.",
+        ),
+        ("research_ops", "mechanical", "S"): (
+            "grok", "xai", "grok-4.6", "medium",
+            "Candidate routing-policy-v2: research_ops, mechanical effective size S"
+            " selects grok-4.6 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "mechanical", "M"): (
+            "grok", "xai", "grok-4.6", "medium",
+            "Candidate routing-policy-v2: research_ops, mechanical effective size M"
+            " selects grok-4.6 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "mechanical", "L"): (
+            "grok", "xai", "grok-4.6", "high",
+            "Candidate routing-policy-v2: research_ops, mechanical effective size L"
+            " selects grok-4.6 at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "visual", "S"): (
+            "grok", "xai", "grok-4.6", "medium",
+            "Candidate routing-policy-v2: research_ops, visual effective size S"
+            " selects grok-4.6 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "visual", "M"): (
+            "grok", "xai", "grok-4.6", "medium",
+            "Candidate routing-policy-v2: research_ops, visual effective size M"
+            " selects grok-4.6 at medium effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "visual", "L"): (
+            "grok", "xai", "grok-4.6", "high",
+            "Candidate routing-policy-v2: research_ops, visual effective size L"
+            " selects grok-4.6 at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "sensitive", "S"): (
+            "grok", "xai", "grok-4.6", "high",
+            "Candidate routing-policy-v2: research_ops, sensitive effective size S"
+            " selects grok-4.6 at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "sensitive", "M"): (
+            "grok", "xai", "grok-4.6", "high",
+            "Candidate routing-policy-v2: research_ops, sensitive effective size M"
+            " selects grok-4.6 at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+        ("research_ops", "sensitive", "L"): (
+            "grok", "xai", "grok-4.6", "high",
+            "Candidate routing-policy-v2: research_ops, sensitive effective size L"
+            " selects grok-4.6 at high effort; benchmark evidence is"
+            " required before activation.",
+        ),
+    }
+    # Hard-coded from docs/notes/routing-v1-baseline.md, not from SLICE_BUDGET.
+    CANDIDATE_BUDGETS = {
+        ("mechanical", "S"): (10, 120, 0), ("mechanical", "M"): (30, 300, 1),
+        ("mechanical", "L"): (50, 600, 1), ("visual", "S"): (10, 180, 1),
+        ("visual", "M"): (30, 600, 1), ("visual", "L"): (50, 900, 1),
+        ("sensitive", "S"): (10, 180, 2), ("sensitive", "M"): (30, 600, 2),
+        ("sensitive", "L"): (50, 900, 2),
+    }
+    # Hard-coded opposing-provider reviewer identities per writer provider.
+    CANDIDATE_REVIEWERS = {
+        "openai": (
+            ("claude", "anthropic", "claude-sonnet-5"), ("grok", "xai", "grok-4.6"),
+        ),
+        "anthropic": (
+            ("codex", "openai", "gpt-5.6-sol"), ("grok", "xai", "grok-4.6"),
+        ),
+        "xai": (
+            ("codex", "openai", "gpt-5.6-sol"), ("claude", "anthropic", "claude-opus-5"),
+        ),
+    }
+
+    def test_routing_policy_v2_candidate_emits_exact_hard_coded_reasons_and_profiles(self):
+        for (work_kind, class_name, size), expected in self.CANDIDATE_MATRIX.items():
+            launcher, provider, model, effort, reason = expected
+            turns, wall, review_count = self.CANDIDATE_BUDGETS[(class_name, size)]
+            with self.subTest(work_kind=work_kind, class_name=class_name, size=size):
+                route = server.routing_policy_v2_candidate(
+                    class_name, size, ac_count=0, seams=0, work_kind=work_kind
+                )
+                self.assertEqual(route["policy_version"], "routing-policy-v2")
+                self.assertEqual(route["policy_status"], "benchmark_candidate")
+                self.assertEqual(route["route_version"], "routing-policy-v2-candidate")
+                self.assertEqual(route["size_floor"], size)
+                self.assertEqual(route["size"], size)
+                self.assertEqual(route["max_turns"], turns)
+                self.assertEqual(route["run_budget_seconds"], wall)
+                self.assertEqual(
+                    (route["launcher"], route["provider"], route["model"], route["effort"]),
+                    (launcher, provider, model, effort),
+                )
+                self.assertEqual(route["reason"], reason)
+                self.assertIn(model, route["reason"])
+                self.assertIn(f"at {effort} effort", route["reason"])
+                self.assertIn(f"effective size {size}", route["reason"])
+
+                reviewers = self.CANDIDATE_REVIEWERS[provider][:review_count]
+                review_effort = "high" if class_name == "sensitive" else "medium"
+                for index in (1, 2):
+                    role = f"reviewer{index}"
+                    if index <= review_count:
+                        expected_reviewer = (*reviewers[index - 1], review_effort)
+                        self.assertEqual(
+                            tuple(
+                                route[f"{role}_{key}"]
+                                for key in ("launcher", "provider", "model", "effort")
+                            ),
+                            expected_reviewer,
+                        )
+                        self.assertEqual(
+                            route[f"{role}_execution_profile"],
+                            {
+                                "version": "route-execution-profile-v1",
+                                "route_version": "routing-policy-v2-candidate",
+                                "role": role, "work_kind": work_kind,
+                                "class": class_name, "size": size,
+                                "launcher": expected_reviewer[0],
+                                "provider": expected_reviewer[1],
+                                "model": expected_reviewer[2],
+                                "effort": expected_reviewer[3],
+                            },
+                        )
+                    else:
+                        self.assertEqual(route[f"{role}_launcher"], "none")
+                        self.assertEqual(route[f"{role}_effort"], "none")
+                        self.assertNotIn(f"{role}_execution_profile", route)
+                expected_review = {
+                    0: "none",
+                    1: reviewers[0][2] if review_count else "none",
+                    2: f"{reviewers[0][2]}_{reviewers[-1][2]}" if review_count == 2 else "none",
+                }[review_count]
+                self.assertEqual(route["review"], expected_review)
+                self.assertEqual(
+                    route["writer_execution_profile"],
+                    {
+                        "version": "route-execution-profile-v1",
+                        "route_version": "routing-policy-v2-candidate",
+                        "role": "writer", "work_kind": work_kind,
+                        "class": class_name, "size": size,
+                        "launcher": launcher, "provider": provider,
+                        "model": model, "effort": effort,
+                    },
+                )
+        self.assertEqual(len(self.CANDIDATE_MATRIX), 27)
+
+    def test_routing_policy_v2_candidate_rejects_malformed_shape_inputs(self):
+        for kwargs in (
+            {"class_name": "Mechanical", "size_floor": "S"},
+            {"class_name": "mechanical", "size_floor": "s"},
+            {"class_name": "mechanical", "size_floor": "XL"},
+            {"class_name": "mechanical", "size_floor": "S", "work_kind": "rust_coding"},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": True},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": False},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": 6.5},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": 100},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": -1},
+            {"class_name": "mechanical", "size_floor": "S", "ac_count": "many"},
+            {"class_name": "mechanical", "size_floor": "S", "seams": True},
+            {"class_name": "mechanical", "size_floor": "S", "seams": "2.0"},
+            {"class_name": "mechanical", "size_floor": "S", "seams": 21},
+            {"class_name": "mechanical", "size_floor": "S", "seams": -1},
+            {"class_name": "mechanical", "size_floor": "S", "seams": [2]},
+        ):
+            request = {"work_kind": "go_coding", **kwargs}
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValueError):
+                    server.routing_policy_v2_candidate(**request)
+
+        # The candidate accepts exactly the string counts the public route does.
+        self.assertEqual(
+            server.routing_policy_v2_candidate(
+                "mechanical", "S", ac_count="6", seams="1", work_kind="go_coding"
+            ),
+            server.routing_policy_v2_candidate(
+                "mechanical", "S", ac_count=6, seams=1, work_kind="go_coding"
+            ),
+        )
+
+    def test_routing_policy_v2_candidate_cannot_authorize_any_boundary(self):
+        candidate = server.routing_policy_v2_candidate(
+            "sensitive", "M", ac_count=0, seams=0, work_kind="research_ops"
+        )
+        for role in ("writer", "reviewer1", "reviewer2"):
+            profile = candidate[f"{role}_execution_profile"]
+            with self.subTest(role=role):
+                parsed, error = server.parse_route_execution_profile(
+                    profile, expected_role=role, launcher=profile["launcher"],
+                    provider=profile["provider"], model=profile["model"],
+                    effort=profile["effort"],
+                )
+                self.assertIsNone(parsed)
+                self.assertEqual(error["code"], "bad_route_execution_profile")
+
+        writer = candidate["writer_execution_profile"]
+        reviewer = candidate["reviewer1_execution_profile"]
+        normal = server.slice_route_lookup("sensitive", "M", work_kind="research_ops")
+        agent_request = {
+            "prompt": "candidate substitution fixture", "cwd": "scratch",
+            "launcher": writer["launcher"], "provider": writer["provider"],
+            "model": writer["model"], "effort": writer["effort"],
+            "route_execution_profile": writer,
+        }
+        review_request = {
+            "repo": "scratch", "launcher": reviewer["launcher"],
+            "provider": reviewer["provider"], "model": reviewer["model"],
+            "effort": reviewer["effort"], "route_execution_profile": reviewer,
+            "prompt": "candidate substitution review fixture",
+            "response_webhook_url": "https://callback.invalid/fixture",
+        }
+        for path, request, control_profile in (
+            ("/v1/agent/run", agent_request, "writer_execution_profile"),
+            ("/v1/review/run", review_request, "reviewer1_execution_profile"),
+        ):
+            # One isolated job store per boundary; a queued control job would
+            # otherwise hold the shared checkout lock.
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                binary = root / "fixture-launcher"
+                binary.write_text("provider-free fixture")
+                with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
+                     mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+                     mock.patch.object(server, "enqueue_agent") as agent_spawn, \
+                     mock.patch.object(server, "enqueue_review") as review_spawn, \
+                     mock.patch.object(server, "run_review_job") as review_now:
+                    status, payload, _ = server.dispatch(
+                        "POST", path, {}, True, json.dumps(request).encode()
+                    )
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["code"], "bad_route_execution_profile")
+                    agent_spawn.assert_not_called()
+                    review_spawn.assert_not_called()
+                    review_now.assert_not_called()
+                    # Control: the same fixture carrying the active normal-v1
+                    # profile is accepted, so only the candidate route version
+                    # can explain the rejection above.
+                    active = normal[control_profile]
+                    control = {
+                        **request, "launcher": active["launcher"],
+                        "provider": active["provider"], "model": active["model"],
+                        "effort": active["effort"], "route_execution_profile": active,
+                    }
+                    control_status, control_payload, _ = server.dispatch(
+                        "POST", path, {}, True, json.dumps(control).encode()
+                    )
+                    self.assertEqual(control_status, 202, control_payload)
+                    if path != "/v1/agent/run":
+                        continue
+
+                    # Resume: finish that accepted normal-v1 job, then try to
+                    # continue the exact session under the candidate profile.
+                    seed_job = server.read_job(control_payload["job_id"])
+                    identity = deepcopy(seed_job["session_identity"])
+                    identity["native_session_id"] = "fixture-candidate-resume"
+                    seed_job.update({
+                        "status": "completed", "session_identity": identity,
+                        "started_at": seed_job["created_at"],
+                        "finished_at": seed_job["created_at"],
+                    })
+                    seed_job["receipt"] = {
+                        "status": "ok", "job_id": seed_job["job_id"],
+                        "launcher": seed_job["launcher"],
+                        "provider": seed_job["provider"], "model": seed_job["model"],
+                        **{key: seed_job[key] for key in server.AGENT_PROFILE_FIELDS},
+                        "session_identity": identity, "failure_class": "none",
+                        "failure_code": "none", "failover_eligible": False,
+                    }
+                    _replace_persisted_job_fixture(seed_job["job_id"], seed_job)
+                    agent_spawn.reset_mock()
+
+                    resume_request = {
+                        **control, "prompt": "candidate resume attempt",
+                        "resume_job_id": seed_job["job_id"],
+                        "session_identity": {
+                            **identity, "route_execution_profile": writer,
+                        },
+                        "launcher": writer["launcher"],
+                        "provider": writer["provider"], "model": writer["model"],
+                        "effort": writer["effort"], "route_execution_profile": writer,
+                    }
+                    resume_status, resume_payload, _ = server.dispatch(
+                        "POST", "/v1/agent/run", {}, True,
+                        json.dumps(resume_request).encode(),
+                    )
+                    self.assertEqual(resume_status, 400, resume_payload)
+                    self.assertIn(
+                        resume_payload["code"],
+                        {"bad_route_execution_profile", "bad_session_identity"},
+                    )
+                    agent_spawn.assert_not_called()
+                    resume_control_status, resume_control, _ = server.dispatch(
+                        "POST", "/v1/agent/run", {}, True, json.dumps({
+                            **control, "prompt": "active resume control",
+                            "resume_job_id": seed_job["job_id"],
+                            "session_identity": identity,
+                        }).encode(),
+                    )
+                    self.assertEqual(resume_control_status, 202, resume_control)
+
+        fallback_status, fallback_payload = server.slice_route_fallback(json.dumps({
+            "class": "sensitive", "size": "M", "work_kind": "research_ops",
+            "primary_route": candidate, "primary_receipt": {"status": "error"},
+        }).encode())
+        self.assertEqual(fallback_status, 400, fallback_payload)
+        self.assertEqual(fallback_payload["code"], "primary_provider_mismatch")
+
+        recovery_status, recovery_payload = server.slice_route_recovery(json.dumps({
+            "class": "sensitive", "size": "M", "work_kind": "research_ops",
+            "primary_route": candidate, "primary_receipt": {"status": "error"},
+            "fallback_route": normal, "fallback_receipt": {"status": "ok"},
+        }).encode())
+        self.assertEqual(recovery_status, 400, recovery_payload)
+        self.assertEqual(recovery_payload["code"], "recovery_evidence_mismatch")
+
+    def test_reviewer_effort_drift_is_rejected_against_the_class_catalog(self):
+        # Hard-coded: reviewer effort is class-based, sensitive is the only high.
+        for class_name, expected_effort in (
+            ("mechanical", "medium"), ("visual", "medium"), ("sensitive", "high"),
+        ):
+            with self.subTest(class_name=class_name):
+                route = server.slice_route_lookup(class_name, "M", work_kind="go_coding")
+                self.assertEqual(
+                    route["reviewer1_execution_profile"]["effort"], expected_effort
+                )
+                self.assertEqual(route["reviewer1_effort"], expected_effort)
+
+        route = server.slice_route_lookup("sensitive", "M", work_kind="research_ops")
+        canonical = route["reviewer1_execution_profile"]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "fixture-launcher"
+            binary.write_text("provider-free fixture")
+            base = {
+                "repo": "scratch", "prompt": "reviewer drift fixture",
+                "response_webhook_url": "https://callback.invalid/fixture",
+            }
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+                 mock.patch.object(server, "enqueue_review") as review_spawn, \
+                 mock.patch.object(server, "run_review_job") as review_now:
+                # Coordinated drift: request effort and profile effort agree with
+                # each other but not with the versioned class catalog.
+                for label, drifted in (
+                    ("pre_phase5_default", {**canonical, "effort": "default"}),
+                    ("nonsensitive_effort", {**canonical, "effort": "medium"}),
+                    ("role_swap", {**canonical, "role": "reviewer2"}),
+                    ("class_swap", {**canonical, "class": "mechanical"}),
+                ):
+                    with self.subTest(drift=label):
+                        status, payload, _ = server.dispatch(
+                            "POST", "/v1/review/run", {}, True, json.dumps({
+                                **base, "launcher": drifted["launcher"],
+                                "provider": drifted["provider"],
+                                "model": drifted["model"], "effort": drifted["effort"],
+                                "route_execution_profile": drifted,
+                            }).encode(),
+                        )
+                        self.assertEqual(status, 400, payload)
+                        self.assertIn(
+                            payload["code"],
+                            {
+                                "bad_route_execution_profile",
+                                "route_execution_profile_mismatch",
+                            },
+                        )
+                        review_spawn.assert_not_called()
+                        review_now.assert_not_called()
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, json.dumps({
+                        **base, "launcher": canonical["launcher"],
+                        "provider": canonical["provider"], "model": canonical["model"],
+                        "effort": canonical["effort"],
+                        "route_execution_profile": canonical,
+                    }).encode(),
+                )
+                self.assertEqual(status, 202, payload)
+                identity = payload["execution_identity"]
+                self.assertEqual(identity["requested_effort"], "high")
+                self.assertEqual(identity["max_turns"], 12)
+                self.assertEqual(identity["run_budget_seconds"], 200)
+                self.assertEqual(identity["permission_profile"], "codex-read-only")
+
+    def test_slice_route_numeric_shape_inputs_are_typed_and_bounded(self):
+        def route(**overrides):
+            request = {"class": "visual", "work_kind": "go_coding", "size": "S", **overrides}
+            return server.slice_route(json.dumps(request).encode())
+
+        # A JSON boolean is never a count. `seams: true` must not act as 1.
+        for key, value in (
+            ("ac_count", True), ("ac_count", False), ("seams", True), ("seams", False),
+            ("ac_count", 6.0), ("ac_count", 6.9), ("seams", 1.0),
+            ("ac_count", "6.0"), ("ac_count", "١٢"), ("ac_count", "6_0"),
+            ("ac_count", " 6 "), ("ac_count", "+6"), ("ac_count", "-1"),
+            ("ac_count", "0x6"), ("ac_count", "06"), ("seams", "1_0"),
+            ("ac_count", 100), ("ac_count", -1), ("seams", 21), ("seams", -1),
+            ("ac_count", [6]), ("seams", {"n": 1}),
+        ):
+            with self.subTest(key=key, value=value):
+                status, payload = route(**{key: value})
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], f"bad_{key}")
+                self.assertNotIn("route_version", payload)
+
+        # Rewst renders graph inputs as strings; plain decimal strings stay valid.
+        for value in (0, 99, "0", "99"):
+            with self.subTest(accepted=value):
+                status, payload = route(ac_count=value)
+                self.assertEqual(status, 200, payload)
+        for value in (0, 20, "0", "20"):
+            with self.subTest(accepted_seams=value):
+                status, payload = route(seams=value)
+                self.assertEqual(status, 200, payload)
+        self.assertEqual(route(ac_count=6)[1], route(ac_count="6")[1])
+        self.assertEqual(route(seams=1)[1], route(seams="1")[1])
+        self.assertEqual(route(ac_count="")[1], route()[1])
+
+        # Contradictory and boundary shapes resolve to one deterministic step.
+        self.assertEqual(route(ac_count=5, seams=0)[1]["size"], "S")
+        self.assertEqual(route(ac_count=6, seams=0)[1]["size"], "M")
+        self.assertEqual(route(ac_count=6, seams=1)[1]["size"], "M")
+        self.assertEqual(route(size="L", ac_count=6, seams=1)[1]["size"], "L")
+
+        # The same closure applies before fallback and recovery authorization.
+        for handler in (server.slice_route_fallback, server.slice_route_recovery):
+            with self.subTest(handler=handler.__name__):
+                status, payload = handler(json.dumps({
+                    "work_kind": "go_coding", "seams": True,
+                }).encode())
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "bad_seams")
+
+    def test_slice_route_request_openapi_parity_is_exact(self):
+        schemas = json.loads(server.openapi_bytes())["components"]["schemas"]
+        parity = (
+            ("SliceRouteRequest", server.SLICE_ROUTE_INPUT_FIELDS, ["work_kind"]),
+            (
+                "SliceRouteFallbackRequest", server.SLICE_ROUTE_FALLBACK_FIELDS,
+                ["work_kind", "primary_route", "primary_receipt"],
+            ),
+            (
+                "SliceRouteRecoveryRequest", server.SLICE_ROUTE_RECOVERY_FIELDS,
+                [
+                    "work_kind", "primary_route", "primary_receipt",
+                    "fallback_route", "fallback_receipt",
+                ],
+            ),
+        )
+        for name, runtime_fields, required in parity:
+            with self.subTest(schema=name):
+                schema = schemas[name]
+                self.assertIs(schema["additionalProperties"], False)
+                self.assertEqual(set(schema["properties"]), set(runtime_fields))
+                self.assertEqual(schema["required"], required)
+                self.assertLessEqual(set(required), set(runtime_fields))
+        self.assertEqual(
+            set(server.SLICE_ROUTE_INPUT_FIELDS),
+            {"class", "work_kind", "size", "ac_count", "seams"},
+        )
+        for name, code in (
+            ("SliceRouteFallbackRequest", "unexpected_fields"),
+            ("SliceRouteRecoveryRequest", "unexpected_fields"),
+        ):
+            handler = (
+                server.slice_route_fallback if "Fallback" in name
+                else server.slice_route_recovery
+            )
+            for extra in sorted(set(schemas[name]["properties"]) - set(server.SLICE_ROUTE_INPUT_FIELDS)):
+                with self.subTest(schema=name, extra=extra):
+                    status, payload = handler(json.dumps({
+                        "work_kind": "go_coding", extra: {},
+                    }).encode())
+                    self.assertEqual(status, 400, payload)
+                    self.assertNotEqual(payload["code"], code)
+
     def test_slice_route_task_shape_inputs_are_closed_and_evidence_gated(self):
         schema = json.loads(server.openapi_bytes())["components"]["schemas"]["SliceRouteRequest"]
         self.assertFalse(schema["additionalProperties"])
@@ -6994,18 +7587,20 @@ while True:
         }
         reviewers = {
             "openai": (
-                ("claude", "anthropic", "claude-sonnet-5", "default"),
-                ("grok", "xai", "grok-4.6", "default"),
+                ("claude", "anthropic", "claude-sonnet-5"),
+                ("grok", "xai", "grok-4.6"),
             ),
             "anthropic": (
-                ("codex", "openai", "gpt-5.6-sol", "high"),
-                ("grok", "xai", "grok-4.6", "default"),
+                ("codex", "openai", "gpt-5.6-sol"),
+                ("grok", "xai", "grok-4.6"),
             ),
             "xai": (
-                ("codex", "openai", "gpt-5.6-sol", "high"),
-                ("claude", "anthropic", "claude-opus-5", "default"),
+                ("codex", "openai", "gpt-5.6-sol"),
+                ("claude", "anthropic", "claude-opus-5"),
             ),
         }
+        # Reviewer effort is class-based and independent of the writer catalog.
+        review_efforts = {"mechanical": "medium", "visual": "medium", "sensitive": "high"}
         budgets = {
             ("mechanical", "S"): (10, 120),
             ("mechanical", "M"): (30, 300),
@@ -7039,9 +7634,8 @@ while True:
                 review_count = 0
             else:
                 review_count = 1
-            review_effort = "high" if class_name == "sensitive" else "medium"
             selected = [
-                (*reviewer[:3], review_effort)
+                (*reviewer, review_efforts[class_name])
                 for reviewer in reviewers[writer[1]][:review_count]
             ]
             selected.extend([("none", "none", "none", "none")] * (2 - len(selected)))

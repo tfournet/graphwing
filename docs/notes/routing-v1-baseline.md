@@ -18,7 +18,7 @@ The characterization fixture sends JSON through authenticated `POST /v1/slice/ro
 | `typescript_coding` | `claude` | `anthropic` | `claude-opus-5` | `default` |
 | `research_ops` | `grok` | `xai` | `grok-4.6` | `default` |
 
-Reviewer order is provider-dependent and opposing-provider:
+Reviewer order is provider-dependent and opposing-provider. The reviewer **effort** column below records the characterized base only and is superseded by Phase 5: reviewer effort is now class-based (`medium` for mechanical and visual, `high` for sensitive), independent of the writer catalog. See [routing-policy-v2.md](routing-policy-v2.md). Reviewer identities and ordering are unchanged.
 
 | Writer provider | Reviewer 1 | Reviewer 1 effort | Reviewer 2 | Reviewer 2 effort |
 |---|---|---|---|---|

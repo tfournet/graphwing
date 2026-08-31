@@ -468,6 +468,7 @@ SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
+COUNT_RE = re.compile(r"0|[1-9][0-9]*")
 SLICE_ROUTE_INPUT_FIELDS = frozenset({"class", "work_kind", "size", "ac_count", "seams"})
 SLICE_ROUTE_FALLBACK_FIELDS = SLICE_ROUTE_INPUT_FIELDS | frozenset({
     "primary_route", "primary_receipt",
@@ -2147,10 +2148,18 @@ def parse_optional_int(data: dict[str, Any], key: str, lo: int, hi: int) -> tupl
     raw = data.get(key)
     if raw in ("", None):
         return None, None
-    try:
+    # Rewst renders graph inputs as strings, so a plain ASCII decimal string is
+    # the only accepted text form. Booleans, floats, signs, separators, and
+    # non-ASCII digits are never silently coerced into a routing count.
+    bad = {"error": f"{key} must be an integer", "code": f"bad_{key}"}
+    if isinstance(raw, bool):
+        return None, bad
+    if isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, str) and COUNT_RE.fullmatch(raw):
         n = int(raw)
-    except (TypeError, ValueError):
-        return None, {"error": f"{key} must be an integer", "code": f"bad_{key}"}
+    else:
+        return None, bad
     if n < lo or n > hi:
         return None, {"error": f"{key} out of range", "code": f"bad_{key}"}
     return n, None
@@ -2178,6 +2187,15 @@ def routing_policy_v2_candidate(
         raise ValueError("unsupported candidate class or size")
     if work_kind not in SLICE_WORK_KINDS:
         raise ValueError("work_kind is required")
+    # The candidate is closed around the same typed task-shape counts as the
+    # active route, so a benchmark cannot be fed values the public route rejects.
+    counts: dict[str, int | None] = {}
+    for key, value, ceiling in (("ac_count", ac_count, 99), ("seams", seams, 20)):
+        parsed, count_error = parse_optional_int({key: value}, key, 0, ceiling)
+        if count_error is not None:
+            raise ValueError(f"unsupported candidate {key}")
+        counts[key] = parsed
+    ac_count, seams = counts["ac_count"], counts["seams"]
     sized = bump_slice_size(size_floor, class_name, ac_count, seams)
     if seams is None or seams > 1:
         sized = "L"

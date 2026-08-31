@@ -3,13 +3,15 @@
 ## Status and authority
 
 - `normal-v1` remains the active writer policy exposed by `POST /v1/slice/route`.
-- `routing-policy-v2-candidate` is benchmark-only. It is available only through the centralized Python candidate table/function and is not an OpenAPI route.
+- `routing-policy-v2-candidate` is benchmark-only and non-production. It is available only through the centralized Python candidate table/function and is not an OpenAPI route. Nothing in this catalog may select it for real work.
 - Candidate route profiles deliberately fail the existing `route-execution-profile-v1` parser because their route version is not executable. Promotion requires the Phase 8 benchmark and a separately reviewed activation change.
 - No graph, tenant integration, published workflow, launcher, or provider is changed or invoked by this candidate.
 
 ## Evidence gate for task-shape inputs
 
 The retained routing inputs are the objective, closed-schema fields `class`, `work_kind`, size floor (`size`), `ac_count`, and `seams`. Provider-free fixtures prove a deterministic effect for each.
+
+`ac_count` and `seams` are typed counts, not coercible values. The normal, fallback, and recovery requests accept a JSON integer or a plain ASCII decimal string (Rewst renders graph inputs as strings) inside `0–99` and `0–20` respectively. JSON booleans, floats, signed or zero-padded text, digit separators, whitespace, and non-ASCII digits are rejected as `bad_ac_count` / `bad_seams` before any route, launcher, or authorization step. `routing_policy_v2_candidate()` applies the same closed parser and raises `ValueError` rather than benchmarking a value the public route would refuse.
 
 The repository contains a historical `normal-v1` characterization and durable outcome plumbing, but it does not yet contain the representative, repeated, programmatically verified benchmark corpus required by Phase 8. The sanitized historical snapshot is not joined to task-shape fields and therefore cannot demonstrate that another field changes verified outcomes.
 
@@ -40,4 +42,4 @@ Review execution remains independently bounded by the closed review request/iden
 
 ## Verification level
 
-Tests enumerate all 27 candidate combinations, task-shape boundaries, review-free and multi-seam cases, normal/sensitive reviewer effort, native routed-review command boundaries, active-policy preservation, and fail-closed candidate execution evidence. These are local source and provider-free fixture claims only; they do not establish benchmark superiority, publication, tenant parity, or live readiness.
+Tests enumerate all 27 candidate combinations, task-shape boundaries, review-free and multi-seam cases, normal/sensitive reviewer effort, native routed-review command boundaries, active-policy preservation, and fail-closed candidate execution evidence. Expected writer profiles, effective sizes, budgets, reviewer identities, and complete reason strings are hard-coded in the tests and are never recomputed from `server.py`. Adversarial fixtures cover unknown extras, malformed and contradictory counts, booleans supplied as integers, range boundaries, coordinated reviewer-effort drift, and candidate substitution at the agent, review, fallback, recovery, and resume boundaries, asserting rejection before any launcher resolution or spawn. Request/OpenAPI field-set parity for the normal, fallback, and recovery schemas is asserted directly against the runtime allowlists. These are local source and provider-free fixture claims only; they do not establish benchmark superiority, publication, tenant parity, or live readiness.
