@@ -16158,10 +16158,15 @@ class CodeOffTests(unittest.TestCase):
             mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", proven),
             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
             mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")),
+            # One launcher artifact for prepare and launch: the immutable slot
+            # identity pins the exact wrapper fingerprint, so both boundaries
+            # must observe the same file for any fixture that launches a slot.
+            mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)),
         )
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.launcher_version = server.launcher_version_fingerprint(Path(__file__))
 
     def _git(self, *args):
         return subprocess.run(
@@ -16196,7 +16201,18 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(payload["status"], "prepared", payload)
         return payload
 
-    def _launch_done(self, experiment_id, slot):
+    @staticmethod
+    def _usage(**overrides):
+        usage = {
+            "usage_version": server.USAGE_VERSION,
+            "fresh_input_tokens": 100, "cached_input_tokens": 20,
+            "cache_write_tokens": 5, "output_tokens": 30, "reasoning_tokens": 10,
+            "provider_cost_usd": None, "wall_seconds": 1.5, "turns_observed": 2,
+        }
+        usage.update(overrides)
+        return usage
+
+    def _launch_done(self, experiment_id, slot, usage=None, usage_diagnostic=None):
         manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
         identity = manifest["identities"][slot]
         body = self._agent_body(experiment_id, slot)
@@ -16209,6 +16225,8 @@ class CodeOffTests(unittest.TestCase):
         self.assertIsNotNone(job)
         identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
         execution_identity = self._execution_identity(identity)
+        if usage is None and usage_diagnostic is None:
+            usage = self._usage()
         job.update({
             "status": "completed", "started_at": "2026-08-26T12:00:00Z",
             "finished_at": "2026-08-26T12:00:01Z", "session_identity": identity,
@@ -16219,11 +16237,63 @@ class CodeOffTests(unittest.TestCase):
                 "model": job["model"],
                 **{key: job[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
                 "execution_identity": execution_identity, "summary": "fixture",
+                "usage": usage, "usage_diagnostic": usage_diagnostic,
             },
         })
         server.write_job(job)
+        server.seal_terminal_receipt_authority("agent", job["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", job["job_id"])
         self.assertTrue(server._codeoff_record_terminal_manifest(job))
         return job["job_id"]
+
+    def _launch_failed(self, experiment_id, slot, usage=None, usage_diagnostic=None):
+        """A slot attempt that burned real inference and then failed terminally.
+
+        `run_agent_job` seals the terminal receipt for a failed run exactly as it
+        does for a successful one and drops `execution_identity`, so this is the
+        provider-free shape of a genuine paid-for author or judge failure.
+        """
+        body = self._agent_body(experiment_id, slot)
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, payload = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, payload)
+        enqueue.assert_called_once()
+        job = server.read_job(payload["job_id"])
+        identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
+        job.update({
+            "status": "failed", "started_at": "2026-08-26T12:00:00Z",
+            "finished_at": "2026-08-26T12:00:03Z", "session_identity": identity,
+            "error": "agent exited 1",
+            "receipt": {
+                "status": "error", "job_id": job["job_id"], "session_identity": identity,
+                "launcher": job["launcher"], "provider": job["provider"],
+                "model": job["model"],
+                **{key: job[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
+                "summary": "fixture failure",
+                "usage": self._usage() if usage is None and usage_diagnostic is None else usage,
+                "usage_diagnostic": usage_diagnostic,
+            },
+        })
+        job.pop("execution_identity", None)
+        server.write_job(job)
+        server.seal_terminal_receipt_authority("agent", job["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", job["job_id"])
+        return job["job_id"]
+
+    @staticmethod
+    def _effort_collision(identity):
+        """A different requested effort that collapses to the pinned effective one."""
+        return next(
+            (
+                value for value in server.EFFORT_VALUES
+                if value != identity["requested_effort"]
+                and (server.normalize_effort(
+                    identity["launcher"], identity["provider"], identity["exact_model"],
+                    value, server.CODEOFF_EFFORT_SOURCE,
+                )[0] or {}).get("effective_effort") == identity["effective_effort"]
+            ),
+            None,
+        )
 
     @staticmethod
     def _execution_identity(session_identity):
@@ -16277,7 +16347,7 @@ class CodeOffTests(unittest.TestCase):
         return {
             "codeoff_workspace": {"experiment_id": experiment_id, "slot": slot},
             "launcher": identity["launcher"], "provider": identity["provider"],
-            "model": identity["exact_model"],
+            "model": identity["exact_model"], "effort": identity["requested_effort"],
             "max_turns": manifest["budgets"]["max_turns"],
             "run_budget_seconds": (
                 manifest["budgets"]["author_seconds"] if slot.startswith("author-")
@@ -16285,8 +16355,8 @@ class CodeOffTests(unittest.TestCase):
             ),
         }
 
-    def _freeze_and_test(self, experiment_id, slot):
-        job_id = self._launch_done(experiment_id, slot)
+    def _freeze_and_test(self, experiment_id, slot, usage=None, usage_diagnostic=None):
+        job_id = self._launch_done(experiment_id, slot, usage, usage_diagnostic)
         status, frozen = self._post("/v1/code-off/candidate", {
             "experiment_id": experiment_id, "slot": slot, "action": "freeze", "job_id": job_id,
         })
@@ -16337,8 +16407,8 @@ class CodeOffTests(unittest.TestCase):
     def _scores(total_bias=0):
         return {"correctness": 30 + total_bias, "tests": 15, "quality": 15, "scope": 8, "maintainability": 8}
 
-    def _judge_done(self, experiment_id, judge_slot, prefer_author, score_a=0, score_b=0):
-        job_id = self._launch_done(experiment_id, judge_slot)
+    def _judge_done(self, experiment_id, judge_slot, prefer_author, score_a=0, score_b=0, usage=None, usage_diagnostic=None):
+        job_id = self._launch_done(experiment_id, judge_slot, usage, usage_diagnostic)
         private = json.loads((self.records / experiment_id / "private" / "blinding.json").read_text())
         labels = private["judges"][judge_slot]["labels"]
         preferred = next(label for label, slot in labels.items() if slot == prefer_author)
@@ -17183,8 +17253,11 @@ class CodeOffTests(unittest.TestCase):
         resume_body = self._agent_body("experiment-0001", "author-2")
         branch, head, err = server.current_branch_head(server.codeoff_workspace_path("experiment-0001", "author-2"))
         self.assertIsNone(err)
+        # The resume identity carries the slot's pinned effort profile, so this
+        # case proves the resume gate rather than the effort gate ahead of it.
         profile = _fixture_execution_profile(
-            resume_body["launcher"], resume_body["provider"], resume_body["model"], Path(__file__)
+            resume_body["launcher"], resume_body["provider"], resume_body["model"], Path(__file__),
+            requested=resume_body["effort"], source=server.CODEOFF_EFFORT_SOURCE,
         )
         resume_identity = {
             "launcher": resume_body["launcher"], "provider": resume_body["provider"], "model": resume_body["model"],
@@ -17292,9 +17365,10 @@ class CodeOffTests(unittest.TestCase):
             "model": "claude-opus-5",
             "requested_effort": "high",
             "effective_effort": "default",
-            "effort_source": "explicit",
+            "effort_source": "launcher_default",
             "launcher_version": "sha256:" + "f" * 64,
         }
+        self.assertEqual(pristine["effort_source"], server.CODEOFF_EFFORT_SOURCE)
         for field, value in contradictions.items():
             with self.subTest(field=field):
                 job = deepcopy(pristine)
@@ -18029,7 +18103,8 @@ class CodeOffTests(unittest.TestCase):
         server._codeoff_write_state(self.records / experiment_id, state)
         running = _minimal_agent_record(job_id, "running")
         completed = _minimal_agent_record(job_id, "completed")
-        with mock.patch.object(server, "read_job", side_effect=[running, completed]), \
+        # Two drain reads, then one economics read per launched job at finalize.
+        with mock.patch.object(server, "read_job", side_effect=[running, completed, completed]), \
              mock.patch.object(server.time, "sleep") as sleep:
             status, terminal = self._post("/v1/code-off/terminal", {
                 "experiment_id": experiment_id, "outcome": "failed",
@@ -18049,6 +18124,8 @@ class CodeOffTests(unittest.TestCase):
         server._codeoff_write_state(self.records / experiment_id, state)
         reads = [
             _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "running"),
+            _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "failed"),
+            # Economics reads one record per launched job while finalizing.
             _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "failed"),
         ]
         with mock.patch.object(server, "read_job", side_effect=reads), \
@@ -18134,6 +18211,476 @@ class CodeOffTests(unittest.TestCase):
         status, payload = self._post("/v1/code-off/audit", {"experiment_id": "experiment-0001"}, authed=False)
         self.assertEqual(status, 401)
 
+    def test_codeoff_identity_includes_effort_and_launcher_version(self):
+        payload = self._prepare("identity-pin-0001")
+        manifest = json.loads((self.records / "identity-pin-0001" / "manifest.json").read_text())
+        self.assertRegex(self.launcher_version, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(manifest["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION)
+        for slot, identity in manifest["identities"].items():
+            with self.subTest(slot=slot):
+                self.assertLessEqual(set(server.CODEOFF_IDENTITY_FIELDS), set(identity))
+                role = "author" if slot.startswith("author-") else "judge"
+                requested = server.CODEOFF_SLOT_REQUESTED_EFFORT[role]
+                profile, effort_err = server.normalize_effort(
+                    identity["launcher"], identity["provider"], identity["exact_model"],
+                    requested, "explicit",
+                )
+                self.assertIsNone(effort_err)
+                self.assertEqual(identity["requested_effort"], requested)
+                self.assertEqual(identity["effective_effort"], profile["effective_effort"])
+                self.assertEqual(identity["launcher_version"], self.launcher_version)
+                self.assertEqual(
+                    identity["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION,
+                )
+                self.assertEqual(
+                    manifest["identity_snapshot_hashes"][slot],
+                    server.codeoff_identity_snapshot_hash(identity),
+                )
+                launch = payload["launches"][slot.replace("-", "_")]
+                self.assertEqual(launch["effort"], identity["requested_effort"])
+                self.assertEqual(launch["effective_effort"], identity["effective_effort"])
+                self.assertEqual(launch["launcher_version"], identity["launcher_version"])
+        self.assertEqual(
+            manifest["identities_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(manifest["identities"])).hexdigest(),
+        )
+        self.assertIsNone(server.codeoff_manifest_identity_error(manifest))
+
+    def test_codeoff_identity_field_change_moves_manifest_and_identity_authority(self):
+        baseline = self._prepare("identity-authority-a")
+        baseline_manifest = json.loads((self.records / "identity-authority-a" / "manifest.json").read_text())
+        with mock.patch.object(
+            server, "CODEOFF_SLOT_REQUESTED_EFFORT", {"author": "low", "judge": "low"},
+        ):
+            self._prepare("identity-authority-b")
+        changed = json.loads((self.records / "identity-authority-b" / "manifest.json").read_text())
+        for slot in baseline_manifest["identities"]:
+            with self.subTest(slot=slot):
+                self.assertNotEqual(
+                    baseline_manifest["identities"][slot]["effective_effort"],
+                    changed["identities"][slot]["effective_effort"],
+                )
+                self.assertNotEqual(
+                    baseline_manifest["identity_snapshot_hashes"][slot],
+                    changed["identity_snapshot_hashes"][slot],
+                )
+        self.assertNotEqual(baseline_manifest["identities_hash"], changed["identities_hash"])
+        self.assertNotEqual(
+            baseline["manifest_file_hash"],
+            json.loads((self.records / "identity-authority-b" / "state.json").read_text())["manifest_file_hash"],
+        )
+        for field, value in (
+            ("launcher_version", "sha256:" + "a" * 64),
+            ("effective_effort", "max"),
+            ("inference_profile_version", "code-off-inference-profile-v0"),
+        ):
+            with self.subTest(field=field):
+                forged = deepcopy(baseline_manifest)
+                forged["identities"]["author-1"][field] = value
+                self.assertIsNotNone(server.codeoff_manifest_identity_error(forged))
+                self.assertNotEqual(
+                    server.codeoff_identity_snapshot_hash(forged["identities"]["author-1"]),
+                    baseline_manifest["identity_snapshot_hashes"]["author-1"],
+                )
+
+    def test_codeoff_rejects_effort_mismatch(self):
+        self._prepare("effort-mismatch-01")
+        manifest = json.loads((self.records / "effort-mismatch-01" / "manifest.json").read_text())
+        identity = manifest["identities"]["author-1"]
+        pinned = self._agent_body("effort-mismatch-01", "author-1")
+        other = next(
+            value for value in server.EFFORT_VALUES
+            if (server.normalize_effort(
+                identity["launcher"], identity["provider"], identity["exact_model"],
+                value, "explicit",
+            )[0] or {}).get("effective_effort") not in (None, identity["effective_effort"])
+        )
+        status, payload = self._post("/v1/agent/run", {**pinned, "effort": other})
+        self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+        self.assertFalse(json.loads((self.records / "effort-mismatch-01" / "state.json").read_text())["agent_jobs"]["author-1"])
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, launched = self._post(
+                "/v1/agent/run", {**pinned, "effort": identity["requested_effort"]},
+            )
+        self.assertEqual(status, 202, launched)
+        enqueue.assert_called_once()
+
+        # A terminal receipt whose effective effort drifts from the immutable
+        # slot identity cannot freeze, judge, aggregate, or finalize.
+        drifted = server.read_job(launched["job_id"])
+        session = dict(drifted["session_identity"], native_session_id="fixture-author-1")
+        execution_identity = self._execution_identity(session)
+        drifted_effort = "max" if identity["effective_effort"] != "max" else "low"
+        session["effective_effort"] = drifted_effort
+        drifted.update({
+            "status": "completed", "started_at": "2026-08-26T12:00:00Z",
+            "finished_at": "2026-08-26T12:00:01Z", "session_identity": session,
+            "effective_effort": drifted_effort, "execution_identity": execution_identity,
+            "receipt": {
+                "status": "ok", "job_id": drifted["job_id"], "session_identity": session,
+                "launcher": drifted["launcher"], "provider": drifted["provider"],
+                "model": drifted["model"],
+                **{key: drifted[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
+                "execution_identity": execution_identity, "summary": "fixture",
+                "usage": self._usage(), "usage_diagnostic": None,
+            },
+        })
+        drifted["receipt"]["effective_effort"] = drifted_effort
+        server.write_job(drifted)
+        server.seal_terminal_receipt_authority("agent", drifted["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", drifted["job_id"])
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "effort-mismatch-01", "slot": "author-1",
+            "action": "freeze", "job_id": drifted["job_id"],
+        })
+        self.assertEqual((status, payload["code"]), (422, "agent_receipt_mismatch"))
+        state = json.loads((self.records / "effort-mismatch-01" / "state.json").read_text())
+        self.assertTrue(state["finalized"])
+        self.assertEqual(state["candidates"]["author-1"], {})
+        for path, body in (
+            ("/v1/code-off/blind", {"experiment_id": "effort-mismatch-01"}),
+            ("/v1/code-off/judge", {"experiment_id": "effort-mismatch-01", "slot": "judge-fable", "job_id": drifted["job_id"]}),
+            ("/v1/code-off/aggregate", {"experiment_id": "effort-mismatch-01"}),
+            ("/v1/code-off/finalize", {"experiment_id": "effort-mismatch-01"}),
+        ):
+            with self.subTest(path=path):
+                status, payload = self._post(path, body)
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(payload["code"], "experiment_finalized")
+
+    def test_codeoff_unpinned_slot_identity_fails_closed_at_every_gate(self):
+        self._ready_for_judges("unpinned-identity-1")
+        root = self.records / "unpinned-identity-1"
+        manifest = json.loads((root / "manifest.json").read_text())
+        state = json.loads((root / "state.json").read_text())
+        del manifest["identities"]["judge-1"]["effective_effort"]
+        manifest_bytes = server.codeoff_canonical_json(manifest) + b"\n"
+        (root / "manifest.json").write_bytes(manifest_bytes)
+        state["manifest_file_hash"] = hashlib.sha256(manifest_bytes).hexdigest()
+        (root / "state.json").write_text(json.dumps(state))
+        self.assertIsNotNone(server.codeoff_manifest_identity_error(manifest))
+        for path, body in (
+            ("/v1/code-off/candidate", {"experiment_id": "unpinned-identity-1", "slot": "author-1", "action": "test"}),
+            ("/v1/code-off/blind", {"experiment_id": "unpinned-identity-1"}),
+            ("/v1/code-off/judge", {"experiment_id": "unpinned-identity-1", "slot": "judge-1", "job_id": "0" * 32}),
+            ("/v1/code-off/aggregate", {"experiment_id": "unpinned-identity-1"}),
+            ("/v1/code-off/finalize", {"experiment_id": "unpinned-identity-1"}),
+        ):
+            with self.subTest(path=path):
+                status, payload = self._post(path, body)
+                self.assertEqual((status, payload["code"]), (409, "codeoff_identity_unpinned"))
+        status, payload = self._post("/v1/agent/run", {
+            "codeoff_workspace": {"experiment_id": "unpinned-identity-1", "slot": "judge-1"},
+            "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+            "max_turns": 4, "run_budget_seconds": 60,
+        })
+        self.assertEqual((status, payload["code"]), (409, "codeoff_identity_unpinned"))
+        self.assertEqual(self._target_snapshot(), server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"])
+
+    def test_codeoff_audit_publishes_pinned_profile_without_ordering_or_secrets(self):
+        self._ready_to_finalize("audit-identity-1")
+        status, finalized = self._post("/v1/code-off/finalize", {"experiment_id": "audit-identity-1"})
+        self.assertEqual(status, 200, finalized)
+        root = self.records / "audit-identity-1"
+        manifest = json.loads((root / "manifest.json").read_text())
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": ["audit-identity-1"]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        self.assertEqual(audit["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION)
+        self.assertEqual(audit["identities_hash"], manifest["identities_hash"])
+        self.assertEqual(audit["identity_snapshot_hashes"], manifest["identity_snapshot_hashes"])
+        for slot, identity in audit["identities"].items():
+            with self.subTest(slot=slot):
+                for field in ("launcher_version", "requested_effort", "effective_effort", "inference_profile_version"):
+                    self.assertEqual(identity[field], manifest["identities"][slot][field])
+        rendered = json.dumps(audit, sort_keys=True)
+        self.assertNotIn(manifest["selection"]["seed"], rendered)
+        self.assertNotIn('"labels"', rendered)
+        self.assertNotIn("candidate-1", rendered)
+        self.assertNotIn(manifest["task"], rendered)
+        for judge in private["judges"].values():
+            self.assertNotIn(json.dumps(judge["labels"], sort_keys=True), rendered)
+
+    def test_codeoff_economics_artifact_aggregates_authors_judges_tests_and_final(self):
+        experiment_id = "economics-0001"
+        self._prepare(experiment_id)
+        winner = server.codeoff_workspace_path(experiment_id, "author-1")
+        (winner / "README.md").write_text("winner\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot, usage=self._usage(output_tokens=40))
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", usage=self._usage(output_tokens=7))
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        status, finalized = self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, finalized)
+
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        economics = audit["economics"]
+        self.assertEqual(economics["version"], server.CODEOFF_ECONOMICS_VERSION)
+        self.assertEqual(economics["usage_version"], server.USAGE_VERSION)
+        self.assertEqual(
+            audit["economics_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(economics)).hexdigest(),
+        )
+        self.assertEqual(
+            (self.records / experiment_id / "artifacts" / audit["economics_hash"]).read_bytes(),
+            server.codeoff_canonical_json(economics),
+        )
+        self.assertEqual(set(economics["slots"]), set(audit["identities"]))
+        self.assertEqual(economics["authors"]["attempts"], 2)
+        self.assertEqual(economics["judges"]["attempts"], 3)
+        self.assertEqual(economics["inference"]["attempts"], 5)
+        self.assertEqual(economics["authors"]["output_tokens"], 80)
+        self.assertEqual(economics["judges"]["output_tokens"], 21)
+        self.assertEqual(economics["inference"]["output_tokens"], 101)
+        self.assertEqual(economics["inference"]["fresh_input_tokens"], 500)
+        self.assertEqual(economics["inference"]["turns_observed"], 10)
+        self.assertIsNone(economics["inference"]["provider_cost_usd"])
+        self.assertEqual(economics["tests"]["candidate_runs"], 2)
+        self.assertEqual(economics["tests"]["final_runs"], 1)
+        self.assertTrue(economics["final_verification"]["tests_pass"])
+        self.assertEqual(
+            economics["final_verification"]["receipt_hash"], finalized["receipt_hash"],
+        )
+        self.assertEqual(economics["identities_hash"], audit["identities_hash"])
+        rendered = json.dumps(economics, sort_keys=True)
+        for forbidden in (
+            json.loads((self.records / experiment_id / "manifest.json").read_text())["selection"]["seed"],
+            "candidate-1", "labels", "prompt", str(self.repo),
+        ):
+            self.assertNotIn(forbidden, rendered, forbidden)
+
+    def test_codeoff_economics_cost_is_nullable_and_missing_usage_is_not_a_false_zero(self):
+        experiment_id = "economics-cost-01"
+        self._prepare(experiment_id)
+        self._freeze_and_test(experiment_id, "author-1", usage=self._usage(provider_cost_usd=0.25))
+        self._freeze_and_test(experiment_id, "author-2", usage=None, usage_diagnostic="usage_not_reported")
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", usage=self._usage(provider_cost_usd=0.5))
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        self.assertEqual(self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })[0], 200)
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        economics = audit["economics"]
+        self.assertEqual(economics["authors"]["attempts"], 2)
+        self.assertEqual(economics["authors"]["usage_attempts"], 1)
+        self.assertEqual(economics["authors"]["missing_usage_attempts"], 1)
+        self.assertIsNone(economics["authors"]["provider_cost_usd"])
+        self.assertIsNone(economics["inference"]["provider_cost_usd"])
+        self.assertEqual(economics["judges"]["provider_cost_usd"], 1.5)
+        self.assertEqual(economics["slots"]["author-2"]["usage_diagnostics"], ["usage_not_reported"])
+        self.assertIsNone(economics["final_verification"]["receipt_hash"])
+        self.assertEqual(economics["tests"]["final_runs"], 0)
+
+    def test_codeoff_requested_effort_collision_cannot_forge_a_slot_identity(self):
+        # `default` and `high` collapse to the same effective effort on every
+        # codex and grok identity, so an effective-effort-only gate would let a
+        # launch record a requested effort the immutable snapshot never pinned.
+        self._prepare("effort-collision-0")
+        identities = json.loads(
+            (self.records / "effort-collision-0" / "manifest.json").read_text()
+        )["identities"]
+        collisions = {
+            slot: self._effort_collision(identity)
+            for slot, identity in identities.items()
+            if self._effort_collision(identity) is not None
+        }
+        self.assertTrue(collisions, identities)
+        for index, (slot, collision) in enumerate(sorted(collisions.items())):
+            with self.subTest(slot=slot):
+                experiment_id = f"effort-collision-{index + 1}"
+                # Each slot is probed in the one stage that can launch it.
+                if slot.startswith("author-"):
+                    self._prepare(experiment_id)
+                else:
+                    self._ready_for_judges(experiment_id)
+                identity = identities[slot]
+                self.assertEqual(identity["requested_effort"], server.CODEOFF_SLOT_REQUESTED_EFFORT[
+                    server.codeoff_slot_work_role(slot)
+                ])
+                self.assertNotEqual(collision, identity["requested_effort"])
+                before = json.loads(
+                    (self.records / experiment_id / "state.json").read_text()
+                )["agent_jobs"]
+                status, payload = self._post("/v1/agent/run", {
+                    **self._agent_body(experiment_id, slot), "effort": collision,
+                })
+                self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+                state = json.loads((self.records / experiment_id / "state.json").read_text())
+                self.assertEqual(state["agent_jobs"], before)
+
+    def test_codeoff_launch_requires_the_explicit_pinned_effort_source(self):
+        # The snapshot's effective effort is derived under one explicit source.
+        # A launch that inherits a launcher default records a different
+        # effort_source on the job, receipt, and session identity, so the four
+        # identity surfaces would no longer be equal.
+        experiment_id = "effort-source-1"
+        self._prepare(experiment_id)
+        self.assertEqual(server.CODEOFF_EFFORT_SOURCE, "explicit")
+        body = self._agent_body(experiment_id, "author-1")
+        self.assertIn("effort", body)
+        status, payload = self._post("/v1/agent/run", {
+            key: value for key, value in body.items() if key != "effort"
+        })
+        self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, launched = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, launched)
+        enqueue.assert_called_once()
+        job = server.read_job(launched["job_id"])
+        identity = json.loads(
+            (self.records / experiment_id / "manifest.json").read_text()
+        )["identities"]["author-1"]
+        for surface in (job, job["session_identity"]):
+            self.assertEqual(surface["effort_source"], server.CODEOFF_EFFORT_SOURCE)
+            self.assertEqual(surface["requested_effort"], identity["requested_effort"])
+            self.assertEqual(surface["effective_effort"], identity["effective_effort"])
+
+    def test_codeoff_terminal_receipt_must_carry_the_whole_pinned_effort_profile(self):
+        experiment_id = "effort-terminal-1"
+        self._prepare(experiment_id)
+        job_id = self._launch_done(experiment_id, "author-1")
+        job = server.read_job(job_id)
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        identity = manifest["identities"]["author-1"]
+        self.assertTrue(server._codeoff_terminal_identity_matches(job, job["receipt"], identity))
+        collision = self._effort_collision(identity)
+        self.assertIsNotNone(collision)
+        for surface in ("job", "session_identity", "receipt"):
+            with self.subTest(surface=surface):
+                drifted = deepcopy(job)
+                target = {
+                    "job": drifted,
+                    "session_identity": drifted["session_identity"],
+                    "receipt": drifted["receipt"],
+                }[surface]
+                target["requested_effort"] = collision
+                self.assertFalse(server._codeoff_terminal_identity_matches(
+                    drifted, drifted["receipt"], identity,
+                ))
+
+    def test_codeoff_economics_counts_failed_attempt_spend_from_sealed_receipts(self):
+        # A failed author or judge attempt still burns tokens and still carries
+        # an authority-sealed terminal receipt, so its exact spend belongs in
+        # the permanent record instead of being reported as a provenance fault.
+        experiment_id = "economics-failed-1"
+        self._prepare(experiment_id)
+        self._freeze_and_test(experiment_id, "author-1", usage=self._usage(output_tokens=40))
+        failed = self._launch_failed(
+            experiment_id, "author-2", usage=self._usage(output_tokens=11, provider_cost_usd=0.75),
+        )
+        self.assertEqual(server.read_job(failed)["status"], "failed")
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, terminal)
+        economics = terminal["economics"]
+        author_2 = economics["slots"]["author-2"]
+        self.assertEqual(author_2["usage_diagnostics"], [])
+        self.assertEqual(author_2["usage"]["attempts"], 1)
+        self.assertEqual(author_2["usage"]["usage_attempts"], 1)
+        self.assertEqual(author_2["usage"]["missing_usage_attempts"], 0)
+        self.assertEqual(author_2["usage"]["output_tokens"], 11)
+        self.assertEqual(author_2["usage"]["provider_cost_usd"], 0.75)
+        self.assertEqual(economics["authors"]["output_tokens"], 51)
+        self.assertEqual(economics["authors"]["missing_usage_attempts"], 0)
+
+    def test_codeoff_economics_never_funds_itself_from_a_non_terminal_attempt(self):
+        experiment_id = "economics-running-1"
+        self._prepare(experiment_id)
+        with mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post(
+                "/v1/agent/run", self._agent_body(experiment_id, "author-1"),
+            )
+        self.assertEqual(status, 202, launched)
+        self.assertEqual(server.read_job(launched["job_id"])["status"], "queued")
+        usage, diagnostic = server._codeoff_slot_usage(launched["job_id"])
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, "usage_authority_nonterminal")
+        spec = json.loads(server.openapi_bytes())
+        self.assertIn(
+            diagnostic,
+            spec["components"]["schemas"]["CodeOffEconomicsSlot"]
+            ["properties"]["usage_diagnostics"]["items"]["enum"],
+        )
+
+    def test_codeoff_audit_stays_inside_openapi_for_a_record_without_pinned_identity(self):
+        # Records written before the inference profile existed still have to be
+        # auditable, and the compact contract has to admit the nulls they yield.
+        experiment_id = "legacy-identity-1"
+        self._ready_for_judges(experiment_id)
+        root = self.records / experiment_id
+        manifest = json.loads((root / "manifest.json").read_text())
+        state = json.loads((root / "state.json").read_text())
+        for key in ("identities_hash", "identity_snapshot_hashes", "inference_profile_version"):
+            del manifest[key]
+        manifest_bytes = server.codeoff_canonical_json(manifest) + b"\n"
+        (root / "manifest.json").write_bytes(manifest_bytes)
+        state["manifest_file_hash"] = hashlib.sha256(manifest_bytes).hexdigest()
+        (root / "state.json").write_text(json.dumps(state))
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        compact = json.loads(server.openapi_bytes())["components"]["schemas"]["CodeOffCompact"]
+        self.assertLessEqual(set(audit), set(compact["properties"]))
+        for key in ("identities_hash", "inference_profile_version", "identity_snapshot_hashes"):
+            with self.subTest(key=key):
+                self.assertIsNone(audit[key])
+                declared = compact["properties"][key]["type"]
+                self.assertIn("null", declared, key)
+
+    def test_codeoff_terminal_returns_the_durable_economics_receipt_for_rewst(self):
+        experiment_id = "economics-terminal-1"
+        self._ready_to_finalize(experiment_id)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "succeeded",
+        })
+        self.assertEqual(status, 200, terminal)
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(
+            terminal["economics_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(terminal["economics"])).hexdigest(),
+        )
+        self.assertEqual(terminal["economics"]["experiment_id"], experiment_id)
+        status, absent = self._post("/v1/code-off/terminal", {
+            "experiment_id": "economics-absent-1", "outcome": "failed",
+        })
+        self.assertEqual((status, absent["status"]), (200, "absent"))
+        self.assertIsNone(absent["economics"])
+        self.assertIsNone(absent["economics_hash"])
+
+    def test_codeoff_cleanup_removes_local_staging_but_keeps_the_economics_record(self):
+        experiment_id = "economics-cleanup-1"
+        self._ready_to_finalize(experiment_id)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        before = audit["economics"]
+        status, cleaned = self._post("/v1/code-off/cleanup", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, cleaned)
+        self.assertTrue(cleaned["record_preserved"])
+        self.assertFalse((self.workspaces / experiment_id).exists())
+        status, after, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, after)
+        self.assertEqual(after["economics"], before)
+
     def test_codeoff_openapi_identity_contract_matches_runtime_manifest(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
@@ -18212,6 +18759,58 @@ class CodeOffTests(unittest.TestCase):
         for field in ("max_turns", "run_budget_seconds"):
             self.assertEqual({item["type"] for item in agent[field]["oneOf"]}, {"integer", "string"})
 
+        identity = spec["components"]["schemas"]["CodeOffSlotIdentity"]
+        self.assertFalse(identity["additionalProperties"])
+        self.assertLessEqual(set(server.CODEOFF_IDENTITY_FIELDS), set(identity["required"]))
+        self.assertEqual(
+            identity["properties"]["inference_profile_version"]["enum"],
+            [server.CODEOFF_INFERENCE_PROFILE_VERSION],
+        )
+        self.assertEqual(identity["properties"]["launcher_version"]["pattern"], server.LAUNCHER_VERSION_RE.pattern)
+        for field in ("requested_effort", "effective_effort"):
+            self.assertEqual(identity["properties"][field]["enum"], list(server.EFFORT_VALUES))
+        economics = spec["components"]["schemas"]["CodeOffEconomics"]
+        self.assertFalse(economics["additionalProperties"])
+        self.assertEqual(economics["properties"]["version"]["enum"], [server.CODEOFF_ECONOMICS_VERSION])
+        self.assertEqual(economics["properties"]["usage_version"]["enum"], [server.USAGE_VERSION])
+        totals = spec["components"]["schemas"]["CodeOffUsageTotals"]
+        self.assertFalse(totals["additionalProperties"])
+        self.assertEqual(
+            set(totals["required"]),
+            {"usage_version", "attempts", "usage_attempts", "missing_usage_attempts",
+             "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+             "output_tokens", "reasoning_tokens", "wall_seconds", "turns_observed",
+             "provider_cost_usd"},
+        )
+        self.assertEqual(totals["properties"]["provider_cost_usd"]["type"], ["number", "null"])
+        self.assertEqual(totals["properties"]["turns_observed"]["type"], ["integer", "null"])
+        for group in ("authors", "judges", "inference"):
+            self.assertEqual(
+                economics["properties"][group]["$ref"], "#/components/schemas/CodeOffUsageTotals",
+            )
+        compact = spec["components"]["schemas"]["CodeOffCompact"]["properties"]
+        self.assertEqual(compact["economics"]["oneOf"], [
+            {"$ref": "#/components/schemas/CodeOffEconomics"}, {"type": "null"},
+        ])
+        self.assertEqual(compact["economics_hash"]["type"], ["string", "null"])
+        self.assertEqual(compact["identities_hash"]["pattern"], "^[0-9a-f]{64}$")
+        # A record written before the inference profile existed still audits,
+        # so the compact contract admits exactly one version string or null.
+        self.assertEqual(compact["identities_hash"]["type"], ["string", "null"])
+        self.assertEqual(
+            compact["inference_profile_version"]["enum"],
+            [server.CODEOFF_INFERENCE_PROFILE_VERSION, None],
+        )
+        self.assertEqual(compact["inference_profile_version"]["type"], ["string", "null"])
+        terminal = spec["components"]["schemas"]["CodeOffTerminalResult"]
+        self.assertEqual(
+            set(terminal["required"]),
+            {"ok", "experiment_id", "status", "reason", "finalized", "economics", "economics_hash"},
+        )
+        self.assertEqual(terminal["properties"]["economics"]["oneOf"], [
+            {"$ref": "#/components/schemas/CodeOffEconomics"}, {"type": "null"},
+        ])
+
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
         self.assertEqual(graph["slug"], "graphwing-code-off")
@@ -18226,6 +18825,10 @@ class CodeOffTests(unittest.TestCase):
             "logic.join.any": {"out"},
             "logic.join.all": {"out"},
             "action.wait.webhook": {"pending", "out", "timeout", "failure"},
+            "transforms.objectBuilder": {"out"},
+            "transforms.hash": {"out"},
+            "action.datastore.records.upsert": {"success", "failure"},
+            "action.datastore.records.get": {"success", "failure"},
         }
         for edge in edges:
             self.assertEqual(edge.get("targetHandle"), "in", edge)
@@ -18311,9 +18914,75 @@ class CodeOffTests(unittest.TestCase):
         self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
         self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
-        self.assertEqual(leaves, {"done", "terminal", "terminal_error", "success_confirmation_error"})
+        self.assertEqual(leaves, {
+            "economics_recorded", "economics_write_failed", "economics_readback_failed",
+            "economics_readback_mismatch",
+        })
         for leaf in leaves:
             self.assertTrue(all({"terminalize_failed", "terminalize_success"} & set(path) for path in paths_to(leaf)), leaf)
+
+        # Rewst owns the permanent code-off economics/audit record. Every
+        # terminal path converges once on deterministic native Datastore
+        # Records nodes with an exact key/version/payload-hash readback.
+        for triple in (
+            ("done", "out", "join_economics"), ("terminal", "out", "join_economics"),
+            ("terminal_error", "out", "join_economics"),
+            ("success_confirmation_error", "out", "join_economics"),
+            ("join_economics", "out", "economics_record"),
+            ("economics_record", "out", "economics_record_key"),
+            ("economics_record_key", "out", "economics_expected_hash"),
+            ("economics_expected_hash", "out", "economics_upsert"),
+            ("economics_upsert", "success", "economics_readback"),
+            ("economics_upsert", "failure", "economics_write_failed"),
+            ("economics_readback", "success", "economics_readback_hash"),
+            ("economics_readback", "failure", "economics_readback_failed"),
+            ("economics_readback_hash", "out", "economics_readback_check"),
+            ("economics_readback_check", "out", "if_economics_readback"),
+            ("if_economics_readback", "pass", "economics_recorded"),
+            ("if_economics_readback", "fail", "economics_readback_mismatch"),
+        ):
+            self.assertIn(triple, triples, triple)
+        self.assertEqual(nodes["join_economics"]["type"], "logic.join.any")
+        self.assertTrue(nodes["join_economics"]["config"]["stopOnFirst"])
+        self.assertEqual(incoming("join_economics"), {
+            ("done", "out"), ("terminal", "out"),
+            ("terminal_error", "out"), ("success_confirmation_error", "out"),
+        })
+        upsert, readback = nodes["economics_upsert"], nodes["economics_readback"]
+        self.assertEqual(upsert["type"], "action.datastore.records.upsert")
+        self.assertEqual(readback["type"], "action.datastore.records.get")
+        for node in (upsert, readback):
+            self.assertEqual(node["config"]["scope"], "tenant")
+            self.assertEqual(node["config"]["collection"], "graphwing_codeoff_economics_v1")
+            self.assertEqual(node["config"]["recordKey"], "{{ CTX.codeoff_economics_record_key.value }}")
+        self.assertEqual(upsert["config"]["data"], "{{ CTX.codeoff_economics_record }}")
+        self.assertEqual(
+            set(upsert["config"]["indexedFields"]),
+            {"experiment_id", "status", "workflow_run_id", "protocol_version",
+             "inference_profile_version", "economics_hash"},
+        )
+        self.assertEqual(
+            {rule["path"] for rule in nodes["if_economics_readback"]["config"]["rules"]},
+            {"found_matches", "key_matches", "data_matches", "version_matches"},
+        )
+        self.assertEqual(
+            {(mapping["output"]) for mapping in nodes["economics_readback_check"]["config"]["mappings"]},
+            {"found_matches", "key_matches", "data_matches", "version_matches"},
+        )
+        self.assertEqual(
+            nodes["economics_expected_hash"]["config"]["input"], "{{ CTX.codeoff_economics_record }}",
+        )
+        self.assertEqual(
+            nodes["economics_readback_hash"]["config"]["input"], "{{ TASKS.economics_readback.data }}",
+        )
+        for node in (nodes["economics_expected_hash"], nodes["economics_readback_hash"]):
+            self.assertEqual(node["type"], "transforms.hash")
+            self.assertEqual(node["config"]["algorithm"], "sha256")
+            self.assertEqual(node["config"]["inputKind"], "json_stringify")
+        self.assertFalse(
+            any(node["type"] == "transforms.codeExpression" for node in nodes.values()),
+        )
+        self.assertNotIn("{%", json.dumps(graph))
         self.assertIn(("eligible", "pass", "finalize"), triples)
         self.assertIn(("final_verified", "pass", "commit"), triples)
         self.assertIn(("push", "success", "terminalize_success"), triples)
@@ -18390,6 +19059,122 @@ class CodeOffTests(unittest.TestCase):
         for node in nodes:
             if color[node] == 0: visit(node)
         self.assertNotIn("retry", json.dumps(graph).lower())
+
+    def test_codeoff_economics_persistence_failures_hard_fail_with_proven_rewst_regex_contract(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        outgoing = {edge["source"] for edge in graph["edges"]}
+        # Local Rewst's transforms.regexReplace contract hard-fails invalid RE2
+        # patterns; lookahead is intentionally unsupported by RE2. A failed
+        # economics write must never complete as a successful no-op.
+        for node_id, failure_code in (
+            ("economics_write_failed", "graphwing_codeoff_economics_write_failed"),
+            ("economics_readback_failed", "graphwing_codeoff_economics_readback_failed"),
+            ("economics_readback_mismatch", "graphwing_codeoff_economics_readback_mismatch"),
+        ):
+            node = nodes[node_id]
+            self.assertEqual(node["type"], "transforms.regexReplace")
+            self.assertEqual(node["config"], {
+                "input": failure_code, "pattern": "(?=graphwing)", "replacement": "",
+            })
+            self.assertNotIn(node_id, outgoing)
+        self.assertEqual(nodes["economics_recorded"]["type"], "action.noop")
+        self.assertNotIn("ttlSeconds", nodes["economics_upsert"]["config"])
+        self.assertEqual(
+            [node["id"] for node in graph["nodes"]
+             if node["type"] == "action.datastore.records.upsert"],
+            ["economics_upsert"],
+        )
+        key_expression = json.dumps(
+            nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
+        )
+        self.assertIn("graphwing-codeoff-economics-v1:", key_expression)
+        self.assertIn("WORKFLOW.runId", key_expression)
+        self.assertIn(":code-off-terminal", key_expression)
+
+    def test_codeoff_economics_record_has_a_closed_sanitized_field_allowlist(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        builder = next(node for node in graph["nodes"] if node["id"] == "economics_record")
+        self.assertEqual(builder["type"], "transforms.objectBuilder")
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in builder["config"]["mappings"]
+        }
+        self.assertEqual(set(mappings), {
+            "schema_version", "workflow_slug", "workflow_id", "workflow_version",
+            "workflow_run_id", "experiment_id", "status", "reason", "finalized",
+            "protocol_version", "inference_profile_version", "identities_hash",
+            "economics_hash", "economics", "final_verification_hash",
+        })
+        upsert = next(node for node in graph["nodes"] if node["id"] == "economics_upsert")
+        self.assertLessEqual(set(upsert["config"]["indexedFields"]), set(mappings))
+        # Only the two terminalization receipts and the workflow identity may
+        # fund the permanent record; nothing reaches into a launcher surface.
+        projection = json.dumps(builder["config"])
+        for identity in ("WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"):
+            self.assertIn(identity, projection)
+        for forbidden in (
+            "prompt", "log", "raw", "seed", "labels", "candidate-1", "output_text",
+            "response_webhook_token", "resumetoken", "resumeurl", "webhook",
+            "credential", "secret", "/home/",
+        ):
+            self.assertNotIn(forbidden, projection.lower())
+
+    def test_codeoff_graph_launches_send_the_prepared_effort_for_every_slot(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        self._prepare("graph-effort-01")
+        manifest = json.loads((self.records / "graph-effort-01" / "manifest.json").read_text())
+        launches = server._codeoff_launch_plan(manifest)
+        runs = [node for node in graph["nodes"] if node["type"] == "action.graphwing.POST:/v1/agent/run"]
+        self.assertEqual(len(runs), 5)
+        for node in runs:
+            with self.subTest(node=node["id"]):
+                key = node["config"]["codeoff_workspace"]["slot"].replace("-", "_")
+                self.assertIn(key, launches)
+                self.assertEqual(
+                    node["config"]["effort"],
+                    "{{ TASKS.prepare.data.launches." + key + ".effort }}",
+                )
+                self.assertEqual(
+                    launches[key]["effort"], server.CODEOFF_SLOT_REQUESTED_EFFORT[
+                        server.codeoff_slot_work_role(node["config"]["codeoff_workspace"]["slot"])
+                    ],
+                )
+
+    def test_codeoff_graph_converges_every_terminal_into_the_durable_record(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        sources = {edge["source"] for edge in graph["edges"]}
+        terminals = {node["id"] for node in graph["nodes"] if node["id"] not in sources}
+        # The only paths that end without a durable economics record are the
+        # four economics markers themselves; every workflow outcome before them
+        # must fund exactly one record.
+        self.assertEqual(terminals, {
+            "economics_recorded", "economics_write_failed",
+            "economics_readback_failed", "economics_readback_mismatch",
+        })
+        joined = {
+            edge["source"] for edge in graph["edges"] if edge["target"] == "join_economics"
+        }
+        self.assertEqual(joined, {"done", "terminal", "terminal_error", "success_confirmation_error"})
+        status = next(
+            mapping for mapping in
+            next(node for node in graph["nodes"] if node["id"] == "economics_record")["config"]["mappings"]
+            if mapping["output"] == "status"
+        )
+        # `status` is an indexed field, so an unconfirmed terminalization has to
+        # land as a stated string rather than a null the index cannot carry.
+        self.assertEqual(
+            json.dumps(status["expression"]).count('"kind": "literal"'), 1,
+        )
+        self.assertNotIn("null", json.dumps(status["expression"]))
 
     def test_publish_catalog_includes_codeoff_and_validated_implement_slice(self):
         source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()
