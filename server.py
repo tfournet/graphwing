@@ -109,6 +109,16 @@ EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
 REVIEW_EFFORT_SOURCES = frozenset({"explicit", "launcher_default"})
 REVIEW_EXECUTION_VERSION = "review-execution-v1"
+# One review authority binds the complete diff, hashed byte-exact. A prefix hash
+# would give two candidates sharing that prefix the same diff_sha256 and the same
+# review authority, so an oversized diff is rejected before launch instead of
+# truncated. Two documented host limits bound the safe maximum: CMD_MAX_BYTES is
+# the 256-KiB capture cap, and Linux MAX_ARG_STRLEN rejects a single argv string of
+# 131,072 bytes or more, which is how the Claude reviewer receives its whole prompt.
+# Worst case that prompt is the review boilerplate plus the 8,000-character ticket
+# excerpt (at most 4 UTF-8 bytes each) plus the complete diff, so 64 KiB stays
+# under both limits with a wide margin.
+REVIEW_MAX_DIFF_BYTES = 64 * 1024
 REVIEW_PERMISSION_PROFILES = {
     "codex": "codex-read-only",
     "claude": "claude-plan",
@@ -3161,6 +3171,33 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
+def complete_review_diff(resolved: Path) -> tuple[str, str | None]:
+    """Return the complete review diff, or a closed failure code; never a prefix."""
+    result = git_diff(resolved, "HEAD", None)
+    diff_text = result.get("diff")
+    if not result.get("ok") or not isinstance(diff_text, str):
+        return "", "git_state_unavailable"
+    if result.get("truncated") or len(diff_text.encode()) > REVIEW_MAX_DIFF_BYTES:
+        return "", "review_diff_too_large"
+    return diff_text, None
+
+
+def review_diff_rejection(code: str) -> dict[str, str]:
+    """Author the one sanitized acceptance error for an unreviewable diff."""
+    if code == "review_diff_too_large":
+        return {
+            "error": (
+                "review diff exceeds the reviewable maximum of "
+                f"{REVIEW_MAX_DIFF_BYTES} bytes"
+            ),
+            "code": "review_diff_too_large",
+        }
+    return {
+        "error": "review repository identity is unavailable",
+        "code": "git_state_unavailable",
+    }
+
+
 def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     usage_started = time.monotonic()
@@ -3388,15 +3425,15 @@ def run_review_job(job_id: str) -> None:
             }
         else:
             sealed_identity = snapshot.get("execution_identity")
-            if not isinstance(sealed_identity, dict):
+            diff_text, diff_code = complete_review_diff(Path(snapshot["cwd"]))
+            if not isinstance(sealed_identity, dict) or diff_code is not None:
+                # An unreadable or oversized diff can no longer reproduce the exact
+                # bytes sealed into this authority, so the worker never launches.
                 result = {
                     "ok": False, "verdict": "NACK", "no_verdict": True,
                     "code": "review_execution_identity_mismatch",
                 }
             else:
-                diff_text = str(
-                    git_diff(Path(snapshot["cwd"]), "HEAD", None).get("diff") or ""
-                )[:12000]
                 result = native_review_result(NativeReviewExecutionContext(
                     authority_identity=json.loads(json.dumps(sealed_identity)),
                     execution_identity=identity,
@@ -3541,7 +3578,9 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         or not isinstance(starting_head, str) or not GIT_SHA_RE.fullmatch(starting_head)
     ):
         return 409, {"error": "review repository identity is unavailable", "code": "git_state_unavailable"}
-    diff_text = str(git_diff(resolved, "HEAD", None).get("diff") or "")[:12000]
+    diff_text, diff_code = complete_review_diff(resolved)
+    if diff_code is not None:
+        return 409, review_diff_rejection(diff_code)
     binary = resolve_launcher_binary_now(launcher)
     accepted_launcher: PinnedLauncher | None = None
     try:
@@ -4941,6 +4980,7 @@ def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bo
         and isinstance(context.resolved, Path)
         and isinstance(context.prompt, str)
         and isinstance(context.diff_text, str)
+        and len(context.diff_text.encode()) <= REVIEW_MAX_DIFF_BYTES
         and all(isinstance(value, str) for value in (
             context.launcher, context.provider, context.model,
             context.requested_effort, context.effective_effort,

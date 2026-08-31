@@ -522,7 +522,7 @@
           "400": { "description": "invalid review request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "401": { "description": "missing or invalid API key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewError" } } } },
           "409": {
-            "description": "busy or synchronous execution identity mismatch",
+            "description": "busy, unreviewable repository diff, or synchronous execution identity mismatch",
             "content": {
               "application/json": {
                 "schema": {

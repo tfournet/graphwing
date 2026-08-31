@@ -8164,7 +8164,10 @@ while True:
             launcher.chmod(0o755)
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(
+                     server, "git_diff",
+                     return_value={"ok": True, "diff": "fixture", "truncated": False},
+                 ), \
                  mock.patch.object(server.subprocess, "run", side_effect=fake_run):
                 status, payload, _ = server.dispatch(
                     "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
@@ -8223,7 +8226,10 @@ while True:
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(
+                     server, "git_diff",
+                     return_value={"ok": True, "diff": "fixture", "truncated": False},
+                 ), \
                  mock.patch.object(server, "enqueue_review") as enqueue, \
                  mock.patch.object(server.subprocess, "Popen", side_effect=counted_popen), \
                  mock.patch.dict(os.environ, env, clear=False), \
@@ -13968,19 +13974,13 @@ func main() {
                 json.loads((jobs / ("a4" * 16) / "job.json").read_text())["status"], "running"
             )
 
-    def test_review_run_409_and_501_actual_bodies_match_exact_openapi_branches(self):
+    def _openapi_schema_validator(self, spec):
+        """Author one Draft 2020-12 checker for these closed OpenAPI shapes."""
         try:
             from jsonschema import Draft202012Validator
         except ImportError:  # catalog CI intentionally installs no third-party packages
             Draft202012Validator = None
 
-        spec = json.loads(server.openapi_bytes())
-        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
-        response_409 = responses["409"]["content"]["application/json"]["schema"]
-        self.assertEqual(
-            {item["$ref"] for item in response_409["oneOf"]},
-            {"#/components/schemas/ReviewError", "#/components/schemas/ReviewReceipt"},
-        )
         def dereference(value):
             if isinstance(value, dict):
                 if set(value) == {"$ref"} and value["$ref"].startswith("#/"):
@@ -14055,6 +14055,17 @@ func main() {
             self.assertEqual(portable, authoritative)
             return authoritative
 
+        return valid
+
+    def test_review_run_409_and_501_actual_bodies_match_exact_openapi_branches(self):
+        spec = json.loads(server.openapi_bytes())
+        valid = self._openapi_schema_validator(spec)
+        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        response_409 = responses["409"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            {item["$ref"] for item in response_409["oneOf"]},
+            {"#/components/schemas/ReviewError", "#/components/schemas/ReviewReceipt"},
+        )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             status, busy, *_ = self._queue_closed_review(
@@ -14117,6 +14128,271 @@ func main() {
         self.assertTrue(valid(response_400, invalid))
         response_501 = responses["501"]["content"]["application/json"]["schema"]
         self.assertTrue(valid(response_501, unavailable))
+
+    # One added line is exactly 80 diff bytes: "+", 78 payload characters, "\n".
+    _REVIEW_DIFF_LINE = "x" * 78
+    _REVIEW_DIFF_LINE_BYTES = 80
+
+    def _review_diff_worktree(self, root, *, prefix_lines, tail):
+        """Author one worktree whose `git diff HEAD` starts with a fixed long prefix."""
+        root.mkdir(parents=True, exist_ok=True)
+        repo = self._scratch_git(root)
+        for name in ("a_payload.txt", "z_tail.txt"):
+            repo.joinpath(name).write_text("")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "a_payload.txt", "z_tail.txt"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "payload"],
+            check=True, capture_output=True,
+        )
+        # a_payload.txt sorts first and is byte-identical across cases, so every
+        # produced diff shares one long prefix and differs only in z_tail.txt.
+        repo.joinpath("a_payload.txt").write_text(
+            f"{self._REVIEW_DIFF_LINE}\n" * prefix_lines
+        )
+        repo.joinpath("z_tail.txt").write_text(tail)
+        return repo
+
+    def _worktree_diff(self, repo):
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "HEAD"], check=True, capture_output=True
+        )
+        return proc.stdout.decode()
+
+    def _review_wrapper(self, root):
+        launcher = root / "claude-review-wrapper"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        return launcher
+
+    _REVIEW_DIFF_BODY = {
+        "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+        "model": "claude-sonnet-5", "prompt": "bounded ticket",
+    }
+
+    def test_review_identity_hashes_the_complete_diff_and_never_a_prefix(self):
+        contexts, identities, diffs = [], [], []
+
+        def capture(context):
+            contexts.append(context)
+            return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+        body = json.dumps(self._REVIEW_DIFF_BODY).encode()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            launcher = self._review_wrapper(root)
+            for index, tail in enumerate(("first suffix\n", "second suffix\n")):
+                case = root / f"case-{index}"
+                case.mkdir()
+                repo = self._review_diff_worktree(case, prefix_lines=200, tail=tail)
+                diffs.append(self._worktree_diff(repo))
+                with mock.patch.object(
+                    server, "load_repos", return_value={"scratch": str(repo)}
+                ), mock.patch.object(
+                    server, "resolve_launcher_binary_now", return_value=launcher
+                ), mock.patch.object(
+                    server, "native_review_result", side_effect=capture
+                ):
+                    status, receipt, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, body
+                    )
+                self.assertEqual(status, 200, receipt)
+                identities.append(receipt["execution_identity"])
+
+        # The demonstrated blocker: 200 identical added lines are 16,000 diff bytes,
+        # so both candidates share the first 12,000 characters exactly.
+        self.assertGreater(len(diffs[0]), 12000)
+        self.assertEqual(diffs[0][:12000], diffs[1][:12000])
+        self.assertNotEqual(diffs[0], diffs[1])
+        self.assertEqual(
+            hashlib.sha256(diffs[0][:12000].encode()).hexdigest(),
+            hashlib.sha256(diffs[1][:12000].encode()).hexdigest(),
+        )
+        self.assertNotEqual(identities[0]["diff_sha256"], identities[1]["diff_sha256"])
+        self.assertEqual(len(contexts), 2)
+        for identity, diff, context in zip(identities, diffs, contexts):
+            self.assertEqual(
+                identity["diff_sha256"], hashlib.sha256(diff.encode()).hexdigest()
+            )
+            # The reviewer context carries the same exact full bytes the identity binds.
+            self.assertEqual(context.diff_text, diff)
+
+    def test_review_suffix_drift_after_acceptance_fails_before_launch(self):
+        real_run = subprocess.run
+        spawned = []
+
+        def guard_run(command, **kwargs):
+            if not command or str(command[0]) != "git":
+                spawned.append(list(command))
+                raise AssertionError("drifted review must not reach a launcher")
+            return real_run(command, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            launcher = self._review_wrapper(root)
+            repo = self._review_diff_worktree(
+                root / "case", prefix_lines=200, tail="accepted suffix\n"
+            )
+            accepted_diff = self._worktree_diff(repo)
+            request = json.dumps({
+                **self._REVIEW_DIFF_BODY, "repo": "scratch", "async": True
+            }).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "enqueue_review"):
+                status, accepted, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, request
+                )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            self.addCleanup(server.release_review_authority, job_id)
+            self.assertEqual(
+                accepted["execution_identity"]["diff_sha256"],
+                hashlib.sha256(accepted_diff.encode()).hexdigest(),
+            )
+
+            repo.joinpath("z_tail.txt").write_text("drifted suffix\n")
+            drifted_diff = self._worktree_diff(repo)
+            self.assertEqual(accepted_diff[:12000], drifted_diff[:12000])
+            self.assertNotEqual(accepted_diff, drifted_diff)
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server.subprocess, "run", side_effect=guard_run), \
+                 mock.patch.object(server, "deliver_webhook") as callback, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            delivered = callback.call_args.args[1]
+            record = json.loads((jobs / job_id / "job.json").read_text())
+
+        self.assertEqual(spawned, [])
+        self.assertEqual(record["status"], "failed")
+        receipt = record["receipt"]
+        self.assertEqual(delivered, receipt)
+        self.assertEqual(receipt["code"], "review_execution_identity_mismatch")
+        self.assertEqual(receipt["status"], "error")
+        self.assertIsNone(receipt["verdict"])
+        self.assertTrue(receipt["no_verdict"])
+
+    def test_oversized_review_diff_rejects_before_any_launcher_call(self):
+        spec = json.loads(server.openapi_bytes())
+        valid = self._openapi_schema_validator(spec)
+        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        # The documented response set is unchanged; an unreviewable diff is a 409.
+        self.assertEqual(
+            set(responses), {"200", "202", "400", "401", "409", "501", "504"}
+        )
+        response_409 = responses["409"]["content"]["application/json"]["schema"]
+
+        # 900 identical added lines are 72,000 diff bytes, above the 65,536 maximum.
+        self.assertGreater(900 * self._REVIEW_DIFF_LINE_BYTES, server.REVIEW_MAX_DIFF_BYTES)
+        rejections = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            repo = self._review_diff_worktree(
+                root / "case", prefix_lines=900, tail="oversized suffix\n"
+            )
+            self.assertGreater(
+                len(self._worktree_diff(repo).encode()), server.REVIEW_MAX_DIFF_BYTES
+            )
+            for async_requested in (False, True):
+                request = json.dumps({
+                    **self._REVIEW_DIFF_BODY, "async": async_requested
+                }).encode()
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                     mock.patch.object(server, "resolve_launcher_binary_now") as resolve, \
+                     mock.patch.object(server, "pin_launcher") as pin, \
+                     mock.patch.object(server, "native_review_result") as spawn, \
+                     mock.patch.object(server, "enqueue_review") as queued:
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, request
+                    )
+                resolve.assert_not_called()
+                pin.assert_not_called()
+                spawn.assert_not_called()
+                queued.assert_not_called()
+                self.assertEqual(status, 409, payload)
+                rejections.append(payload)
+            self.assertFalse(jobs.exists())
+            repo_path = str(repo)
+
+        for payload in rejections:
+            self.assertEqual(set(payload), {"error", "code"})
+            self.assertEqual(payload["code"], "review_diff_too_large")
+            self.assertEqual(
+                payload["error"],
+                "review diff exceeds the reviewable maximum of 65536 bytes",
+            )
+            self.assertNotIn(repo_path, json.dumps(payload))
+            self.assertNotIn("x" * 78, json.dumps(payload))
+            self.assertTrue(valid(response_409, payload))
+            self.assertEqual(
+                sum(valid(branch, payload) for branch in response_409["oneOf"]), 1
+            )
+
+    def test_accepted_full_size_review_diff_stays_reviewable(self):
+        # 800 identical added lines are 64,000 diff bytes: far past the old 12,000
+        # prefix and still inside the 65,536 maximum.
+        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 65536)
+        self.assertLess(800 * self._REVIEW_DIFF_LINE_BYTES, server.REVIEW_MAX_DIFF_BYTES)
+        real_run = subprocess.run
+        commands = []
+
+        class FakeProc:
+            stderr = b""
+            returncode = 0
+            stdout = b"VERDICT: PASS\n"
+
+        def fake_run(command, **kwargs):
+            if command and str(command[0]) == "git":
+                return real_run(command, **kwargs)
+            commands.append(list(command))
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            launcher = self._review_wrapper(root)
+            repo = self._review_diff_worktree(
+                root / "case", prefix_lines=800, tail="reviewable suffix\n"
+            )
+            diff = self._worktree_diff(repo)
+            self.assertGreater(len(diff), 12000)
+            self.assertLessEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+            body = json.dumps(self._REVIEW_DIFF_BODY).encode()
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                status, receipt, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, body
+                )
+
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt["status"], receipt["verdict"]), ("ok", "PASS"))
+        self.assertEqual(
+            receipt["execution_identity"]["diff_sha256"],
+            hashlib.sha256(diff.encode()).hexdigest(),
+        )
+        self.assertEqual(len(commands), 1)
+        launched_prompt = commands[0][-1]
+        self.assertIn("--permission-mode", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--permission-mode") + 1], "plan")
+        # The reviewer reads the complete diff, prefix and suffix alike.
+        self.assertIn(diff, launched_prompt)
+        self.assertIn("reviewable suffix", launched_prompt)
+        # One argv string still fits the documented Linux MAX_ARG_STRLEN limit,
+        # which rejects a single argument of 131,072 bytes or more. Worst case is
+        # the boilerplate plus a 4-bytes-per-character 8,000-character ticket
+        # excerpt plus a maximum diff, and that still clears the limit.
+        self.assertLess(len(launched_prompt.encode()), 131072)
+        self.assertLess(1024 + 4 * 8000 + server.REVIEW_MAX_DIFF_BYTES, 131072)
 
     def test_review_alien_replacement_at_terminal_cas_is_preserved_without_callback(self):
         with tempfile.TemporaryDirectory() as td:
