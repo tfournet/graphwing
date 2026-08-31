@@ -18403,6 +18403,49 @@ class CodeOffTests(unittest.TestCase):
         for judge in private["judges"].values():
             self.assertNotIn(json.dumps(judge["labels"], sort_keys=True), rendered)
 
+    def test_codeoff_audit_totals_key_order_never_republishes_blind_ordering(self):
+        """Seed 0…01 shuffles judge-fable opposite the other two judges.
+
+        The audit body is serialized without `sort_keys`, so emitting a judge's
+        totals in that judge's own blind order would hand the whole per-judge
+        shuffle to any reader of the wire bytes, no label string required.
+        """
+        experiment_id = "audit-order-01"
+        seed = "0" * 63 + "1"
+        self._prepare(experiment_id, seed=seed)
+        (server.codeoff_workspace_path(experiment_id, "author-1") / "README.md").write_text("winner\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot)
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", score_a=3)
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+
+        private = json.loads((self.records / experiment_id / "private" / "blinding.json").read_text())
+        first_seen = {slot: item["labels"]["candidate-1"] for slot, item in private["judges"].items()}
+        self.assertEqual(len(set(first_seen.values())), 2, first_seen)
+
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        # Bind to the exact bytes the HTTP layer emits, not to dict identity.
+        wire = json.loads(json.dumps(audit).encode())
+        orders = {slot: list(value["totals"]) for slot, value in wire["judges"].items()}
+        self.assertEqual(set(orders), {"judge-fable", "judge-1", "judge-2"})
+        for slot, order in orders.items():
+            with self.subTest(slot=slot):
+                self.assertEqual(order, ["author-1", "author-2"])
+        self.assertNotEqual(
+            {slot: order[0] for slot, order in orders.items()}, first_seen,
+        )
+        # Author-slot totals stay exact after the re-key: author-1 scored higher.
+        for slot, value in wire["judges"].items():
+            with self.subTest(slot=slot):
+                self.assertGreater(value["totals"]["author-1"], value["totals"]["author-2"])
+                self.assertEqual(value["preference"], "author-1")
+
     def test_codeoff_economics_artifact_aggregates_authors_judges_tests_and_final(self):
         experiment_id = "economics-0001"
         self._prepare(experiment_id)
@@ -18482,6 +18525,64 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(economics["slots"]["author-2"]["usage_diagnostics"], ["usage_not_reported"])
         self.assertIsNone(economics["final_verification"]["receipt_hash"])
         self.assertEqual(economics["tests"]["final_runs"], 0)
+
+    def test_codeoff_economics_never_claims_a_pass_the_whole_author_field_did_not_run(self):
+        """One green candidate is not a green pair.
+
+        A park after author-1 tested and author-2 never did would otherwise
+        write `candidate_pass: true` into the permanent Rewst record for an
+        experiment where half the author field never ran its recipes.
+        """
+        experiment_id = "economics-partial"
+        self._prepare(experiment_id)
+        frozen, tested = self._freeze_and_test(experiment_id, "author-1")
+        self.assertTrue(tested["tests_pass"], (frozen, tested))
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, terminal)
+        tests = terminal["economics"]["tests"]
+        self.assertEqual(tests["candidate_runs"], 1)
+        self.assertEqual(tests["expected_candidate_runs"], 2)
+        self.assertIsNone(tests["candidate_pass"])
+        self.assertEqual(
+            sum(1 for slot in terminal["economics"]["slots"].values() if slot["work_role"] == "author"), 2,
+        )
+        self.assertEqual(
+            sum(1 for slot in terminal["economics"]["slots"].values() if slot["work_role"] == "judge"), 3,
+        )
+        # The complete pair still reports a real verdict.
+        complete = "economics-complete"
+        self._prepare(complete)
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(complete, slot)
+        status, both = self._post("/v1/code-off/terminal", {
+            "experiment_id": complete, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, both)
+        self.assertEqual(both["economics"]["tests"]["candidate_runs"], 2)
+        self.assertEqual(both["economics"]["tests"]["expected_candidate_runs"], 2)
+        self.assertIs(both["economics"]["tests"]["candidate_pass"], True)
+
+    def test_codeoff_usage_diagnostics_enum_is_the_closed_server_set(self):
+        """Every diagnostic `_codeoff_slot_usage` can emit must be published."""
+        self.assertEqual(
+            server.CODEOFF_USAGE_DIAGNOSTICS,
+            server.USAGE_DIAGNOSTICS | {"usage_authority_nonterminal"},
+        )
+        schema = json.loads(server.openapi_bytes())["components"]["schemas"]["CodeOffEconomicsSlot"]
+        published = set(schema["properties"]["usage_diagnostics"]["items"]["enum"])
+        self.assertEqual(published, set(server.CODEOFF_USAGE_DIAGNOSTICS))
+        # A queued attempt is a real, closed, non-funding diagnostic.
+        experiment_id = "economics-diag-1"
+        self._prepare(experiment_id)
+        with mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", self._agent_body(experiment_id, "author-1"))
+        self.assertEqual(status, 202, launched)
+        usage, diagnostic = server._codeoff_slot_usage(launched["job_id"])
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, server.CODEOFF_USAGE_NONTERMINAL)
+        self.assertIn(diagnostic, server.CODEOFF_USAGE_DIAGNOSTICS)
 
     def test_codeoff_requested_effort_collision_cannot_forge_a_slot_identity(self):
         # `default` and `high` collapse to the same effective effort on every
@@ -19175,6 +19276,55 @@ class CodeOffTests(unittest.TestCase):
             json.dumps(status["expression"]).count('"kind": "literal"'), 1,
         )
         self.assertNotIn("null", json.dumps(status["expression"]))
+
+    def test_codeoff_graph_actual_riftwing_workflow_lint_when_available(self):
+        """Use Riftwing's authoritative Go checker; keep CI hermetic and stdlib-only."""
+        graph_path = Path(server.__file__).parent / "graphs" / "code-off.json"
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            graph = json.loads(graph_path.read_text())["spec"]
+            economics_nodes = [
+                node for node in graph["nodes"]
+                if node["id"].startswith("economics_") or node["id"] in ("join_economics", "if_economics_readback")
+            ]
+            self.assertTrue(economics_nodes)
+            self.assertNotIn("transforms.codeExpression", {node["type"] for node in economics_nodes})
+            dumped = json.dumps(economics_nodes)
+            self.assertNotIn("namespace(", dumped)
+            self.assertNotRegex(dumped, r"{%-?\s*set\s+[A-Za-z_]\w*[.\[]")
+            return
+
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    raw, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+    spec, ok := envelope["spec"].(map[string]any); if !ok { panic("missing object spec") }
+    result := linter.Lint(spec)
+    for _, issue := range result.Issues {
+        encoded, _ := json.Marshal(issue)
+        fmt.Println(string(encoded))
+    }
+    fmt.Printf("issues=%d\n", len(result.Issues))
+    if len(result.Issues) != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "graphwing_workflow_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(
+                ["go", "run", str(checker), str(graph_path)],
+                cwd=Path(riftwing) / "rewst-go", text=True,
+                capture_output=True, timeout=300, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("issues=0", result.stdout)
 
     def test_publish_catalog_includes_codeoff_and_validated_implement_slice(self):
         source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()

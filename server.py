@@ -8451,6 +8451,13 @@ CODEOFF_USAGE_TOKEN_FIELDS = (
     "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
     "output_tokens", "reasoning_tokens",
 )
+# A slot attempt the graph has not driven to a terminal state cannot fund a
+# number. That is the one diagnostic code-off adds to the receipt-level closed
+# set; deriving the code-off set from `USAGE_DIAGNOSTICS` keeps the published
+# `CodeOffEconomicsSlot.usage_diagnostics` enum from drifting away from what
+# `_codeoff_slot_usage` can actually emit.
+CODEOFF_USAGE_NONTERMINAL = "usage_authority_nonterminal"
+CODEOFF_USAGE_DIAGNOSTICS = USAGE_DIAGNOSTICS | {CODEOFF_USAGE_NONTERMINAL}
 
 
 def _codeoff_slot_usage(job_id: Any) -> tuple[dict[str, Any] | None, str]:
@@ -8469,7 +8476,7 @@ def _codeoff_slot_usage(job_id: Any) -> tuple[dict[str, Any] | None, str]:
         return None, "usage_authority_unavailable"
     assert isinstance(job, dict)
     if job.get("status") not in ("completed", "failed"):
-        return None, "usage_authority_nonterminal"
+        return None, CODEOFF_USAGE_NONTERMINAL
     receipt = job.get("receipt")
     if not receipt_profile_matches_job(job, receipt):
         return None, "usage_authority_mismatch"
@@ -8542,11 +8549,19 @@ def _codeoff_economics(manifest: dict[str, Any], state: dict[str, Any]) -> dict[
             "usage": _codeoff_usage_totals(attempts),
             "usage_diagnostics": sorted(diagnostics),
         }
+    candidate_slots = state.get("candidates") or {}
     candidate_runs = [
-        state["candidates"][slot]["tests"]
-        for slot in sorted(state.get("candidates") or {})
-        if isinstance((state["candidates"].get(slot) or {}).get("tests"), dict)
+        candidate_slots[slot]["tests"]
+        for slot in sorted(candidate_slots)
+        if isinstance((candidate_slots.get(slot) or {}).get("tests"), dict)
     ]
+    # `candidate_pass` is a claim about the whole author field, so it is a
+    # verdict only when every author candidate actually ran its recipes. A park
+    # after one candidate tested green must not report the pair as passing.
+    candidate_pass = (
+        all(run.get("pass") is True for run in candidate_runs)
+        if candidate_slots and len(candidate_runs) == len(candidate_slots) else None
+    )
     final_verification = state.get("final_verification") if isinstance(state.get("final_verification"), dict) else None
     final_summary = state.get("final_test_summary") if isinstance(state.get("final_test_summary"), dict) else None
     everything = grouped["author"] + grouped["judge"]
@@ -8565,7 +8580,8 @@ def _codeoff_economics(manifest: dict[str, Any], state: dict[str, Any]) -> dict[
         "inference": _codeoff_usage_totals(everything),
         "tests": {
             "candidate_runs": len(candidate_runs),
-            "candidate_pass": all(run.get("pass") is True for run in candidate_runs) if candidate_runs else None,
+            "expected_candidate_runs": len(candidate_slots),
+            "candidate_pass": candidate_pass,
             "candidate_elapsed_seconds": round(sum(float(run.get("elapsed_seconds") or 0) for run in candidate_runs), 6),
             "final_runs": 1 if final_summary else 0,
             "final_pass": final_summary.get("pass") if final_summary else None,
@@ -9650,8 +9666,13 @@ def _codeoff_audit_judges(root: Path, state: dict[str, Any]) -> dict[str, Any]:
 
     Before finalization only the receipt hash is public. After finalization the
     audit needs each judge's decision, so scores and the preference are stated
-    in author-slot terms. The blind label a judge saw is never emitted, so the
-    per-judge shuffle stays unreconstructable from the public record.
+    in author-slot terms. The blind label a judge saw is never emitted.
+
+    Key order is authority too: the wire body is not canonicalized, so emitting
+    each judge's totals in the order that judge's own result file listed the
+    blind labels would republish the exact per-judge shuffle. Totals are keyed
+    by author slot and sorted by author slot, so the projection reads the same
+    for every judge whatever ordering that judge saw.
     """
     judges = state.get("judges", {})
     if state.get("finalized") is not True:
@@ -9665,12 +9686,14 @@ def _codeoff_audit_judges(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     for slot, value in judges.items():
         labels = mapping.get(slot) or {}
         preference = value.get("preference")
+        scored = value.get("candidates") or {}
         projected[slot] = {
             "receipt_hash": value.get("receipt_hash"),
             "preference": "abstain" if preference == "abstain" else labels.get(preference),
             "totals": {
-                labels[label]: item.get("total")
-                for label, item in (value.get("candidates") or {}).items() if label in labels
+                author_slot: scored[label].get("total")
+                for label, author_slot in sorted(labels.items(), key=lambda item: item[1])
+                if isinstance(scored.get(label), dict)
             },
         }
     return projected
