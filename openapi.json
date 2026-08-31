@@ -1291,6 +1291,7 @@
       "SliceRouteRequest": {
         "type": "object",
         "required": ["work_kind"],
+        "additionalProperties": false,
         "properties": {
           "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
           "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
@@ -1302,6 +1303,7 @@
       "SliceRouteFallbackRequest": {
         "type": "object",
         "required": ["work_kind", "primary_route", "primary_receipt"],
+        "additionalProperties": false,
         "properties": {
           "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
           "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
@@ -1315,6 +1317,7 @@
       "SliceRouteRecoveryRequest": {
         "type": "object",
         "required": ["work_kind", "primary_route", "primary_receipt", "fallback_route", "fallback_receipt"],
+        "additionalProperties": false,
         "properties": {
           "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
           "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
@@ -1351,13 +1354,13 @@
           "reviewer1_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
           "reviewer1_provider": { "type": "string" },
           "reviewer1_model": { "type": "string" },
-          "reviewer1_effort": { "type": "string", "enum": ["none", "high", "default"] },
+          "reviewer1_effort": { "type": "string", "enum": ["none", "medium", "high"] },
           "reviewer1_reason": { "type": "string" },
           "reviewer2": { "type": "string" },
           "reviewer2_launcher": { "type": "string", "enum": ["none", "codex", "claude", "grok"] },
           "reviewer2_provider": { "type": "string" },
           "reviewer2_model": { "type": "string" },
-          "reviewer2_effort": { "type": "string", "enum": ["none", "high", "default"] },
+          "reviewer2_effort": { "type": "string", "enum": ["none", "medium", "high"] },
           "reviewer2_reason": { "type": "string" },
           "writer_execution_profile": { "$ref": "#/components/schemas/RouteExecutionProfile" },
           "reviewer1_execution_profile": { "$ref": "#/components/schemas/RouteExecutionProfile" },
