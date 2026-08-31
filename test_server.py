@@ -6750,22 +6750,22 @@ while True:
             "go_coding": {
                 "writer": ("codex", "openai", "gpt-5.6-sol", "high", "work_kind=go_coding"),
                 "reviewers": (
-                    ("claude", "anthropic", "claude-sonnet-5", "default", "different_provider_from_writer"),
-                    ("grok", "xai", "grok-4.6", "default", "different_provider_from_writer_and_reviewer1"),
+                    ("claude", "anthropic", "claude-sonnet-5", "high", "different_provider_from_writer"),
+                    ("grok", "xai", "grok-4.6", "high", "different_provider_from_writer_and_reviewer1"),
                 ),
             },
             "typescript_coding": {
                 "writer": ("claude", "anthropic", "claude-opus-5", "default", "work_kind=typescript_coding"),
                 "reviewers": (
                     ("codex", "openai", "gpt-5.6-sol", "high", "different_provider_from_writer"),
-                    ("grok", "xai", "grok-4.6", "default", "different_provider_from_writer_and_reviewer1"),
+                    ("grok", "xai", "grok-4.6", "high", "different_provider_from_writer_and_reviewer1"),
                 ),
             },
             "research_ops": {
                 "writer": ("grok", "xai", "grok-4.6", "default", "work_kind=research_ops"),
                 "reviewers": (
                     ("codex", "openai", "gpt-5.6-sol", "high", "different_provider_from_writer"),
-                    ("claude", "anthropic", "claude-opus-5", "default", "different_provider_from_writer_and_reviewer1"),
+                    ("claude", "anthropic", "claude-opus-5", "high", "different_provider_from_writer_and_reviewer1"),
                 ),
             },
         }
@@ -6797,7 +6797,138 @@ while True:
             actual = sum(route[f"reviewer{i}_launcher"] != "none" for i in (1, 2))
             self.assertEqual(actual, count, f"{class_name}/{size}")
 
-    def test_normal_v1_route_matrix_is_byte_for_byte_unchanged(self):
+    def test_routing_policy_v2_note_records_evidence_gate_and_activation_boundary(self):
+        note = (Path(__file__).parent / "docs/notes/routing-policy-v2.md").read_text()
+        human_loop = (Path(__file__).parent / "docs/HUMAN-LOOP.md").read_text()
+        for statement in (
+            "`normal-v1` remains the active writer policy",
+            "`routing-policy-v2-candidate` is benchmark-only",
+            "`closed_contract`, `existing_failing_test`, and `external_verification` are omitted",
+            "Red test state is never a routing input",
+            "Normal review effort is `medium`; sensitive review effort is `high`",
+            "12 turns and 200 seconds",
+        ):
+            self.assertIn(statement, note)
+        self.assertIn("routing-policy-v2 candidate is not active", human_loop)
+        self.assertIn("normal reviews request `medium`", human_loop)
+        self.assertIn("sensitive reviews request `high`", human_loop)
+
+    def test_writer_and_reviewer_effort_policies_are_separate_and_bounded(self):
+        for work_kind in server.SLICE_WORK_KINDS:
+            with self.subTest(work_kind=work_kind, class_name="mechanical"):
+                normal = server.slice_route_lookup(
+                    "mechanical", "M", seams=0, work_kind=work_kind
+                )
+                self.assertEqual(normal["reviewer1_effort"], "medium")
+                self.assertEqual(
+                    normal["reviewer1_execution_profile"]["effort"], "medium"
+                )
+                self.assertNotEqual(normal["max_turns"], server.REVIEW_MAX_TURNS)
+                self.assertNotEqual(
+                    normal["run_budget_seconds"], server.REVIEW_DEFAULT_BUDGET_SECONDS
+                )
+
+            with self.subTest(work_kind=work_kind, class_name="sensitive"):
+                sensitive = server.slice_route_lookup(
+                    "sensitive", "M", seams=0, work_kind=work_kind
+                )
+                self.assertEqual(sensitive["reviewer1_effort"], "high")
+                self.assertEqual(sensitive["reviewer2_effort"], "high")
+                self.assertEqual(
+                    sensitive["reviewer2_execution_profile"]["effort"], "high"
+                )
+
+        closed_small = server.routing_policy_v2_candidate(
+            "mechanical", "S", ac_count=5, seams=1, work_kind="go_coding"
+        )
+        self.assertEqual(closed_small["review"], "none")
+        self.assertEqual(closed_small["reviewer1_effort"], "none")
+
+        multi_seam = server.routing_policy_v2_candidate(
+            "mechanical", "S", ac_count=5, seams=2, work_kind="go_coding"
+        )
+        self.assertEqual(multi_seam["size"], "L")
+        self.assertEqual(multi_seam["model"], "gpt-5.6-sol")
+        self.assertEqual(multi_seam["effort"], "high")
+        self.assertEqual(multi_seam["reviewer1_effort"], "medium")
+        unknown_seams = server.routing_policy_v2_candidate(
+            "mechanical", "S", ac_count=5, work_kind="go_coding"
+        )
+        self.assertEqual(unknown_seams["size"], "L")
+        self.assertEqual(unknown_seams["reviewer1_effort"], "medium")
+
+        self.assertEqual(server.REVIEW_MAX_TURNS, 12)
+        self.assertEqual(server.REVIEW_DEFAULT_BUDGET_SECONDS, 200)
+        self.assertEqual(server.REVIEW_MAX_REQUEST_TURNS, 30)
+        self.assertEqual(server.REVIEW_MAX_BUDGET_SECONDS, 600)
+
+    def test_routing_policy_v2_candidate_covers_every_supported_combination(self):
+        sonnet_medium = ("claude", "anthropic", "claude-sonnet-5", "medium")
+        sol_high = ("codex", "openai", "gpt-5.6-sol", "high")
+        opus_high = ("claude", "anthropic", "claude-opus-5", "high")
+        grok_medium = ("grok", "xai", "grok-4.6", "medium")
+        grok_high = ("grok", "xai", "grok-4.6", "high")
+        expected = {
+            "go_coding": {
+                "mechanical": {"S": sonnet_medium, "M": sonnet_medium, "L": sol_high},
+                "visual": {"S": sol_high, "M": sol_high, "L": sol_high},
+                "sensitive": {"S": sol_high, "M": sol_high, "L": sol_high},
+            },
+            "typescript_coding": {
+                "mechanical": {"S": sonnet_medium, "M": sonnet_medium, "L": opus_high},
+                "visual": {"S": opus_high, "M": opus_high, "L": opus_high},
+                "sensitive": {"S": opus_high, "M": opus_high, "L": opus_high},
+            },
+            "research_ops": {
+                "mechanical": {"S": grok_medium, "M": grok_medium, "L": grok_high},
+                "visual": {"S": grok_medium, "M": grok_medium, "L": grok_high},
+                "sensitive": {"S": grok_high, "M": grok_high, "L": grok_high},
+            },
+        }
+        seen = set()
+        for work_kind, classes in expected.items():
+            for class_name, sizes in classes.items():
+                for size, profile in sizes.items():
+                    with self.subTest(work_kind=work_kind, class_name=class_name, size=size):
+                        route = server.routing_policy_v2_candidate(
+                            class_name, size, ac_count=0, seams=0, work_kind=work_kind
+                        )
+                        seen.add((work_kind, class_name, size))
+                        self.assertEqual(route["policy_version"], "routing-policy-v2")
+                        self.assertEqual(route["policy_status"], "benchmark_candidate")
+                        self.assertEqual(route["route_version"], "routing-policy-v2-candidate")
+                        self.assertEqual(
+                            tuple(route[key] for key in ("launcher", "provider", "model", "effort")),
+                            profile,
+                        )
+                        self.assertRegex(route["reason"], r"^Candidate routing-policy-v2: .+\.$")
+                        normalized, error = server.normalize_effort(*profile, "route")
+                        self.assertIsNone(error)
+                        self.assertIsNotNone(normalized)
+        self.assertEqual(len(seen), 27)
+
+    def test_routing_policy_v2_is_benchmark_only_and_normal_v1_remains_active(self):
+        active = server.slice_route_lookup("mechanical", "S", seams=0, work_kind="go_coding")
+        candidate = server.routing_policy_v2_candidate(
+            "mechanical", "S", ac_count=0, seams=1, work_kind="go_coding"
+        )
+        self.assertEqual(active["route_version"], "normal-v1")
+        self.assertNotIn("policy_version", active)
+        self.assertNotEqual(active["writer_execution_profile"], candidate["writer_execution_profile"])
+
+        profile = candidate["writer_execution_profile"]
+        parsed, error = server.parse_route_execution_profile(
+            profile,
+            expected_role="writer",
+            launcher=profile["launcher"],
+            provider=profile["provider"],
+            model=profile["model"],
+            effort=profile["effort"],
+        )
+        self.assertIsNone(parsed)
+        self.assertEqual(error["code"], "bad_route_execution_profile")
+
+    def test_normal_v1_active_matrix_records_review_effort_split(self):
         routes = [
             server.slice_route_lookup(class_name, size, work_kind=work_kind)
             for work_kind in ("go_coding", "typescript_coding", "research_ops")
@@ -6807,8 +6938,53 @@ while True:
         encoded = json.dumps(routes, separators=(",", ":"), ensure_ascii=True).encode()
         self.assertEqual(
             hashlib.sha256(encoded).hexdigest(),
-            "f173c6543685d38a1cf67c2e1c7ffe01ccb54f98b5eba00e9e8a8d2ae5e234ed",
+            "920ca44787092da31c5277ca31a8fa77cc44c96b35703df8fcc2f6581a28a430",
         )
+
+    def test_slice_route_task_shape_inputs_are_closed_and_evidence_gated(self):
+        schema = json.loads(server.openapi_bytes())["components"]["schemas"]["SliceRouteRequest"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            set(schema["properties"]),
+            {"class", "work_kind", "size", "ac_count", "seams"},
+        )
+        schemas = json.loads(server.openapi_bytes())["components"]["schemas"]
+        self.assertFalse(schemas["SliceRouteFallbackRequest"]["additionalProperties"])
+        self.assertFalse(schemas["SliceRouteRecoveryRequest"]["additionalProperties"])
+
+        def route(**overrides):
+            request = {
+                "class": "mechanical", "work_kind": "go_coding", "size": "S",
+                "ac_count": 1, "seams": 0, **overrides,
+            }
+            return server.slice_route(json.dumps(request).encode())
+
+        baseline = route()[1]
+        self.assertEqual(route(**{"class": "sensitive"})[1]["reviewer2_launcher"], "grok")
+        self.assertNotEqual(route(work_kind="typescript_coding")[1]["model"], baseline["model"])
+        self.assertGreater(route(size="M")[1]["max_turns"], baseline["max_turns"])
+        self.assertEqual(route(ac_count=6)[1]["size"], "M")
+        self.assertEqual(route(**{"class": "visual"}, seams=1)[1]["size"], "M")
+
+        for unsupported, value in (
+            ("closed_contract", True),
+            ("existing_failing_test", True),
+            ("external_verification", "browser"),
+            ("test_red", True),
+        ):
+            with self.subTest(unsupported=unsupported):
+                status, payload = route(**{unsupported: value})
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "unexpected_fields")
+
+        for handler in (server.slice_route_fallback, server.slice_route_recovery):
+            with self.subTest(handler=handler.__name__):
+                status, payload = handler(json.dumps({
+                    "work_kind": "go_coding", "closed_contract": True,
+                }).encode())
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(payload["code"], "unexpected_fields")
+                self.assertEqual(payload["fields"], ["closed_contract"])
 
     def test_slice_route_current_matrix_is_frozen(self):
         writers = {
@@ -6863,7 +7039,11 @@ while True:
                 review_count = 0
             else:
                 review_count = 1
-            selected = list(reviewers[writer[1]][:review_count])
+            review_effort = "high" if class_name == "sensitive" else "medium"
+            selected = [
+                (*reviewer[:3], review_effort)
+                for reviewer in reviewers[writer[1]][:review_count]
+            ]
             selected.extend([("none", "none", "none", "none")] * (2 - len(selected)))
             reviewer1, reviewer2 = selected
             turns, wall = budgets[(class_name, effective_size)]
@@ -11219,8 +11399,8 @@ func main() {
         )
         route_properties = spec["components"]["schemas"]["SliceRoute"]["properties"]
         self.assertEqual(route_properties["effort"]["enum"], ["high", "default"])
-        self.assertEqual(route_properties["reviewer1_effort"]["enum"], ["none", "high", "default"])
-        self.assertEqual(route_properties["reviewer2_effort"]["enum"], ["none", "high", "default"])
+        self.assertEqual(route_properties["reviewer1_effort"]["enum"], ["none", "medium", "high"])
+        self.assertEqual(route_properties["reviewer2_effort"]["enum"], ["none", "medium", "high"])
 
     def test_pr_drive_gates_wait_for_results_too(self):
         # implement-slice got wait nodes for every async op; pr-drive did not.

@@ -468,8 +468,18 @@ SLICE_STATUSES = frozenset({"open", "done"})
 SLICE_CLASSES = frozenset({"mechanical", "visual", "sensitive"})
 SLICE_WORK_KINDS = frozenset({"go_coding", "typescript_coding", "research_ops"})
 SLICE_SIZES = ("S", "M", "L")
+SLICE_ROUTE_INPUT_FIELDS = frozenset({"class", "work_kind", "size", "ac_count", "seams"})
+SLICE_ROUTE_FALLBACK_FIELDS = SLICE_ROUTE_INPUT_FIELDS | frozenset({
+    "primary_route", "primary_receipt",
+})
+SLICE_ROUTE_RECOVERY_FIELDS = SLICE_ROUTE_INPUT_FIELDS | frozenset({
+    "primary_route", "primary_receipt", "fallback_route", "fallback_receipt",
+    "fresh_primary_receipt",
+})
 ROUTE_VERSION = "normal-v1"
 FALLBACK_ROUTE_VERSION = "availability-fallback-v1"
+ROUTING_POLICY_V2_VERSION = "routing-policy-v2"
+ROUTING_POLICY_V2_ROUTE_VERSION = "routing-policy-v2-candidate"
 ROUTE_EXECUTION_PROFILE_VERSION = "route-execution-profile-v1"
 ROUTE_EXECUTION_ROLES = frozenset({"writer", "reviewer1", "reviewer2"})
 ROUTE_EXECUTION_PROFILE_FIELDS = frozenset({
@@ -500,6 +510,30 @@ NORMAL_REVIEWER_ROUTES = {
         ("codex", "openai", "gpt-5.6-sol", "high"),
         ("claude", "anthropic", "claude-opus-5", "default"),
     ),
+}
+# Benchmark-only candidate profiles. This table is deliberately not reachable
+# from sliceRoute and its route version is not accepted as execution evidence.
+_SONNET_MEDIUM = ("claude", "anthropic", "claude-sonnet-5", "medium")
+_SOL_HIGH = ("codex", "openai", "gpt-5.6-sol", "high")
+_OPUS_HIGH = ("claude", "anthropic", "claude-opus-5", "high")
+_GROK_MEDIUM = ("grok", "xai", "grok-4.6", "medium")
+_GROK_HIGH = ("grok", "xai", "grok-4.6", "high")
+ROUTING_POLICY_V2_WRITER_TABLE = {
+    "go_coding": {
+        "mechanical": {"S": _SONNET_MEDIUM, "M": _SONNET_MEDIUM, "L": _SOL_HIGH},
+        "visual": {"S": _SOL_HIGH, "M": _SOL_HIGH, "L": _SOL_HIGH},
+        "sensitive": {"S": _SOL_HIGH, "M": _SOL_HIGH, "L": _SOL_HIGH},
+    },
+    "typescript_coding": {
+        "mechanical": {"S": _SONNET_MEDIUM, "M": _SONNET_MEDIUM, "L": _OPUS_HIGH},
+        "visual": {"S": _OPUS_HIGH, "M": _OPUS_HIGH, "L": _OPUS_HIGH},
+        "sensitive": {"S": _OPUS_HIGH, "M": _OPUS_HIGH, "L": _OPUS_HIGH},
+    },
+    "research_ops": {
+        "mechanical": {"S": _GROK_MEDIUM, "M": _GROK_MEDIUM, "L": _GROK_HIGH},
+        "visual": {"S": _GROK_MEDIUM, "M": _GROK_MEDIUM, "L": _GROK_HIGH},
+        "sensitive": {"S": _GROK_HIGH, "M": _GROK_HIGH, "L": _GROK_HIGH},
+    },
 }
 # Reviews need enough turns to read the ticket and diff before returning a verdict.
 REVIEW_MAX_TURNS = int(os.environ.get("GRAPHWING_REVIEW_MAX_TURNS", "12"))
@@ -2132,6 +2166,38 @@ def bump_slice_size(size: str, class_name: str, ac_count: int | None, seams: int
     return SLICE_SIZES[min(i + bump, len(SLICE_SIZES) - 1)]
 
 
+def routing_policy_v2_candidate(
+    class_name: str,
+    size_floor: str,
+    ac_count: int | None = None,
+    seams: int | None = None,
+    work_kind: str | None = None,
+) -> dict[str, Any]:
+    """Return one non-active candidate route for deterministic benchmarking."""
+    if class_name not in SLICE_CLASSES or size_floor not in SLICE_SIZES:
+        raise ValueError("unsupported candidate class or size")
+    if work_kind not in SLICE_WORK_KINDS:
+        raise ValueError("work_kind is required")
+    sized = bump_slice_size(size_floor, class_name, ac_count, seams)
+    if seams is None or seams > 1:
+        sized = "L"
+    writer = ROUTING_POLICY_V2_WRITER_TABLE[work_kind][class_name][sized]
+    reason = (
+        f"Candidate {ROUTING_POLICY_V2_VERSION}: {work_kind}, {class_name} effective "
+        f"size {sized} selects {writer[2]} at {writer[3]} effort; benchmark evidence "
+        "is required before activation."
+    )
+    route = build_slice_route(
+        class_name, size_floor, ac_count, seams, work_kind, writer,
+        ROUTING_POLICY_V2_ROUTE_VERSION, reason, effective_size=sized,
+    )
+    return {
+        **route,
+        "policy_version": ROUTING_POLICY_V2_VERSION,
+        "policy_status": "benchmark_candidate",
+    }
+
+
 def slice_route_lookup(
     class_name: str,
     size_floor: str,
@@ -2242,8 +2308,10 @@ def build_slice_route(
     route_version: str,
     reason: str,
     unavailable_provider: str | None = None,
+    *,
+    effective_size: str | None = None,
 ) -> dict[str, Any]:
-    sized = bump_slice_size(size_floor, class_name, ac_count, seams)
+    sized = effective_size or bump_slice_size(size_floor, class_name, ac_count, seams)
     turns, wait = SLICE_BUDGET[(class_name, sized)]
     launcher, provider, model, effort = writer
     if class_name == "sensitive":
@@ -2255,7 +2323,8 @@ def build_slice_route(
     reviewer_candidates = list(NORMAL_REVIEWER_ROUTES[provider])
     if unavailable_provider:
         reviewer_candidates.sort(key=lambda reviewer: reviewer[1] == unavailable_provider)
-    reviewers = reviewer_candidates[:review_count]
+    review_effort = "high" if class_name == "sensitive" else "medium"
+    reviewers = [(*reviewer[:3], review_effort) for reviewer in reviewer_candidates[:review_count]]
     while len(reviewers) < 2:
         reviewers.append(("none", "none", "none", "none"))
     reviewer1, reviewer2 = reviewers
@@ -2323,6 +2392,13 @@ def slice_route(body: bytes) -> tuple[int, dict[str, Any]]:
     if err:
         return 400, err
     assert data is not None
+    unexpected = sorted(set(data) - SLICE_ROUTE_INPUT_FIELDS)
+    if unexpected:
+        return 400, {
+            "error": "slice route request contains unsupported fields",
+            "code": "unexpected_fields",
+            "fields": unexpected,
+        }
     class_name, size_floor, work_kind, ac_count, seams, common_err = parse_slice_route_common(data)
     if common_err:
         return 400, common_err
@@ -2458,6 +2534,13 @@ def slice_route_fallback(body: bytes) -> tuple[int, dict[str, Any]]:
     if err:
         return 400, err
     assert data is not None
+    unexpected = sorted(set(data) - SLICE_ROUTE_FALLBACK_FIELDS)
+    if unexpected:
+        return 400, {
+            "error": "slice fallback request contains unsupported fields",
+            "code": "unexpected_fields",
+            "fields": unexpected,
+        }
     return derive_slice_fallback_route(data)
 
 
@@ -2736,6 +2819,13 @@ def slice_route_recovery(body: bytes) -> tuple[int, dict[str, Any]]:
     if err:
         return 400, err
     assert data is not None
+    unexpected = sorted(set(data) - SLICE_ROUTE_RECOVERY_FIELDS)
+    if unexpected:
+        return 400, {
+            "error": "slice recovery request contains unsupported fields",
+            "code": "unexpected_fields",
+            "fields": unexpected,
+        }
     return derive_slice_recovery_route(data)
 
 
