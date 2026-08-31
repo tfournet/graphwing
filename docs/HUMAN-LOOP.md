@@ -122,3 +122,7 @@ git diff --check
 - Parallelize writers on one story branch.
 
 How to fire a run: [USING.md](USING.md).
+
+## Phase 6 authority summary
+
+Review authority hashes the complete diff and rejects more than 258,048 bytes before launcher lookup; prompts travel off argv. Code-off identities bind approved launcher/provider/model, effort provenance, and `launcher_version`, and terminal economics are sanitized with Rewst as the permanent owner. For Grok scripts with an exact supported Node shebang, `launcher_version` is a domain-separated composite SHA-256 over the exact script and resolved Node bytes; acceptance and execution pin both artifacts and invoke their descriptors with `--preserve-symlinks-main`. Local fixtures do not claim publication or live readback.

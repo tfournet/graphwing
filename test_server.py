@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import errno
 import fcntl
 import hashlib
 import io
@@ -14,7 +15,7 @@ import threading
 import time
 import unittest
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,13 @@ def _fixture_identity_profile(profile):
         "effort_source": profile["effort_source"],
         "launcher_version": profile["launcher_version"],
     }
+
+
+def _grok_node_fixture_version(script: bytes, node: bytes) -> str:
+    return "sha256:" + hashlib.sha256(
+        b"graphwing/grok-node-launcher/v1\0"
+        + hashlib.sha256(script).digest() + hashlib.sha256(node).digest()
+    ).hexdigest()
 
 
 def _stamp_fixture_execution_profile(job, binary=None, requested="default", source="launcher_default"):
@@ -880,8 +888,14 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             grok = root / "grok"
-            grok.write_text("fixture")
+            node = root / "node"
+            script_bytes, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"node-initial"
+            grok.write_bytes(script_bytes)
+            node.write_bytes(node_bytes)
+            grok.chmod(0o755)
+            node.chmod(0o755)
             expected_profile = _fixture_execution_profile("grok", "xai", "grok-4.6", grok)
+            expected_profile["launcher_version"] = _grok_node_fixture_version(script_bytes, node_bytes)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
                 check=True, capture_output=True, text=True,
@@ -894,7 +908,9 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "ping", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6",
             }).encode()
-            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
+            with mock.patch.dict(os.environ, {
+                     "GRAPHWING_GROK_BIN": str(grok), "GRAPHWING_NODE_BIN": str(node)
+                 }), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -916,7 +932,12 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             grok = root / "grok"
-            grok.write_text("fixture")
+            node = root / "node"
+            script_bytes, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"node-resume"
+            grok.write_bytes(script_bytes)
+            node.write_bytes(node_bytes)
+            grok.chmod(0o755)
+            node.chmod(0o755)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
                 check=True, capture_output=True, text=True,
@@ -926,6 +947,7 @@ class DispatchTests(unittest.TestCase):
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
             profile = _fixture_execution_profile("grok", "xai", "grok-4.6", grok)
+            profile["launcher_version"] = _grok_node_fixture_version(script_bytes, node_bytes)
             identity = {
                 "launcher": "grok", "provider": "xai", "model": "grok-4.6",
                 **_fixture_identity_profile(profile),
@@ -952,7 +974,9 @@ class DispatchTests(unittest.TestCase):
                 "prompt": "continue", "cwd": "scratch", "launcher": "grok",
                 "provider": "xai", "model": "grok-4.6", "resume_job_id": prior_job_id,
             }
-            with mock.patch.dict(os.environ, {"GRAPHWING_GROK_BIN": str(grok)}), \
+            with mock.patch.dict(os.environ, {
+                     "GRAPHWING_GROK_BIN": str(grok), "GRAPHWING_NODE_BIN": str(node)
+                 }), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -3034,6 +3058,129 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(captured["cmd"][captured["cmd"].index("--sandbox") + 1], "read-only")
 
+    def test_codex_writer_and_review_commands_are_exact(self):
+        """Codex 0.151.0 resolves its code-mode host as a sibling of argv[0].
+
+        Graphwing execs the sealed memfd at /proc/self/fd/N, so the sibling
+        resolves to /codex-code-mode-host and the run dies before it reviews.
+        Every Codex invocation therefore pins features.code_mode_host=false.
+        """
+        job = self._adapter_contract_job(
+            "codex", "openai", "gpt-5.6-sol", "high", "high"
+        )
+        self.assertEqual(
+            server.codex_command(
+                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"),
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "workspace-write",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "-",
+            ],
+        )
+        self.assertEqual(
+            server.codex_command(
+                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"), sandbox="read-only",
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "read-only",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "-",
+            ],
+        )
+        resumed = dict(job, session_identity={"native_session_id": "0f" * 16})
+        self.assertEqual(
+            server.codex_command(
+                resumed, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"),
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "workspace-write",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "resume", "0f" * 16, "-",
+            ],
+        )
+
+    def test_codex_command_never_requests_the_missing_code_mode_host(self):
+        """Regression: the pre-fix argv, which omitted the setting, is gone."""
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra"):
+            for effort in ("low", "medium", "high", "max"):
+                for sandbox in ("workspace-write", "read-only"):
+                    for session_id in (None, "1a" * 16):
+                        with self.subTest(
+                            model=model, effort=effort, sandbox=sandbox,
+                            resume=bool(session_id),
+                        ):
+                            job = self._adapter_contract_job(
+                                "codex", "openai", model, effort, effort
+                            )
+                            job["session_identity"] = {"native_session_id": session_id}
+                            cmd = server.codex_command(
+                                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                                Path("/fixture/codex"), sandbox=sandbox,
+                            )
+                            settings = [
+                                cmd[index + 1]
+                                for index, value in enumerate(cmd[:-1])
+                                if value == "-c"
+                                and cmd[index + 1].startswith("features.code_mode_host=")
+                            ]
+                            self.assertEqual(
+                                settings, ["features.code_mode_host=false"]
+                            )
+                            position = cmd.index("features.code_mode_host=false")
+                            self.assertEqual(cmd[position - 1], "-c")
+                            self.assertLess(position, cmd.index("-C"))
+                            self.assertNotIn("--config", cmd)
+                            self.assertEqual(
+                                [v for v in cmd if v.startswith("features.")],
+                                ["features.code_mode_host=false"],
+                            )
+                            self.assertEqual(cmd[-1], "-")
+                            self.assertEqual(
+                                cmd[cmd.index("--sandbox") + 1], sandbox
+                            )
+
+    def test_codex_review_invocation_disables_the_code_mode_host(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            output = b'{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}\n'
+            return subprocess.CompletedProcess(cmd, 0, output, b"")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", Path(__file__),
+                diff_text="fixture", requested_effort="high", effort_source="explicit",
+            ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                result = server.native_review_result(context)
+        self.assertTrue(result["ok"], result)
+        cmd = captured["cmd"]
+        self.assertEqual(
+            [
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "-c" and cmd[index + 1].startswith("features.")
+            ],
+            ["features.code_mode_host=false"],
+        )
+        self.assertLess(cmd.index("features.code_mode_host=false"), cmd.index("-C"))
+        self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+        self.assertEqual(cmd[-1], "-")
+
     def test_claude_command_uses_effective_effort(self):
         for effort in ("low", "medium", "high", "max"):
             with self.subTest(effort=effort):
@@ -3108,6 +3255,106 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result, (1, False, None, "unsupported effort profile"))
         self.assertEqual(job["_adapter_failure_code"], "unsupported_effort")
         popen.assert_not_called()
+
+    def test_grok_node_composite_pin_shebang_argv_and_cleanup(self):
+        job = self._adapter_contract_job("grok", "xai", "grok-4.6", "high", "high")
+        domain = b"graphwing/grok-node-launcher/v1\0"
+        matrix = ((b"#!/usr/bin/env node\n", True), (b"#!/usr/bin/env -S node\r\n", True),
+                  (b"#!/usr/bin/node", True), (b"#!/usr/bin/env  node\n", False),
+                  (b"#!/usr/bin/env node --flag\n", False), (b"#!/usr/bin/env node\r", False),
+                  (b"#!/usr/bin/env node\r\r\n", False), (b"#!/usr/bin/env nodejs\n", False))
+        with tempfile.TemporaryDirectory() as td:
+            root, captured = Path(td), []
+            grok, node = Path(td)/"grok", Path(td)/"node"
+            for raw, expected in matrix:
+                grok.write_bytes(raw)
+                self.assertEqual(server.grok_node_shebang(grok), expected, raw)
+            script, node_bytes = b"#!/usr/bin/env node\nfixture\n", b"exact-node"
+            grok.write_bytes(script); node.write_bytes(node_bytes)
+            grok.chmod(0o755); node.chmod(0o755)
+            (root/"jobs"/job["job_id"]).mkdir(parents=True)
+            expected = "sha256:" + hashlib.sha256(
+                domain + hashlib.sha256(script).digest() + hashlib.sha256(node_bytes).digest()
+            ).hexdigest()
+            with mock.patch.object(server, "JOBS_DIR", root/"jobs"), \
+                 mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN": str(node)}), \
+                 server.pinned_native_launcher(grok, "grok") as accepted:
+                accepted_fds = (accepted.fd, accepted.companion.fd)
+                self.assertEqual(accepted.fingerprint, expected)
+                for mode in ("writer", "review"):
+                    with server.repin_native_launcher(accepted, "grok") as execution:
+                        execution_fds = (execution.fd, execution.companion.fd)
+                        def stop(command, **kwargs):
+                            captured.append((mode, command, kwargs["pass_fds"])); raise AssertionError("stop")
+                        with mock.patch.object(server.subprocess, "Popen", side_effect=stop), \
+                             self.assertRaises(AssertionError):
+                            server.run_grok_acp(dict(job), execution.path, mode=mode,
+                                                interpreter=execution.companion.path)
+                    self.assertTrue(all(self._fd_is_closed(fd) for fd in execution_fds))
+            self.assertTrue(all(self._fd_is_closed(fd) for fd in accepted_fds))
+            for mode, command, fds in captured:
+                self.assertEqual(command[:4], [f"/proc/self/fd/{fds[1]}", "--preserve-symlinks-main",
+                                               f"/proc/self/fd/{fds[0]}", "agent"])
+                self.assertEqual(tuple(fds), tuple(sorted(set(fds))))
+                self.assertEqual("--always-approve" in command, mode == "writer")
+                self.assertNotIn("node", command)
+            node.write_bytes(b"changed-node")
+            with mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN": str(node)}), \
+                 server.pinned_native_launcher(grok, "grok") as changed:
+                self.assertNotEqual(changed.fingerprint, expected)
+            for launcher in ("codex", "claude"):
+                with server.pinned_native_launcher(grok, launcher) as unchanged:
+                    self.assertEqual(unchanged.fingerprint,
+                                     "sha256:" + hashlib.sha256(script).hexdigest())
+                    self.assertIsNone(unchanged.companion)
+
+    @staticmethod
+    def _fd_is_closed(fd):
+        try:
+            os.fstat(fd)
+        except OSError:
+            return True
+        return False
+
+    def test_grok_node_acceptance_reviews_and_failures_are_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, grok, node = Path(td), Path(td)/"grok", Path(td)/"node"
+            grok.write_bytes(b"#!/usr/bin/env node\nfixture\n"); node.write_bytes(b"node")
+            grok.chmod(0o755); node.chmod(0o755)
+            body = json.dumps({"repo":"scratch", "launcher":"grok", "provider":"xai",
+                               "model":"grok-4.6", "prompt":"fixture"}).encode()
+            raw = {"ok":True, "verdict":"PASS", "no_verdict":False, "returncode":0,
+                   "usage":None, "usage_diagnostic":"usage_not_reported"}
+            common = (mock.patch.object(server, "resolve_launcher_binary_now", return_value=grok),
+                      mock.patch.object(server, "git_diff", return_value={"ok":True,"diff":"x","truncated":False}),
+                      mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN":str(node)}),
+                      mock.patch.object(server, "JOBS_DIR", root/"jobs"),
+                      mock.patch.object(server, "active_job_count", return_value=0))
+            with common[0], common[1], common[2], common[3], common[4], mock.patch.object(
+                    server, "_native_review_result_pinned", return_value=raw) as boundary:
+                status, sync, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+            self.assertEqual((status, sync["status"]), (200, "ok"))
+            context = boundary.call_args.args[0]
+            self.assertEqual(context.pinned_launcher.fingerprint,
+                             sync["execution_identity"]["launcher_version"])
+            with common[0], common[1], common[2], common[3], common[4], mock.patch.object(server, "enqueue_review") as enqueue:
+                status, queued, _ = server.dispatch("POST", "/v1/review/run", {}, True,
+                                                    json.dumps({**json.loads(body), "async":True}).encode())
+            self.assertEqual(status, 202); enqueue.assert_called_once()
+            authority = server.review_authority(queued["job_id"])
+            self.assertEqual(authority.launcher.fingerprint,
+                             queued["execution_identity"]["launcher_version"])
+            server.release_review_authority(queued["job_id"])
+            for failure, expected_status in ((root/"missing-node", 501), (node, 409)):
+                side = (None if expected_status == 501 else OSError("/secret TOKEN"))
+                with mock.patch.dict(os.environ, {
+                         "GRAPHWING_GROK_BIN":str(grok), "GRAPHWING_NODE_BIN":str(failure)
+                     }), \
+                     mock.patch.object(server, "grok_node_shebang", side_effect=side) if side else nullcontext(), \
+                     mock.patch.object(server, "native_review_result") as spawn:
+                    status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
+                self.assertEqual(status, expected_status); spawn.assert_not_called()
+                self.assertNotIn("TOKEN", json.dumps(payload))
 
     def test_all_native_adapters_bind_execution_profile(self):
         # Independent contract: do not derive expected rows from implementation tables.
@@ -3466,7 +3713,7 @@ while True:
                     server.run_agent_job(job_id)
         return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
 
-    def _run_grok_review_fixture(self, cfg=None):
+    def _run_grok_review_fixture(self, cfg=None, **context_kwargs):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -3488,7 +3735,7 @@ while True:
         with mock.patch.object(server, "JOBS_DIR", jobs), \
              mock.patch.dict(os.environ, env, clear=False):
             with self._native_review_context(
-                "grok", "xai", "grok-4.6", fixture
+                "grok", "xai", "grok-4.6", fixture, **context_kwargs
             ) as context:
                 result = server.native_review_result(context)
         return result, json.loads(capture.read_text())
@@ -8164,7 +8411,10 @@ while True:
             launcher.chmod(0o755)
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(
+                     server, "git_diff",
+                     return_value={"ok": True, "diff": "fixture", "truncated": False},
+                 ), \
                  mock.patch.object(server.subprocess, "run", side_effect=fake_run):
                 status, payload, _ = server.dispatch(
                     "POST", "/v1/review/run", {}, True, json.dumps(request).encode()
@@ -8223,7 +8473,10 @@ while True:
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.object(server, "active_job_count", return_value=0), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server, "git_diff", return_value={"diff": "fixture"}), \
+                 mock.patch.object(
+                     server, "git_diff",
+                     return_value={"ok": True, "diff": "fixture", "truncated": False},
+                 ), \
                  mock.patch.object(server, "enqueue_review") as enqueue, \
                  mock.patch.object(server.subprocess, "Popen", side_effect=counted_popen), \
                  mock.patch.dict(os.environ, env, clear=False), \
@@ -13968,19 +14221,13 @@ func main() {
                 json.loads((jobs / ("a4" * 16) / "job.json").read_text())["status"], "running"
             )
 
-    def test_review_run_409_and_501_actual_bodies_match_exact_openapi_branches(self):
+    def _openapi_schema_validator(self, spec):
+        """Author one Draft 2020-12 checker for these closed OpenAPI shapes."""
         try:
             from jsonschema import Draft202012Validator
         except ImportError:  # catalog CI intentionally installs no third-party packages
             Draft202012Validator = None
 
-        spec = json.loads(server.openapi_bytes())
-        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
-        response_409 = responses["409"]["content"]["application/json"]["schema"]
-        self.assertEqual(
-            {item["$ref"] for item in response_409["oneOf"]},
-            {"#/components/schemas/ReviewError", "#/components/schemas/ReviewReceipt"},
-        )
         def dereference(value):
             if isinstance(value, dict):
                 if set(value) == {"$ref"} and value["$ref"].startswith("#/"):
@@ -14055,6 +14302,17 @@ func main() {
             self.assertEqual(portable, authoritative)
             return authoritative
 
+        return valid
+
+    def test_review_run_409_and_501_actual_bodies_match_exact_openapi_branches(self):
+        spec = json.loads(server.openapi_bytes())
+        valid = self._openapi_schema_validator(spec)
+        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        response_409 = responses["409"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            {item["$ref"] for item in response_409["oneOf"]},
+            {"#/components/schemas/ReviewError", "#/components/schemas/ReviewReceipt"},
+        )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             status, busy, *_ = self._queue_closed_review(
@@ -14117,6 +14375,571 @@ func main() {
         self.assertTrue(valid(response_400, invalid))
         response_501 = responses["501"]["content"]["application/json"]["schema"]
         self.assertTrue(valid(response_501, unavailable))
+
+    # One added line is exactly 80 diff bytes: "+", 78 payload characters, "\n".
+    _REVIEW_DIFF_LINE = "x" * 78
+    _REVIEW_DIFF_LINE_BYTES = 80
+
+    def _review_diff_worktree(self, root, *, prefix_lines, tail):
+        """Author one worktree whose `git diff HEAD` starts with a fixed long prefix."""
+        root.mkdir(parents=True, exist_ok=True)
+        repo = self._scratch_git(root)
+        for name in ("a_payload.txt", "z_tail.txt"):
+            repo.joinpath(name).write_text("")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "a_payload.txt", "z_tail.txt"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "payload"],
+            check=True, capture_output=True,
+        )
+        # a_payload.txt sorts first and is byte-identical across cases, so every
+        # produced diff shares one long prefix and differs only in z_tail.txt.
+        repo.joinpath("a_payload.txt").write_text(
+            f"{self._REVIEW_DIFF_LINE}\n" * prefix_lines
+        )
+        repo.joinpath("z_tail.txt").write_text(tail)
+        return repo
+
+    def _worktree_diff(self, repo):
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "HEAD"], check=True, capture_output=True
+        )
+        return proc.stdout.decode()
+
+    # `git diff HEAD` over a `_review_diff_worktree` costs exactly
+    # 80 * prefix_lines + 248 + len(tail) bytes: two file headers, two index
+    # lines, two `---`/`+++` pairs and two hunk headers are the fixed 248.
+    _REVIEW_DIFF_STRUCTURE_BYTES = 248
+    # The maximum the complete-diff bound superseded. It rejected the cumulative
+    # Phase 6 candidate the bound was introduced to review.
+    _SUPERSEDED_REVIEW_MAX_DIFF_BYTES = 65536
+    # A fixed large fixture size: past the superseded maximum and past
+    # MAX_ARG_STRLEN, under the current maximum. It is a fixture dimension, not a
+    # measurement of the patch under review, so it never goes stale.
+    _LARGE_CANDIDATE_DIFF_BYTES = 224 * 1024
+    # The Phase 6 candidate diff is part of this patch, so its size changes with
+    # every follow-up commit. Pinning that size in a test would make the test
+    # invalidate itself, so the coverage claim is measured live against this base
+    # and skipped wherever the base is not reachable.
+    _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
+
+    def _cumulative_candidate_diff_bytes(self):
+        """Measure `git diff <phase 6 base>` now, or None when unmeasurable."""
+        repo = str(Path(__file__).resolve().parent)
+        reachable = subprocess.run(
+            ["git", "-C", repo, "cat-file", "-e", f"{self._PHASE6_BASE_COMMIT}^{{commit}}"],
+            capture_output=True,
+        )
+        if reachable.returncode != 0:
+            return None
+        measured = subprocess.run(
+            ["git", "-C", repo, "diff", self._PHASE6_BASE_COMMIT], capture_output=True
+        )
+        if measured.returncode != 0:
+            return None
+        return len(measured.stdout)
+
+    def _review_diff_worktree_sized(self, root, *, total_bytes, marker):
+        """Author a worktree whose `git diff HEAD` is exactly `total_bytes` long.
+
+        The payload file carries whole 80-byte lines and the tail line absorbs
+        the remainder, so a caller can land on an exact byte count and on the
+        byte either side of it.
+        """
+        payload_bytes = total_bytes - self._REVIEW_DIFF_STRUCTURE_BYTES
+        prefix_lines, remainder = divmod(payload_bytes, self._REVIEW_DIFF_LINE_BYTES)
+        # Hand one whole payload line to the tail so it always outsizes its marker.
+        prefix_lines -= 1
+        tail_bytes = remainder + self._REVIEW_DIFF_LINE_BYTES
+        # The marker sits at the very end so two cases that differ only in it
+        # differ only in their last diff bytes.
+        tail = "y" * (tail_bytes - len(marker) - 1) + marker + "\n"
+        self.assertEqual(len(tail.encode()), tail_bytes)
+        repo = self._review_diff_worktree(root, prefix_lines=prefix_lines, tail=tail)
+        diff = self._worktree_diff(repo)
+        self.assertEqual(len(diff.encode()), total_bytes)
+        return repo, diff
+
+    def _review_wrapper(self, root):
+        launcher = root / "claude-review-wrapper"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        return launcher
+
+    _REVIEW_DIFF_BODY = {
+        "repo": "scratch", "launcher": "claude", "provider": "anthropic",
+        "model": "claude-sonnet-5", "prompt": "bounded ticket",
+    }
+
+    def test_review_identity_hashes_the_complete_diff_and_never_a_prefix(self):
+        contexts, identities, diffs = [], [], []
+
+        def capture(context):
+            contexts.append(context)
+            return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+        body = json.dumps(self._REVIEW_DIFF_BODY).encode()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            launcher = self._review_wrapper(root)
+            for index, tail in enumerate(("first suffix\n", "second suffix\n")):
+                case = root / f"case-{index}"
+                case.mkdir()
+                repo = self._review_diff_worktree(case, prefix_lines=200, tail=tail)
+                diffs.append(self._worktree_diff(repo))
+                with mock.patch.object(
+                    server, "load_repos", return_value={"scratch": str(repo)}
+                ), mock.patch.object(
+                    server, "resolve_launcher_binary_now", return_value=launcher
+                ), mock.patch.object(
+                    server, "native_review_result", side_effect=capture
+                ):
+                    status, receipt, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, body
+                    )
+                self.assertEqual(status, 200, receipt)
+                identities.append(receipt["execution_identity"])
+
+        # The demonstrated blocker: 200 identical added lines are 16,000 diff bytes,
+        # so both candidates share the first 12,000 characters exactly.
+        self.assertGreater(len(diffs[0]), 12000)
+        self.assertEqual(diffs[0][:12000], diffs[1][:12000])
+        self.assertNotEqual(diffs[0], diffs[1])
+        self.assertEqual(
+            hashlib.sha256(diffs[0][:12000].encode()).hexdigest(),
+            hashlib.sha256(diffs[1][:12000].encode()).hexdigest(),
+        )
+        self.assertNotEqual(identities[0]["diff_sha256"], identities[1]["diff_sha256"])
+        self.assertEqual(len(contexts), 2)
+        for identity, diff, context in zip(identities, diffs, contexts):
+            self.assertEqual(
+                identity["diff_sha256"], hashlib.sha256(diff.encode()).hexdigest()
+            )
+            # The reviewer context carries the same exact full bytes the identity binds.
+            self.assertEqual(context.diff_text, diff)
+
+    def test_review_suffix_drift_after_acceptance_fails_before_launch(self):
+        real_run = subprocess.run
+        spawned = []
+
+        def guard_run(command, **kwargs):
+            if not command or str(command[0]) != "git":
+                spawned.append(list(command))
+                raise AssertionError("drifted review must not reach a launcher")
+            return real_run(command, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            launcher = self._review_wrapper(root)
+            repo = self._review_diff_worktree(
+                root / "case", prefix_lines=200, tail="accepted suffix\n"
+            )
+            accepted_diff = self._worktree_diff(repo)
+            request = json.dumps({
+                **self._REVIEW_DIFF_BODY, "repo": "scratch", "async": True
+            }).encode()
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "active_job_count", return_value=0), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "enqueue_review"):
+                status, accepted, _ = server.dispatch(
+                    "POST", "/v1/review/run", {}, True, request
+                )
+            self.assertEqual(status, 202, accepted)
+            job_id = accepted["job_id"]
+            self.addCleanup(server.release_review_authority, job_id)
+            self.assertEqual(
+                accepted["execution_identity"]["diff_sha256"],
+                hashlib.sha256(accepted_diff.encode()).hexdigest(),
+            )
+
+            repo.joinpath("z_tail.txt").write_text("drifted suffix\n")
+            drifted_diff = self._worktree_diff(repo)
+            self.assertEqual(accepted_diff[:12000], drifted_diff[:12000])
+            self.assertNotEqual(accepted_diff, drifted_diff)
+
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server.subprocess, "run", side_effect=guard_run), \
+                 mock.patch.object(server, "deliver_webhook") as callback, \
+                 mock.patch.object(server, "herdr_job_done"):
+                server.run_review_job(job_id)
+            delivered = callback.call_args.args[1]
+            record = json.loads((jobs / job_id / "job.json").read_text())
+
+        self.assertEqual(spawned, [])
+        self.assertEqual(record["status"], "failed")
+        receipt = record["receipt"]
+        self.assertEqual(delivered, receipt)
+        self.assertEqual(receipt["code"], "review_execution_identity_mismatch")
+        self.assertEqual(receipt["status"], "error")
+        self.assertIsNone(receipt["verdict"])
+        self.assertTrue(receipt["no_verdict"])
+
+    def test_oversized_review_diff_rejects_before_any_launcher_call(self):
+        spec = json.loads(server.openapi_bytes())
+        valid = self._openapi_schema_validator(spec)
+        responses = spec["paths"]["/v1/review/run"]["post"]["responses"]
+        # The documented response set is unchanged; an unreviewable diff is a 409.
+        self.assertEqual(
+            set(responses), {"200", "202", "400", "401", "409", "501", "504"}
+        )
+        response_409 = responses["409"]["content"]["application/json"]["schema"]
+
+        # Exactly one byte past the maximum: the smallest diff that must be
+        # rejected, so the boundary cannot drift without this failing.
+        rejections = []
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            repo, oversized = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES + 1,
+                marker="oversized suffix",
+            )
+            self.assertEqual(len(oversized.encode()), 258049)
+            self.assertEqual(
+                len(oversized.encode()), server.REVIEW_MAX_DIFF_BYTES + 1
+            )
+            for async_requested in (False, True):
+                request = json.dumps({
+                    **self._REVIEW_DIFF_BODY, "async": async_requested
+                }).encode()
+                with mock.patch.object(server, "JOBS_DIR", jobs), \
+                     mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                     mock.patch.object(server, "resolve_launcher_binary_now") as resolve, \
+                     mock.patch.object(server, "pin_launcher") as pin, \
+                     mock.patch.object(server, "native_review_result") as spawn, \
+                     mock.patch.object(server, "enqueue_review") as queued:
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, request
+                    )
+                resolve.assert_not_called()
+                pin.assert_not_called()
+                spawn.assert_not_called()
+                queued.assert_not_called()
+                self.assertEqual(status, 409, payload)
+                rejections.append(payload)
+            self.assertFalse(jobs.exists())
+            repo_path = str(repo)
+
+        for payload in rejections:
+            self.assertEqual(set(payload), {"error", "code"})
+            self.assertEqual(payload["code"], "review_diff_too_large")
+            self.assertEqual(
+                payload["error"],
+                "review diff exceeds the reviewable maximum of 258048 bytes",
+            )
+            self.assertNotIn(repo_path, json.dumps(payload))
+            self.assertNotIn("x" * 78, json.dumps(payload))
+            self.assertTrue(valid(response_409, payload))
+            self.assertEqual(
+                sum(valid(branch, payload) for branch in response_409["oneOf"]), 1
+            )
+
+    # Linux rejects a single argv string of this many bytes or more.
+    _MAX_ARG_STRLEN = 131072
+
+    def _launch_sync_review(self, repo, root, *, body=None):
+        """Run one sync review to a launcher, capturing exact argv and kwargs."""
+        real_run = subprocess.run
+        calls = []
+
+        class FakeProc:
+            stderr = b""
+            returncode = 0
+            stdout = b"VERDICT: PASS\n"
+
+        def fake_run(command, **kwargs):
+            if command and str(command[0]) == "git":
+                return real_run(command, **kwargs)
+            calls.append((list(command), kwargs))
+            return FakeProc()
+
+        launcher = self._review_wrapper(root)
+        payload = json.dumps(body or self._REVIEW_DIFF_BODY).encode()
+        with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+             mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+            status, receipt, _ = server.dispatch(
+                "POST", "/v1/review/run", {}, True, payload
+            )
+        return status, receipt, calls
+
+    def test_review_diff_maximum_is_bounded_by_the_host_not_by_one_candidate(self):
+        # Every figure the maximum is derived from is a host limit, so none of
+        # them moves when the patch under review grows.
+        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 258048)
+        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 252 * 1024)
+        # A diff at or over the capture cap comes back flagged truncated, which is
+        # a prefix and never reviewable, so the maximum stays strictly under it
+        # with headroom.
+        self.assertEqual(server.CMD_MAX_BYTES, 262144)
+        self.assertLess(server.REVIEW_MAX_DIFF_BYTES, server.CMD_MAX_BYTES)
+        self.assertEqual(server.CMD_MAX_BYTES - server.REVIEW_MAX_DIFF_BYTES, 4096)
+        # It is nearly four times the superseded maximum that rejected the
+        # cumulative Phase 6 candidate outright.
+        self.assertGreater(
+            server.REVIEW_MAX_DIFF_BYTES, 3 * self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES
+        )
+        # Nothing at this maximum could fit one argv string, which is why no
+        # review launcher carries its prompt there any more. The host proves it:
+        # a maximum-sized single argument is rejected, one byte under the limit
+        # is not.
+        self.assertGreater(server.REVIEW_MAX_DIFF_BYTES, self._MAX_ARG_STRLEN)
+        with self.assertRaises(OSError) as rejected:
+            subprocess.run(
+                ["/bin/true", "x" * server.REVIEW_MAX_DIFF_BYTES], capture_output=True
+            )
+        self.assertEqual(rejected.exception.errno, errno.E2BIG)
+        self.assertEqual(
+            subprocess.run(
+                ["/bin/true", "x" * (self._MAX_ARG_STRLEN - 1)], capture_output=True
+            ).returncode,
+            0,
+        )
+        for doc in (Path("docs/USING.md"), Path("docs/HUMAN-LOOP.md")):
+            with self.subTest(doc=doc.name):
+                text = doc.read_text()
+                self.assertIn("258,048", text)
+                self.assertNotIn("245,760", text)
+                self.assertNotIn("65,536", text)
+                # No documented cumulative-candidate size, because the patch
+                # being documented changes its own diff size on every commit.
+                self.assertNotIn("223,401", text)
+                self.assertNotIn("241,008", text)
+
+    def test_cumulative_phase6_candidate_still_fits_the_review_maximum(self):
+        # Measured now rather than pinned: this patch is part of the diff it
+        # measures, so any recorded figure would invalidate itself on the next
+        # commit. Skipped where the base commit is not reachable.
+        measured = self._cumulative_candidate_diff_bytes()
+        if not measured:
+            self.skipTest("phase 6 base commit is not reachable from this checkout")
+        self.assertGreater(measured, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(measured, server.REVIEW_MAX_DIFF_BYTES)
+
+    def test_large_review_diff_launches_with_the_prompt_off_argv(self):
+        # A 224-KiB diff: far past the superseded maximum and past the single
+        # argument limit, so it can only reach a launcher off argv.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=self._LARGE_CANDIDATE_DIFF_BYTES,
+                marker="large candidate suffix",
+            )
+            status, receipt, calls = self._launch_sync_review(repo, root)
+
+        self.assertEqual(len(diff.encode()), 229376)
+        self.assertGreater(
+            len(diff.encode()), self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES
+        )
+        self.assertLessEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt["status"], receipt["verdict"]), ("ok", "PASS"))
+        self.assertEqual(
+            receipt["execution_identity"]["diff_sha256"],
+            hashlib.sha256(diff.encode()).hexdigest(),
+        )
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        # Read-only plan semantics and command shape are unchanged by the move.
+        self.assertIn("-p", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", argv)
+        self.assertNotIn("--allowedTools", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-sonnet-5")
+        self.assertEqual(
+            argv[argv.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS)
+        )
+        # Nothing in argv comes near the single-argument limit, because the
+        # prompt is not there at all.
+        self.assertLess(max(len(value.encode()) for value in argv), 4096)
+        self.assertNotIn(diff, "".join(argv))
+        # The reviewer reads the complete diff, prefix and suffix alike, over stdin.
+        self.assertIsNotNone(kwargs["input"])
+        prompt = kwargs["input"].decode()
+        self.assertIn(diff, prompt)
+        self.assertIn("large candidate suffix", prompt)
+        self.assertGreater(len(prompt.encode()), self._MAX_ARG_STRLEN)
+
+    def test_review_diff_at_the_exact_maximum_is_accepted_and_launched(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                marker="exact maximum suffix",
+            )
+            status, receipt, calls = self._launch_sync_review(repo, root)
+
+        self.assertEqual(len(diff.encode()), 258048)
+        self.assertEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt["status"], receipt["verdict"]), ("ok", "PASS"))
+        self.assertEqual(
+            receipt["execution_identity"]["diff_sha256"],
+            hashlib.sha256(diff.encode()).hexdigest(),
+        )
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        prompt = kwargs["input"].decode()
+        self.assertIn(diff, prompt)
+        self.assertIn("exact maximum suffix", prompt)
+        self.assertLess(max(len(value.encode()) for value in argv), 4096)
+
+    def test_maximum_sized_review_prompt_leaves_argv_for_every_launcher(self):
+        real_run = subprocess.run
+        launched = {}
+
+        class FakeProc:
+            stderr = b""
+            returncode = 0
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(command, **kwargs):
+            if command and str(command[0]) == "git":
+                return real_run(command, **kwargs)
+            launcher = "codex" if "exec" in command else "claude"
+            launched[launcher] = (list(command), kwargs)
+            if launcher == "codex":
+                receipt = json.dumps({
+                    "status": "ok", "sha": None, "pr_url": None,
+                    "summary": "VERDICT: PASS",
+                })
+                event = {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": receipt},
+                }
+                return FakeProc((json.dumps(event) + "\n").encode())
+            return FakeProc(b"VERDICT: PASS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                marker="every launcher suffix",
+            )
+            codex_bin = root / "codex"
+            claude_bin = root / "claude"
+            codex_bin.write_text("fixture")
+            claude_bin.write_text("fixture")
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", codex_bin, diff_text=diff
+            ) as codex_context, self._native_review_context(
+                "claude", "anthropic", "claude-sonnet-5", claude_bin, diff_text=diff
+            ) as claude_context, mock.patch.object(
+                server, "JOBS_DIR", root / "jobs"
+            ), mock.patch.object(server.subprocess, "run", fake_run):
+                codex = server.native_review_result(codex_context)
+                claude = server.native_review_result(claude_context)
+            grok, grok_capture = self._run_grok_review_fixture(diff_text=diff)
+
+        self.assertEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+        self.assertEqual(
+            (codex["verdict"], claude["verdict"], grok["verdict"]),
+            ("PASS", "PASS", "PASS"),
+        )
+
+        # Codex: prompt on stdin, `-` as the trailing argument, read-only sandbox.
+        codex_argv, codex_kwargs = launched["codex"]
+        self.assertEqual(codex_argv[-1], "-")
+        self.assertEqual(codex_argv[codex_argv.index("--sandbox") + 1], "read-only")
+        self.assertLess(max(len(value.encode()) for value in codex_argv), 4096)
+        self.assertIsNotNone(codex_kwargs["input"])
+        self.assertIn(diff, codex_kwargs["input"].decode())
+
+        # Claude: prompt on stdin, plan permission mode, nothing appended to argv.
+        claude_argv, claude_kwargs = launched["claude"]
+        self.assertEqual(claude_argv[claude_argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude_argv)
+        self.assertLess(max(len(value.encode()) for value in claude_argv), 4096)
+        self.assertIsNotNone(claude_kwargs["input"])
+        self.assertIn(diff, claude_kwargs["input"].decode())
+
+        # Grok: prompt as an ACP session/prompt text block over a real pipe.
+        self.assertEqual(
+            grok_capture["argv"],
+            ["agent", "--model", "grok-4.6", "--reasoning-effort", "high", "stdio"],
+        )
+        prompted = next(
+            request for request in grok_capture["requests"]
+            if request["method"] == "session/prompt"
+        )
+        grok_prompt = prompted["params"]["prompt"][0]["text"]
+        self.assertIn(diff, grok_prompt)
+        self.assertGreater(len(grok_prompt.encode()), self._MAX_ARG_STRLEN)
+        self.assertLess(
+            max(len(value.encode()) for value in grok_capture["argv"]),
+            4096,
+        )
+
+    def test_maximum_sized_review_diffs_hash_their_complete_bytes(self):
+        identities, diffs = [], []
+
+        def capture(context):
+            self.assertEqual(
+                len(context.diff_text.encode()), server.REVIEW_MAX_DIFF_BYTES
+            )
+            return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+        body = json.dumps(self._REVIEW_DIFF_BODY).encode()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            launcher = self._review_wrapper(root)
+            for index, marker in enumerate(("full bytes a", "full bytes b")):
+                repo, diff = self._review_diff_worktree_sized(
+                    root / f"case-{index}",
+                    total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                    marker=marker,
+                )
+                diffs.append(diff)
+                with mock.patch.object(
+                    server, "load_repos", return_value={"scratch": str(repo)}
+                ), mock.patch.object(
+                    server, "resolve_launcher_binary_now", return_value=launcher
+                ), mock.patch.object(
+                    server, "native_review_result", side_effect=capture
+                ):
+                    status, receipt, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, body
+                    )
+                self.assertEqual(status, 200, receipt)
+                identities.append(receipt["execution_identity"])
+
+        # Two maximum-sized candidates differing only in their trailing bytes.
+        self.assertEqual(
+            [len(diff.encode()) for diff in diffs],
+            [server.REVIEW_MAX_DIFF_BYTES] * 2,
+        )
+        self.assertNotEqual(diffs[0], diffs[1])
+        # Any prefix hash — the superseded 65,536 maximum, or a prefix as long as
+        # a 224-KiB candidate — collides across both candidates.
+        for prefix in (
+            self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES, self._LARGE_CANDIDATE_DIFF_BYTES
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(diffs[0][:prefix], diffs[1][:prefix])
+                self.assertEqual(
+                    hashlib.sha256(diffs[0][:prefix].encode()).hexdigest(),
+                    hashlib.sha256(diffs[1][:prefix].encode()).hexdigest(),
+                )
+        # The complete hash separates them, and is the one bound into identity.
+        self.assertNotEqual(identities[0]["diff_sha256"], identities[1]["diff_sha256"])
+        for identity, diff in zip(identities, diffs):
+            self.assertEqual(
+                identity["diff_sha256"], hashlib.sha256(diff.encode()).hexdigest()
+            )
 
     def test_review_alien_replacement_at_terminal_cas_is_preserved_without_callback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -14419,7 +15242,9 @@ func main() {
         self.assertIn("model_reasoning_effort=high", codex_cmd)
         self.assertEqual(codex_cmd[codex_cmd.index("--model") + 1], "gpt-5.6-sol")
         self.assertIn("input", codex_kwargs)
-        claude_cmd, _ = commands[1]
+        claude_cmd, claude_kwargs = commands[1]
+        # Both direct launchers hand the prompt to stdin, never to argv.
+        self.assertIn("input", claude_kwargs)
         self.assertEqual(claude_cmd[claude_cmd.index("--permission-mode") + 1], "plan")
         self.assertNotIn("acceptEdits", claude_cmd)
         self.assertEqual(claude_cmd[claude_cmd.index("--model") + 1], "claude-sonnet-5")
@@ -16158,10 +16983,15 @@ class CodeOffTests(unittest.TestCase):
             mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", proven),
             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
             mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")),
+            # One launcher artifact for prepare and launch: the immutable slot
+            # identity pins the exact wrapper fingerprint, so both boundaries
+            # must observe the same file for any fixture that launches a slot.
+            mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)),
         )
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.launcher_version = server.launcher_version_fingerprint(Path(__file__))
 
     def _git(self, *args):
         return subprocess.run(
@@ -16196,7 +17026,18 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(payload["status"], "prepared", payload)
         return payload
 
-    def _launch_done(self, experiment_id, slot):
+    @staticmethod
+    def _usage(**overrides):
+        usage = {
+            "usage_version": server.USAGE_VERSION,
+            "fresh_input_tokens": 100, "cached_input_tokens": 20,
+            "cache_write_tokens": 5, "output_tokens": 30, "reasoning_tokens": 10,
+            "provider_cost_usd": None, "wall_seconds": 1.5, "turns_observed": 2,
+        }
+        usage.update(overrides)
+        return usage
+
+    def _launch_done(self, experiment_id, slot, usage=None, usage_diagnostic=None):
         manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
         identity = manifest["identities"][slot]
         body = self._agent_body(experiment_id, slot)
@@ -16209,6 +17050,8 @@ class CodeOffTests(unittest.TestCase):
         self.assertIsNotNone(job)
         identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
         execution_identity = self._execution_identity(identity)
+        if usage is None and usage_diagnostic is None:
+            usage = self._usage()
         job.update({
             "status": "completed", "started_at": "2026-08-26T12:00:00Z",
             "finished_at": "2026-08-26T12:00:01Z", "session_identity": identity,
@@ -16219,11 +17062,63 @@ class CodeOffTests(unittest.TestCase):
                 "model": job["model"],
                 **{key: job[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
                 "execution_identity": execution_identity, "summary": "fixture",
+                "usage": usage, "usage_diagnostic": usage_diagnostic,
             },
         })
         server.write_job(job)
+        server.seal_terminal_receipt_authority("agent", job["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", job["job_id"])
         self.assertTrue(server._codeoff_record_terminal_manifest(job))
         return job["job_id"]
+
+    def _launch_failed(self, experiment_id, slot, usage=None, usage_diagnostic=None):
+        """A slot attempt that burned real inference and then failed terminally.
+
+        `run_agent_job` seals the terminal receipt for a failed run exactly as it
+        does for a successful one and drops `execution_identity`, so this is the
+        provider-free shape of a genuine paid-for author or judge failure.
+        """
+        body = self._agent_body(experiment_id, slot)
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, payload = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, payload)
+        enqueue.assert_called_once()
+        job = server.read_job(payload["job_id"])
+        identity = dict(job["session_identity"], native_session_id=f"fixture-{slot}")
+        job.update({
+            "status": "failed", "started_at": "2026-08-26T12:00:00Z",
+            "finished_at": "2026-08-26T12:00:03Z", "session_identity": identity,
+            "error": "agent exited 1",
+            "receipt": {
+                "status": "error", "job_id": job["job_id"], "session_identity": identity,
+                "launcher": job["launcher"], "provider": job["provider"],
+                "model": job["model"],
+                **{key: job[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
+                "summary": "fixture failure",
+                "usage": self._usage() if usage is None and usage_diagnostic is None else usage,
+                "usage_diagnostic": usage_diagnostic,
+            },
+        })
+        job.pop("execution_identity", None)
+        server.write_job(job)
+        server.seal_terminal_receipt_authority("agent", job["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", job["job_id"])
+        return job["job_id"]
+
+    @staticmethod
+    def _effort_collision(identity):
+        """A different requested effort that collapses to the pinned effective one."""
+        return next(
+            (
+                value for value in server.EFFORT_VALUES
+                if value != identity["requested_effort"]
+                and (server.normalize_effort(
+                    identity["launcher"], identity["provider"], identity["exact_model"],
+                    value, server.CODEOFF_EFFORT_SOURCE,
+                )[0] or {}).get("effective_effort") == identity["effective_effort"]
+            ),
+            None,
+        )
 
     @staticmethod
     def _execution_identity(session_identity):
@@ -16277,7 +17172,7 @@ class CodeOffTests(unittest.TestCase):
         return {
             "codeoff_workspace": {"experiment_id": experiment_id, "slot": slot},
             "launcher": identity["launcher"], "provider": identity["provider"],
-            "model": identity["exact_model"],
+            "model": identity["exact_model"], "effort": identity["requested_effort"],
             "max_turns": manifest["budgets"]["max_turns"],
             "run_budget_seconds": (
                 manifest["budgets"]["author_seconds"] if slot.startswith("author-")
@@ -16285,8 +17180,8 @@ class CodeOffTests(unittest.TestCase):
             ),
         }
 
-    def _freeze_and_test(self, experiment_id, slot):
-        job_id = self._launch_done(experiment_id, slot)
+    def _freeze_and_test(self, experiment_id, slot, usage=None, usage_diagnostic=None):
+        job_id = self._launch_done(experiment_id, slot, usage, usage_diagnostic)
         status, frozen = self._post("/v1/code-off/candidate", {
             "experiment_id": experiment_id, "slot": slot, "action": "freeze", "job_id": job_id,
         })
@@ -16337,8 +17232,8 @@ class CodeOffTests(unittest.TestCase):
     def _scores(total_bias=0):
         return {"correctness": 30 + total_bias, "tests": 15, "quality": 15, "scope": 8, "maintainability": 8}
 
-    def _judge_done(self, experiment_id, judge_slot, prefer_author, score_a=0, score_b=0):
-        job_id = self._launch_done(experiment_id, judge_slot)
+    def _judge_done(self, experiment_id, judge_slot, prefer_author, score_a=0, score_b=0, usage=None, usage_diagnostic=None):
+        job_id = self._launch_done(experiment_id, judge_slot, usage, usage_diagnostic)
         private = json.loads((self.records / experiment_id / "private" / "blinding.json").read_text())
         labels = private["judges"][judge_slot]["labels"]
         preferred = next(label for label, slot in labels.items() if slot == prefer_author)
@@ -17183,8 +18078,11 @@ class CodeOffTests(unittest.TestCase):
         resume_body = self._agent_body("experiment-0001", "author-2")
         branch, head, err = server.current_branch_head(server.codeoff_workspace_path("experiment-0001", "author-2"))
         self.assertIsNone(err)
+        # The resume identity carries the slot's pinned effort profile, so this
+        # case proves the resume gate rather than the effort gate ahead of it.
         profile = _fixture_execution_profile(
-            resume_body["launcher"], resume_body["provider"], resume_body["model"], Path(__file__)
+            resume_body["launcher"], resume_body["provider"], resume_body["model"], Path(__file__),
+            requested=resume_body["effort"], source=server.CODEOFF_EFFORT_SOURCE,
         )
         resume_identity = {
             "launcher": resume_body["launcher"], "provider": resume_body["provider"], "model": resume_body["model"],
@@ -17292,9 +18190,10 @@ class CodeOffTests(unittest.TestCase):
             "model": "claude-opus-5",
             "requested_effort": "high",
             "effective_effort": "default",
-            "effort_source": "explicit",
+            "effort_source": "launcher_default",
             "launcher_version": "sha256:" + "f" * 64,
         }
+        self.assertEqual(pristine["effort_source"], server.CODEOFF_EFFORT_SOURCE)
         for field, value in contradictions.items():
             with self.subTest(field=field):
                 job = deepcopy(pristine)
@@ -18029,7 +18928,8 @@ class CodeOffTests(unittest.TestCase):
         server._codeoff_write_state(self.records / experiment_id, state)
         running = _minimal_agent_record(job_id, "running")
         completed = _minimal_agent_record(job_id, "completed")
-        with mock.patch.object(server, "read_job", side_effect=[running, completed]), \
+        # Two drain reads, then one economics read per launched job at finalize.
+        with mock.patch.object(server, "read_job", side_effect=[running, completed, completed]), \
              mock.patch.object(server.time, "sleep") as sleep:
             status, terminal = self._post("/v1/code-off/terminal", {
                 "experiment_id": experiment_id, "outcome": "failed",
@@ -18049,6 +18949,8 @@ class CodeOffTests(unittest.TestCase):
         server._codeoff_write_state(self.records / experiment_id, state)
         reads = [
             _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "running"),
+            _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "failed"),
+            # Economics reads one record per launched job while finalizing.
             _minimal_agent_record(first, "completed"), _minimal_agent_record(second, "failed"),
         ]
         with mock.patch.object(server, "read_job", side_effect=reads), \
@@ -18134,6 +19036,577 @@ class CodeOffTests(unittest.TestCase):
         status, payload = self._post("/v1/code-off/audit", {"experiment_id": "experiment-0001"}, authed=False)
         self.assertEqual(status, 401)
 
+    def test_codeoff_identity_includes_effort_and_launcher_version(self):
+        payload = self._prepare("identity-pin-0001")
+        manifest = json.loads((self.records / "identity-pin-0001" / "manifest.json").read_text())
+        self.assertRegex(self.launcher_version, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(manifest["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION)
+        for slot, identity in manifest["identities"].items():
+            with self.subTest(slot=slot):
+                self.assertLessEqual(set(server.CODEOFF_IDENTITY_FIELDS), set(identity))
+                role = "author" if slot.startswith("author-") else "judge"
+                requested = server.CODEOFF_SLOT_REQUESTED_EFFORT[role]
+                profile, effort_err = server.normalize_effort(
+                    identity["launcher"], identity["provider"], identity["exact_model"],
+                    requested, "explicit",
+                )
+                self.assertIsNone(effort_err)
+                self.assertEqual(identity["requested_effort"], requested)
+                self.assertEqual(identity["effective_effort"], profile["effective_effort"])
+                self.assertEqual(identity["launcher_version"], self.launcher_version)
+                self.assertEqual(
+                    identity["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION,
+                )
+                self.assertEqual(
+                    manifest["identity_snapshot_hashes"][slot],
+                    server.codeoff_identity_snapshot_hash(identity),
+                )
+                launch = payload["launches"][slot.replace("-", "_")]
+                self.assertEqual(launch["effort"], identity["requested_effort"])
+                self.assertEqual(launch["effective_effort"], identity["effective_effort"])
+                self.assertEqual(launch["launcher_version"], identity["launcher_version"])
+        self.assertEqual(
+            manifest["identities_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(manifest["identities"])).hexdigest(),
+        )
+        self.assertIsNone(server.codeoff_manifest_identity_error(manifest))
+
+    def test_codeoff_identity_field_change_moves_manifest_and_identity_authority(self):
+        baseline = self._prepare("identity-authority-a")
+        baseline_manifest = json.loads((self.records / "identity-authority-a" / "manifest.json").read_text())
+        with mock.patch.object(
+            server, "CODEOFF_SLOT_REQUESTED_EFFORT", {"author": "low", "judge": "low"},
+        ):
+            self._prepare("identity-authority-b")
+        changed = json.loads((self.records / "identity-authority-b" / "manifest.json").read_text())
+        for slot in baseline_manifest["identities"]:
+            with self.subTest(slot=slot):
+                self.assertNotEqual(
+                    baseline_manifest["identities"][slot]["effective_effort"],
+                    changed["identities"][slot]["effective_effort"],
+                )
+                self.assertNotEqual(
+                    baseline_manifest["identity_snapshot_hashes"][slot],
+                    changed["identity_snapshot_hashes"][slot],
+                )
+        self.assertNotEqual(baseline_manifest["identities_hash"], changed["identities_hash"])
+        self.assertNotEqual(
+            baseline["manifest_file_hash"],
+            json.loads((self.records / "identity-authority-b" / "state.json").read_text())["manifest_file_hash"],
+        )
+        for field, value in (
+            ("launcher_version", "sha256:" + "a" * 64),
+            ("effective_effort", "max"),
+            ("inference_profile_version", "code-off-inference-profile-v0"),
+        ):
+            with self.subTest(field=field):
+                forged = deepcopy(baseline_manifest)
+                forged["identities"]["author-1"][field] = value
+                self.assertIsNotNone(server.codeoff_manifest_identity_error(forged))
+                self.assertNotEqual(
+                    server.codeoff_identity_snapshot_hash(forged["identities"]["author-1"]),
+                    baseline_manifest["identity_snapshot_hashes"]["author-1"],
+                )
+
+    def test_codeoff_rejects_effort_mismatch(self):
+        self._prepare("effort-mismatch-01")
+        manifest = json.loads((self.records / "effort-mismatch-01" / "manifest.json").read_text())
+        identity = manifest["identities"]["author-1"]
+        pinned = self._agent_body("effort-mismatch-01", "author-1")
+        other = next(
+            value for value in server.EFFORT_VALUES
+            if (server.normalize_effort(
+                identity["launcher"], identity["provider"], identity["exact_model"],
+                value, "explicit",
+            )[0] or {}).get("effective_effort") not in (None, identity["effective_effort"])
+        )
+        status, payload = self._post("/v1/agent/run", {**pinned, "effort": other})
+        self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+        self.assertFalse(json.loads((self.records / "effort-mismatch-01" / "state.json").read_text())["agent_jobs"]["author-1"])
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, launched = self._post(
+                "/v1/agent/run", {**pinned, "effort": identity["requested_effort"]},
+            )
+        self.assertEqual(status, 202, launched)
+        enqueue.assert_called_once()
+
+        # A terminal receipt whose effective effort drifts from the immutable
+        # slot identity cannot freeze, judge, aggregate, or finalize.
+        drifted = server.read_job(launched["job_id"])
+        session = dict(drifted["session_identity"], native_session_id="fixture-author-1")
+        execution_identity = self._execution_identity(session)
+        drifted_effort = "max" if identity["effective_effort"] != "max" else "low"
+        session["effective_effort"] = drifted_effort
+        drifted.update({
+            "status": "completed", "started_at": "2026-08-26T12:00:00Z",
+            "finished_at": "2026-08-26T12:00:01Z", "session_identity": session,
+            "effective_effort": drifted_effort, "execution_identity": execution_identity,
+            "receipt": {
+                "status": "ok", "job_id": drifted["job_id"], "session_identity": session,
+                "launcher": drifted["launcher"], "provider": drifted["provider"],
+                "model": drifted["model"],
+                **{key: drifted[key] for key in server.AGENT_PROFILE_FIELDS[3:]},
+                "execution_identity": execution_identity, "summary": "fixture",
+                "usage": self._usage(), "usage_diagnostic": None,
+            },
+        })
+        drifted["receipt"]["effective_effort"] = drifted_effort
+        server.write_job(drifted)
+        server.seal_terminal_receipt_authority("agent", drifted["receipt"])
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", drifted["job_id"])
+        status, payload = self._post("/v1/code-off/candidate", {
+            "experiment_id": "effort-mismatch-01", "slot": "author-1",
+            "action": "freeze", "job_id": drifted["job_id"],
+        })
+        self.assertEqual((status, payload["code"]), (422, "agent_receipt_mismatch"))
+        state = json.loads((self.records / "effort-mismatch-01" / "state.json").read_text())
+        self.assertTrue(state["finalized"])
+        self.assertEqual(state["candidates"]["author-1"], {})
+        for path, body in (
+            ("/v1/code-off/blind", {"experiment_id": "effort-mismatch-01"}),
+            ("/v1/code-off/judge", {"experiment_id": "effort-mismatch-01", "slot": "judge-fable", "job_id": drifted["job_id"]}),
+            ("/v1/code-off/aggregate", {"experiment_id": "effort-mismatch-01"}),
+            ("/v1/code-off/finalize", {"experiment_id": "effort-mismatch-01"}),
+        ):
+            with self.subTest(path=path):
+                status, payload = self._post(path, body)
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(payload["code"], "experiment_finalized")
+
+    def test_codeoff_unpinned_slot_identity_fails_closed_at_every_gate(self):
+        self._ready_for_judges("unpinned-identity-1")
+        root = self.records / "unpinned-identity-1"
+        manifest = json.loads((root / "manifest.json").read_text())
+        state = json.loads((root / "state.json").read_text())
+        del manifest["identities"]["judge-1"]["effective_effort"]
+        manifest_bytes = server.codeoff_canonical_json(manifest) + b"\n"
+        (root / "manifest.json").write_bytes(manifest_bytes)
+        state["manifest_file_hash"] = hashlib.sha256(manifest_bytes).hexdigest()
+        (root / "state.json").write_text(json.dumps(state))
+        self.assertIsNotNone(server.codeoff_manifest_identity_error(manifest))
+        for path, body in (
+            ("/v1/code-off/candidate", {"experiment_id": "unpinned-identity-1", "slot": "author-1", "action": "test"}),
+            ("/v1/code-off/blind", {"experiment_id": "unpinned-identity-1"}),
+            ("/v1/code-off/judge", {"experiment_id": "unpinned-identity-1", "slot": "judge-1", "job_id": "0" * 32}),
+            ("/v1/code-off/aggregate", {"experiment_id": "unpinned-identity-1"}),
+            ("/v1/code-off/finalize", {"experiment_id": "unpinned-identity-1"}),
+        ):
+            with self.subTest(path=path):
+                status, payload = self._post(path, body)
+                self.assertEqual((status, payload["code"]), (409, "codeoff_identity_unpinned"))
+        status, payload = self._post("/v1/agent/run", {
+            "codeoff_workspace": {"experiment_id": "unpinned-identity-1", "slot": "judge-1"},
+            "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+            "max_turns": 4, "run_budget_seconds": 60,
+        })
+        self.assertEqual((status, payload["code"]), (409, "codeoff_identity_unpinned"))
+        self.assertEqual(self._target_snapshot(), server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"])
+
+    def test_codeoff_audit_publishes_pinned_profile_without_ordering_or_secrets(self):
+        self._ready_to_finalize("audit-identity-1")
+        status, finalized = self._post("/v1/code-off/finalize", {"experiment_id": "audit-identity-1"})
+        self.assertEqual(status, 200, finalized)
+        root = self.records / "audit-identity-1"
+        manifest = json.loads((root / "manifest.json").read_text())
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": ["audit-identity-1"]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        self.assertEqual(audit["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION)
+        self.assertEqual(audit["identities_hash"], manifest["identities_hash"])
+        self.assertEqual(audit["identity_snapshot_hashes"], manifest["identity_snapshot_hashes"])
+        for slot, identity in audit["identities"].items():
+            with self.subTest(slot=slot):
+                for field in ("launcher_version", "requested_effort", "effective_effort", "inference_profile_version"):
+                    self.assertEqual(identity[field], manifest["identities"][slot][field])
+        rendered = json.dumps(audit, sort_keys=True)
+        self.assertNotIn(manifest["selection"]["seed"], rendered)
+        self.assertNotIn('"labels"', rendered)
+        self.assertNotIn("candidate-1", rendered)
+        self.assertNotIn(manifest["task"], rendered)
+        for judge in private["judges"].values():
+            self.assertNotIn(json.dumps(judge["labels"], sort_keys=True), rendered)
+
+    def test_codeoff_audit_totals_key_order_never_republishes_blind_ordering(self):
+        """Seed 0…01 shuffles judge-fable opposite the other two judges.
+
+        The audit body is serialized without `sort_keys`, so emitting a judge's
+        totals in that judge's own blind order would hand the whole per-judge
+        shuffle to any reader of the wire bytes, no label string required.
+        """
+        experiment_id = "audit-order-01"
+        seed = "0" * 63 + "1"
+        self._prepare(experiment_id, seed=seed)
+        (server.codeoff_workspace_path(experiment_id, "author-1") / "README.md").write_text("winner\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot)
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", score_a=3)
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+
+        private = json.loads((self.records / experiment_id / "private" / "blinding.json").read_text())
+        first_seen = {slot: item["labels"]["candidate-1"] for slot, item in private["judges"].items()}
+        self.assertEqual(len(set(first_seen.values())), 2, first_seen)
+
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        # Bind to the exact bytes the HTTP layer emits, not to dict identity.
+        wire = json.loads(json.dumps(audit).encode())
+        orders = {slot: list(value["totals"]) for slot, value in wire["judges"].items()}
+        self.assertEqual(set(orders), {"judge-fable", "judge-1", "judge-2"})
+        for slot, order in orders.items():
+            with self.subTest(slot=slot):
+                self.assertEqual(order, ["author-1", "author-2"])
+        self.assertNotEqual(
+            {slot: order[0] for slot, order in orders.items()}, first_seen,
+        )
+        # Author-slot totals stay exact after the re-key: author-1 scored higher.
+        for slot, value in wire["judges"].items():
+            with self.subTest(slot=slot):
+                self.assertGreater(value["totals"]["author-1"], value["totals"]["author-2"])
+                self.assertEqual(value["preference"], "author-1")
+
+    def test_codeoff_economics_artifact_aggregates_authors_judges_tests_and_final(self):
+        experiment_id = "economics-0001"
+        self._prepare(experiment_id)
+        winner = server.codeoff_workspace_path(experiment_id, "author-1")
+        (winner / "README.md").write_text("winner\n")
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(experiment_id, slot, usage=self._usage(output_tokens=40))
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", usage=self._usage(output_tokens=7))
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        status, finalized = self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, finalized)
+
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        economics = audit["economics"]
+        self.assertEqual(economics["version"], server.CODEOFF_ECONOMICS_VERSION)
+        self.assertEqual(economics["usage_version"], server.USAGE_VERSION)
+        self.assertEqual(
+            audit["economics_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(economics)).hexdigest(),
+        )
+        self.assertEqual(
+            (self.records / experiment_id / "artifacts" / audit["economics_hash"]).read_bytes(),
+            server.codeoff_canonical_json(economics),
+        )
+        self.assertEqual(set(economics["slots"]), set(audit["identities"]))
+        self.assertEqual(economics["authors"]["attempts"], 2)
+        self.assertEqual(economics["judges"]["attempts"], 3)
+        self.assertEqual(economics["inference"]["attempts"], 5)
+        self.assertEqual(economics["authors"]["output_tokens"], 80)
+        self.assertEqual(economics["judges"]["output_tokens"], 21)
+        self.assertEqual(economics["inference"]["output_tokens"], 101)
+        self.assertEqual(economics["inference"]["fresh_input_tokens"], 500)
+        self.assertEqual(economics["inference"]["turns_observed"], 10)
+        self.assertIsNone(economics["inference"]["provider_cost_usd"])
+        self.assertEqual(economics["tests"]["candidate_runs"], 2)
+        self.assertEqual(economics["tests"]["final_runs"], 1)
+        self.assertTrue(economics["final_verification"]["tests_pass"])
+        self.assertEqual(
+            economics["final_verification"]["receipt_hash"], finalized["receipt_hash"],
+        )
+        self.assertEqual(economics["identities_hash"], audit["identities_hash"])
+        rendered = json.dumps(economics, sort_keys=True)
+        for forbidden in (
+            json.loads((self.records / experiment_id / "manifest.json").read_text())["selection"]["seed"],
+            "candidate-1", "labels", "prompt", str(self.repo),
+        ):
+            self.assertNotIn(forbidden, rendered, forbidden)
+
+    def test_codeoff_economics_cost_is_nullable_and_missing_usage_is_not_a_false_zero(self):
+        experiment_id = "economics-cost-01"
+        self._prepare(experiment_id)
+        self._freeze_and_test(experiment_id, "author-1", usage=self._usage(provider_cost_usd=0.25))
+        self._freeze_and_test(experiment_id, "author-2", usage=None, usage_diagnostic="usage_not_reported")
+        self.assertEqual(self._post("/v1/code-off/blind", {"experiment_id": experiment_id})[0], 200)
+        for judge in ("judge-fable", "judge-1", "judge-2"):
+            self._judge_done(experiment_id, judge, "author-1", usage=self._usage(provider_cost_usd=0.5))
+        self.assertEqual(self._post("/v1/code-off/aggregate", {"experiment_id": experiment_id})[0], 200)
+        self.assertEqual(self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })[0], 200)
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        economics = audit["economics"]
+        self.assertEqual(economics["authors"]["attempts"], 2)
+        self.assertEqual(economics["authors"]["usage_attempts"], 1)
+        self.assertEqual(economics["authors"]["missing_usage_attempts"], 1)
+        self.assertIsNone(economics["authors"]["provider_cost_usd"])
+        self.assertIsNone(economics["inference"]["provider_cost_usd"])
+        self.assertEqual(economics["judges"]["provider_cost_usd"], 1.5)
+        self.assertEqual(economics["slots"]["author-2"]["usage_diagnostics"], ["usage_not_reported"])
+        self.assertIsNone(economics["final_verification"]["receipt_hash"])
+        self.assertEqual(economics["tests"]["final_runs"], 0)
+
+    def test_codeoff_economics_never_claims_a_pass_the_whole_author_field_did_not_run(self):
+        """One green candidate is not a green pair.
+
+        A park after author-1 tested and author-2 never did would otherwise
+        write `candidate_pass: true` into the permanent Rewst record for an
+        experiment where half the author field never ran its recipes.
+        """
+        experiment_id = "economics-partial"
+        self._prepare(experiment_id)
+        frozen, tested = self._freeze_and_test(experiment_id, "author-1")
+        self.assertTrue(tested["tests_pass"], (frozen, tested))
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, terminal)
+        tests = terminal["economics"]["tests"]
+        self.assertEqual(tests["candidate_runs"], 1)
+        self.assertEqual(tests["expected_candidate_runs"], 2)
+        self.assertIsNone(tests["candidate_pass"])
+        self.assertEqual(
+            sum(1 for slot in terminal["economics"]["slots"].values() if slot["work_role"] == "author"), 2,
+        )
+        self.assertEqual(
+            sum(1 for slot in terminal["economics"]["slots"].values() if slot["work_role"] == "judge"), 3,
+        )
+        # The complete pair still reports a real verdict.
+        complete = "economics-complete"
+        self._prepare(complete)
+        for slot in ("author-1", "author-2"):
+            self._freeze_and_test(complete, slot)
+        status, both = self._post("/v1/code-off/terminal", {
+            "experiment_id": complete, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, both)
+        self.assertEqual(both["economics"]["tests"]["candidate_runs"], 2)
+        self.assertEqual(both["economics"]["tests"]["expected_candidate_runs"], 2)
+        self.assertIs(both["economics"]["tests"]["candidate_pass"], True)
+
+    def test_codeoff_usage_diagnostics_enum_is_the_closed_server_set(self):
+        """Every diagnostic `_codeoff_slot_usage` can emit must be published."""
+        self.assertEqual(
+            server.CODEOFF_USAGE_DIAGNOSTICS,
+            server.USAGE_DIAGNOSTICS | {"usage_authority_nonterminal"},
+        )
+        schema = json.loads(server.openapi_bytes())["components"]["schemas"]["CodeOffEconomicsSlot"]
+        published = set(schema["properties"]["usage_diagnostics"]["items"]["enum"])
+        self.assertEqual(published, set(server.CODEOFF_USAGE_DIAGNOSTICS))
+        # A queued attempt is a real, closed, non-funding diagnostic.
+        experiment_id = "economics-diag-1"
+        self._prepare(experiment_id)
+        with mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post("/v1/agent/run", self._agent_body(experiment_id, "author-1"))
+        self.assertEqual(status, 202, launched)
+        usage, diagnostic = server._codeoff_slot_usage(launched["job_id"])
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, server.CODEOFF_USAGE_NONTERMINAL)
+        self.assertIn(diagnostic, server.CODEOFF_USAGE_DIAGNOSTICS)
+
+    def test_codeoff_requested_effort_collision_cannot_forge_a_slot_identity(self):
+        # `default` and `high` collapse to the same effective effort on every
+        # codex and grok identity, so an effective-effort-only gate would let a
+        # launch record a requested effort the immutable snapshot never pinned.
+        self._prepare("effort-collision-0")
+        identities = json.loads(
+            (self.records / "effort-collision-0" / "manifest.json").read_text()
+        )["identities"]
+        collisions = {
+            slot: self._effort_collision(identity)
+            for slot, identity in identities.items()
+            if self._effort_collision(identity) is not None
+        }
+        self.assertTrue(collisions, identities)
+        for index, (slot, collision) in enumerate(sorted(collisions.items())):
+            with self.subTest(slot=slot):
+                experiment_id = f"effort-collision-{index + 1}"
+                # Each slot is probed in the one stage that can launch it.
+                if slot.startswith("author-"):
+                    self._prepare(experiment_id)
+                else:
+                    self._ready_for_judges(experiment_id)
+                identity = identities[slot]
+                self.assertEqual(identity["requested_effort"], server.CODEOFF_SLOT_REQUESTED_EFFORT[
+                    server.codeoff_slot_work_role(slot)
+                ])
+                self.assertNotEqual(collision, identity["requested_effort"])
+                before = json.loads(
+                    (self.records / experiment_id / "state.json").read_text()
+                )["agent_jobs"]
+                status, payload = self._post("/v1/agent/run", {
+                    **self._agent_body(experiment_id, slot), "effort": collision,
+                })
+                self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+                state = json.loads((self.records / experiment_id / "state.json").read_text())
+                self.assertEqual(state["agent_jobs"], before)
+
+    def test_codeoff_launch_requires_the_explicit_pinned_effort_source(self):
+        # The snapshot's effective effort is derived under one explicit source.
+        # A launch that inherits a launcher default records a different
+        # effort_source on the job, receipt, and session identity, so the four
+        # identity surfaces would no longer be equal.
+        experiment_id = "effort-source-1"
+        self._prepare(experiment_id)
+        self.assertEqual(server.CODEOFF_EFFORT_SOURCE, "explicit")
+        body = self._agent_body(experiment_id, "author-1")
+        self.assertIn("effort", body)
+        status, payload = self._post("/v1/agent/run", {
+            key: value for key, value in body.items() if key != "effort"
+        })
+        self.assertEqual((status, payload["code"]), (400, "codeoff_identity_mismatch"))
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
+            status, launched = self._post("/v1/agent/run", body)
+        self.assertEqual(status, 202, launched)
+        enqueue.assert_called_once()
+        job = server.read_job(launched["job_id"])
+        identity = json.loads(
+            (self.records / experiment_id / "manifest.json").read_text()
+        )["identities"]["author-1"]
+        for surface in (job, job["session_identity"]):
+            self.assertEqual(surface["effort_source"], server.CODEOFF_EFFORT_SOURCE)
+            self.assertEqual(surface["requested_effort"], identity["requested_effort"])
+            self.assertEqual(surface["effective_effort"], identity["effective_effort"])
+
+    def test_codeoff_terminal_receipt_must_carry_the_whole_pinned_effort_profile(self):
+        experiment_id = "effort-terminal-1"
+        self._prepare(experiment_id)
+        job_id = self._launch_done(experiment_id, "author-1")
+        job = server.read_job(job_id)
+        manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
+        identity = manifest["identities"]["author-1"]
+        self.assertTrue(server._codeoff_terminal_identity_matches(job, job["receipt"], identity))
+        collision = self._effort_collision(identity)
+        self.assertIsNotNone(collision)
+        for surface in ("job", "session_identity", "receipt"):
+            with self.subTest(surface=surface):
+                drifted = deepcopy(job)
+                target = {
+                    "job": drifted,
+                    "session_identity": drifted["session_identity"],
+                    "receipt": drifted["receipt"],
+                }[surface]
+                target["requested_effort"] = collision
+                self.assertFalse(server._codeoff_terminal_identity_matches(
+                    drifted, drifted["receipt"], identity,
+                ))
+
+    def test_codeoff_economics_counts_failed_attempt_spend_from_sealed_receipts(self):
+        # A failed author or judge attempt still burns tokens and still carries
+        # an authority-sealed terminal receipt, so its exact spend belongs in
+        # the permanent record instead of being reported as a provenance fault.
+        experiment_id = "economics-failed-1"
+        self._prepare(experiment_id)
+        self._freeze_and_test(experiment_id, "author-1", usage=self._usage(output_tokens=40))
+        failed = self._launch_failed(
+            experiment_id, "author-2", usage=self._usage(output_tokens=11, provider_cost_usd=0.75),
+        )
+        self.assertEqual(server.read_job(failed)["status"], "failed")
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "failed",
+        })
+        self.assertEqual(status, 200, terminal)
+        economics = terminal["economics"]
+        author_2 = economics["slots"]["author-2"]
+        self.assertEqual(author_2["usage_diagnostics"], [])
+        self.assertEqual(author_2["usage"]["attempts"], 1)
+        self.assertEqual(author_2["usage"]["usage_attempts"], 1)
+        self.assertEqual(author_2["usage"]["missing_usage_attempts"], 0)
+        self.assertEqual(author_2["usage"]["output_tokens"], 11)
+        self.assertEqual(author_2["usage"]["provider_cost_usd"], 0.75)
+        self.assertEqual(economics["authors"]["output_tokens"], 51)
+        self.assertEqual(economics["authors"]["missing_usage_attempts"], 0)
+
+    def test_codeoff_economics_never_funds_itself_from_a_non_terminal_attempt(self):
+        experiment_id = "economics-running-1"
+        self._prepare(experiment_id)
+        with mock.patch.object(server, "enqueue_agent"):
+            status, launched = self._post(
+                "/v1/agent/run", self._agent_body(experiment_id, "author-1"),
+            )
+        self.assertEqual(status, 202, launched)
+        self.assertEqual(server.read_job(launched["job_id"])["status"], "queued")
+        usage, diagnostic = server._codeoff_slot_usage(launched["job_id"])
+        self.assertIsNone(usage)
+        self.assertEqual(diagnostic, "usage_authority_nonterminal")
+        spec = json.loads(server.openapi_bytes())
+        self.assertIn(
+            diagnostic,
+            spec["components"]["schemas"]["CodeOffEconomicsSlot"]
+            ["properties"]["usage_diagnostics"]["items"]["enum"],
+        )
+
+    def test_codeoff_audit_stays_inside_openapi_for_a_record_without_pinned_identity(self):
+        # Records written before the inference profile existed still have to be
+        # auditable, and the compact contract has to admit the nulls they yield.
+        experiment_id = "legacy-identity-1"
+        self._ready_for_judges(experiment_id)
+        root = self.records / experiment_id
+        manifest = json.loads((root / "manifest.json").read_text())
+        state = json.loads((root / "state.json").read_text())
+        for key in ("identities_hash", "identity_snapshot_hashes", "inference_profile_version"):
+            del manifest[key]
+        manifest_bytes = server.codeoff_canonical_json(manifest) + b"\n"
+        (root / "manifest.json").write_bytes(manifest_bytes)
+        state["manifest_file_hash"] = hashlib.sha256(manifest_bytes).hexdigest()
+        (root / "state.json").write_text(json.dumps(state))
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        compact = json.loads(server.openapi_bytes())["components"]["schemas"]["CodeOffCompact"]
+        self.assertLessEqual(set(audit), set(compact["properties"]))
+        for key in ("identities_hash", "inference_profile_version", "identity_snapshot_hashes"):
+            with self.subTest(key=key):
+                self.assertIsNone(audit[key])
+                declared = compact["properties"][key]["type"]
+                self.assertIn("null", declared, key)
+
+    def test_codeoff_terminal_returns_the_durable_economics_receipt_for_rewst(self):
+        experiment_id = "economics-terminal-1"
+        self._ready_to_finalize(experiment_id)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+        status, terminal = self._post("/v1/code-off/terminal", {
+            "experiment_id": experiment_id, "outcome": "succeeded",
+        })
+        self.assertEqual(status, 200, terminal)
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(
+            terminal["economics_hash"],
+            hashlib.sha256(server.codeoff_canonical_json(terminal["economics"])).hexdigest(),
+        )
+        self.assertEqual(terminal["economics"]["experiment_id"], experiment_id)
+        status, absent = self._post("/v1/code-off/terminal", {
+            "experiment_id": "economics-absent-1", "outcome": "failed",
+        })
+        self.assertEqual((status, absent["status"]), (200, "absent"))
+        self.assertIsNone(absent["economics"])
+        self.assertIsNone(absent["economics_hash"])
+
+    def test_codeoff_cleanup_removes_local_staging_but_keeps_the_economics_record(self):
+        experiment_id = "economics-cleanup-1"
+        self._ready_to_finalize(experiment_id)
+        self.assertEqual(self._post("/v1/code-off/finalize", {"experiment_id": experiment_id})[0], 200)
+        status, audit, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, audit)
+        before = audit["economics"]
+        status, cleaned = self._post("/v1/code-off/cleanup", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, cleaned)
+        self.assertTrue(cleaned["record_preserved"])
+        self.assertFalse((self.workspaces / experiment_id).exists())
+        status, after, _ = server.dispatch(
+            "GET", "/v1/code-off/audit", {"experiment_id": [experiment_id]}, True, b"",
+        )
+        self.assertEqual(status, 200, after)
+        self.assertEqual(after["economics"], before)
+
     def test_codeoff_openapi_identity_contract_matches_runtime_manifest(self):
         spec = json.loads(server.openapi_bytes())
         schemas = spec["components"]["schemas"]
@@ -18212,6 +19685,58 @@ class CodeOffTests(unittest.TestCase):
         for field in ("max_turns", "run_budget_seconds"):
             self.assertEqual({item["type"] for item in agent[field]["oneOf"]}, {"integer", "string"})
 
+        identity = spec["components"]["schemas"]["CodeOffSlotIdentity"]
+        self.assertFalse(identity["additionalProperties"])
+        self.assertLessEqual(set(server.CODEOFF_IDENTITY_FIELDS), set(identity["required"]))
+        self.assertEqual(
+            identity["properties"]["inference_profile_version"]["enum"],
+            [server.CODEOFF_INFERENCE_PROFILE_VERSION],
+        )
+        self.assertEqual(identity["properties"]["launcher_version"]["pattern"], server.LAUNCHER_VERSION_RE.pattern)
+        for field in ("requested_effort", "effective_effort"):
+            self.assertEqual(identity["properties"][field]["enum"], list(server.EFFORT_VALUES))
+        economics = spec["components"]["schemas"]["CodeOffEconomics"]
+        self.assertFalse(economics["additionalProperties"])
+        self.assertEqual(economics["properties"]["version"]["enum"], [server.CODEOFF_ECONOMICS_VERSION])
+        self.assertEqual(economics["properties"]["usage_version"]["enum"], [server.USAGE_VERSION])
+        totals = spec["components"]["schemas"]["CodeOffUsageTotals"]
+        self.assertFalse(totals["additionalProperties"])
+        self.assertEqual(
+            set(totals["required"]),
+            {"usage_version", "attempts", "usage_attempts", "missing_usage_attempts",
+             "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+             "output_tokens", "reasoning_tokens", "wall_seconds", "turns_observed",
+             "provider_cost_usd"},
+        )
+        self.assertEqual(totals["properties"]["provider_cost_usd"]["type"], ["number", "null"])
+        self.assertEqual(totals["properties"]["turns_observed"]["type"], ["integer", "null"])
+        for group in ("authors", "judges", "inference"):
+            self.assertEqual(
+                economics["properties"][group]["$ref"], "#/components/schemas/CodeOffUsageTotals",
+            )
+        compact = spec["components"]["schemas"]["CodeOffCompact"]["properties"]
+        self.assertEqual(compact["economics"]["oneOf"], [
+            {"$ref": "#/components/schemas/CodeOffEconomics"}, {"type": "null"},
+        ])
+        self.assertEqual(compact["economics_hash"]["type"], ["string", "null"])
+        self.assertEqual(compact["identities_hash"]["pattern"], "^[0-9a-f]{64}$")
+        # A record written before the inference profile existed still audits,
+        # so the compact contract admits exactly one version string or null.
+        self.assertEqual(compact["identities_hash"]["type"], ["string", "null"])
+        self.assertEqual(
+            compact["inference_profile_version"]["enum"],
+            [server.CODEOFF_INFERENCE_PROFILE_VERSION, None],
+        )
+        self.assertEqual(compact["inference_profile_version"]["type"], ["string", "null"])
+        terminal = spec["components"]["schemas"]["CodeOffTerminalResult"]
+        self.assertEqual(
+            set(terminal["required"]),
+            {"ok", "experiment_id", "status", "reason", "finalized", "economics", "economics_hash"},
+        )
+        self.assertEqual(terminal["properties"]["economics"]["oneOf"], [
+            {"$ref": "#/components/schemas/CodeOffEconomics"}, {"type": "null"},
+        ])
+
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
         self.assertEqual(graph["slug"], "graphwing-code-off")
@@ -18226,6 +19751,10 @@ class CodeOffTests(unittest.TestCase):
             "logic.join.any": {"out"},
             "logic.join.all": {"out"},
             "action.wait.webhook": {"pending", "out", "timeout", "failure"},
+            "transforms.objectBuilder": {"out"},
+            "transforms.hash": {"out"},
+            "action.datastore.records.upsert": {"success", "failure"},
+            "action.datastore.records.get": {"success", "failure"},
         }
         for edge in edges:
             self.assertEqual(edge.get("targetHandle"), "in", edge)
@@ -18311,9 +19840,75 @@ class CodeOffTests(unittest.TestCase):
         self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
         self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
-        self.assertEqual(leaves, {"done", "terminal", "terminal_error", "success_confirmation_error"})
+        self.assertEqual(leaves, {
+            "economics_recorded", "economics_write_failed", "economics_readback_failed",
+            "economics_readback_mismatch",
+        })
         for leaf in leaves:
             self.assertTrue(all({"terminalize_failed", "terminalize_success"} & set(path) for path in paths_to(leaf)), leaf)
+
+        # Rewst owns the permanent code-off economics/audit record. Every
+        # terminal path converges once on deterministic native Datastore
+        # Records nodes with an exact key/version/payload-hash readback.
+        for triple in (
+            ("done", "out", "join_economics"), ("terminal", "out", "join_economics"),
+            ("terminal_error", "out", "join_economics"),
+            ("success_confirmation_error", "out", "join_economics"),
+            ("join_economics", "out", "economics_record"),
+            ("economics_record", "out", "economics_record_key"),
+            ("economics_record_key", "out", "economics_expected_hash"),
+            ("economics_expected_hash", "out", "economics_upsert"),
+            ("economics_upsert", "success", "economics_readback"),
+            ("economics_upsert", "failure", "economics_write_failed"),
+            ("economics_readback", "success", "economics_readback_hash"),
+            ("economics_readback", "failure", "economics_readback_failed"),
+            ("economics_readback_hash", "out", "economics_readback_check"),
+            ("economics_readback_check", "out", "if_economics_readback"),
+            ("if_economics_readback", "pass", "economics_recorded"),
+            ("if_economics_readback", "fail", "economics_readback_mismatch"),
+        ):
+            self.assertIn(triple, triples, triple)
+        self.assertEqual(nodes["join_economics"]["type"], "logic.join.any")
+        self.assertTrue(nodes["join_economics"]["config"]["stopOnFirst"])
+        self.assertEqual(incoming("join_economics"), {
+            ("done", "out"), ("terminal", "out"),
+            ("terminal_error", "out"), ("success_confirmation_error", "out"),
+        })
+        upsert, readback = nodes["economics_upsert"], nodes["economics_readback"]
+        self.assertEqual(upsert["type"], "action.datastore.records.upsert")
+        self.assertEqual(readback["type"], "action.datastore.records.get")
+        for node in (upsert, readback):
+            self.assertEqual(node["config"]["scope"], "tenant")
+            self.assertEqual(node["config"]["collection"], "graphwing_codeoff_economics_v1")
+            self.assertEqual(node["config"]["recordKey"], "{{ CTX.codeoff_economics_record_key.value }}")
+        self.assertEqual(upsert["config"]["data"], "{{ CTX.codeoff_economics_record }}")
+        self.assertEqual(
+            set(upsert["config"]["indexedFields"]),
+            {"experiment_id", "status", "workflow_run_id", "protocol_version",
+             "inference_profile_version", "economics_hash"},
+        )
+        self.assertEqual(
+            {rule["path"] for rule in nodes["if_economics_readback"]["config"]["rules"]},
+            {"found_matches", "key_matches", "data_matches", "version_matches"},
+        )
+        self.assertEqual(
+            {(mapping["output"]) for mapping in nodes["economics_readback_check"]["config"]["mappings"]},
+            {"found_matches", "key_matches", "data_matches", "version_matches"},
+        )
+        self.assertEqual(
+            nodes["economics_expected_hash"]["config"]["input"], "{{ CTX.codeoff_economics_record }}",
+        )
+        self.assertEqual(
+            nodes["economics_readback_hash"]["config"]["input"], "{{ TASKS.economics_readback.data }}",
+        )
+        for node in (nodes["economics_expected_hash"], nodes["economics_readback_hash"]):
+            self.assertEqual(node["type"], "transforms.hash")
+            self.assertEqual(node["config"]["algorithm"], "sha256")
+            self.assertEqual(node["config"]["inputKind"], "json_stringify")
+        self.assertFalse(
+            any(node["type"] == "transforms.codeExpression" for node in nodes.values()),
+        )
+        self.assertNotIn("{%", json.dumps(graph))
         self.assertIn(("eligible", "pass", "finalize"), triples)
         self.assertIn(("final_verified", "pass", "commit"), triples)
         self.assertIn(("push", "success", "terminalize_success"), triples)
@@ -18390,6 +19985,171 @@ class CodeOffTests(unittest.TestCase):
         for node in nodes:
             if color[node] == 0: visit(node)
         self.assertNotIn("retry", json.dumps(graph).lower())
+
+    def test_codeoff_economics_persistence_failures_hard_fail_with_proven_rewst_regex_contract(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        outgoing = {edge["source"] for edge in graph["edges"]}
+        # Local Rewst's transforms.regexReplace contract hard-fails invalid RE2
+        # patterns; lookahead is intentionally unsupported by RE2. A failed
+        # economics write must never complete as a successful no-op.
+        for node_id, failure_code in (
+            ("economics_write_failed", "graphwing_codeoff_economics_write_failed"),
+            ("economics_readback_failed", "graphwing_codeoff_economics_readback_failed"),
+            ("economics_readback_mismatch", "graphwing_codeoff_economics_readback_mismatch"),
+        ):
+            node = nodes[node_id]
+            self.assertEqual(node["type"], "transforms.regexReplace")
+            self.assertEqual(node["config"], {
+                "input": failure_code, "pattern": "(?=graphwing)", "replacement": "",
+            })
+            self.assertNotIn(node_id, outgoing)
+        self.assertEqual(nodes["economics_recorded"]["type"], "action.noop")
+        self.assertNotIn("ttlSeconds", nodes["economics_upsert"]["config"])
+        self.assertEqual(
+            [node["id"] for node in graph["nodes"]
+             if node["type"] == "action.datastore.records.upsert"],
+            ["economics_upsert"],
+        )
+        key_expression = json.dumps(
+            nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
+        )
+        self.assertIn("graphwing-codeoff-economics-v1:", key_expression)
+        self.assertIn("WORKFLOW.runId", key_expression)
+        self.assertIn(":code-off-terminal", key_expression)
+
+    def test_codeoff_economics_record_has_a_closed_sanitized_field_allowlist(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        builder = next(node for node in graph["nodes"] if node["id"] == "economics_record")
+        self.assertEqual(builder["type"], "transforms.objectBuilder")
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in builder["config"]["mappings"]
+        }
+        self.assertEqual(set(mappings), {
+            "schema_version", "workflow_slug", "workflow_id", "workflow_version",
+            "workflow_run_id", "experiment_id", "status", "reason", "finalized",
+            "protocol_version", "inference_profile_version", "identities_hash",
+            "economics_hash", "economics", "final_verification_hash",
+        })
+        upsert = next(node for node in graph["nodes"] if node["id"] == "economics_upsert")
+        self.assertLessEqual(set(upsert["config"]["indexedFields"]), set(mappings))
+        # Only the two terminalization receipts and the workflow identity may
+        # fund the permanent record; nothing reaches into a launcher surface.
+        projection = json.dumps(builder["config"])
+        for identity in ("WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"):
+            self.assertIn(identity, projection)
+        for forbidden in (
+            "prompt", "log", "raw", "seed", "labels", "candidate-1", "output_text",
+            "response_webhook_token", "resumetoken", "resumeurl", "webhook",
+            "credential", "secret", "/home/",
+        ):
+            self.assertNotIn(forbidden, projection.lower())
+
+    def test_codeoff_graph_launches_send_the_prepared_effort_for_every_slot(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        self._prepare("graph-effort-01")
+        manifest = json.loads((self.records / "graph-effort-01" / "manifest.json").read_text())
+        launches = server._codeoff_launch_plan(manifest)
+        runs = [node for node in graph["nodes"] if node["type"] == "action.graphwing.POST:/v1/agent/run"]
+        self.assertEqual(len(runs), 5)
+        for node in runs:
+            with self.subTest(node=node["id"]):
+                key = node["config"]["codeoff_workspace"]["slot"].replace("-", "_")
+                self.assertIn(key, launches)
+                self.assertEqual(
+                    node["config"]["effort"],
+                    "{{ TASKS.prepare.data.launches." + key + ".effort }}",
+                )
+                self.assertEqual(
+                    launches[key]["effort"], server.CODEOFF_SLOT_REQUESTED_EFFORT[
+                        server.codeoff_slot_work_role(node["config"]["codeoff_workspace"]["slot"])
+                    ],
+                )
+
+    def test_codeoff_graph_converges_every_terminal_into_the_durable_record(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )["spec"]
+        sources = {edge["source"] for edge in graph["edges"]}
+        terminals = {node["id"] for node in graph["nodes"] if node["id"] not in sources}
+        # The only paths that end without a durable economics record are the
+        # four economics markers themselves; every workflow outcome before them
+        # must fund exactly one record.
+        self.assertEqual(terminals, {
+            "economics_recorded", "economics_write_failed",
+            "economics_readback_failed", "economics_readback_mismatch",
+        })
+        joined = {
+            edge["source"] for edge in graph["edges"] if edge["target"] == "join_economics"
+        }
+        self.assertEqual(joined, {"done", "terminal", "terminal_error", "success_confirmation_error"})
+        status = next(
+            mapping for mapping in
+            next(node for node in graph["nodes"] if node["id"] == "economics_record")["config"]["mappings"]
+            if mapping["output"] == "status"
+        )
+        # `status` is an indexed field, so an unconfirmed terminalization has to
+        # land as a stated string rather than a null the index cannot carry.
+        self.assertEqual(
+            json.dumps(status["expression"]).count('"kind": "literal"'), 1,
+        )
+        self.assertNotIn("null", json.dumps(status["expression"]))
+
+    def test_codeoff_graph_actual_riftwing_workflow_lint_when_available(self):
+        """Use Riftwing's authoritative Go checker; keep CI hermetic and stdlib-only."""
+        graph_path = Path(server.__file__).parent / "graphs" / "code-off.json"
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            graph = json.loads(graph_path.read_text())["spec"]
+            economics_nodes = [
+                node for node in graph["nodes"]
+                if node["id"].startswith("economics_") or node["id"] in ("join_economics", "if_economics_readback")
+            ]
+            self.assertTrue(economics_nodes)
+            self.assertNotIn("transforms.codeExpression", {node["type"] for node in economics_nodes})
+            dumped = json.dumps(economics_nodes)
+            self.assertNotIn("namespace(", dumped)
+            self.assertNotRegex(dumped, r"{%-?\s*set\s+[A-Za-z_]\w*[.\[]")
+            return
+
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    raw, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+    spec, ok := envelope["spec"].(map[string]any); if !ok { panic("missing object spec") }
+    result := linter.Lint(spec)
+    for _, issue := range result.Issues {
+        encoded, _ := json.Marshal(issue)
+        fmt.Println(string(encoded))
+    }
+    fmt.Printf("issues=%d\n", len(result.Issues))
+    if len(result.Issues) != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "graphwing_workflow_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(
+                ["go", "run", str(checker), str(graph_path)],
+                cwd=Path(riftwing) / "rewst-go", text=True,
+                capture_output=True, timeout=300, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("issues=0", result.stdout)
 
     def test_publish_catalog_includes_codeoff_and_validated_implement_slice(self):
         source = (Path(server.__file__).parent / "scripts" / "publish_graphs.py").read_text()

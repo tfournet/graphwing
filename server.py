@@ -24,7 +24,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -109,6 +109,10 @@ EFFORT_VALUES = ("default", "low", "medium", "high", "max")
 EFFORT_SOURCES = frozenset({"route", "explicit", "launcher_default"})
 REVIEW_EFFORT_SOURCES = frozenset({"explicit", "launcher_default"})
 REVIEW_EXECUTION_VERSION = "review-execution-v1"
+# Complete git diff bytes, never a prefix. 252 KiB is the largest round maximum
+# under the 256-KiB capture cap (4,096 bytes of headroom). Prompt text travels
+# off argv (stdin or ACP), so MAX_ARG_STRLEN does not bound this.
+REVIEW_MAX_DIFF_BYTES = 252 * 1024
 REVIEW_PERMISSION_PROFILES = {
     "codex": "codex-read-only",
     "claude": "claude-plan",
@@ -339,6 +343,21 @@ CODEOFF_POLICY_VERSION = "code-off-policy-v1"
 CODEOFF_AGGREGATION_VERSION = "code-off-aggregation-v1"
 CODEOFF_RUBRIC_VERSION = "code-off-rubric-v1"
 CODEOFF_EXECUTION_MANIFEST_VERSION = "code-off-execution-manifest-v1"
+CODEOFF_INFERENCE_PROFILE_VERSION = "code-off-inference-profile-v1"
+CODEOFF_ECONOMICS_VERSION = "code-off-economics-v1"
+# Every code-off slot pins one closed requested effort per work role. Changing a
+# value here is a versioned policy change: it moves each slot identity snapshot,
+# the identities hash, and the immutable manifest file hash, so no in-flight
+# experiment can silently inherit a different inference profile.
+CODEOFF_SLOT_REQUESTED_EFFORT = {"author": "default", "judge": "default"}
+# Code-off states its effort; it never inherits a launcher default. The pinned
+# effective effort is derived under this one source, so every launch, job,
+# session identity, and terminal receipt must report it too.
+CODEOFF_EFFORT_SOURCE = "explicit"
+CODEOFF_IDENTITY_FIELDS = (
+    "launcher", "launcher_version", "provider", "exact_model",
+    "requested_effort", "effective_effort", "inference_profile_version",
+)
 CODEOFF_AUTHOR_POOL = ["grok", "sol", "terra", "sonnet", "opus"]
 CODEOFF_CATEGORIES = frozenset({"ui", "backend", "full_stack", "data", "infrastructure", "developer_tooling", "mobile", "documentation"})
 CODEOFF_TAGS = frozenset({"api", "database", "auth", "security", "accessibility", "testing", "migration", "performance", "observability", "build_ci", "bug_fix", "refactor"})
@@ -2583,8 +2602,13 @@ class PinnedLauncher:
         self.fd = fd
         self.path = Path(f"/proc/self/fd/{fd}")
         self.fingerprint = fingerprint
+        self.companion: PinnedLauncher | None = None
 
     def close(self) -> None:
+        companion = self.companion
+        self.companion = None
+        if companion is not None:
+            companion.close()
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
@@ -2662,11 +2686,90 @@ def pinned_launcher(binary: Path):
             pinned.close()
 
 
-def launcher_version_fingerprint(binary: Path) -> str | None:
+GROK_NODE_SHEBANGS = frozenset({
+    b"#!/usr/bin/env node", b"#!/usr/bin/env -S node", b"#!/usr/bin/node",
+})
+GROK_NODE_FINGERPRINT_DOMAIN = b"graphwing/grok-node-launcher/v1\0"
+
+
+class GrokNodeUnavailable(FileNotFoundError):
+    """The exact Node companion required by a Grok script could not be pinned."""
+
+
+def grok_node_shebang(binary: Path) -> bool:
+    """Recognize only the exact closed Node shebang forms Graphwing supports."""
+    with binary.open("rb") as fh:
+        line = fh.readline(128)
+    if line.endswith(b"\r\n"):
+        line = line[:-2]
+    elif line.endswith(b"\n"):
+        line = line[:-1]
+    return line in GROK_NODE_SHEBANGS
+
+
+def _grok_composite_fingerprint(script: str, node: str) -> str:
+    digest = hashlib.sha256(GROK_NODE_FINGERPRINT_DOMAIN
+                            + bytes.fromhex(script[7:]) + bytes.fromhex(node[7:]))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _attach_grok_node(pinned: PinnedLauncher, node_binary: Path | None = None) -> None:
+    if not grok_node_shebang(pinned.path):
+        return
+    try:
+        pinned.companion = pin_launcher(node_binary or resolve_executable(
+            "node", "GRAPHWING_NODE_BIN", Path.home() / ".local" / "bin" / "node"))
+    except FileNotFoundError as exc:
+        raise GrokNodeUnavailable("Grok Node companion is unavailable") from exc
+    pinned.fingerprint = _grok_composite_fingerprint(
+        pinned.fingerprint, pinned.companion.fingerprint)
+
+
+def pin_native_launcher(binary: Path, launcher: str) -> PinnedLauncher:
+    """Pin every executable artifact consumed by one supported launcher."""
+    pinned = pin_launcher(binary)
+    try:
+        if launcher == "grok":
+            _attach_grok_node(pinned)
+        return pinned
+    except BaseException:
+        pinned.close()
+        raise
+
+
+@contextmanager
+def pinned_native_launcher(binary: Path, launcher: str):
+    pinned = pin_native_launcher(binary, launcher)
+    try:
+        yield pinned
+    finally:
+        pinned.close()
+
+
+@contextmanager
+def repin_native_launcher(accepted: PinnedLauncher, launcher: str):
+    """Copy accepted sealed artifacts into fresh execution-only descriptors."""
+    execution = pin_launcher(accepted.path)
+    try:
+        if launcher == "grok":
+            node_script = grok_node_shebang(execution.path)
+            if node_script != (accepted.companion is not None):
+                raise OSError("accepted Grok launcher shape changed")
+            if node_script:
+                assert accepted.companion is not None
+                _attach_grok_node(execution, accepted.companion.path)
+        yield execution
+    finally:
+        execution.close()
+
+
+def launcher_version_fingerprint(binary: Path, launcher: str | None = None) -> str | None:
     """Return a path-free immutable launcher artifact identity without executing it."""
     try:
-        with pinned_launcher(binary) as pinned:
+        with pinned_native_launcher(binary, launcher or "") as pinned:
             return pinned.fingerprint
+    except GrokNodeUnavailable:
+        return "missing_companion"
     except FileNotFoundError:
         return "missing"
     except OSError:
@@ -3146,7 +3249,52 @@ def parse_review_verdict(text: str) -> tuple[str, str]:
     return verdict, line[:500]
 
 
+def complete_review_diff(resolved: Path) -> tuple[str, str | None]:
+    """Return the complete review diff, or a closed failure code; never a prefix."""
+    result = git_diff(resolved, "HEAD", None)
+    diff_text = result.get("diff")
+    if not result.get("ok") or not isinstance(diff_text, str):
+        return "", "git_state_unavailable"
+    if result.get("truncated") or len(diff_text.encode()) > REVIEW_MAX_DIFF_BYTES:
+        return "", "review_diff_too_large"
+    return diff_text, None
+
+
+def review_diff_rejection(code: str) -> dict[str, str]:
+    """Author the one sanitized acceptance error for an unreviewable diff."""
+    if code == "review_diff_too_large":
+        return {
+            "error": (
+                "review diff exceeds the reviewable maximum of "
+                f"{REVIEW_MAX_DIFF_BYTES} bytes"
+            ),
+            "code": "review_diff_too_large",
+        }
+    return {
+        "error": "review repository identity is unavailable",
+        "code": "git_state_unavailable",
+    }
+
+
 def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
+    """Re-pin accepted Grok artifacts into one execution authority."""
+    if context.launcher != "grok":
+        return _native_review_result_pinned(context)
+    mismatch = {
+        "ok": False, "verdict": "NACK", "no_verdict": True,
+        "error": "review execution identity changed before launch",
+        "code": "review_execution_identity_mismatch",
+    }
+    try:
+        with repin_native_launcher(context.pinned_launcher, "grok") as execution:
+            if execution.fingerprint != context.execution_identity.get("launcher_version"):
+                return mismatch
+            return _native_review_result_pinned(replace(context, pinned_launcher=execution))
+    except OSError:
+        return mismatch
+
+
+def _native_review_result_pinned(context: NativeReviewExecutionContext) -> dict[str, Any]:
     """Run one read-only review through a proven direct native launcher."""
     usage_started = time.monotonic()
     if not review_runtime_matches_identity(context):
@@ -3218,8 +3366,10 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
             "run_budget_seconds": run_budget_seconds,
             "session_identity": None,
         })
+        companion = context.pinned_launcher.companion
         returncode, timed_out, _session_id, error = run_grok_acp(
-            grok_job, binary, mode="review"
+            grok_job, binary, mode="review",
+            **({} if companion is None else {"interpreter": companion.path}),
         )
         native_usage = grok_job.pop("_native_usage", None)
         text = read_bounded_output(path / "last-message.txt")
@@ -3233,11 +3383,13 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
             )
             run_input = receipt_prompt.encode()
         else:
+            # The prompt carries the complete diff, which can exceed the Linux
+            # single-argument limit, so it goes to stdin exactly as Codex's does.
             cmd = claude_command(
-                adapter_job, body_prompt, str(resolved), binary,
+                adapter_job, None, str(resolved), binary,
                 permission_mode="plan", output_format="json",
             )
-            run_input = None
+            run_input = body_prompt.encode()
         try:
             proc = subprocess.run(
                 cmd, cwd=str(resolved), env={k: v for k, v in os.environ.items()},
@@ -3373,15 +3525,15 @@ def run_review_job(job_id: str) -> None:
             }
         else:
             sealed_identity = snapshot.get("execution_identity")
-            if not isinstance(sealed_identity, dict):
+            diff_text, diff_code = complete_review_diff(Path(snapshot["cwd"]))
+            if not isinstance(sealed_identity, dict) or diff_code is not None:
+                # An unreadable or oversized diff can no longer reproduce the exact
+                # bytes sealed into this authority, so the worker never launches.
                 result = {
                     "ok": False, "verdict": "NACK", "no_verdict": True,
                     "code": "review_execution_identity_mismatch",
                 }
             else:
-                diff_text = str(
-                    git_diff(Path(snapshot["cwd"]), "HEAD", None).get("diff") or ""
-                )[:12000]
                 result = native_review_result(NativeReviewExecutionContext(
                     authority_identity=json.loads(json.dumps(sealed_identity)),
                     execution_identity=identity,
@@ -3526,17 +3678,21 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
         or not isinstance(starting_head, str) or not GIT_SHA_RE.fullmatch(starting_head)
     ):
         return 409, {"error": "review repository identity is unavailable", "code": "git_state_unavailable"}
-    diff_text = str(git_diff(resolved, "HEAD", None).get("diff") or "")[:12000]
+    diff_text, diff_code = complete_review_diff(resolved)
+    if diff_code is not None:
+        return 409, review_diff_rejection(diff_code)
     binary = resolve_launcher_binary_now(launcher)
     accepted_launcher: PinnedLauncher | None = None
     try:
-        accepted_launcher = pin_launcher(binary)
-    except FileNotFoundError:
-        return 501, {
-            "error": "review launcher identity is unavailable",
-            "code": "not_implemented",
-        }
-    except OSError:
+        accepted_launcher = pin_native_launcher(binary, launcher)
+    except (FileNotFoundError, OSError) as exc:
+        if accepted_launcher is not None:
+            accepted_launcher.close()
+        if isinstance(exc, FileNotFoundError):
+            return 501, {
+                "error": "review launcher identity is unavailable",
+                "code": "not_implemented",
+            }
         return 409, {
             "error": "review launcher identity changed during acceptance",
             "code": "review_execution_identity_mismatch",
@@ -4926,6 +5082,7 @@ def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bo
         and isinstance(context.resolved, Path)
         and isinstance(context.prompt, str)
         and isinstance(context.diff_text, str)
+        and len(context.diff_text.encode()) <= REVIEW_MAX_DIFF_BYTES
         and all(isinstance(value, str) for value in (
             context.launcher, context.provider, context.model,
             context.requested_effort, context.effective_effort,
@@ -4992,8 +5149,11 @@ def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bo
         and identity.get("effort_source") == context.effort_source
         and identity.get("route_execution_profile") == context.route_execution_profile
         and identity.get("launcher_version") == context.pinned_launcher.fingerprint
-        and launcher_version_fingerprint(context.pinned_launcher.path)
-            == context.pinned_launcher.fingerprint
+        and (
+            context.launcher == "grok"
+            or launcher_version_fingerprint(context.pinned_launcher.path)
+                == context.pinned_launcher.fingerprint
+        )
         and identity.get("repo") == context.repo
         and context.resolved == context.resolved.resolve()
         and identity.get("run_budget_seconds") == context.run_budget_seconds
@@ -7006,10 +7166,18 @@ def launcher_pass_fds(binary: Path) -> tuple[int, ...]:
 
 
 def claude_command(
-    job: dict[str, Any], prompt: str, cwd: str, binary: Path | None = None, *,
+    job: dict[str, Any], prompt: str | None, cwd: str, binary: Path | None = None, *,
     permission_mode: Literal["acceptEdits", "plan"] = "acceptEdits",
     output_format: Literal["json", "text"] = "json",
 ) -> list[str]:
+    """Build one `claude -p` argv. A None prompt means the caller writes stdin.
+
+    Linux MAX_ARG_STRLEN rejects a single argv string of 131,072 bytes or more,
+    so a maximum-sized review prompt cannot travel as the trailing argument.
+    `claude -p` takes its input from either that argument or stdin, and refuses
+    to start with neither, so passing None here obliges the caller to supply the
+    prompt on the child's stdin.
+    """
     binary = binary or CLAUDE_BIN
     valid, effort = native_effort_value(job)
     if not valid:
@@ -7033,7 +7201,8 @@ def claude_command(
     session_id = (job.get("session_identity") or {}).get("native_session_id")
     if session_id:
         command.extend(["--resume", str(session_id)])
-    command.append(prompt)
+    if prompt is not None:
+        command.append(prompt)
     return command
 
 
@@ -7090,9 +7259,15 @@ def codex_command(
     valid, effort = native_effort_value(job)
     if not valid or effort is None:
         raise ValueError("unsupported effort profile")
+    # Codex 0.151.0 enables features.code_mode_host by default and resolves
+    # codex-code-mode-host as a sibling of its own executable. Graphwing execs
+    # the sealed memfd copy at /proc/self/fd/N, whose sibling is
+    # /codex-code-mode-host, so the host launch fails before any work starts.
+    # Pinning the launcher is the invariant, so the feature is turned off here.
     command = [
         str(binary), "exec", "--json", "--model", str(job["model"]),
         "-c", f"model_reasoning_effort={effort}",
+        "-c", "features.code_mode_host=false",
         "-C", cwd, "--sandbox", sandbox,
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
     ]
@@ -7143,6 +7318,7 @@ def spawn_codex(
 def grok_acp_command(
     job: dict[str, Any], binary: Path | None = None, *,
     mode: Literal["writer", "review"],
+    interpreter: Path | None = None,
 ) -> list[str]:
     if mode not in ("writer", "review"):
         raise ValueError("invalid Grok ACP mode")
@@ -7151,6 +7327,8 @@ def grok_acp_command(
     if not valid or effort is None:
         raise ValueError("unsupported effort profile")
     command = [str(binary), "agent"]
+    if interpreter is not None:
+        command[:0] = [str(interpreter), "--preserve-symlinks-main"]
     if mode == "writer":
         command.append("--always-approve")
     command.extend([
@@ -7162,6 +7340,7 @@ def grok_acp_command(
 def run_grok_acp(
     job: dict[str, Any], binary: Path | None = None, *,
     mode: Literal["writer", "review"],
+    interpreter: Path | None = None,
 ) -> tuple[int, bool, str | None, str | None]:
     """Run one bounded ACP writer or read-only review turn."""
     if mode not in ("writer", "review"):
@@ -7175,7 +7354,9 @@ def run_grok_acp(
     env = native_job_env(job)
     env["GROK_DISABLE_AUTOUPDATER"] = "1"
     try:
-        command = grok_acp_command(job, binary, mode=mode)
+        command = grok_acp_command(
+            job, binary, mode=mode, interpreter=interpreter
+        )
     except ValueError as exc:
         job["_adapter_failure_code"] = (
             "adapter_contract_invalid" if str(exc) == "invalid Grok ACP mode" else "unsupported_effort"
@@ -7186,7 +7367,10 @@ def run_grok_acp(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, env=env, start_new_session=True, bufsize=0,
-            pass_fds=launcher_pass_fds(binary),
+            pass_fds=tuple(sorted(set(
+                launcher_pass_fds(binary)
+                + (() if interpreter is None else launcher_pass_fds(interpreter))
+            ))),
         )
     except OSError as exc:
         job["_adapter_failure_code"] = "spawn_failed"
@@ -7699,15 +7883,17 @@ def run_agent_job(job_id: str) -> None:
     usage_started = time.monotonic()
     binary = resolve_launcher_binary_now(str(job["launcher"]))
     try:
-        with pinned_launcher(binary) as pinned:
+        with pinned_native_launcher(binary, str(job["launcher"])) as pinned:
             if pinned.fingerprint != job.get("launcher_version"):
                 proc, err = None, {
                     "error": "launcher version changed after request validation",
                     "code": "launcher_version_mismatch",
                 }
             elif job.get("launcher") == "grok":
+                companion = pinned.companion
                 returncode, timed_out, session_id, protocol_error = run_grok_acp(
-                    job, pinned.path, mode="writer"
+                    job, pinned.path, mode="writer",
+                    **({} if companion is None else {"interpreter": companion.path}),
                 )
                 proc, err = None, None
             else:
@@ -8128,6 +8314,56 @@ def _codeoff_read_artifact(root: Path, digest: str) -> bytes:
         raise CodeOffArtifactError("artifact hash mismatch")
     return data
 
+def codeoff_slot_work_role(slot: Any) -> str:
+    return "author" if isinstance(slot, str) and slot.startswith("author-") else "judge"
+
+def codeoff_identity_snapshot_hash(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(codeoff_canonical_json(identity)).hexdigest()
+
+def codeoff_identity_is_pinned(slot: str, identity: Any) -> bool:
+    """Require one complete, self-consistent inference identity for a slot."""
+    if not isinstance(identity, dict) or not all(
+        isinstance(identity.get(field), str) and identity.get(field)
+        for field in CODEOFF_IDENTITY_FIELDS
+    ):
+        return False
+    launcher, provider, model = (
+        identity["launcher"], identity["provider"], identity["exact_model"]
+    )
+    profile, error = normalize_effort(
+        launcher, provider, model, identity["requested_effort"], CODEOFF_EFFORT_SOURCE,
+    ) if identity["requested_effort"] in EFFORT_VALUES else (None, {"code": "bad_effort"})
+    return bool(
+        launcher in NATIVE_LAUNCHERS
+        and LAUNCHER_VERSION_RE.fullmatch(identity["launcher_version"])
+        and identity["inference_profile_version"] == CODEOFF_INFERENCE_PROFILE_VERSION
+        and identity["requested_effort"] == CODEOFF_SLOT_REQUESTED_EFFORT[codeoff_slot_work_role(slot)]
+        and error is None and profile is not None
+        and identity["effective_effort"] == profile["effective_effort"]
+    )
+
+def codeoff_manifest_identity_error(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Fail closed unless every immutable slot identity is fully pinned."""
+    identities = manifest.get("identities")
+    snapshots = manifest.get("identity_snapshot_hashes")
+    if not isinstance(identities, dict) or not isinstance(snapshots, dict) or set(identities) != set(snapshots):
+        return {"error": "code-off slot identities are not fully pinned", "code": "codeoff_identity_unpinned"}
+    unpinned = sorted(
+        slot for slot, identity in identities.items()
+        if not codeoff_identity_is_pinned(slot, identity)
+        or snapshots.get(slot) != codeoff_identity_snapshot_hash(identity)
+    )
+    if (
+        unpinned
+        or manifest.get("inference_profile_version") != CODEOFF_INFERENCE_PROFILE_VERSION
+        or manifest.get("identities_hash") != hashlib.sha256(codeoff_canonical_json(identities)).hexdigest()
+    ):
+        return {
+            "error": "code-off slot identities are not fully pinned",
+            "code": "codeoff_identity_unpinned", "slots": unpinned,
+        }
+    return None
+
 def _codeoff_launch_execution_manifest(job: dict[str, Any]) -> dict[str, Any] | None:
     """Project the complete server-validated launch authority for one slot."""
     workspace = job.get("codeoff_workspace")
@@ -8382,6 +8618,156 @@ def _codeoff_elapsed(start: str | None, end: str | None) -> float | None:
     except (TypeError, ValueError):
         return None
 
+CODEOFF_USAGE_TOKEN_FIELDS = (
+    "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+    "output_tokens", "reasoning_tokens",
+)
+# A slot attempt the graph has not driven to a terminal state cannot fund a
+# number. That is the one diagnostic code-off adds to the receipt-level closed
+# set; deriving the code-off set from `USAGE_DIAGNOSTICS` keeps the published
+# `CodeOffEconomicsSlot.usage_diagnostics` enum from drifting away from what
+# `_codeoff_slot_usage` can actually emit.
+CODEOFF_USAGE_NONTERMINAL = "usage_authority_nonterminal"
+CODEOFF_USAGE_DIAGNOSTICS = USAGE_DIAGNOSTICS | {CODEOFF_USAGE_NONTERMINAL}
+
+
+def _codeoff_slot_usage(job_id: Any) -> tuple[dict[str, Any] | None, str]:
+    """Only an authority-sealed terminal agent receipt may fund economics.
+
+    A failed attempt is still a paid-for attempt: `run_agent_job` seals its
+    terminal receipt exactly as it seals a successful one, so its exact usage
+    belongs in the record. Excluding it would understate real spend and would
+    report an ordinary failure as if it were a provenance fault.
+    """
+    try:
+        job = read_job(job_id) if isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        job = None
+    if not is_agent_job_record(job):
+        return None, "usage_authority_unavailable"
+    assert isinstance(job, dict)
+    if job.get("status") not in ("completed", "failed"):
+        return None, CODEOFF_USAGE_NONTERMINAL
+    receipt = job.get("receipt")
+    if not receipt_profile_matches_job(job, receipt):
+        return None, "usage_authority_mismatch"
+    usage, diagnostic = authorized_receipt_usage("agent", receipt)
+    return usage, diagnostic or "usage_reported"
+
+
+def _codeoff_usage_totals(attempts: list[dict[str, Any] | None]) -> dict[str, Any]:
+    """Sum exact normalized usage; nullable fields never become a false zero.
+
+    Token and wall totals are honest lower bounds over the attempts that did
+    report, and `missing_usage_attempts` says how many did not. Cost and turns
+    are all-or-nothing: one unreported attempt makes the whole total unknown,
+    so a partial sum can never be read as the real spend for the group.
+    """
+    counted = [usage for usage in attempts if usage is not None]
+    complete = bool(attempts) and len(counted) == len(attempts)
+    costs = [usage.get("provider_cost_usd") for usage in counted]
+    turns = [usage.get("turns_observed") for usage in counted]
+    return {
+        "usage_version": USAGE_VERSION,
+        "attempts": len(attempts),
+        "usage_attempts": len(counted),
+        "missing_usage_attempts": len(attempts) - len(counted),
+        **{
+            field: sum(int(usage.get(field) or 0) for usage in counted)
+            for field in CODEOFF_USAGE_TOKEN_FIELDS
+        },
+        "wall_seconds": round(sum(float(usage.get("wall_seconds") or 0) for usage in counted), 6),
+        "turns_observed": (
+            sum(int(value) for value in turns)
+            if complete and all(value is not None for value in turns) else None
+        ),
+        "provider_cost_usd": (
+            round(sum(float(value) for value in costs), 6)
+            if complete and all(value is not None for value in costs) else None
+        ),
+    }
+
+
+def _codeoff_test_summary(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the sanitized shape of one code-off test receipt for economics."""
+    return {
+        "pass": receipt.get("pass"),
+        "receipt_hash": receipt.get("receipt_hash"),
+        "elapsed_seconds": receipt.get("elapsed_seconds"),
+    }
+
+
+def _codeoff_economics(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Sanitized aggregate for two authors, three judges, tests, and final verification."""
+    identities = manifest.get("identities") or {}
+    slots: dict[str, Any] = {}
+    grouped: dict[str, list[dict[str, Any] | None]] = {"author": [], "judge": []}
+    for slot in sorted(identities):
+        identity = identities[slot] if isinstance(identities.get(slot), dict) else {}
+        role = codeoff_slot_work_role(slot)
+        attempts: list[dict[str, Any] | None] = []
+        diagnostics: set[str] = set()
+        for job_id in state.get("agent_jobs", {}).get(slot, []) or []:
+            usage, diagnostic = _codeoff_slot_usage(job_id)
+            attempts.append(usage)
+            if usage is None:
+                diagnostics.add(diagnostic)
+        grouped[role].extend(attempts)
+        slots[slot] = {
+            "work_role": role,
+            **{field: identity.get(field) for field in CODEOFF_IDENTITY_FIELDS},
+            "logical_model": identity.get("logical_model"),
+            "usage": _codeoff_usage_totals(attempts),
+            "usage_diagnostics": sorted(diagnostics),
+        }
+    candidate_slots = state.get("candidates") or {}
+    candidate_runs = [
+        candidate_slots[slot]["tests"]
+        for slot in sorted(candidate_slots)
+        if isinstance((candidate_slots.get(slot) or {}).get("tests"), dict)
+    ]
+    # `candidate_pass` is a claim about the whole author field, so it is a
+    # verdict only when every author candidate actually ran its recipes. A park
+    # after one candidate tested green must not report the pair as passing.
+    candidate_pass = (
+        all(run.get("pass") is True for run in candidate_runs)
+        if candidate_slots and len(candidate_runs) == len(candidate_slots) else None
+    )
+    final_verification = state.get("final_verification") if isinstance(state.get("final_verification"), dict) else None
+    final_summary = state.get("final_test_summary") if isinstance(state.get("final_test_summary"), dict) else None
+    everything = grouped["author"] + grouped["judge"]
+    return {
+        "version": CODEOFF_ECONOMICS_VERSION,
+        "usage_version": USAGE_VERSION,
+        "protocol_version": CODEOFF_PROTOCOL_VERSION,
+        "inference_profile_version": manifest.get("inference_profile_version"),
+        "experiment_id": manifest.get("experiment_id"),
+        "status": state.get("status"),
+        "reason": state.get("reason"),
+        "identities_hash": manifest.get("identities_hash"),
+        "slots": slots,
+        "authors": _codeoff_usage_totals(grouped["author"]),
+        "judges": _codeoff_usage_totals(grouped["judge"]),
+        "inference": _codeoff_usage_totals(everything),
+        "tests": {
+            "candidate_runs": len(candidate_runs),
+            "expected_candidate_runs": len(candidate_slots),
+            "candidate_pass": candidate_pass,
+            "candidate_elapsed_seconds": round(sum(float(run.get("elapsed_seconds") or 0) for run in candidate_runs), 6),
+            "final_runs": 1 if final_summary else 0,
+            "final_pass": final_summary.get("pass") if final_summary else None,
+            "final_elapsed_seconds": final_summary.get("elapsed_seconds") if final_summary else None,
+        },
+        "final_verification": {
+            "present": final_verification is not None,
+            "receipt_hash": final_verification.get("receipt_hash") if final_verification else None,
+            "tests_pass": final_verification.get("tests_pass") if final_verification else None,
+            "no_mutation": final_verification.get("no_mutation") if final_verification else None,
+            "commit_eligible": final_verification.get("commit_eligible") if final_verification else None,
+        },
+    }
+
+
 def _codeoff_final_value(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     return {
         "protocol_version": CODEOFF_PROTOCOL_VERSION,
@@ -8396,6 +8782,8 @@ def _codeoff_final_value(manifest: dict[str, Any], state: dict[str, Any]) -> dic
         "aggregation": state.get("aggregation"),
         "promotion": state.get("promotion"),
         "final_verification": state.get("final_verification"),
+        "economics": state.get("economics"),
+        "economics_hash": state.get("economics_hash"),
     }
 
 def _codeoff_finalize_record(root: Path, manifest: dict[str, Any], state: dict[str, Any], status: str, reason: str | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -8404,7 +8792,10 @@ def _codeoff_finalize_record(root: Path, manifest: dict[str, Any], state: dict[s
     state.update({"status": status, "reason": reason, "finalized": True, "finished_at": utcnow()})
     if extra:
         state.update(extra)
-    _codeoff_event(root, state, "finalized", {"status": status, "reason": reason})
+    economics = _codeoff_economics(manifest, state)
+    state["economics"] = economics
+    state["economics_hash"] = _codeoff_artifact(root, codeoff_canonical_json(economics))
+    _codeoff_event(root, state, "finalized", {"status": status, "reason": reason, "economics_hash": state["economics_hash"]})
     final = _codeoff_final_value(manifest, state)
     final_bytes = codeoff_canonical_json(final) + b"\n"
     state["final_file_hash"] = hashlib.sha256(final_bytes).hexdigest()
@@ -8623,6 +9014,10 @@ def _codeoff_launch_plan(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "launcher": identity["launcher"], "provider": identity["provider"],
             "model": identity["exact_model"], "max_turns": manifest["budgets"]["max_turns"],
             "run_budget_seconds": manifest["budgets"]["author_seconds" if slot.startswith("author-") else "judge_seconds"],
+            "effort": identity.get("requested_effort"),
+            "effective_effort": identity.get("effective_effort"),
+            "launcher_version": identity.get("launcher_version"),
+            "inference_profile_version": identity.get("inference_profile_version"),
         }
     return out
 
@@ -8757,10 +9152,40 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
         approved = embedded.get("models", {}).get(logical) or {}
         identities[slot] = {
             "logical_model": logical, "exact_model": approved.get("exact_model"), "provider": approved.get("provider"), "launcher": approved.get("launcher"),
+            "launcher_version": None,
+            "requested_effort": CODEOFF_SLOT_REQUESTED_EFFORT[codeoff_slot_work_role(slot)],
+            "effective_effort": None,
+            "inference_profile_version": CODEOFF_INFERENCE_PROFILE_VERSION,
             "runnable": approved.get("runnable") is True, "proven": approved.get("proven") is True, "reason": approved.get("reason") or "identity absent from manifest",
             "manifest_version": embedded.get("version"), "manifest_as_of": embedded.get("as_of"),
             "manifest_max_age_days": embedded.get("max_age_days"), "manifest_current": current,
         }
+    # Ineligible manifests park before any launcher artifact is even resolved;
+    # only an otherwise-approved draw earns an exact wrapper fingerprint pin.
+    reasons = ([] if current else ["approved_model_manifest_stale"]) + catalog_reasons + [
+        f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}"
+        for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]
+    ]
+    if not reasons:
+        fingerprints: dict[str, str | None] = {}
+        for slot, identity in identities.items():
+            launcher = identity["launcher"]
+            if launcher not in fingerprints:
+                fingerprints[launcher] = (
+                    launcher_version_fingerprint(resolve_launcher_binary_now(launcher), launcher)
+                    if launcher in NATIVE_LAUNCHERS else None
+                )
+            profile, effort_err = normalize_effort(
+                str(launcher), str(identity["provider"]), str(identity["exact_model"]),
+                identity["requested_effort"], CODEOFF_EFFORT_SOURCE,
+            )
+            identity["launcher_version"] = fingerprints[launcher]
+            identity["effective_effort"] = None if effort_err else profile["effective_effort"]  # type: ignore[index]
+            if not codeoff_identity_is_pinned(slot, identity):
+                reasons.append(f"inference_identity_unpinned:{slot}:{identity['logical_model']}")
+    identity_snapshot_hashes = {
+        slot: codeoff_identity_snapshot_hash(identity) for slot, identity in identities.items()
+    }
     fable_provider = identities["judge-fable"]["provider"]
     overlaps = [{"fixed_judge": "judge-fable", "other": slot, "provider": fable_provider} for slot, identity in identities.items() if slot != "judge-fable" and identity["provider"] == fable_provider]
     canonical_prompt = _codeoff_author_prompt(task, base_sha, base_tree, names, dict(sorted(toolchain.items())), budgets)
@@ -8776,7 +9201,11 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
         "base_tree": base_tree, "base_snapshot_hash": base_snapshot["manifest_hash"],
         "classification": {"version": CODEOFF_CATEGORY_VERSION, "category": category, "tags": sorted(set(raw_tags))},
         "original_classification": {"category": category, "tags": raw_tags}, "category_source": category_source.strip(),
-        "selection": {**draw, "seed": seed}, "identities": identities, "fable_provider_overlap": overlaps,
+        "selection": {**draw, "seed": seed}, "identities": identities,
+        "identity_snapshot_hashes": identity_snapshot_hashes,
+        "identities_hash": hashlib.sha256(codeoff_canonical_json(identities)).hexdigest(),
+        "inference_profile_version": CODEOFF_INFERENCE_PROFILE_VERSION,
+        "fable_provider_overlap": overlaps,
         "approved_model_manifest": embedded, "approved_model_manifest_current": current,
         "bounded_catalog_inventory": catalog_inventory, "approved_model_manifest_hash": embedded_hash,
         "limitation": embedded.get("limitation"),
@@ -8806,8 +9235,7 @@ def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
             _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
             manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
             state = {"status": "preparing", "reason": None, "finalized": False, "manifest_file_hash": manifest_file_hash, "event_count": 0, "event_head": "0" * 64, "agent_jobs": {slot: [] for slot in slot_logical}, "execution_manifests": {slot: {} for slot in slot_logical}, "candidates": {"author-1": {}, "author-2": {}}, "judges": {}, "aggregation": None}
-            _codeoff_commit_event(record_build, state, "prepared_manifest", {"manifest_file_hash": manifest_file_hash, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash})
-            reasons = ([] if current else ["approved_model_manifest_stale"]) + catalog_reasons + [f"identity_unproven:{slot}:{identity['logical_model']}:{identity['exact_model']}" for slot, identity in identities.items() if not identity["runnable"] or not identity["proven"]]
+            _codeoff_commit_event(record_build, state, "prepared_manifest", {"manifest_file_hash": manifest_file_hash, "prompt_hash": prompt_hash, "rubric_hash": rubric_hash, "identities_hash": locked["identities_hash"]})
             if reasons:
                 _codeoff_finalize_record(record_build, manifest, state, "parked", ";".join(reasons))
                 record_build.replace(record_root)
@@ -8841,10 +9269,34 @@ def _codeoff_terminal_identity_matches(
         job, job.get("session_identity"), receipt.get("session_identity"),
         job.get("execution_identity"), receipt.get("execution_identity"),
     )
+    # The pinned inference profile is authority: the whole requested/effective/
+    # source effort triple and the exact launcher wrapper fingerprint must agree
+    # on the job, both session identities, and the terminal receipt.
+    pinned = (
+        (
+            manifest_identity.get("requested_effort"),
+            manifest_identity.get("effective_effort"),
+            CODEOFF_EFFORT_SOURCE,
+            manifest_identity.get("launcher_version"),
+        )
+        if isinstance(manifest_identity, dict) else (None, None, None, None)
+    )
+
+    def profile(surface: Any) -> tuple[Any, ...] | None:
+        if not isinstance(surface, dict):
+            return None
+        return tuple(surface.get(key) for key in (
+            "requested_effort", "effective_effort", "effort_source", "launcher_version",
+        ))
+
+    profile_surfaces = (
+        job, job.get("session_identity"), receipt.get("session_identity"), receipt,
+    )
     return bool(
         expected is not None and source is not None and execution is not None
         and receipt_profile_matches_job(job, receipt)
         and all(_codeoff_identity_values(surface) == expected for surface in surfaces)
+        and all(profile(surface) == pinned for surface in profile_surfaces)
         and receipt.get("session_identity") == job.get("session_identity")
         and execution.get("source") == source
         and job.get("execution_identity") == execution
@@ -8937,6 +9389,9 @@ def codeoff_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
         candidate = state["candidates"][slot]
         workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
         if action == "freeze":
@@ -9044,6 +9499,9 @@ def codeoff_blind(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
         if state.get("blind_bundle_hashes") or state.get("status") in ("blinded", "judging"):
             return 409, {"error": "blind bundles are already frozen", "code": "already_blinded"}
         for judge_slot in ("judge-fable", "judge-1", "judge-2"):
@@ -9154,6 +9612,9 @@ def codeoff_judge(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
         if state.get("status") not in ("blinded", "judging"):
             return 409, {"error": "blind bundles must be frozen before judging", "code": "not_blinded"}
         if slot in state["judges"]:
@@ -9220,6 +9681,9 @@ def codeoff_aggregate(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
         private = json.loads((root / "private" / "blinding.json").read_text()) if (root / "private" / "blinding.json").is_file() else {"judges": {}}
         mapping = {slot: item["labels"] for slot, item in private["judges"].items()}
         tests = {slot: state["candidates"][slot].get("tests", {}).get("pass") is True for slot in ("author-1", "author-2")}
@@ -9285,6 +9749,9 @@ def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
         aggregation = state.get("aggregation") or {}
         if state.get("status") != "aggregated" or aggregation.get("promotion_eligible") is not True:
             return 409, {"error": "a tested aggregate winner is required", "code": "not_promotion_eligible"}
@@ -9318,6 +9785,7 @@ def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
             receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(final_receipt))
             final_receipt["receipt_hash"] = receipt_hash
             state["final_verification"] = final_receipt
+            state["final_test_summary"] = _codeoff_test_summary(verification)
             _codeoff_event(root, state, "final_verification", {"winner": winner, "receipt_hash": receipt_hash, "tests_pass": verification["pass"], "no_mutation": exact, "eligible": False})
             _codeoff_finalize_record(root, manifest, state, "parked", "final_tests_failed" if not verification["pass"] else "final_tree_mutated")
         return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "parked", **final_receipt}
@@ -9349,6 +9817,7 @@ def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
             final_receipt["receipt_hash"] = receipt_hash
             state["promotion"] = {"winner": winner, "artifact_hash": candidate["artifact_hash"], "tree_manifest_hash": candidate["tree_manifest_hash"], "promoted_tree_hash": after["manifest_hash"], "git_tree": verified["git_tree"]}
             state["final_verification"] = final_receipt
+            state["final_test_summary"] = _codeoff_test_summary(verification)
             _codeoff_event(root, state, "final_verification", {"winner": winner, "receipt_hash": receipt_hash, "tests_pass": True, "no_mutation": True, "eligible": True})
             _codeoff_finalize_record(root, manifest, state, "completed", None)
         except (OSError, RuntimeError):
@@ -9363,16 +9832,54 @@ def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
                 raise
     return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": "completed", **final_receipt}
 
+def _codeoff_audit_judges(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Project judge receipts without republishing per-judge blind ordering.
+
+    Before finalization only the receipt hash is public. After finalization the
+    audit needs each judge's decision, so scores and the preference are stated
+    in author-slot terms. The blind label a judge saw is never emitted.
+
+    Key order is authority too: the wire body is not canonicalized, so emitting
+    each judge's totals in the order that judge's own result file listed the
+    blind labels would republish the exact per-judge shuffle. Totals are keyed
+    by author slot and sorted by author slot, so the projection reads the same
+    for every judge whatever ordering that judge saw.
+    """
+    judges = state.get("judges", {})
+    if state.get("finalized") is not True:
+        return {slot: {"receipt_hash": value.get("receipt_hash")} for slot, value in judges.items()}
+    try:
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        mapping = {slot: item["labels"] for slot, item in private["judges"].items()}
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        mapping = {}
+    projected = {}
+    for slot, value in judges.items():
+        labels = mapping.get(slot) or {}
+        preference = value.get("preference")
+        scored = value.get("candidates") or {}
+        projected[slot] = {
+            "receipt_hash": value.get("receipt_hash"),
+            "preference": "abstain" if preference == "abstain" else labels.get(preference),
+            "totals": {
+                author_slot: scored[label].get("total")
+                for label, author_slot in sorted(labels.items(), key=lambda item: item[1])
+                if isinstance(scored.get(label), dict)
+            },
+        }
+    return projected
+
+
 def codeoff_audit(qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
     with CODEOFF_LOCK: root, manifest, state, err = _codeoff_load(first_query(qs, "experiment_id"), active=False)
     if err:
         return 404 if err["code"] == "experiment_not_found" else 400, err
     assert root and manifest and state
-    identities = {slot: {key: identity.get(key) for key in ("logical_model", "exact_model", "provider", "launcher", "runnable", "proven", "manifest_version", "manifest_current")} for slot, identity in manifest["identities"].items()}
+    identities = {slot: {key: identity.get(key) for key in ("logical_model", "exact_model", "provider", "launcher", "runnable", "proven", "manifest_version", "manifest_current", *CODEOFF_IDENTITY_FIELDS)} for slot, identity in manifest["identities"].items()}
     selection = {key: manifest["selection"][key] for key in ("algorithm_version", "policy_version", "ordered_pool", "authors", "fixed_judge", "random_judges", "seed_commitment")}
     candidates = {slot: {key: value.get(key) for key in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash") if value.get(key)} | ({"tests_pass": value["tests"]["pass"], "test_receipt_hash": value["tests"]["receipt_hash"]} if value.get("tests") else {}) for slot, value in state["candidates"].items()}
-    judges = {slot: ({"receipt_hash": value.get("receipt_hash"), "preference": value.get("preference"), "totals": {label: item.get("total") for label, item in value.get("candidates", {}).items()}} if state.get("finalized") is True else {"receipt_hash": value.get("receipt_hash")}) for slot, value in state.get("judges", {}).items()}
-    return 200, {"ok": True, "protocol_version": manifest["protocol_version"], "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": state["finalized"], "classification": manifest["classification"], "original_classification": manifest["original_classification"], "category_source": manifest["category_source"], "selection": selection, "identities": identities, "fable_provider_overlap": manifest["fable_provider_overlap"], "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "prompt_hash": manifest["prompt_hash"], "rubric_hash": manifest["rubric_hash"], "manifest_file_hash": state["manifest_file_hash"], "event_head": state["event_head"], "event_count": state["event_count"], "candidates": candidates, "judges": judges, "aggregation": state.get("aggregation") if state.get("finalized") or not state.get("aggregation") else {key: value for key, value in state["aggregation"].items() if key != "preferences"}, "promotion": state.get("promotion"), "final_verification": state.get("final_verification"), "final_file_hash": state.get("final_file_hash")}
+    judges = _codeoff_audit_judges(root, state)
+    return 200, {"ok": True, "protocol_version": manifest["protocol_version"], "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": state["finalized"], "classification": manifest["classification"], "original_classification": manifest["original_classification"], "category_source": manifest["category_source"], "selection": selection, "identities": identities, "identity_snapshot_hashes": manifest.get("identity_snapshot_hashes"), "identities_hash": manifest.get("identities_hash"), "inference_profile_version": manifest.get("inference_profile_version"), "fable_provider_overlap": manifest["fable_provider_overlap"], "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"], "prompt_hash": manifest["prompt_hash"], "rubric_hash": manifest["rubric_hash"], "manifest_file_hash": state["manifest_file_hash"], "event_head": state["event_head"], "event_count": state["event_count"], "candidates": candidates, "judges": judges, "aggregation": state.get("aggregation") if state.get("finalized") or not state.get("aggregation") else {key: value for key, value in state["aggregation"].items() if key != "preferences"}, "promotion": state.get("promotion"), "final_verification": state.get("final_verification"), "final_file_hash": state.get("final_file_hash"), "economics": state.get("economics"), "economics_hash": state.get("economics_hash")}
 
 def _codeoff_wait_for_jobs(state: dict[str, Any], timeout_seconds: int = CODEOFF_TERMINAL_DRAIN_SECONDS) -> dict[str, Any] | None:
     job_ids = [job_id for jobs in state.get("agent_jobs", {}).values() for job_id in jobs]
@@ -9393,6 +9900,15 @@ def _codeoff_wait_for_jobs(state: dict[str, Any], timeout_seconds: int = CODEOFF
         time.sleep(0.2)
 
 
+def _codeoff_terminal_result(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """The durable terminal receipt Rewst persists as the permanent record."""
+    return {
+        "ok": True, "experiment_id": manifest["experiment_id"],
+        "status": state["status"], "reason": state.get("reason"), "finalized": True,
+        "economics": state.get("economics"), "economics_hash": state.get("economics_hash"),
+    }
+
+
 def codeoff_terminal(body: bytes) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id", "outcome"}, exact=True)
     if err:
@@ -9407,11 +9923,11 @@ def codeoff_terminal(body: bytes) -> tuple[int, dict[str, Any]]:
             if load_err.get("code") == "experiment_not_found":
                 if outcome == "succeeded":
                     return 409, {"error": "successful graph terminal requires completed durable finalization", "code": "not_finalized"}
-                return 200, {"ok": True, "experiment_id": data["experiment_id"], "status": "absent", "reason": None, "finalized": False}
+                return 200, {"ok": True, "experiment_id": data["experiment_id"], "status": "absent", "reason": None, "finalized": False, "economics": None, "economics_hash": None}
             return 400, load_err
         assert root and manifest and state
         if state.get("finalized"):
-            return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+            return 200, _codeoff_terminal_result(manifest, state)
         if outcome == "succeeded":
             return 409, {"error": "successful graph terminal requires completed durable finalization", "code": "not_finalized"}
         launched = state.get("agent_jobs", {})
@@ -9424,11 +9940,11 @@ def codeoff_terminal(body: bytes) -> tuple[int, dict[str, Any]]:
             return 400, load_err
         assert root and manifest and state
         if state.get("finalized"):
-            return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+            return 200, _codeoff_terminal_result(manifest, state)
         if state.get("agent_jobs", {}) != launched:
             return 409, {"error": "code-off launches changed during terminalization", "code": "agent_jobs_changed"}
         _codeoff_finalize_record(root, manifest, state, "parked", "graph_terminal_failure")
-        return 200, {"ok": True, "experiment_id": manifest["experiment_id"], "status": state["status"], "reason": state.get("reason"), "finalized": True}
+        return 200, _codeoff_terminal_result(manifest, state)
 
 
 def codeoff_cleanup(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -9478,6 +9994,9 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     if err:
         return None, err
     assert root and manifest and state
+    identity_err = codeoff_manifest_identity_error(manifest)
+    if identity_err:
+        return None, identity_err
     workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
     if not workspace.is_dir():
         return None, {"error": "opaque code-off workspace is unavailable", "code": "workspace_unavailable"}
@@ -9517,7 +10036,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             return 400, {"error": "code-off jobs resolve prompt and cwd from the opaque reference", "code": "bad_codeoff_workspace"}
         codeoff, codeoff_err = _resolve_codeoff_agent(data.get("codeoff_workspace"))
         if codeoff_err:
-            return 409 if codeoff_err.get("code") in ("experiment_finalized", "bad_experiment_stage") else 400, codeoff_err
+            return 409 if codeoff_err.get("code") in ("experiment_finalized", "bad_experiment_stage", "codeoff_identity_unpinned") else 400, codeoff_err
         assert codeoff is not None
         prompt_bytes = codeoff["prompt"]
         prompt = prompt_bytes.decode("utf-8")
@@ -9616,6 +10135,15 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if effort_err:
         return 400, effort_err
     assert effort is not None
+    # Effective effort alone is not the identity: `default` and `high` collapse
+    # to one effective value on every codex and grok model, so a slot could
+    # otherwise record a requested effort or source the snapshot never pinned.
+    if codeoff is not None and effort != {
+        "requested_effort": codeoff["identity"].get("requested_effort"),
+        "effective_effort": codeoff["identity"].get("effective_effort"),
+        "effort_source": CODEOFF_EFFORT_SOURCE,
+    }:
+        return 400, {"error": "code-off effort profile differs from the immutable snapshot; fallback/substitution is forbidden", "code": "codeoff_identity_mismatch"}
     turns, turns_err = parse_optional_int(data, "max_turns", 1, 80)
     if turns_err:
         return 400, turns_err
@@ -9625,14 +10153,24 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
         return 400, {"error": "code-off job must use the immutable turn and time budgets", "code": "codeoff_budget_mismatch"}
     binary = resolve_launcher_binary_now(launcher)
-    launcher_version = launcher_version_fingerprint(binary)
-    if launcher_version is None:
-        classified = classify_agent_failure("launcher_version_mismatch")
+    launcher_version = launcher_version_fingerprint(binary, launcher)
+    if launcher_version in (None, "missing_companion"):
+        failure_code = (
+            "missing_binary" if launcher_version == "missing_companion"
+            else "launcher_version_mismatch"
+        )
+        classified = classify_agent_failure(failure_code)
         return 501, {
-            "error": "launcher version is unavailable",
-            "code": "launcher_version_mismatch",
+            "error": (
+                "Grok Node interpreter is unavailable"
+                if launcher_version == "missing_companion"
+                else "launcher version is unavailable"
+            ),
+            "code": failure_code,
             **classified,
         }
+    if codeoff is not None and launcher_version != codeoff["identity"].get("launcher_version"):
+        return 409, {"error": "code-off launcher wrapper fingerprint differs from the immutable snapshot", "code": "codeoff_identity_mismatch"}
     if not binary.is_file() and not webhook_url:
         classified = classify_agent_failure("missing_binary")
         return 501, {"error": f"{launcher} binary missing: {binary}", "code": "missing_binary", **classified}
