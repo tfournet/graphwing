@@ -3035,6 +3035,129 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(captured["cmd"][captured["cmd"].index("--sandbox") + 1], "read-only")
 
+    def test_codex_writer_and_review_commands_are_exact(self):
+        """Codex 0.151.0 resolves its code-mode host as a sibling of argv[0].
+
+        Graphwing execs the sealed memfd at /proc/self/fd/N, so the sibling
+        resolves to /codex-code-mode-host and the run dies before it reviews.
+        Every Codex invocation therefore pins features.code_mode_host=false.
+        """
+        job = self._adapter_contract_job(
+            "codex", "openai", "gpt-5.6-sol", "high", "high"
+        )
+        self.assertEqual(
+            server.codex_command(
+                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"),
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "workspace-write",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "-",
+            ],
+        )
+        self.assertEqual(
+            server.codex_command(
+                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"), sandbox="read-only",
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "read-only",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "-",
+            ],
+        )
+        resumed = dict(job, session_identity={"native_session_id": "0f" * 16})
+        self.assertEqual(
+            server.codex_command(
+                resumed, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                Path("/fixture/codex"),
+            ),
+            [
+                "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high",
+                "-c", "features.code_mode_host=false",
+                "-C", "/fixture/repo", "--sandbox", "workspace-write",
+                "--output-last-message", "/fixture/job/last-message.txt",
+                "resume", "0f" * 16, "-",
+            ],
+        )
+
+    def test_codex_command_never_requests_the_missing_code_mode_host(self):
+        """Regression: the pre-fix argv, which omitted the setting, is gone."""
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra"):
+            for effort in ("low", "medium", "high", "max"):
+                for sandbox in ("workspace-write", "read-only"):
+                    for session_id in (None, "1a" * 16):
+                        with self.subTest(
+                            model=model, effort=effort, sandbox=sandbox,
+                            resume=bool(session_id),
+                        ):
+                            job = self._adapter_contract_job(
+                                "codex", "openai", model, effort, effort
+                            )
+                            job["session_identity"] = {"native_session_id": session_id}
+                            cmd = server.codex_command(
+                                job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
+                                Path("/fixture/codex"), sandbox=sandbox,
+                            )
+                            settings = [
+                                cmd[index + 1]
+                                for index, value in enumerate(cmd[:-1])
+                                if value == "-c"
+                                and cmd[index + 1].startswith("features.code_mode_host=")
+                            ]
+                            self.assertEqual(
+                                settings, ["features.code_mode_host=false"]
+                            )
+                            position = cmd.index("features.code_mode_host=false")
+                            self.assertEqual(cmd[position - 1], "-c")
+                            self.assertLess(position, cmd.index("-C"))
+                            self.assertNotIn("--config", cmd)
+                            self.assertEqual(
+                                [v for v in cmd if v.startswith("features.")],
+                                ["features.code_mode_host=false"],
+                            )
+                            self.assertEqual(cmd[-1], "-")
+                            self.assertEqual(
+                                cmd[cmd.index("--sandbox") + 1], sandbox
+                            )
+
+    def test_codex_review_invocation_disables_the_code_mode_host(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            output = b'{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}\n'
+            return subprocess.CompletedProcess(cmd, 0, output, b"")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", Path(__file__),
+                diff_text="fixture", requested_effort="high", effort_source="explicit",
+            ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                result = server.native_review_result(context)
+        self.assertTrue(result["ok"], result)
+        cmd = captured["cmd"]
+        self.assertEqual(
+            [
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "-c" and cmd[index + 1].startswith("features.")
+            ],
+            ["features.code_mode_host=false"],
+        )
+        self.assertLess(cmd.index("features.code_mode_host=false"), cmd.index("-C"))
+        self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+        self.assertEqual(cmd[-1], "-")
+
     def test_claude_command_uses_effective_effort(self):
         for effort in ("low", "medium", "high", "max"):
             with self.subTest(effort=effort):

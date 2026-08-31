@@ -7168,9 +7168,15 @@ def codex_command(
     valid, effort = native_effort_value(job)
     if not valid or effort is None:
         raise ValueError("unsupported effort profile")
+    # Codex 0.151.0 enables features.code_mode_host by default and resolves
+    # codex-code-mode-host as a sibling of its own executable. Graphwing execs
+    # the sealed memfd copy at /proc/self/fd/N, whose sibling is
+    # /codex-code-mode-host, so the host launch fails before any work starts.
+    # Pinning the launcher is the invariant, so the feature is turned off here.
     command = [
         str(binary), "exec", "--json", "--model", str(job["model"]),
         "-c", f"model_reasoning_effort={effort}",
+        "-c", "features.code_mode_host=false",
         "-C", cwd, "--sandbox", sandbox,
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
     ]
