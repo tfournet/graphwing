@@ -7584,6 +7584,9 @@ def run_grok_acp(
                 ):
                     raise ValueError("malformed Grok ACP authentication methods")
                 method_by_id[method_id] = method
+            if default_auth_method is not None and default_auth_method not in method_by_id:
+                job["_adapter_failure_code"] = "adapter_contract_invalid"
+                raise RuntimeError("unsupported Grok ACP authentication")
             if auth_methods:
                 if not set(method_by_id).issubset(GROK_ACP_AUTH_METHODS):
                     job["_adapter_failure_code"] = "adapter_contract_invalid"

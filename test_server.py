@@ -4065,6 +4065,31 @@ while True:
         review_auth = next(r for r in review_capture["requests"] if r["method"] == "authenticate")
         self.assertEqual(review_auth["params"]["methodId"], "cached_token")
 
+    def test_grok_acp_rejects_nonnull_default_without_advertised_auth_methods(self):
+        for auth_methods_state in ("omitted", "empty"):
+            for default_auth_method in ("grok.com", "cached_token", "unknown"):
+                with self.subTest(
+                    auth_methods_state=auth_methods_state,
+                    default_auth_method=default_auth_method,
+                ):
+                    cfg: dict[str, Any] = {
+                        "initialize_meta": {"defaultAuthMethodId": default_auth_method},
+                    }
+                    if auth_methods_state == "omitted":
+                        cfg["omit_auth_methods"] = True
+                    else:
+                        cfg["auth_methods"] = []
+                    saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
+                    self.assertEqual(saved["status"], "failed")
+                    self.assertEqual(
+                        saved["receipt"]["failure_code"],
+                        "adapter_contract_invalid",
+                    )
+                    self.assertEqual(
+                        [request["method"] for request in capture["requests"]],
+                        ["initialize"],
+                    )
+
     def test_grok_acp_rejects_interactive_only_cached_oauth(self):
         saved, capture, _ = self._run_grok_fixture({
             "auth_methods": [{"id": "grok.com"}],
@@ -4184,10 +4209,26 @@ while True:
                 self.assertEqual(saved["receipt"]["failure_code"], "adapter_contract_invalid")
                 self.assertEqual(capture, {})
 
-    def test_grok_acp_allows_omitted_auth_methods_without_authenticate(self):
-        saved, capture, _ = self._run_grok_fixture({"omit_auth_methods": True})
-        self.assertEqual(saved["status"], "completed")
-        self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+    def test_grok_acp_allows_no_auth_methods_with_absent_or_null_default(self):
+        for auth_methods_state in ("omitted", "empty"):
+            for default_auth_method_state in ("absent", "null"):
+                with self.subTest(
+                    auth_methods_state=auth_methods_state,
+                    default_auth_method_state=default_auth_method_state,
+                ):
+                    cfg: dict[str, Any] = {}
+                    if auth_methods_state == "omitted":
+                        cfg["omit_auth_methods"] = True
+                    else:
+                        cfg["auth_methods"] = []
+                    if default_auth_method_state == "null":
+                        cfg["initialize_meta"] = {"defaultAuthMethodId": None}
+                    saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
+                    self.assertEqual(saved["status"], "completed")
+                    self.assertEqual(
+                        [request["method"] for request in capture["requests"]],
+                        ["initialize", "session/new", "session/prompt"],
+                    )
 
     def test_grok_acp_rejects_malformed_auth_methods(self):
         malformed = [
