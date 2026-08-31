@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import errno
 import fcntl
 import hashlib
 import io
@@ -3466,7 +3467,7 @@ while True:
                     server.run_agent_job(job_id)
         return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
 
-    def _run_grok_review_fixture(self, cfg=None):
+    def _run_grok_review_fixture(self, cfg=None, **context_kwargs):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -3488,7 +3489,7 @@ while True:
         with mock.patch.object(server, "JOBS_DIR", jobs), \
              mock.patch.dict(os.environ, env, clear=False):
             with self._native_review_context(
-                "grok", "xai", "grok-4.6", fixture
+                "grok", "xai", "grok-4.6", fixture, **context_kwargs
             ) as context:
                 result = server.native_review_result(context)
         return result, json.loads(capture.read_text())
@@ -14161,6 +14162,60 @@ func main() {
         )
         return proc.stdout.decode()
 
+    # `git diff HEAD` over a `_review_diff_worktree` costs exactly
+    # 80 * prefix_lines + 248 + len(tail) bytes: two file headers, two index
+    # lines, two `---`/`+++` pairs and two hunk headers are the fixed 248.
+    _REVIEW_DIFF_STRUCTURE_BYTES = 248
+    # The maximum the complete-diff bound superseded. It rejected the cumulative
+    # Phase 6 candidate the bound was introduced to review.
+    _SUPERSEDED_REVIEW_MAX_DIFF_BYTES = 65536
+    # A fixed large fixture size: past the superseded maximum and past
+    # MAX_ARG_STRLEN, under the current maximum. It is a fixture dimension, not a
+    # measurement of the patch under review, so it never goes stale.
+    _LARGE_CANDIDATE_DIFF_BYTES = 224 * 1024
+    # The Phase 6 candidate diff is part of this patch, so its size changes with
+    # every follow-up commit. Pinning that size in a test would make the test
+    # invalidate itself, so the coverage claim is measured live against this base
+    # and skipped wherever the base is not reachable.
+    _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
+
+    def _cumulative_candidate_diff_bytes(self):
+        """Measure `git diff <phase 6 base>` now, or None when unmeasurable."""
+        repo = str(Path(__file__).resolve().parent)
+        reachable = subprocess.run(
+            ["git", "-C", repo, "cat-file", "-e", f"{self._PHASE6_BASE_COMMIT}^{{commit}}"],
+            capture_output=True,
+        )
+        if reachable.returncode != 0:
+            return None
+        measured = subprocess.run(
+            ["git", "-C", repo, "diff", self._PHASE6_BASE_COMMIT], capture_output=True
+        )
+        if measured.returncode != 0:
+            return None
+        return len(measured.stdout)
+
+    def _review_diff_worktree_sized(self, root, *, total_bytes, marker):
+        """Author a worktree whose `git diff HEAD` is exactly `total_bytes` long.
+
+        The payload file carries whole 80-byte lines and the tail line absorbs
+        the remainder, so a caller can land on an exact byte count and on the
+        byte either side of it.
+        """
+        payload_bytes = total_bytes - self._REVIEW_DIFF_STRUCTURE_BYTES
+        prefix_lines, remainder = divmod(payload_bytes, self._REVIEW_DIFF_LINE_BYTES)
+        # Hand one whole payload line to the tail so it always outsizes its marker.
+        prefix_lines -= 1
+        tail_bytes = remainder + self._REVIEW_DIFF_LINE_BYTES
+        # The marker sits at the very end so two cases that differ only in it
+        # differ only in their last diff bytes.
+        tail = "y" * (tail_bytes - len(marker) - 1) + marker + "\n"
+        self.assertEqual(len(tail.encode()), tail_bytes)
+        repo = self._review_diff_worktree(root, prefix_lines=prefix_lines, tail=tail)
+        diff = self._worktree_diff(repo)
+        self.assertEqual(len(diff.encode()), total_bytes)
+        return repo, diff
+
     def _review_wrapper(self, root):
         launcher = root / "claude-review-wrapper"
         launcher.write_text("#!/bin/sh\nexit 0\n")
@@ -14289,17 +14344,20 @@ func main() {
         )
         response_409 = responses["409"]["content"]["application/json"]["schema"]
 
-        # 900 identical added lines are 72,000 diff bytes, above the 65,536 maximum.
-        self.assertGreater(900 * self._REVIEW_DIFF_LINE_BYTES, server.REVIEW_MAX_DIFF_BYTES)
+        # Exactly one byte past the maximum: the smallest diff that must be
+        # rejected, so the boundary cannot drift without this failing.
         rejections = []
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             jobs = root / "jobs"
-            repo = self._review_diff_worktree(
-                root / "case", prefix_lines=900, tail="oversized suffix\n"
+            repo, oversized = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES + 1,
+                marker="oversized suffix",
             )
-            self.assertGreater(
-                len(self._worktree_diff(repo).encode()), server.REVIEW_MAX_DIFF_BYTES
+            self.assertEqual(len(oversized.encode()), 258049)
+            self.assertEqual(
+                len(oversized.encode()), server.REVIEW_MAX_DIFF_BYTES + 1
             )
             for async_requested in (False, True):
                 request = json.dumps({
@@ -14328,7 +14386,7 @@ func main() {
             self.assertEqual(payload["code"], "review_diff_too_large")
             self.assertEqual(
                 payload["error"],
-                "review diff exceeds the reviewable maximum of 65536 bytes",
+                "review diff exceeds the reviewable maximum of 258048 bytes",
             )
             self.assertNotIn(repo_path, json.dumps(payload))
             self.assertNotIn("x" * 78, json.dumps(payload))
@@ -14337,13 +14395,13 @@ func main() {
                 sum(valid(branch, payload) for branch in response_409["oneOf"]), 1
             )
 
-    def test_accepted_full_size_review_diff_stays_reviewable(self):
-        # 800 identical added lines are 64,000 diff bytes: far past the old 12,000
-        # prefix and still inside the 65,536 maximum.
-        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 65536)
-        self.assertLess(800 * self._REVIEW_DIFF_LINE_BYTES, server.REVIEW_MAX_DIFF_BYTES)
+    # Linux rejects a single argv string of this many bytes or more.
+    _MAX_ARG_STRLEN = 131072
+
+    def _launch_sync_review(self, repo, root, *, body=None):
+        """Run one sync review to a launcher, capturing exact argv and kwargs."""
         real_run = subprocess.run
-        commands = []
+        calls = []
 
         class FakeProc:
             stderr = b""
@@ -14353,46 +14411,289 @@ func main() {
         def fake_run(command, **kwargs):
             if command and str(command[0]) == "git":
                 return real_run(command, **kwargs)
-            commands.append(list(command))
+            calls.append((list(command), kwargs))
             return FakeProc()
 
+        launcher = self._review_wrapper(root)
+        payload = json.dumps(body or self._REVIEW_DIFF_BODY).encode()
+        with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+             mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+            status, receipt, _ = server.dispatch(
+                "POST", "/v1/review/run", {}, True, payload
+            )
+        return status, receipt, calls
+
+    def test_review_diff_maximum_is_bounded_by_the_host_not_by_one_candidate(self):
+        # Every figure the maximum is derived from is a host limit, so none of
+        # them moves when the patch under review grows.
+        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 258048)
+        self.assertEqual(server.REVIEW_MAX_DIFF_BYTES, 252 * 1024)
+        # A diff at or over the capture cap comes back flagged truncated, which is
+        # a prefix and never reviewable, so the maximum stays strictly under it
+        # with headroom.
+        self.assertEqual(server.CMD_MAX_BYTES, 262144)
+        self.assertLess(server.REVIEW_MAX_DIFF_BYTES, server.CMD_MAX_BYTES)
+        self.assertEqual(server.CMD_MAX_BYTES - server.REVIEW_MAX_DIFF_BYTES, 4096)
+        # It is nearly four times the superseded maximum that rejected the
+        # cumulative Phase 6 candidate outright.
+        self.assertGreater(
+            server.REVIEW_MAX_DIFF_BYTES, 3 * self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES
+        )
+        # Nothing at this maximum could fit one argv string, which is why no
+        # review launcher carries its prompt there any more. The host proves it:
+        # a maximum-sized single argument is rejected, one byte under the limit
+        # is not.
+        self.assertGreater(server.REVIEW_MAX_DIFF_BYTES, self._MAX_ARG_STRLEN)
+        with self.assertRaises(OSError) as rejected:
+            subprocess.run(
+                ["/bin/true", "x" * server.REVIEW_MAX_DIFF_BYTES], capture_output=True
+            )
+        self.assertEqual(rejected.exception.errno, errno.E2BIG)
+        self.assertEqual(
+            subprocess.run(
+                ["/bin/true", "x" * (self._MAX_ARG_STRLEN - 1)], capture_output=True
+            ).returncode,
+            0,
+        )
+        for doc in (Path("docs/USING.md"), Path("docs/HUMAN-LOOP.md")):
+            with self.subTest(doc=doc.name):
+                text = doc.read_text()
+                self.assertIn("258,048", text)
+                self.assertNotIn("245,760", text)
+                self.assertNotIn("65,536", text)
+                # No documented cumulative-candidate size, because the patch
+                # being documented changes its own diff size on every commit.
+                self.assertNotIn("223,401", text)
+                self.assertNotIn("241,008", text)
+
+    def test_cumulative_phase6_candidate_still_fits_the_review_maximum(self):
+        # Measured now rather than pinned: this patch is part of the diff it
+        # measures, so any recorded figure would invalidate itself on the next
+        # commit. Skipped where the base commit is not reachable.
+        measured = self._cumulative_candidate_diff_bytes()
+        if not measured:
+            self.skipTest("phase 6 base commit is not reachable from this checkout")
+        self.assertGreater(measured, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(measured, server.REVIEW_MAX_DIFF_BYTES)
+
+    def test_large_review_diff_launches_with_the_prompt_off_argv(self):
+        # A 224-KiB diff: far past the superseded maximum and past the single
+        # argument limit, so it can only reach a launcher off argv.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            launcher = self._review_wrapper(root)
-            repo = self._review_diff_worktree(
-                root / "case", prefix_lines=800, tail="reviewable suffix\n"
+            repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=self._LARGE_CANDIDATE_DIFF_BYTES,
+                marker="large candidate suffix",
             )
-            diff = self._worktree_diff(repo)
-            self.assertGreater(len(diff), 12000)
-            self.assertLessEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
-            body = json.dumps(self._REVIEW_DIFF_BODY).encode()
-            with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
-                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
-                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
-                 mock.patch.object(server.subprocess, "run", side_effect=fake_run):
-                status, receipt, _ = server.dispatch(
-                    "POST", "/v1/review/run", {}, True, body
-                )
+            status, receipt, calls = self._launch_sync_review(repo, root)
 
+        self.assertEqual(len(diff.encode()), 229376)
+        self.assertGreater(
+            len(diff.encode()), self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES
+        )
+        self.assertLessEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
         self.assertEqual(status, 200, receipt)
         self.assertEqual((receipt["status"], receipt["verdict"]), ("ok", "PASS"))
         self.assertEqual(
             receipt["execution_identity"]["diff_sha256"],
             hashlib.sha256(diff.encode()).hexdigest(),
         )
-        self.assertEqual(len(commands), 1)
-        launched_prompt = commands[0][-1]
-        self.assertIn("--permission-mode", commands[0])
-        self.assertEqual(commands[0][commands[0].index("--permission-mode") + 1], "plan")
-        # The reviewer reads the complete diff, prefix and suffix alike.
-        self.assertIn(diff, launched_prompt)
-        self.assertIn("reviewable suffix", launched_prompt)
-        # One argv string still fits the documented Linux MAX_ARG_STRLEN limit,
-        # which rejects a single argument of 131,072 bytes or more. Worst case is
-        # the boilerplate plus a 4-bytes-per-character 8,000-character ticket
-        # excerpt plus a maximum diff, and that still clears the limit.
-        self.assertLess(len(launched_prompt.encode()), 131072)
-        self.assertLess(1024 + 4 * 8000 + server.REVIEW_MAX_DIFF_BYTES, 131072)
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        # Read-only plan semantics and command shape are unchanged by the move.
+        self.assertIn("-p", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", argv)
+        self.assertNotIn("--allowedTools", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-sonnet-5")
+        self.assertEqual(
+            argv[argv.index("--max-turns") + 1], str(server.REVIEW_MAX_TURNS)
+        )
+        # Nothing in argv comes near the single-argument limit, because the
+        # prompt is not there at all.
+        self.assertLess(max(len(value.encode()) for value in argv), 4096)
+        self.assertNotIn(diff, "".join(argv))
+        # The reviewer reads the complete diff, prefix and suffix alike, over stdin.
+        self.assertIsNotNone(kwargs["input"])
+        prompt = kwargs["input"].decode()
+        self.assertIn(diff, prompt)
+        self.assertIn("large candidate suffix", prompt)
+        self.assertGreater(len(prompt.encode()), self._MAX_ARG_STRLEN)
+
+    def test_review_diff_at_the_exact_maximum_is_accepted_and_launched(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                marker="exact maximum suffix",
+            )
+            status, receipt, calls = self._launch_sync_review(repo, root)
+
+        self.assertEqual(len(diff.encode()), 258048)
+        self.assertEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt["status"], receipt["verdict"]), ("ok", "PASS"))
+        self.assertEqual(
+            receipt["execution_identity"]["diff_sha256"],
+            hashlib.sha256(diff.encode()).hexdigest(),
+        )
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        prompt = kwargs["input"].decode()
+        self.assertIn(diff, prompt)
+        self.assertIn("exact maximum suffix", prompt)
+        self.assertLess(max(len(value.encode()) for value in argv), 4096)
+
+    def test_maximum_sized_review_prompt_leaves_argv_for_every_launcher(self):
+        real_run = subprocess.run
+        launched = {}
+
+        class FakeProc:
+            stderr = b""
+            returncode = 0
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(command, **kwargs):
+            if command and str(command[0]) == "git":
+                return real_run(command, **kwargs)
+            launcher = "codex" if "exec" in command else "claude"
+            launched[launcher] = (list(command), kwargs)
+            if launcher == "codex":
+                receipt = json.dumps({
+                    "status": "ok", "sha": None, "pr_url": None,
+                    "summary": "VERDICT: PASS",
+                })
+                event = {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": receipt},
+                }
+                return FakeProc((json.dumps(event) + "\n").encode())
+            return FakeProc(b"VERDICT: PASS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _repo, diff = self._review_diff_worktree_sized(
+                root / "case",
+                total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                marker="every launcher suffix",
+            )
+            codex_bin = root / "codex"
+            claude_bin = root / "claude"
+            codex_bin.write_text("fixture")
+            claude_bin.write_text("fixture")
+            with self._native_review_context(
+                "codex", "openai", "gpt-5.6-sol", codex_bin, diff_text=diff
+            ) as codex_context, self._native_review_context(
+                "claude", "anthropic", "claude-sonnet-5", claude_bin, diff_text=diff
+            ) as claude_context, mock.patch.object(
+                server, "JOBS_DIR", root / "jobs"
+            ), mock.patch.object(server.subprocess, "run", fake_run):
+                codex = server.native_review_result(codex_context)
+                claude = server.native_review_result(claude_context)
+            grok, grok_capture = self._run_grok_review_fixture(diff_text=diff)
+
+        self.assertEqual(len(diff.encode()), server.REVIEW_MAX_DIFF_BYTES)
+        self.assertEqual(
+            (codex["verdict"], claude["verdict"], grok["verdict"]),
+            ("PASS", "PASS", "PASS"),
+        )
+
+        # Codex: prompt on stdin, `-` as the trailing argument, read-only sandbox.
+        codex_argv, codex_kwargs = launched["codex"]
+        self.assertEqual(codex_argv[-1], "-")
+        self.assertEqual(codex_argv[codex_argv.index("--sandbox") + 1], "read-only")
+        self.assertLess(max(len(value.encode()) for value in codex_argv), 4096)
+        self.assertIsNotNone(codex_kwargs["input"])
+        self.assertIn(diff, codex_kwargs["input"].decode())
+
+        # Claude: prompt on stdin, plan permission mode, nothing appended to argv.
+        claude_argv, claude_kwargs = launched["claude"]
+        self.assertEqual(claude_argv[claude_argv.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude_argv)
+        self.assertLess(max(len(value.encode()) for value in claude_argv), 4096)
+        self.assertIsNotNone(claude_kwargs["input"])
+        self.assertIn(diff, claude_kwargs["input"].decode())
+
+        # Grok: prompt as an ACP session/prompt text block over a real pipe.
+        self.assertEqual(
+            grok_capture["argv"],
+            ["agent", "--model", "grok-4.6", "--reasoning-effort", "high", "stdio"],
+        )
+        prompted = next(
+            request for request in grok_capture["requests"]
+            if request["method"] == "session/prompt"
+        )
+        grok_prompt = prompted["params"]["prompt"][0]["text"]
+        self.assertIn(diff, grok_prompt)
+        self.assertGreater(len(grok_prompt.encode()), self._MAX_ARG_STRLEN)
+        self.assertLess(
+            max(len(value.encode()) for value in grok_capture["argv"]),
+            4096,
+        )
+
+    def test_maximum_sized_review_diffs_hash_their_complete_bytes(self):
+        identities, diffs = [], []
+
+        def capture(context):
+            self.assertEqual(
+                len(context.diff_text.encode()), server.REVIEW_MAX_DIFF_BYTES
+            )
+            return {"ok": True, "verdict": "PASS", "no_verdict": False}
+
+        body = json.dumps(self._REVIEW_DIFF_BODY).encode()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            launcher = self._review_wrapper(root)
+            for index, marker in enumerate(("full bytes a", "full bytes b")):
+                repo, diff = self._review_diff_worktree_sized(
+                    root / f"case-{index}",
+                    total_bytes=server.REVIEW_MAX_DIFF_BYTES,
+                    marker=marker,
+                )
+                diffs.append(diff)
+                with mock.patch.object(
+                    server, "load_repos", return_value={"scratch": str(repo)}
+                ), mock.patch.object(
+                    server, "resolve_launcher_binary_now", return_value=launcher
+                ), mock.patch.object(
+                    server, "native_review_result", side_effect=capture
+                ):
+                    status, receipt, _ = server.dispatch(
+                        "POST", "/v1/review/run", {}, True, body
+                    )
+                self.assertEqual(status, 200, receipt)
+                identities.append(receipt["execution_identity"])
+
+        # Two maximum-sized candidates differing only in their trailing bytes.
+        self.assertEqual(
+            [len(diff.encode()) for diff in diffs],
+            [server.REVIEW_MAX_DIFF_BYTES] * 2,
+        )
+        self.assertNotEqual(diffs[0], diffs[1])
+        # Any prefix hash — the superseded 65,536 maximum, or a prefix as long as
+        # a 224-KiB candidate — collides across both candidates.
+        for prefix in (
+            self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES, self._LARGE_CANDIDATE_DIFF_BYTES
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(diffs[0][:prefix], diffs[1][:prefix])
+                self.assertEqual(
+                    hashlib.sha256(diffs[0][:prefix].encode()).hexdigest(),
+                    hashlib.sha256(diffs[1][:prefix].encode()).hexdigest(),
+                )
+        # The complete hash separates them, and is the one bound into identity.
+        self.assertNotEqual(identities[0]["diff_sha256"], identities[1]["diff_sha256"])
+        for identity, diff in zip(identities, diffs):
+            self.assertEqual(
+                identity["diff_sha256"], hashlib.sha256(diff.encode()).hexdigest()
+            )
 
     def test_review_alien_replacement_at_terminal_cas_is_preserved_without_callback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -14695,7 +14996,9 @@ func main() {
         self.assertIn("model_reasoning_effort=high", codex_cmd)
         self.assertEqual(codex_cmd[codex_cmd.index("--model") + 1], "gpt-5.6-sol")
         self.assertIn("input", codex_kwargs)
-        claude_cmd, _ = commands[1]
+        claude_cmd, claude_kwargs = commands[1]
+        # Both direct launchers hand the prompt to stdin, never to argv.
+        self.assertIn("input", claude_kwargs)
         self.assertEqual(claude_cmd[claude_cmd.index("--permission-mode") + 1], "plan")
         self.assertNotIn("acceptEdits", claude_cmd)
         self.assertEqual(claude_cmd[claude_cmd.index("--model") + 1], "claude-sonnet-5")

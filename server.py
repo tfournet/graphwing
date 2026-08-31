@@ -112,13 +112,25 @@ REVIEW_EXECUTION_VERSION = "review-execution-v1"
 # One review authority binds the complete diff, hashed byte-exact. A prefix hash
 # would give two candidates sharing that prefix the same diff_sha256 and the same
 # review authority, so an oversized diff is rejected before launch instead of
-# truncated. Two documented host limits bound the safe maximum: CMD_MAX_BYTES is
-# the 256-KiB capture cap, and Linux MAX_ARG_STRLEN rejects a single argv string of
-# 131,072 bytes or more, which is how the Claude reviewer receives its whole prompt.
-# Worst case that prompt is the review boilerplate plus the 8,000-character ticket
-# excerpt (at most 4 UTF-8 bytes each) plus the complete diff, so 64 KiB stays
-# under both limits with a wide margin.
-REVIEW_MAX_DIFF_BYTES = 64 * 1024
+# truncated.
+#
+# The maximum has to cover the candidates this bound exists to review, and the
+# previous 64-KiB maximum rejected the cumulative Phase 6 candidate outright. It
+# is deliberately not derived from that candidate's measured size: the candidate
+# is this patch, so every follow-up commit changes it and any figure recorded
+# here would invalidate itself. The bound comes from the one host limit left
+# instead. CMD_MAX_BYTES is the 256-KiB cap `run_cmd` applies to captured
+# `git diff` output, and a diff at or over that cap comes back flagged
+# truncated, which is a prefix and never reviewable. 252 KiB is the largest
+# round maximum that stays clear of the capture cap, leaving 4,096 bytes of
+# headroom, so an accepted diff is always the complete bytes git produced.
+#
+# Linux MAX_ARG_STRLEN no longer bounds this. It rejects a single argv string of
+# 131,072 bytes or more, so a maximum-sized prompt cannot ride in argv; every
+# review launcher transports its prompt off argv instead. Codex and Claude write
+# the prompt to the child's stdin, and Grok sends it as an ACP `session/prompt`
+# text block read from the job's prompt file.
+REVIEW_MAX_DIFF_BYTES = 252 * 1024
 REVIEW_PERMISSION_PROFILES = {
     "codex": "codex-read-only",
     "claude": "claude-plan",
@@ -3285,11 +3297,13 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
             )
             run_input = receipt_prompt.encode()
         else:
+            # The prompt carries the complete diff, which can exceed the Linux
+            # single-argument limit, so it goes to stdin exactly as Codex's does.
             cmd = claude_command(
-                adapter_job, body_prompt, str(resolved), binary,
+                adapter_job, None, str(resolved), binary,
                 permission_mode="plan", output_format="json",
             )
-            run_input = None
+            run_input = body_prompt.encode()
         try:
             proc = subprocess.run(
                 cmd, cwd=str(resolved), env={k: v for k, v in os.environ.items()},
@@ -7061,10 +7075,18 @@ def launcher_pass_fds(binary: Path) -> tuple[int, ...]:
 
 
 def claude_command(
-    job: dict[str, Any], prompt: str, cwd: str, binary: Path | None = None, *,
+    job: dict[str, Any], prompt: str | None, cwd: str, binary: Path | None = None, *,
     permission_mode: Literal["acceptEdits", "plan"] = "acceptEdits",
     output_format: Literal["json", "text"] = "json",
 ) -> list[str]:
+    """Build one `claude -p` argv. A None prompt means the caller writes stdin.
+
+    Linux MAX_ARG_STRLEN rejects a single argv string of 131,072 bytes or more,
+    so a maximum-sized review prompt cannot travel as the trailing argument.
+    `claude -p` takes its input from either that argument or stdin, and refuses
+    to start with neither, so passing None here obliges the caller to supply the
+    prompt on the child's stdin.
+    """
     binary = binary or CLAUDE_BIN
     valid, effort = native_effort_value(job)
     if not valid:
@@ -7088,7 +7110,8 @@ def claude_command(
     session_id = (job.get("session_identity") or {}).get("native_session_id")
     if session_id:
         command.extend(["--resume", str(session_id)])
-    command.append(prompt)
+    if prompt is not None:
+        command.append(prompt)
     return command
 
 
