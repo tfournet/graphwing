@@ -6918,6 +6918,8 @@ def claude_command(
         "--add-dir", cwd,
         "--model", str(job["model"]),
     ]
+    if permission_mode == "acceptEdits":
+        command.extend(["--allowedTools", "Bash"])
     if effort is not None:
         command.extend(["--effort", effort])
     session_id = (job.get("session_identity") or {}).get("native_session_id")

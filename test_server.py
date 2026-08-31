@@ -3045,15 +3045,19 @@ class DispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(cmd[cmd.index("--effort") + 1], effort)
                 self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "acceptEdits")
+                self.assertEqual(cmd[cmd.index("--allowedTools") + 1], "Bash")
         default_job = self._adapter_contract_job(
             "claude", "anthropic", "claude-opus-5", "default", "default"
         )
+        default_cmd = server.claude_command(
+            default_job, "fixture prompt", "/fixture/repo", Path("/fixture/claude")
+        )
         self.assertNotIn(
             "--effort",
-            server.claude_command(
-                default_job, "fixture prompt", "/fixture/repo", Path("/fixture/claude")
-            ),
+            default_cmd,
         )
+        self.assertEqual(default_cmd.count("--allowedTools"), 1)
+        self.assertEqual(default_cmd[default_cmd.index("--allowedTools") + 1], "Bash")
 
     def test_claude_review_uses_reviewer_effort(self):
         job = self._adapter_contract_job(
@@ -3065,6 +3069,7 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(cmd[cmd.index("--effort") + 1], "high")
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("--allowedTools", cmd)
 
     def test_grok_acp_command_uses_effective_effort(self):
         job = self._adapter_contract_job(
@@ -3189,6 +3194,10 @@ class DispatchTests(unittest.TestCase):
                             self.assertEqual(len(tokens), 0 if effective == "default" else 1)
                             if tokens:
                                 self.assertLess(tokens[0][0], len(cmd) - 1)
+                            allowed_tools = [i for i, value in enumerate(cmd) if value == "--allowedTools"]
+                            self.assertEqual(len(allowed_tools), 1 if mode == "writer" else 0)
+                            if allowed_tools:
+                                self.assertEqual(cmd[allowed_tools[0] + 1], "Bash")
                         else:
                             cmd = server.grok_acp_command(
                                 job, Path("/fixture/grok"), mode=mode
