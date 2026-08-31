@@ -1,0 +1,11 @@
+{
+  "tickets": [
+    {
+      "id": "01-codex-code-mode-host",
+      "path": "slices/phase6/01-codex-code-mode-host.md",
+      "blocked_by": [],
+      "kind": "build",
+      "status": "open"
+    }
+  ]
+}
