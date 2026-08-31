@@ -337,7 +337,13 @@ GROK_VENDOR_NOTIFICATION_METHODS = frozenset({
     "_x.ai/settings/update",
 })
 GROK_ACP_API_KEY_AUTH_METHOD = "xai.api_key"
-GROK_ACP_CACHED_OAUTH_AUTH_METHODS = frozenset({"cached_token", "grok.com"})
+GROK_ACP_CACHED_TOKEN_AUTH_METHOD = "cached_token"
+GROK_ACP_INTERACTIVE_AUTH_METHOD = "grok.com"
+GROK_ACP_AUTH_METHODS = frozenset({
+    GROK_ACP_API_KEY_AUTH_METHOD,
+    GROK_ACP_CACHED_TOKEN_AUTH_METHOD,
+    GROK_ACP_INTERACTIVE_AUTH_METHOD,
+})
 CODEOFF_PROTOCOL_VERSION = "code-off-v1"
 CODEOFF_CATEGORY_VERSION = "code-category-v1"
 CODEOFF_DRAW_VERSION = "code-off-draw-v1"
@@ -7162,6 +7168,19 @@ def native_job_env(job: dict[str, Any]) -> dict[str, str]:
     return env
 
 
+def grok_job_env(job: dict[str, Any]) -> dict[str, str]:
+    """Build the Grok-only child environment with an optional credential home."""
+    env = native_job_env(job)
+    configured = os.environ.get("GRAPHWING_GROK_HOME")
+    if configured is None:
+        return env
+    home = Path(configured)
+    if not home.is_absolute() or not home.is_dir():
+        raise ValueError("invalid Grok credential home")
+    env["HOME"] = str(home.resolve())
+    return env
+
+
 def launcher_pass_fds(binary: Path) -> tuple[int, ...]:
     match = re.fullmatch(r"/proc/self/fd/([0-9]+)", str(binary))
     return (int(match.group(1)),) if match else ()
@@ -7353,15 +7372,17 @@ def run_grok_acp(
     stdout_path = path / "stdout.log"
     stderr_path = path / "stderr.log"
     cwd = str(Path(job["cwd"]).resolve())
-    env = native_job_env(job)
-    env["GROK_DISABLE_AUTOUPDATER"] = "1"
     try:
+        env = grok_job_env(job)
+        env["GROK_DISABLE_AUTOUPDATER"] = "1"
         command = grok_acp_command(
             job, binary, mode=mode, interpreter=interpreter
         )
     except ValueError as exc:
         job["_adapter_failure_code"] = (
-            "adapter_contract_invalid" if str(exc) == "invalid Grok ACP mode" else "unsupported_effort"
+            "adapter_contract_invalid"
+            if str(exc) in ("invalid Grok ACP mode", "invalid Grok credential home")
+            else "unsupported_effort"
         )
         return 1, False, None, str(exc)
     try:
@@ -7544,6 +7565,15 @@ def run_grok_acp(
             auth_methods = initialized.get("authMethods", [])
             if not isinstance(auth_methods, list):
                 raise ValueError("malformed Grok ACP authentication methods")
+            initialize_meta = initialized.get("_meta")
+            if initialize_meta is not None and not isinstance(initialize_meta, dict):
+                raise ValueError("malformed Grok ACP authentication metadata")
+            default_auth_method = (
+                initialize_meta.get("defaultAuthMethodId")
+                if isinstance(initialize_meta, dict) else None
+            )
+            if default_auth_method is not None and not isinstance(default_auth_method, str):
+                raise ValueError("malformed Grok ACP authentication metadata")
             method_by_id: dict[str, dict[str, Any]] = {}
             for method in auth_methods:
                 method_id = method.get("id") if isinstance(method, dict) else None
@@ -7555,21 +7585,27 @@ def run_grok_acp(
                     raise ValueError("malformed Grok ACP authentication methods")
                 method_by_id[method_id] = method
             if auth_methods:
-                supported_ids = GROK_ACP_CACHED_OAUTH_AUTH_METHODS | {GROK_ACP_API_KEY_AUTH_METHOD}
-                if not set(method_by_id).issubset(supported_ids):
+                if not set(method_by_id).issubset(GROK_ACP_AUTH_METHODS):
                     job["_adapter_failure_code"] = "adapter_contract_invalid"
                     raise RuntimeError("unsupported Grok ACP authentication")
                 if os.environ.get("XAI_API_KEY"):
                     method_id = GROK_ACP_API_KEY_AUTH_METHOD
                 else:
-                    cached_ids = [
-                        method_id for method_id in method_by_id
-                        if method_id in GROK_ACP_CACHED_OAUTH_AUTH_METHODS
-                    ]
-                    if len(cached_ids) != 1:
+                    if default_auth_method is not None:
+                        method_id = default_auth_method
+                    elif (
+                        GROK_ACP_CACHED_TOKEN_AUTH_METHOD in method_by_id
+                        and GROK_ACP_INTERACTIVE_AUTH_METHOD not in method_by_id
+                    ):
+                        method_id = GROK_ACP_CACHED_TOKEN_AUTH_METHOD
+                    else:
+                        method_id = ""
+                    if (
+                        method_id != GROK_ACP_CACHED_TOKEN_AUTH_METHOD
+                        or method_id not in method_by_id
+                    ):
                         job["_adapter_failure_code"] = "adapter_contract_invalid"
                         raise RuntimeError("unsupported Grok ACP authentication")
-                    method_id = cached_ids[0]
                 selected = method_by_id.get(method_id)
                 if selected is None or selected.get("type", "agent") != "agent":
                     job["_adapter_failure_code"] = "adapter_contract_invalid"
