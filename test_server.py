@@ -20946,7 +20946,7 @@ class RunControlSettlementTests(unittest.TestCase):
                 "launch_descriptor_sha256": descriptor or self.DESCRIPTOR}
 
     def sealed_receipt(self, job_hex="c", *, status="ok", failure_code="none",
-                       usage="default", usage_diagnostic=None, role=None):
+                       usage="default", usage_diagnostic=None, role=None, job_id=None):
         if usage == "default":
             usage = {
                 "usage_version": "normalized-usage-v1",
@@ -20956,7 +20956,7 @@ class RunControlSettlementTests(unittest.TestCase):
                 "wall_seconds": 12.9, "turns_observed": 4,
             }
         receipt = {
-            "status": status, "job_id": job_hex * 32,
+            "status": status, "job_id": job_id or job_hex * 32,
             "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
             "session_identity": {"repo": "r"}, "requested_effort": "default",
             "effective_effort": "default", "effort_source": "launcher_default",
@@ -20988,7 +20988,14 @@ class RunControlSettlementTests(unittest.TestCase):
         )
         return status, payload
 
-    def kick(self, trio=None, *, ok=True):
+    def kick_request(self, trio=None, *, with_trio=True):
+        request = {"repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                   "kick_url": "https://app.rewst.ai/api/hooks/x", "kick_token": "secret-token"}
+        if with_trio:
+            request["run_control"] = trio or self.trio()
+        return request
+
+    def kick(self, trio=None, *, ok=True, with_trio=True):
         posted = []
 
         def fake_post(url, payload, token=None):
@@ -20996,12 +21003,45 @@ class RunControlSettlementTests(unittest.TestCase):
             return {"ok": ok}
 
         with mock.patch.object(server, "post_receipt", fake_post):
-            status, out = server.pr_continue(json.dumps({
-                "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
-                "kick_url": "https://app.rewst.ai/api/hooks/x",
-                "run_control": trio or self.trio(),
-            }).encode(), {"r": str(Path(server.__file__).parent)})
+            status, out = server.pr_continue(
+                json.dumps(self.kick_request(trio, with_trio=with_trio)).encode(),
+                {"r": str(Path(server.__file__).parent)},
+            )
         return status, out, posted
+
+    def launch(self, trio=None, **overrides):
+        """Launch a writer under a carried reservation without a model process."""
+        if not hasattr(self, "repo"):
+            repo = self.ledger / "repo"
+            repo.mkdir()
+            for command in (["init", "-b", "main", "."], ["config", "user.email", "gw@test"],
+                            ["config", "user.name", "gw"], ["config", "commit.gpgsign", "false"]):
+                subprocess.run(["git", "-C", str(repo), *command], check=True, capture_output=True)
+            (repo / "README").write_text("hi\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True, capture_output=True)
+            self.repo = repo
+            binary = self.ledger / "codex"
+            binary.write_text("codex fixture")
+            self.binary = binary
+        body = {"prompt": "fix it", "cwd": "scratch", "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", **({"run_control": trio or self.trio()} if trio is not False else {}),
+                **overrides}
+        with mock.patch.object(server, "JOBS_DIR", self.ledger / "jobs"), \
+                mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.binary), \
+                mock.patch.object(server, "enqueue_agent", lambda job: None):
+            status, payload = server.agent_run(json.dumps(body).encode(), {"scratch": str(self.repo)})
+            job = server.read_job(payload.get("job_id", "")) if status == 202 else None
+        return status, payload, job
+
+    def finish(self, job):
+        """Free the checkout so the next launch is judged by run control alone."""
+        with mock.patch.object(server, "JOBS_DIR", self.ledger / "jobs"):
+            server.write_job({**job, "status": "completed"})
+
+    def ledger_record(self, trio=None):
+        trio = trio or self.trio()
+        return json.loads((self.ledger / "reservations" / f"{trio['authorization_id']}.json").read_text())
 
     def test_settle_binds_trio_and_projects_the_live_wait_body(self):
         receipt = self.sealed_receipt()
@@ -21214,6 +21254,99 @@ class RunControlSettlementTests(unittest.TestCase):
         status, refused, posted = self.kick(trio=trio)
         self.assertEqual((status, refused["code"], posted), (409, "continuity_already_used", []))
 
+    def test_kick_ack_reports_the_exact_kick_request_hash(self):
+        status, ack, posted = self.kick()
+        self.assertEqual(status, 200, ack)
+        material = {k: v for k, v in self.kick_request().items() if k not in ("run_control", "kick_token")}
+        expected = hashlib.sha256(json.dumps(
+            material, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        # This is the value the reserving run records as the reservation's
+        # exact_request_body_sha256: the one request run N renders and sends.
+        self.assertEqual(ack["kick_request_sha256"], expected)
+        self.assertEqual(self.ledger_record()["kick"]["kick_request_sha256"], expected)
+        self.assertNotIn("kick_request_sha256", posted[0])
+        status, legacy, _ = self.kick(with_trio=False)
+        self.assertEqual(status, 200, legacy)
+        self.assertNotIn("kick_request_sha256", legacy)
+
+    def test_agent_run_pins_the_launch_to_the_kicked_reservation(self):
+        status, ack, _ = self.kick()
+        self.assertEqual(status, 200, ack)
+        status, payload, job = self.launch()
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(job["run_control"], self.trio())
+        record = self.ledger_record()
+        self.assertEqual(record["launch"]["job_id"], job["job_id"])
+        self.assertEqual(record["launch"]["launched_at"], self.now[0])
+        # One launch per reservation, exactly as kicked.
+        self.finish(job)
+        status, again, _ = self.launch()
+        self.assertEqual((status, again["code"]), (409, "reservation_already_launched"))
+        status, drift, _ = self.launch(trio=self.trio(descriptor="1" * 64))
+        self.assertEqual((status, drift["code"]), (409, "run_control_mismatch"))
+        # A definitively failed kick never launches; a settled one never relaunches.
+        failed = self.trio(attempt_hex="2" * 64)
+        self.kick(trio=failed, ok=False)
+        status, refused, _ = self.launch(trio=failed)
+        self.assertEqual((status, refused["code"]), (409, "continuation_kick_failed"))
+        settled = self.trio(attempt_hex="3" * 64)
+        status, out = self.settle(self.sealed_receipt(job_hex="3"), trio=settled)
+        self.assertEqual(status, 200, out)
+        status, refused, _ = self.launch(trio=settled)
+        self.assertEqual((status, refused["code"]), (409, "reservation_already_settled"))
+        # Malformed continuity is refused before any job exists.
+        status, bad, job = self.launch(trio={**self.trio(), "attempt_id": "x"})
+        self.assertEqual((status, bad["code"]), (400, "bad_run_control_continuity"))
+        self.assertIsNone(job)
+        # A same-run reservation this daemon never kicked may still launch once.
+        same_run = self.trio(attempt_hex="4" * 64)
+        status, payload, job = self.launch(trio=same_run)
+        self.assertEqual(status, 202, payload)
+        record = self.ledger_record(same_run)
+        self.assertIsNone(record["kick"])
+        self.assertEqual(record["launch"]["job_id"], job["job_id"])
+        # Legacy launches without run_control stay untouched by the ledger.
+        self.finish(job)
+        status, payload, job = self.launch(trio=False)
+        self.assertEqual(status, 202, payload)
+        self.assertNotIn("run_control", job)
+
+    def test_settle_requires_the_job_launched_under_the_reservation(self):
+        self.kick()
+        status, payload, job = self.launch()
+        self.assertEqual(status, 202, payload)
+        stranger = self.sealed_receipt(job_hex="9")
+        status, conflict = self.settle(stranger)
+        self.assertEqual((status, conflict["code"]), (409, "settlement_conflict"))
+        launched = self.sealed_receipt(job_hex=None, job_id=job["job_id"])
+        status, out = self.settle(launched)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["receipt"]["job_id"], job["job_id"])
+
+    def test_authority_loss_respects_a_started_run(self):
+        self.kick()
+        status, payload, job = self.launch()
+        self.assertEqual(status, 202, payload)
+        self.now[0] += 10 * server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS
+        with mock.patch.object(server, "JOBS_DIR", self.ledger / "jobs"):
+            status, started = self.authority_loss()
+            self.assertEqual((status, started["code"]), (409, "run_started"))
+            self.assertEqual(started["job_id"], job["job_id"])
+            # The run ended without settling: still wait out the grace window
+            # from the launch, then charge the full envelope.
+            job["status"] = "failed"
+            server.write_job(job)
+            record = self.ledger_record()
+            record["launch"]["launched_at"] = self.now[0]
+            (self.ledger / "reservations" / f"{self.trio()['authorization_id']}.json").write_text(json.dumps(record))
+            status, early = self.authority_loss()
+            self.assertEqual((status, early["code"]), (409, "launch_within_grace"))
+            self.now[0] += server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS
+            status, lost = self.authority_loss()
+        self.assertEqual(status, 200, lost)
+        self.assertEqual(lost["authority_loss_reason"], "launched_run_never_settled")
+
     def test_settlement_ops_are_declared_in_openapi(self):
         spec = json.loads(server.openapi_bytes())
         settle = spec["paths"]["/v1/run/control/settle"]["post"]
@@ -21238,6 +21371,10 @@ class RunControlSettlementTests(unittest.TestCase):
             set(settlement["properties"]["authority_loss_reason"]["enum"]),
             set(server.RUN_CONTROL_AUTHORITY_LOSS_REASONS) | {None},
         )
+        self.assertIn("launched_run_never_settled", server.RUN_CONTROL_AUTHORITY_LOSS_REASONS)
+        agent_request = schemas["AgentRunRequest"]["properties"]
+        self.assertEqual(agent_request["run_control"]["$ref"], "#/components/schemas/PrContinueRunControl")
+        self.assertIn("409", spec["paths"]["/v1/agent/run"]["post"]["responses"])
         projected = schemas["RunControlSettledReceipt"]
         self.assertIs(projected["additionalProperties"], False)
         self.assertEqual(list(projected["properties"]), [

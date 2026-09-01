@@ -116,6 +116,36 @@ pr-drive path. It goes in a separate slug or a publish-time render, so the
 shipped `graphwing-pr-drive` stays byte-identical and step 3's zero-write
 assertion means something.
 
+## Cross-run binding, decided 2026-09-01
+
+Defect 2 (caller-precomputed evidence) had no honest answer for the continue
+leg: run N cannot fingerprint the writer request run N+1 will render. The
+reservation now binds what run N does know, and the daemon binds the rest:
+
+- **Kick fingerprint.** `/v1/pr/continue` with continuity returns
+  `kick_request_sha256`, the SHA-256 of the canonical kick request minus
+  `run_control` (its descriptor hash covers this value) and `kick_token` (a
+  secret never belongs in a durable descriptor). For the continue leg the
+  reservation descriptor's `exact_request_body_sha256` is this value; the
+  reserving run renders the kick request, hashes it the same way, reserves,
+  then sends exactly that request. The ledger records the fingerprint with
+  the kick for isolated-tenant comparison against durable state.
+- **Launch pinning.** `/v1/agent/run` accepts the four-field `run_control`
+  forwarded verbatim from `CTX.INPUT.run_control`. The daemon refuses a launch
+  whose continuity differs from what it kicked (`run_control_mismatch`), a
+  second launch (`reservation_already_launched`), a launch after settlement
+  (`reservation_already_settled`), or one under a definitively failed kick
+  (`continuation_kick_failed`), and otherwise pins the job to the reservation
+  before the job record exists. A reservation this daemon never kicked (the
+  same-run agent leg) may launch once; the unguessable trio binds it there.
+- **Settlement names the job.** Once a reservation is launched, only that
+  job's sealed receipt can settle it.
+- **Run-started signal.** Authority loss on a launched reservation is refused
+  while the job is queued or running (`run_started`), waits out the grace
+  window after the job ends (`launch_within_grace`), then charges the full
+  envelope as `launched_run_never_settled`. The kick-only grace path still
+  covers a kick whose run never launched.
+
 ## Next bounded task
 
 Author the enabled pr-drive shape as a separate dormant catalog graph
@@ -125,8 +155,11 @@ or `--only pr-drive`. Under a carried `CTX.INPUT.run_control` the agent leg must
 not reserve again (the state graph refuses a second outstanding reservation); it
 launches the writer, settles through `/v1/run/control/settle` from
 `TASKS.wait.request.body`, and feeds the result to the pinned reconcile child.
-The continue leg reserves, consumes, kicks with the four-field continuity built
-from the state subworkflow's outputs, and on kick failure closes through
-`/v1/run/control/authority-loss`. Prove the shape with provider-free structural
-tests; `graphs/pr-drive.json` stays untouched. Do not publish until the flag-off
+The continue leg renders the kick request first, hashes it as
+`kick_request_sha256` above for the reservation's `exact_request_body_sha256`,
+reserves, consumes, sends exactly that request with the four-field continuity
+built from the state subworkflow's outputs, and on kick failure closes through
+`/v1/run/control/authority-loss`. The agent leg passes the carried continuity
+to `/v1/agent/run`. Prove the shape with provider-free structural tests;
+`graphs/pr-drive.json` stays untouched. Do not publish until the flag-off
 traversal test and both suites are green and an isolated tenant is available.
