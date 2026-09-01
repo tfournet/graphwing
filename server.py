@@ -41,6 +41,7 @@ STACKS_PATH = HOME / "stacks.json"
 TESTS_PATH = HOME / "tests.json"
 RR_PATH = HOME / "rr.json"
 KEY_PATH = HOME / "api.key"
+REWST_ISSUER_SECRET_PATH = HOME / "rewst-hmac.key"
 JOBS_DIR = HOME / "jobs"
 CODEOFFS_DIR = HOME / "codeoffs"
 CODEOFF_WORKSPACES_DIR = HOME / "codeoff-workspaces"
@@ -65,6 +66,36 @@ HERDR_JOB_TAB_MAX = 8
 # The tab-count cap still wins: a burst of jobs evicts lingering tabs early.
 HERDR_TAB_LINGER_SECONDS = int(os.environ.get("GRAPHWING_HERDR_TAB_LINGER", "180"))
 HERDR_LOCK = threading.Lock()
+
+# Dormant Rewst launch-authorization primitives. Existing request dispatch does
+# not call these until the workflow-enforcement phase lands.
+REWST_SIGNATURE_MAX_SKEW_SECONDS = 300
+REWST_REPLAY_REGISTRY_MAX = 4096
+REWST_TIMESTAMP_RE = re.compile(r"[1-9][0-9]{9}")
+REWST_NONCE_RE = re.compile(r"[0-9a-f]{64}")
+REWST_SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
+REWST_AUTHORIZATION_FIELDS = frozenset({
+    "authorization_version", "authorization_id", "state", "ok", "swapped",
+    "expected_version", "consumed_version", "issued_at", "expires_at", "collection",
+    "record_key", "record_found", "record_version", "payload_sha256", "descriptor",
+})
+REWST_DESCRIPTOR_FIELDS = frozenset({
+    "descriptor_version", "operation", "route_version", "role", "work_kind", "work_class",
+    "effective_size", "profile_version", "launcher", "provider", "model",
+    "requested_effort", "effective_effort", "effort_source", "launcher_version", "repo",
+    "branch", "starting_head", "prompt_sha256", "diff_sha256", "resume_parent_job_id",
+    "max_turns", "wall_seconds", "max_tokens", "max_cost_usd", "callback_sha256",
+    "permission_profile", "authorization_id", "consumed_version", "record_key",
+    "record_version", "payload_sha256", "request_sha256",
+})
+REWST_OPERATION_BY_PATH = {
+    "/v1/agent/run": "agent_run",
+    "/v1/review/run": "review_run",
+    "/v1/pr/continue": "pr_continue",
+    "/v1/slice/continue": "slice_continue",
+}
+_REWST_AUTHORITY_LOCK = threading.Lock()
+_REWST_AUTHORITIES: dict[str, dict[str, Any]] = {}
 
 
 def resolve_executable(name: str, env_var: str, fallback: Path) -> Path:
@@ -651,6 +682,319 @@ def load_key() -> bytes:
     if not raw:
         raise RuntimeError(f"empty API key at {KEY_PATH}")
     return raw
+
+
+def load_rewst_issuer_secret() -> bytes:
+    """Load a distinct HMAC secret from the environment or a private seat file."""
+    env = os.environ.get("GRAPHWING_REWST_HMAC_SECRET", "").encode()
+    if env.strip():
+        raw = env.strip()
+    else:
+        try:
+            metadata = REWST_ISSUER_SECRET_PATH.lstat()
+        except OSError as exc:
+            raise RuntimeError("Rewst issuer secret is unavailable") from exc
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise RuntimeError("Rewst issuer secret is unavailable")
+        try:
+            raw = REWST_ISSUER_SECRET_PATH.read_bytes().strip()
+        except OSError as exc:
+            raise RuntimeError("Rewst issuer secret is unavailable") from exc
+    if len(raw) < 32:
+        raise RuntimeError("Rewst issuer secret is unavailable")
+    return raw
+
+
+def _header(headers: Any, name: str) -> str:
+    if headers is None or not hasattr(headers, "get"):
+        return ""
+    direct = headers.get(name)
+    if direct is not None:
+        return str(direct)
+    lowered = name.lower()
+    for key, value in getattr(headers, "items", lambda: ())():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
+
+
+def _rewst_auth_error(code: str) -> tuple[int, dict[str, str]]:
+    return 401, {"error": "invalid Rewst authorization", "code": code}
+
+
+def reset_rewst_authority_registry_for_test() -> None:
+    with _REWST_AUTHORITY_LOCK:
+        _REWST_AUTHORITIES.clear()
+
+
+def _valid_rewst_id(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value)
+        and ".." not in value
+        and not value.lower().startswith(("secret", "token", "key"))
+    )
+
+
+def _valid_sha256(value: Any, *, nullable: bool = False) -> bool:
+    return (nullable and value is None) or bool(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+    )
+
+
+def _rewst_unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def _reject_rewst_json_constant(_value: str) -> None:
+    raise ValueError("non-JSON number")
+
+
+def _validate_rewst_consumed_authorization(
+    path: str, body: bytes, timestamp: int,
+) -> dict[str, Any] | None:
+    try:
+        data = json.loads(
+            body,
+            object_pairs_hook=_rewst_unique_object,
+            parse_constant=_reject_rewst_json_constant,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    auth = data.get("rewst_authorization")
+    if not isinstance(auth, dict) or set(auth) != REWST_AUTHORIZATION_FIELDS:
+        return None
+    descriptor = auth.get("descriptor")
+    if not isinstance(descriptor, dict) or set(descriptor) != REWST_DESCRIPTOR_FIELDS:
+        return None
+    expected_version = auth.get("expected_version")
+    consumed_version = auth.get("consumed_version")
+    issued_at, expires_at = auth.get("issued_at"), auth.get("expires_at")
+    if (auth.get("authorization_version") != "graphwing-rewst-authorization-v1"
+            or auth.get("state") != "consumed"
+            or auth.get("ok") is not True
+            or auth.get("swapped") is not True
+            or auth.get("record_found") is not True
+            or type(expected_version) is not int
+            or expected_version < 1
+            or type(consumed_version) is not int
+            or consumed_version != expected_version + 1
+            or type(auth.get("record_version")) is not int
+            or auth["record_version"] < 1
+            or type(issued_at) is not int
+            or type(expires_at) is not int
+            or not issued_at <= timestamp <= expires_at
+            or expires_at - issued_at > 900
+            or not _valid_rewst_id(auth.get("authorization_id"))
+            or auth.get("collection") != "graphwing_run_control_v1"
+            or not _valid_rewst_id(auth.get("record_key"))
+            or not _valid_sha256(auth.get("payload_sha256"))):
+        return None
+    request = dict(data)
+    request.pop("rewst_authorization", None)
+    request_hash = hashlib.sha256(
+        json.dumps(
+            request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+    text_fields = (
+        "route_version", "role", "work_kind", "work_class", "effective_size",
+        "profile_version", "launcher", "provider", "model", "requested_effort",
+        "effective_effort", "effort_source", "repo", "branch", "permission_profile",
+    )
+    if (descriptor.get("descriptor_version") != "graphwing-launch-descriptor-v1"
+            or descriptor.get("operation") != REWST_OPERATION_BY_PATH.get(path)
+            or descriptor.get("authorization_id") != auth["authorization_id"]
+            or descriptor.get("consumed_version") != consumed_version
+            or descriptor.get("record_key") != auth["record_key"]
+            or descriptor.get("record_version") != auth["record_version"]
+            or descriptor.get("payload_sha256") != auth["payload_sha256"]
+            or descriptor.get("request_sha256") != request_hash
+            or any(not isinstance(descriptor.get(key), str)
+                   or not descriptor[key]
+                   or len(descriptor[key]) > 128 for key in text_fields)
+            or not isinstance(descriptor.get("launcher_version"), str)
+            or re.fullmatch(
+                r"(?:sha256:[0-9a-f]{64}|missing)", descriptor["launcher_version"]
+            ) is None
+            or re.fullmatch(r"[0-9a-f]{40}", str(descriptor.get("starting_head"))) is None
+            or any(not _valid_sha256(descriptor.get(key)) for key in (
+                "prompt_sha256", "callback_sha256", "request_sha256", "payload_sha256",
+            ))
+            or not _valid_sha256(descriptor.get("diff_sha256"), nullable=True)
+            or (descriptor.get("resume_parent_job_id") is not None
+                and not _valid_rewst_id(descriptor.get("resume_parent_job_id")))
+            or type(descriptor.get("max_turns")) is not int
+            or not 1 <= descriptor["max_turns"] <= 80
+            or type(descriptor.get("wall_seconds")) is not int
+            or not 1 <= descriptor["wall_seconds"] <= 1800
+            or type(descriptor.get("max_tokens")) is not int
+            or not 0 <= descriptor["max_tokens"] <= 1_000_000_000
+            or not isinstance(descriptor.get("max_cost_usd"), str)
+            or re.fullmatch(
+                r"(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?",
+                descriptor["max_cost_usd"],
+            ) is None):
+        return None
+    return {"authorization": auth, "descriptor": descriptor}
+
+
+def verify_rewst_issuer_request(
+    method: str, path: str, body: bytes, headers: Any, *, now: int | None = None,
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, str]] | None]:
+    """Authenticate exact request bytes and reserve a process-local nonce."""
+    timestamp_text = _header(headers, "X-Graphwing-Rewst-Timestamp")
+    nonce = _header(headers, "X-Graphwing-Rewst-Nonce")
+    signature = _header(headers, "X-Graphwing-Rewst-Signature")
+    if (method != "POST"
+            or path not in REWST_OPERATION_BY_PATH
+            or REWST_TIMESTAMP_RE.fullmatch(timestamp_text) is None
+            or REWST_NONCE_RE.fullmatch(nonce) is None
+            or REWST_SIGNATURE_RE.fullmatch(signature) is None):
+        return None, _rewst_auth_error("rewst_authorization_invalid")
+    timestamp = int(timestamp_text)
+    current = int(time.time()) if now is None else now
+    if type(current) is not int or abs(current - timestamp) > REWST_SIGNATURE_MAX_SKEW_SECONDS:
+        return None, _rewst_auth_error("rewst_authorization_stale")
+    try:
+        secret = load_rewst_issuer_secret()
+    except (OSError, RuntimeError):
+        return None, _rewst_auth_error("rewst_authorization_invalid")
+    signed = timestamp_text.encode("ascii") + b"." + nonce.encode("ascii") + b"." + body
+    expected = hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None, _rewst_auth_error("rewst_authorization_invalid")
+    validated = _validate_rewst_consumed_authorization(path, body, timestamp)
+    if validated is None:
+        return None, _rewst_auth_error("rewst_authorization_invalid")
+    authority = {
+        "nonce": nonce,
+        "timestamp": timestamp,
+        "method": method,
+        "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "authorization": validated["authorization"],
+        "descriptor": validated["descriptor"],
+    }
+    with _REWST_AUTHORITY_LOCK:
+        expired = [
+            key for key, item in _REWST_AUTHORITIES.items()
+            if abs(current - int(item["timestamp"])) > REWST_SIGNATURE_MAX_SKEW_SECONDS
+        ]
+        for key in expired:
+            _REWST_AUTHORITIES.pop(key, None)
+        if nonce in _REWST_AUTHORITIES:
+            return None, _rewst_auth_error("rewst_authorization_replayed")
+        if len(_REWST_AUTHORITIES) >= REWST_REPLAY_REGISTRY_MAX:
+            return None, _rewst_auth_error("rewst_authorization_registry_saturated")
+        authority_digest = _rewst_authority_digest(authority)
+        if authority_digest is None:
+            return None, _rewst_auth_error("rewst_authorization_invalid")
+        _REWST_AUTHORITIES[nonce] = {
+            "timestamp": timestamp,
+            "authority_sha256": authority_digest,
+            "state": "verified",
+            "job_id": None,
+        }
+    return authority, None
+
+
+def rewst_descriptor_matches(authority: Any, expected: Any) -> bool:
+    if (not isinstance(authority, dict)
+            or not isinstance(expected, dict)
+            or set(expected) != REWST_DESCRIPTOR_FIELDS):
+        return False
+    descriptor = authority.get("descriptor")
+    if not isinstance(descriptor, dict) or set(descriptor) != REWST_DESCRIPTOR_FIELDS:
+        return False
+    actual_hash = hashlib.sha256(
+        json.dumps(
+            descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).digest()
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).digest()
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def _rewst_authority_digest(authority: Any) -> bytes | None:
+    if not isinstance(authority, dict) or set(authority) != {
+        "nonce", "timestamp", "method", "path", "body_sha256", "authorization", "descriptor",
+    }:
+        return None
+    try:
+        canonical = json.dumps(
+            authority, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    return hashlib.sha256(canonical).digest()
+
+
+def claim_rewst_launch_authority(authority: Any, job_id: str) -> bool:
+    if not isinstance(authority, dict) or not _valid_rewst_id(job_id):
+        return False
+    nonce = authority.get("nonce")
+    authority_digest = _rewst_authority_digest(authority)
+    if authority_digest is None:
+        return False
+    with _REWST_AUTHORITY_LOCK:
+        stored = _REWST_AUTHORITIES.get(nonce)
+        stored_digest = stored.get("authority_sha256") if stored is not None else None
+        if (stored is None
+                or stored.get("state") != "verified"
+                or not isinstance(stored_digest, bytes)
+                or not hmac.compare_digest(stored_digest, authority_digest)):
+            return False
+        stored.update({"state": "claimed", "job_id": job_id})
+        return True
+
+
+def consume_rewst_authority_for_job(job_id: str, *, required: bool = True) -> bool:
+    if not _valid_rewst_id(job_id):
+        return False
+    with _REWST_AUTHORITY_LOCK:
+        matching = [
+            item for item in _REWST_AUTHORITIES.values() if item.get("job_id") == job_id
+        ]
+        if len(matching) != 1:
+            return not required and not matching
+        stored = matching[0]
+        if stored.get("state") != "claimed":
+            return False
+        stored["state"] = "consumed"
+        return True
+
+
+def consume_rewst_launch_authority(authority: Any, job_id: str) -> bool:
+    if not isinstance(authority, dict) or not _valid_rewst_id(job_id):
+        return False
+    authority_digest = _rewst_authority_digest(authority)
+    if authority_digest is None:
+        return False
+    with _REWST_AUTHORITY_LOCK:
+        stored = _REWST_AUTHORITIES.get(authority.get("nonce"))
+        stored_digest = stored.get("authority_sha256") if stored is not None else None
+        if (stored is None
+                or stored.get("state") != "claimed"
+                or stored.get("job_id") != job_id
+                or not isinstance(stored_digest, bytes)
+                or not hmac.compare_digest(stored_digest, authority_digest)):
+            return False
+        stored["state"] = "consumed"
+        return True
 
 
 def load_repos() -> dict[str, str]:

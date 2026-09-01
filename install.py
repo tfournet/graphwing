@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ CATALOG = (
 )
 LOCAL_KEEP = (
     "api.key",
+    "rewst-hmac.key",
     "cloudflared.token",
     "cloudflared-meta.json",
     "repos.json",
@@ -141,6 +143,29 @@ def ensure_key(home: Path) -> Path:
         return path
     path.write_text(secrets.token_urlsafe(32) + "\n")
     path.chmod(0o600)
+    return path
+
+
+def ensure_rewst_hmac_secret(home: Path) -> Path:
+    """Create or preserve the distinct Rewst issuer secret as a private seat file."""
+    path = home / "rewst-hmac.key"
+    if path.exists():
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit(f"refusing non-regular Rewst HMAC secret path: {path}")
+        if len(path.read_bytes().strip()) < 32:
+            raise SystemExit(f"existing Rewst HMAC secret is shorter than 32 bytes: {path}")
+        path.chmod(0o600)
+        return path
+    supplied = os.environ.get("GRAPHWING_REWST_HMAC_SECRET", "").strip()
+    if supplied and len(supplied.encode()) < 32:
+        raise SystemExit("GRAPHWING_REWST_HMAC_SECRET must be at least 32 bytes")
+    raw = (supplied or secrets.token_hex(32)) + "\n"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, raw.encode())
+    finally:
+        os.close(descriptor)
     return path
 
 
@@ -382,6 +407,7 @@ def main() -> None:
     copy_file(REPO / "examples" / "doorbell.example.json", home / "doorbell.example.json")
 
     key_path = ensure_key(home)
+    ensure_rewst_hmac_secret(home)
     ensure_repos(home, REPO, ni, extra=args.repo)
     ensure_stacks(home, args.port)
 

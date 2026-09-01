@@ -16,7 +16,7 @@
           "allowDrafts": false,
           "inputs": {
             "repo": { "type": "string", "required": true },
-            "pr_number": { "type": "string", "required": true, "description": "PR number. Named pr_number because a plain `pr` input never reaches CTX.INPUT." },
+            "pr_number": { "type": "string", "required": true, "description": "PR number. Named pr_number because a plain pr input never reaches the workflow input context." },
             "attempt": { "type": "string", "required": false },
             "max_attempts": { "type": "string", "required": false },
             "auto_merge": { "type": "string", "required": false },
