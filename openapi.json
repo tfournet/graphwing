@@ -917,7 +917,41 @@
     "/v1/code-off/finalize": {"post":{"operationId":"codeOffFinalize","tags":["code-off"],"summary":"Verify the exact frozen winner and named tests in an isolated git worktree, then safely apply it and expose commit/push eligibility.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffExperimentRequest"}}}},"responses":{"200":{"description":"bounded code-off receipt","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffCompact"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"422":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
     "/v1/code-off/audit": {"get":{"operationId":"codeOffAudit","tags":["code-off"],"summary":"Return compact audit fields and the seed commitment; never the seed, raw prompts/logs/paths, or a reconstructing private blind map.","parameters":[{"name":"experiment_id","in":"query","required":true,"schema":{"type":"string","pattern":"^[a-z0-9][a-z0-9-]{7,63}$"}}],"responses":{"200":{"description":"sanitized audit","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffCompact"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"404":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
     "/v1/code-off/cleanup": {"post":{"operationId":"codeOffCleanup","tags":["code-off"],"summary":"Remove opaque workspaces only after terminal finalization; preserve the scientific record.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffExperimentRequest"}}}},"responses":{"200":{"description":"bounded code-off receipt","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffCompact"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"422":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
-    "/v1/code-off/terminal": {"post":{"operationId":"codeOffTerminal","tags":["code-off"],"summary":"Make a graph terminal outcome durable. Failure parks an active experiment; success only confirms prior completed finalization.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalRequest"}}}},"responses":{"200":{"description":"durable terminal state","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalResult"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}}
+    "/v1/code-off/terminal": {"post":{"operationId":"codeOffTerminal","tags":["code-off"],"summary":"Make a graph terminal outcome durable. Failure parks an active experiment; success only confirms prior completed finalization.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalRequest"}}}},"responses":{"200":{"description":"durable terminal state","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalResult"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
+    "/v1/run/control/evaluate": {
+      "post": {
+        "operationId": "runControlEvaluate",
+        "tags": [
+          "agent"
+        ],
+        "summary": "Advisory pure-policy evaluation for aggregate limits, progress, handoff, restructure, or termination",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunControlRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "closed advisory policy receipt; not launch authorization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunControlReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    }
   },
   "components": {
     "securitySchemes": {
@@ -1841,6 +1875,673 @@
           "failover_eligible": { "type": "boolean" },
           "blocker_kind": { "type": "string", "enum": ["agent", "codeoff", "script", "test", "rr", "review"] },
           "blocker_job_id": { "type": "string", "pattern": "^([0-9a-f]{32}|unknown)$" }
+        }
+      },
+      "RunControlRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "route_version",
+          "launcher",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "route_version": {
+            "type": "string",
+            "enum": [
+              "normal-v1",
+              "availability-fallback-v1"
+            ]
+          },
+          "launcher": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "claude",
+              "grok"
+            ]
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "openai",
+              "anthropic",
+              "xai"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "enum": [
+              "gpt-5.6-sol",
+              "claude-opus-5",
+              "claude-sonnet-5",
+              "grok-4.6"
+            ]
+          }
+        }
+      },
+      "RunControlCost": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,4}|100000)(\\.[0-9]{1,12})?$"
+      },
+      "RunControlBudgets": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempts",
+          "turns",
+          "wall_seconds",
+          "tokens",
+          "provider_cost_usd"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "wall_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 86400
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "provider_cost_usd": {
+            "$ref": "#/components/schemas/RunControlCost"
+          }
+        }
+      },
+      "RunControlUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "turns",
+          "wall_seconds",
+          "tokens",
+          "provider_cost_usd"
+        ],
+        "properties": {
+          "turns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "wall_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 86400
+          },
+          "tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "provider_cost_usd": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RunControlCost"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "RunControlProgress": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "checkpoint",
+          "failing_regression_present",
+          "production_diff_bytes",
+          "focused_tests_green",
+          "diff_fingerprint"
+        ],
+        "properties": {
+          "checkpoint": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "failing_regression_present": {
+            "type": "boolean"
+          },
+          "production_diff_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000000
+          },
+          "focused_tests_green": {
+            "type": "boolean"
+          },
+          "diff_fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "RunControlAttempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sequence",
+          "attempt_id",
+          "route_version",
+          "launcher",
+          "provider",
+          "model",
+          "usage",
+          "reservation",
+          "terminal_state",
+          "progress",
+          "constraint_signals",
+          "verified_outcome"
+        ],
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "attempt_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+          },
+          "route_version": {
+            "type": "string",
+            "enum": [
+              "normal-v1",
+              "availability-fallback-v1"
+            ]
+          },
+          "launcher": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "claude",
+              "grok"
+            ]
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "openai",
+              "anthropic",
+              "xai"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "enum": [
+              "gpt-5.6-sol",
+              "claude-opus-5",
+              "claude-sonnet-5",
+              "grok-4.6"
+            ]
+          },
+          "usage": {
+            "$ref": "#/components/schemas/RunControlUsage"
+          },
+          "reservation": {
+            "$ref": "#/components/schemas/RunControlNextEnvelope"
+          },
+          "terminal_state": {
+            "type": "string",
+            "enum": [
+              "terminal",
+              "authority_lost"
+            ]
+          },
+          "progress": {
+            "$ref": "#/components/schemas/RunControlProgress"
+          },
+          "constraint_signals": {
+            "type": "array",
+            "maxItems": 9,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "test_deleted",
+                "test_moved",
+                "test_compressed",
+                "test_weakened",
+                "unrelated_docs_churn",
+                "unapproved_safety_limit_change",
+                "unapproved_size_limit_change",
+                "diff_size_manipulation",
+                "size_limit_conflict"
+              ]
+            }
+          },
+          "verified_outcome": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RunControlAggregate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempts_completed",
+          "turns",
+          "wall_seconds",
+          "tokens",
+          "provider_cost_usd",
+          "verified_outcomes"
+        ],
+        "properties": {
+          "attempts_completed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "turns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "wall_seconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "provider_cost_usd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^(0|[1-9][0-9]{0,5}|1000000)(\\.[0-9]{1,12})?$"
+          },
+          "verified_outcomes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          }
+        }
+      },
+      "RunControlLimits": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempts",
+          "turns",
+          "wall_seconds",
+          "tokens",
+          "provider_cost_usd"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "turns": {
+            "type": "integer"
+          },
+          "wall_seconds": {
+            "type": "integer"
+          },
+          "tokens": {
+            "type": "integer"
+          },
+          "provider_cost_usd": {
+            "$ref": "#/components/schemas/RunControlCost"
+          }
+        }
+      },
+      "RunControlConstraintGaming": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "detected",
+          "codes"
+        ],
+        "properties": {
+          "detected": {
+            "type": "boolean"
+          },
+          "codes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "test_deleted",
+                "test_moved",
+                "test_compressed",
+                "test_weakened",
+                "unrelated_docs_churn",
+                "unapproved_safety_limit_change",
+                "unapproved_size_limit_change",
+                "diff_size_manipulation"
+              ]
+            }
+          }
+        }
+      },
+      "RunControlRouteEligibility": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "eligible",
+          "verified_outcomes",
+          "attempts_per_verified_outcome",
+          "tokens_per_verified_outcome",
+          "provider_cost_per_verified_outcome_usd",
+          "reason_codes"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "verified-efficiency-v1"
+          },
+          "eligible": {
+            "type": "boolean"
+          },
+          "verified_outcomes": {
+            "type": "integer"
+          },
+          "attempts_per_verified_outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,12})?$"
+          },
+          "tokens_per_verified_outcome": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider_cost_per_verified_outcome_usd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,12})?$"
+          },
+          "reason_codes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "no_verified_outcome",
+                "no_progress",
+                "constraint_gaming"
+              ]
+            }
+          }
+        }
+      },
+      "RunControlNextEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt_id",
+          "turns",
+          "wall_seconds",
+          "tokens",
+          "provider_cost_usd"
+        ],
+        "properties": {
+          "attempt_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "wall_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 86400
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "provider_cost_usd": {
+            "$ref": "#/components/schemas/RunControlCost"
+          }
+        }
+      },
+      "RunControlRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "route",
+          "budgets",
+          "attempts",
+          "next_attempt",
+          "next_envelope"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+          },
+          "route": {
+            "$ref": "#/components/schemas/RunControlRoute"
+          },
+          "budgets": {
+            "$ref": "#/components/schemas/RunControlBudgets"
+          },
+          "attempts": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "$ref": "#/components/schemas/RunControlAttempt"
+            }
+          },
+          "next_attempt": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 11
+          },
+          "next_route": {
+            "$ref": "#/components/schemas/RunControlRoute"
+          },
+          "next_envelope": {
+            "$ref": "#/components/schemas/RunControlNextEnvelope"
+          }
+        }
+      },
+      "RunControlReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "decision",
+          "classification",
+          "retryable",
+          "aggregate",
+          "limits",
+          "projected",
+          "checkpoint",
+          "required_checkpoint",
+          "no_progress",
+          "loop_detected",
+          "constraint_gaming",
+          "same_model_continuations_used",
+          "evidence_codes",
+          "route_eligibility"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "run-control-v1"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "continue_same_model",
+              "handoff_cross_model",
+              "restructure",
+              "terminate"
+            ]
+          },
+          "classification": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "budget_exhausted",
+              "budget_exhausted_no_progress",
+              "size_limit_conflict",
+              "constraint_gaming",
+              "incomplete_usage_accounting",
+              "next_envelope_exceeds_remaining_budget",
+              null
+            ]
+          },
+          "retryable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "aggregate": {
+            "$ref": "#/components/schemas/RunControlAggregate"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/RunControlLimits"
+          },
+          "projected": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "attempts",
+              "turns",
+              "wall_seconds",
+              "tokens",
+              "provider_cost_usd"
+            ],
+            "properties": {
+              "attempts": {
+                "type": "integer"
+              },
+              "turns": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wall_seconds": {
+                "type": "integer"
+              },
+              "tokens": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "provider_cost_usd": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,12})?$"
+              }
+            }
+          },
+          "checkpoint": {
+            "type": "string",
+            "enum": [
+              "none",
+              "failing_regression",
+              "production_diff",
+              "focused_green"
+            ]
+          },
+          "required_checkpoint": {
+            "type": "string",
+            "enum": [
+              "none",
+              "failing_regression",
+              "production_diff",
+              "focused_green"
+            ]
+          },
+          "no_progress": {
+            "type": "boolean"
+          },
+          "loop_detected": {
+            "type": "boolean"
+          },
+          "constraint_gaming": {
+            "$ref": "#/components/schemas/RunControlConstraintGaming"
+          },
+          "same_model_continuations_used": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "evidence_codes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "attempts_exhausted",
+                "turns_exhausted",
+                "wall_seconds_exhausted",
+                "tokens_exhausted",
+                "provider_cost_exhausted",
+                "materially_unchanged_diff",
+                "failing_regression_checkpoint_missed",
+                "production_diff_checkpoint_missed",
+                "focused_green_checkpoint_missed",
+                "constraint_gaming_detected",
+                "split_or_approve_limit_change",
+                "same_model_continuation_exhausted",
+                "turns_unknown",
+                "tokens_unknown",
+                "provider_cost_unknown",
+                "attempts_reservation_exceeds_remaining",
+                "turns_reservation_exceeds_remaining",
+                "wall_seconds_reservation_exceeds_remaining",
+                "tokens_reservation_exceeds_remaining",
+                "provider_cost_reservation_exceeds_remaining"
+              ]
+            }
+          },
+          "route_eligibility": {
+            "$ref": "#/components/schemas/RunControlRouteEligibility"
+          }
         }
       }
     },

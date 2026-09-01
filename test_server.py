@@ -14941,7 +14941,7 @@ func main() {
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
-    _NATIVE_ROUTE_PREREQ_COMMIT = "543ef8ee9260b250a936958f82639618196158e1"
+    _NATIVE_ROUTE_PREREQ_COMMIT = "e44e5d49dda2db1557aa0ec55f4a674689dc3dcd"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
