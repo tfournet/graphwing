@@ -9247,11 +9247,86 @@ while True:
             self.assertEqual(status, 400, payload)
             self.assertEqual(payload["code"], "primary_receipt_mismatch")
 
+    @staticmethod
+    def _hard_coded_full_route_ledger() -> tuple[dict, dict]:
+        def profile(version, role, launcher, provider, model, effort):
+            return {
+                "version": "route-execution-profile-v1", "route_version": version,
+                "role": role, "work_kind": "go_coding", "class": "sensitive",
+                "size": "M", "launcher": launcher, "provider": provider,
+                "model": model, "effort": effort,
+            }
+
+        primary = {
+            "ok": True, "route_version": "normal-v1", "class": "sensitive",
+            "work_kind": "go_coding", "size": "M", "size_floor": "M",
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "effort": "high", "max_turns": 30, "run_budget_seconds": 600,
+            "reason": "work_kind=go_coding", "review": "claude-sonnet-5_grok-4.6",
+            "writer_execution_profile": profile(
+                "normal-v1", "writer", "codex", "openai", "gpt-5.6-sol", "high"
+            ),
+            "reviewer1": "claude-sonnet-5", "reviewer1_launcher": "claude",
+            "reviewer1_provider": "anthropic", "reviewer1_model": "claude-sonnet-5",
+            "reviewer1_effort": "high",
+            "reviewer1_reason": "different_provider_from_writer",
+            "reviewer1_execution_profile": profile(
+                "normal-v1", "reviewer1", "claude", "anthropic", "claude-sonnet-5", "high"
+            ),
+            "reviewer2": "grok-4.6", "reviewer2_launcher": "grok",
+            "reviewer2_provider": "xai", "reviewer2_model": "grok-4.6",
+            "reviewer2_effort": "high",
+            "reviewer2_reason": "different_provider_from_writer_and_reviewer1",
+            "reviewer2_execution_profile": profile(
+                "normal-v1", "reviewer2", "grok", "xai", "grok-4.6", "high"
+            ),
+        }
+        fallback = {
+            "ok": True, "route_version": "availability-fallback-v1",
+            "class": "sensitive", "work_kind": "go_coding", "size": "M",
+            "size_floor": "M", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-opus-5", "effort": "default", "max_turns": 30,
+            "run_budget_seconds": 600,
+            "reason": "availability_fallback:provider_network",
+            "review": "grok-4.6_gpt-5.6-sol",
+            "writer_execution_profile": profile(
+                "availability-fallback-v1", "writer", "claude", "anthropic",
+                "claude-opus-5", "default"
+            ),
+            "reviewer1": "grok-4.6", "reviewer1_launcher": "grok",
+            "reviewer1_provider": "xai", "reviewer1_model": "grok-4.6",
+            "reviewer1_effort": "high",
+            "reviewer1_reason": "different_provider_from_writer",
+            "reviewer1_execution_profile": profile(
+                "availability-fallback-v1", "reviewer1", "grok", "xai",
+                "grok-4.6", "high"
+            ),
+            "reviewer2": "gpt-5.6-sol", "reviewer2_launcher": "codex",
+            "reviewer2_provider": "openai", "reviewer2_model": "gpt-5.6-sol",
+            "reviewer2_effort": "high",
+            "reviewer2_reason": "different_provider_from_writer_and_reviewer1",
+            "reviewer2_execution_profile": profile(
+                "availability-fallback-v1", "reviewer2", "codex", "openai",
+                "gpt-5.6-sol", "high"
+            ),
+            "role": "availability_fallback", "primary_route_version": "normal-v1",
+            "primary_reason": "work_kind=go_coding",
+            "fallback_reason": "availability_fallback:provider_network",
+            "fallback_code": "provider_network",
+            "selected_alternate_route": {
+                "route_version": "availability-fallback-v1", "launcher": "claude",
+                "provider": "anthropic", "model": "claude-opus-5",
+                "effort": "default", "reason": "availability_fallback:provider_network",
+            },
+        }
+        return primary, fallback
+
     def _provider_recovery_fixture(
         self,
         jobs: Path,
         failure_code: str = "missing_binary",
         *,
+        route_ledger: tuple[dict, dict] | None = None,
         primary_job_id: str = "1" * 32,
         primary_starting_head: str | None = None,
         primary_created_at: str = "2026-08-26T12:00:00Z",
@@ -9264,34 +9339,37 @@ while True:
         fresh_primary: bool = False,
         fresh_created_at: str = "2026-08-26T12:02:00Z",
     ) -> dict:
-        primary_route = server.slice_route_lookup(
-            "mechanical", "M", work_kind="go_coding"
-        )
-        fallback_route = server.build_slice_route(
-            "mechanical",
-            "M",
-            None,
-            None,
-            "go_coding",
-            server.AVAILABILITY_FALLBACK_WRITER_ROUTES["go_coding"],
-            server.FALLBACK_ROUTE_VERSION,
-            f"availability_fallback:{failure_code}",
-            "openai",
-        )
-        selected = {
-            key: fallback_route[key]
-            for key in ("route_version", "launcher", "provider", "model", "effort", "reason")
-        }
-        fallback_route.update(
-            {
-                "role": "availability_fallback",
-                "primary_route_version": "normal-v1",
-                "primary_reason": "work_kind=go_coding",
-                "fallback_reason": f"availability_fallback:{failure_code}",
-                "fallback_code": failure_code,
-                "selected_alternate_route": selected,
+        if route_ledger is None:
+            primary_route = server.slice_route_lookup(
+                "mechanical", "M", work_kind="go_coding"
+            )
+            fallback_route = server.build_slice_route(
+                "mechanical",
+                "M",
+                None,
+                None,
+                "go_coding",
+                server.AVAILABILITY_FALLBACK_WRITER_ROUTES["go_coding"],
+                server.FALLBACK_ROUTE_VERSION,
+                f"availability_fallback:{failure_code}",
+                "openai",
+            )
+            selected = {
+                key: fallback_route[key]
+                for key in ("route_version", "launcher", "provider", "model", "effort", "reason")
             }
-        )
+            fallback_route.update(
+                {
+                    "role": "availability_fallback",
+                    "primary_route_version": "normal-v1",
+                    "primary_reason": "work_kind=go_coding",
+                    "fallback_reason": f"availability_fallback:{failure_code}",
+                    "fallback_code": failure_code,
+                    "selected_alternate_route": selected,
+                }
+            )
+        else:
+            primary_route, fallback_route = deepcopy(route_ledger)
 
         initial_head = "a" * 40
 
@@ -9392,9 +9470,9 @@ while True:
             }
         )
         body = {
-            "class": "mechanical",
-            "size": "M",
-            "work_kind": "go_coding",
+            "class": primary_route["class"],
+            "size": primary_route["size"],
+            "work_kind": primary_route["work_kind"],
             "primary_route": primary_route,
             "primary_receipt": primary_receipt,
             "fallback_route": fallback_route,
@@ -9906,28 +9984,28 @@ while True:
         )["spec"]
         nodes = {node["id"]: node for node in graph["nodes"]}
         expected_effort = {
-            "agent": "{{ CTX.selected_route.effort }}",
-            "agent_fallback": "{{ CTX.fallback_route_choice.effort }}",
+            "agent": "{{ CTX.selected_route.result.effort }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.result.effort }}",
             "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
             "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
             "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
             "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
-            "review1": "{{ CTX.active_route.reviewer1_effort }}",
-            "review1b": "{{ CTX.active_route.reviewer1_effort }}",
-            "review2": "{{ CTX.active_route.reviewer2_effort }}",
-            "review2b": "{{ CTX.active_route.reviewer2_effort }}",
+            "review1": "{{ CTX.active_route.result.reviewer1_effort }}",
+            "review1b": "{{ CTX.active_route.result.reviewer1_effort }}",
+            "review2": "{{ CTX.active_route.result.reviewer2_effort }}",
+            "review2b": "{{ CTX.active_route.result.reviewer2_effort }}",
         }
         expected_profile = {
-            "agent": "{{ CTX.selected_route.writer_execution_profile }}",
-            "agent_fallback": "{{ CTX.fallback_route_choice.writer_execution_profile }}",
+            "agent": "{{ CTX.selected_route.result.writer_execution_profile }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.result.writer_execution_profile }}",
             "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
             "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
             "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
             "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
-            "review1": "{{ CTX.active_route.reviewer1_execution_profile }}",
-            "review1b": "{{ CTX.active_route.reviewer1_execution_profile }}",
-            "review2": "{{ CTX.active_route.reviewer2_execution_profile }}",
-            "review2b": "{{ CTX.active_route.reviewer2_execution_profile }}",
+            "review1": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
+            "review1b": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
+            "review2": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
+            "review2b": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
         }
         actual_model_nodes = {
             node_id for node_id, node in nodes.items()
@@ -9947,7 +10025,7 @@ while True:
             nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.route.data",
         )
-        self.assertEqual(nodes["selected_route"]["type"], "transforms.objectBuilder")
+        self.assertEqual(nodes["selected_route"]["type"], "transforms.lookupTable")
         self.assertEqual(
             nodes["selected_route_pick"]["config"]["defaultValue"],
             {"kind": "getField", "path": "CTX.normal_primary_candidate.route"},
@@ -9956,7 +10034,7 @@ while True:
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.fallback_route.data",
         )
-        self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
+        self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.lookupTable")
         self.assertEqual(
             nodes["fallback_route_choice_pick"]["config"]["defaultValue"],
             {"kind": "getField", "path": "CTX.recovery_selection.route"},
@@ -12360,28 +12438,28 @@ func main() {
             "implement-slice.json": {
                 "route_nodes": {"route", "fallback_route", "recovery_route"},
                 "consumers": {
-                    "agent": "{{ CTX.selected_route.effort }}",
-                    "agent_fallback": "{{ CTX.fallback_route_choice.effort }}",
+                    "agent": "{{ CTX.selected_route.result.effort }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.result.effort }}",
                     "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
                     "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
                     "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
                     "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
-                    "review1": "{{ CTX.active_route.reviewer1_effort }}",
-                    "review1b": "{{ CTX.active_route.reviewer1_effort }}",
-                    "review2": "{{ CTX.active_route.reviewer2_effort }}",
-                    "review2b": "{{ CTX.active_route.reviewer2_effort }}",
+                    "review1": "{{ CTX.active_route.result.reviewer1_effort }}",
+                    "review1b": "{{ CTX.active_route.result.reviewer1_effort }}",
+                    "review2": "{{ CTX.active_route.result.reviewer2_effort }}",
+                    "review2b": "{{ CTX.active_route.result.reviewer2_effort }}",
                 },
                 "profiles": {
-                    "agent": "{{ CTX.selected_route.writer_execution_profile }}",
-                    "agent_fallback": "{{ CTX.fallback_route_choice.writer_execution_profile }}",
+                    "agent": "{{ CTX.selected_route.result.writer_execution_profile }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.result.writer_execution_profile }}",
                     "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
                     "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
                     "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
                     "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
-                    "review1": "{{ CTX.active_route.reviewer1_execution_profile }}",
-                    "review1b": "{{ CTX.active_route.reviewer1_execution_profile }}",
-                    "review2": "{{ CTX.active_route.reviewer2_execution_profile }}",
-                    "review2b": "{{ CTX.active_route.reviewer2_execution_profile }}",
+                    "review1": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
+                    "review1b": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
+                    "review2": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
+                    "review2b": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
                 },
             },
             "pr-drive.json": {
@@ -12789,7 +12867,7 @@ func main() {
         self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), triples)
         self.assertNotIn("session_identity", nodes["agent_fallback"]["config"])
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
+            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.result.{field} }}}}")
 
     def test_implement_slice_route_materialization_is_native_and_exactly_wired(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -12809,11 +12887,11 @@ func main() {
         self.assertEqual(
             {node_id: nodes[node_id]["type"] for node_id in replaced},
             {
-                "fallback_route_choice": "transforms.objectBuilder",
-                "selected_route": "transforms.objectBuilder",
+                "fallback_route_choice": "transforms.lookupTable",
+                "selected_route": "transforms.lookupTable",
                 "walk_recovery_input": "transforms.lookupTable",
                 "walk_e2e_recovery_input": "transforms.lookupTable",
-                "active_route": "transforms.objectBuilder",
+                "active_route": "transforms.lookupTable",
             },
         )
         self.assertEqual(
@@ -12912,150 +12990,136 @@ func main() {
             ):
                 self.assertEqual(nodes[walk_id]["config"][field], f"{{{{ CTX.{alias}.result.{field} }}}}")
 
-    def test_implement_slice_native_route_materialization_preserves_legacy_fallback_semantics(self):
+    def test_implement_slice_full_route_projection_reaches_server_recovery_validation(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
-        self.assertTrue({
-            "selected_route_pick", "fallback_route_choice_pick",
-            "active_route_pick", "continuation_primary_pick",
-        }.issubset(nodes), "native selection helpers are missing")
-        missing = object()
+        primary, fallback = self._hard_coded_full_route_ledger()
 
         def get_path(context, path):
             current = context
             for part in path.split("."):
-                if not isinstance(current, dict) or part not in current:
-                    return missing
-                current = current[part]
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(part)
             return current
 
         def evaluate(expression, context):
             if expression["kind"] == "getField":
                 return get_path(context, expression["path"])
             if expression["kind"] == "literal":
-                return expression["value"]
+                return deepcopy(expression["value"])
             if expression["kind"] == "object":
                 return {
                     key: evaluate(value, context)
                     for key, value in expression["properties"].items()
                 }
-            self.fail(f"unsupported fixture AST: {expression}")
+            self.fail(f"unsupported graph-projection AST: {expression}")
 
         def run_node(node_id, context):
             node = nodes[node_id]
+            config = node["config"]
             if node["type"] == "transforms.lookupTable":
-                config = node["config"]
+                key = evaluate(config["input"], context)
                 selected = next(
-                    (entry["value"] for entry in config["entries"]
-                     if evaluate(config["input"], context) == entry["key"]),
+                    (entry["value"] for entry in config["entries"] if entry["key"] == key),
                     config["defaultValue"],
                 )
                 result = evaluate(selected, context)
-                context.setdefault("CTX", {})[config["alias"]] = {"result": result}
+                context["CTX"][config["alias"]] = {"result": result}
                 return result
             if node["type"] == "transforms.objectBuilder":
                 result = {
                     mapping["output"]: evaluate(mapping["expression"], context)
-                    for mapping in node["config"]["mappings"]
+                    for mapping in config["mappings"]
                 }
-                context.setdefault("CTX", {})[node["config"]["alias"]] = result
+                context["CTX"][config["alias"]] = result
                 return result
-            self.fail(f"unsupported fixture node: {node}")
+            self.fail(f"unsupported graph-projection node: {node_id}")
 
-        primary = {
-            "route_version": "normal-v1", "class": "mechanical", "work_kind": "go_coding",
-            "effective_size": "M", "launcher": "codex", "provider": "openai",
-            "model": "gpt-5.6-sol", "effort": "high", "max_turns": 40,
-            "run_budget_seconds": 600, "writer_execution_profile": {"role": "writer"},
-            "reviewer1_effort": "medium", "reviewer1_execution_profile": {"role": "reviewer1"},
-            "reviewer1_launcher": "claude", "reviewer1_provider": "anthropic",
-            "reviewer1_model": "claude-opus-5", "reviewer2_effort": "none",
-            "reviewer2_execution_profile": None, "reviewer2_launcher": "none",
-            "reviewer2_provider": "none", "reviewer2_model": "none",
-        }
-        recovered_primary = {**primary, "model": "gpt-5.6-sol-recovered"}
-        normal_fallback = {
-            **primary, "route_version": "availability-fallback-v1", "launcher": "claude",
-            "provider": "anthropic", "model": "claude-opus-5", "effort": "default",
-        }
-        retained_fallback = {**normal_fallback, "model": "claude-opus-5-retained"}
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs"
+            fixture = self._provider_recovery_fixture(
+                jobs, "provider_network", route_ledger=(primary, fallback)
+            )
+            primary_callback = {
+                **fixture["primary_receipt"], "summary": "primary unavailable",
+                "sha": "a" * 40, "usage": None,
+                "usage_diagnostic": "usage_not_reported",
+            }
+            fallback_callback = {
+                **fixture["fallback_receipt"], "summary": "fallback completed",
+                "sha": "b" * 40, "usage": None,
+                "usage_diagnostic": "usage_not_reported",
+            }
+            context = {
+                "CTX": {
+                    "INPUT": {},
+                    "normal_primary_candidate": {"route": deepcopy(primary)},
+                    "normal_fallback_candidate": {"route": deepcopy(fallback)},
+                },
+                "TASKS": {
+                    "git": {"repo": "scratch", "branch": "main"},
+                    "wait": {"request": {"body": primary_callback}},
+                    "wait_fallback": {"request": {"body": fallback_callback}},
+                },
+            }
 
-        cases = (
-            ("selected_route_pick", "selected_route", {
-                "CTX": {"normal_primary_candidate": {"route": primary}},
-            }, primary),
-            ("selected_route_pick", "selected_route", {"CTX": {
-                "normal_primary_candidate": {"route": primary},
-                "recovery_selection": {"route": recovered_primary},
-            }}, recovered_primary),
-            # Legacy default() gave a newly computed fallback priority even when
-            # recovery evidence was also present. This catches marker-based picks.
-            ("fallback_route_choice_pick", "fallback_route_choice", {"CTX": {
-                "normal_fallback_candidate": {"route": normal_fallback},
-                "recovery_selection": {"route": recovered_primary},
-            }}, normal_fallback),
-            ("fallback_route_choice_pick", "fallback_route_choice", {"CTX": {
-                "recovery_selection": {"route": retained_fallback},
-            }}, retained_fallback),
-            ("active_route_pick", "active_route", {"CTX": {
-                "receipt": {"route": primary},
-            }}, primary),
-            ("active_route_pick", "active_route", {"CTX": {
-                "receipt": {"route": primary},
-                "fallback_receipt": {"status": "ok", "route": normal_fallback},
-            }}, normal_fallback),
-        )
-        for picker, builder, context, expected in cases:
-            with self.subTest(picker=picker, expected=expected["model"]):
-                run_node(picker, context)
-                materialized = run_node(builder, context)
-                self.assertEqual(
-                    materialized,
-                    {field: expected[field] for field in materialized},
-                )
+            run_node("selected_route_pick", context)
+            self.assertEqual(run_node("selected_route", context), primary)
+            receipt = run_node("record", context)
+            self.assertEqual(receipt["route"], primary)
+            run_node("fallback_route_choice_pick", context)
+            self.assertEqual(run_node("fallback_route_choice", context), fallback)
+            fallback_receipt = run_node("record_fallback", context)
+            self.assertEqual(fallback_receipt["route"], fallback)
+            run_node("active_route_pick", context)
+            self.assertEqual(run_node("active_route", context), fallback)
+            run_node("continuation_primary_pick", context)
 
-        prior_receipt = {"status": "error", "job_id": "primary-now", "route": primary}
-        prior_input_receipt = {"status": "error", "job_id": "primary-before", "route": recovered_primary}
-        fallback_receipt = {"status": "ok", "job_id": "fallback", "route": normal_fallback}
-        expected_blank = {
-            "recovery_version": "", "prior_primary_route": "", "prior_primary_receipt": "",
-            "prior_fallback_route": "", "prior_fallback_receipt": "", "fresh_primary_receipt": "",
-        }
-        for walk_picker in ("walk_recovery_input", "walk_e2e_recovery_input"):
-            with self.subTest(walk_picker=walk_picker, source="current-primary"):
-                context = {"CTX": {
-                    "INPUT": {"prior_primary_route": recovered_primary,
-                              "prior_primary_receipt": prior_input_receipt},
-                    "receipt": prior_receipt, "fallback_receipt": fallback_receipt,
-                }}
-                run_node("continuation_primary_pick", context)
-                self.assertEqual(run_node(walk_picker, context), {
-                    "recovery_version": "provider-recovery-v1",
-                    "prior_primary_route": primary, "prior_primary_receipt": prior_receipt,
-                    "prior_fallback_route": normal_fallback,
-                    "prior_fallback_receipt": fallback_receipt, "fresh_primary_receipt": "",
-                })
-            with self.subTest(walk_picker=walk_picker, source="prior-invocation"):
-                context = {"CTX": {
-                    "INPUT": {"prior_primary_route": recovered_primary,
-                              "prior_primary_receipt": prior_input_receipt},
-                    "fallback_receipt": fallback_receipt,
-                }}
-                run_node("continuation_primary_pick", context)
-                self.assertEqual(run_node(walk_picker, context), {
-                    "recovery_version": "provider-recovery-v1",
-                    "prior_primary_route": recovered_primary,
-                    "prior_primary_receipt": prior_input_receipt,
-                    "prior_fallback_route": normal_fallback,
-                    "prior_fallback_receipt": fallback_receipt, "fresh_primary_receipt": "",
-                })
-            with self.subTest(walk_picker=walk_picker, source="no-fallback"):
-                context = {"CTX": {"INPUT": {}, "receipt": prior_receipt}}
-                run_node("continuation_primary_pick", context)
-                self.assertEqual(run_node(walk_picker, context), expected_blank)
+            projected = []
+            for walk_node in ("walk_recovery_input", "walk_e2e_recovery_input"):
+                recovery = run_node(walk_node, context)
+                self.assertEqual(recovery["prior_primary_route"], primary)
+                self.assertEqual(recovery["prior_primary_receipt"]["route"], primary)
+                self.assertEqual(recovery["prior_fallback_route"], fallback)
+                self.assertEqual(recovery["prior_fallback_receipt"]["route"], fallback)
+                projected.append(recovery)
+            self.assertEqual(projected[0], projected[1])
 
-        for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
+            recovery = projected[0]
+            recovery_body = {
+                "class": "sensitive", "size": "M", "work_kind": "go_coding",
+                "primary_route": recovery["prior_primary_route"],
+                "primary_receipt": recovery["prior_primary_receipt"],
+                "fallback_route": recovery["prior_fallback_route"],
+                "fallback_receipt": recovery["prior_fallback_receipt"],
+            }
+            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(
+                server, "resolve_launcher_binary_now",
+                side_effect=AssertionError("remote recovery cannot inspect binaries"),
+            ):
+                status, accepted = server.derive_slice_recovery_route(recovery_body)
+            self.assertEqual(status, 200, accepted)
+            self.assertEqual(accepted["selected_route"], fallback)
+            self.assertEqual(accepted["decision"], "fallback_retained")
+
+            mutation_probes = (
+                ("primary_route", "primary_receipt", "route_version"),
+                ("fallback_route", "fallback_receipt", "reviewer1_execution_profile"),
+                ("fallback_route", "fallback_receipt", "reviewer2_provider"),
+            )
+            for route_key, receipt_key, omitted in mutation_probes:
+                with self.subTest(omitted=omitted):
+                    mutated = deepcopy(recovery_body)
+                    mutated[route_key].pop(omitted)
+                    mutated[receipt_key]["route"].pop(omitted, None)
+                    with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(
+                        server, "resolve_launcher_binary_now",
+                        side_effect=AssertionError("remote recovery cannot inspect binaries"),
+                    ):
+                        rejected_status, rejected = server.derive_slice_recovery_route(mutated)
+                    self.assertEqual(rejected_status, 400, rejected)
+                    self.assertEqual(rejected.get("code"), "recovery_evidence_mismatch", rejected)
 
     def test_implement_slice_recovery_is_only_a_later_initial_boundary(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -13200,13 +13264,13 @@ func main() {
         ):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                self.assertEqual(value, f"{{{{ CTX.active_route.{slot}_{field} }}}}")
+                self.assertEqual(value, f"{{{{ CTX.active_route.result.{slot}_{field} }}}}")
                 self.assertNotIn("TASKS.", value)
 
         for node_id, ordinary in (("agent", "route"), ("agent_fallback", "fallback_route")):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                expected = "CTX.selected_route" if node_id == "agent" else "CTX.fallback_route_choice"
+                expected = "CTX.selected_route.result" if node_id == "agent" else "CTX.fallback_route_choice.result"
                 self.assertEqual(value, f"{{{{ {expected}.{field} }}}}")
             self.assertNotIn("session_identity", nodes[node_id]["config"])
             self.assertNotIn("resume_job_id", nodes[node_id]["config"])
@@ -13247,12 +13311,12 @@ func main() {
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
             for field in ("max_turns", "run_budget_seconds"):
-                expected = f"{{{{ CTX.receipt2.route.{field} }}}}" if node_id == "agent3" else f"{{{{ CTX.active_route.{field} }}}}"
+                expected = f"{{{{ CTX.receipt2.route.{field} }}}}" if node_id == "agent3" else f"{{{{ CTX.active_route.result.{field} }}}}"
                 self.assertEqual(cfg[field], expected)
         for node_id, slot in (("review1", "reviewer1"), ("review1b", "reviewer1"), ("review2", "reviewer2"), ("review2b", "reviewer2")):
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
-                self.assertEqual(cfg[field], f"{{{{ CTX.active_route.{slot}_{field} }}}}")
+                self.assertEqual(cfg[field], f"{{{{ CTX.active_route.result.{slot}_{field} }}}}")
         for node_id, receipts in correction_receipts.items():
             cfg = nodes[node_id]["config"]
             for receipt in receipts:
@@ -13552,18 +13616,18 @@ func main() {
             slot = "reviewer1" if suffix.startswith("1") else "reviewer2"
             config = node["config"]
             self.assertNotIn("reviewer", config)
-            self.assertIn(f"CTX.active_route.{slot}_launcher", config["launcher"])
-            self.assertIn(f"CTX.active_route.{slot}_launcher", config["launcher"])
-            self.assertIn(f"CTX.active_route.{slot}_provider", config["provider"])
-            self.assertIn(f"CTX.active_route.{slot}_provider", config["provider"])
-            self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
-            self.assertIn(f"CTX.active_route.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.result.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.result.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.result.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.result.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.result.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.result.{slot}_model", config["model"])
         for index in (1, 2):
             field = f"reviewer{index}_launcher"
             mapping = nodes[f"map_switch_rev{'' if index == 1 else index}"]["config"]["mappings"]
             self.assertEqual(mapping, [{
                 "id": "m1", "output": field,
-                "expression": {"kind": "getField", "path": f"CTX.active_route.{field}"},
+                "expression": {"kind": "getField", "path": f"CTX.active_route.result.{field}"},
             }])
             switch = nodes[f"switch_rev{'' if index == 1 else index}"]["config"]
             self.assertEqual(switch["cases"][0]["rules"], [
@@ -13588,14 +13652,14 @@ func main() {
         implement = json.loads((root / "implement-slice.json").read_text())
         implement_nodes = {n["id"]: n for n in implement["spec"]["nodes"]}
         mappings = {m["output"]: m["expression"] for m in implement_nodes["record"]["config"]["mappings"]}
-        self.assertEqual(mappings["route"], {"kind": "getField", "path": "CTX.selected_route"})
+        self.assertEqual(mappings["route"], {"kind": "getField", "path": "CTX.selected_route.result"})
         retry_mappings = {
             m["output"]: m["expression"] for m in implement_nodes["record2"]["config"]["mappings"]
         }
-        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "CTX.active_route"})
+        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "CTX.active_route.result"})
         self.assertEqual(
             retry_mappings["fallback_route"],
-            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+            {"kind": "getField", "path": "CTX.fallback_route_choice.result"},
         )
         fallback_mappings = {
             m["output"]: m["expression"]
@@ -13603,7 +13667,7 @@ func main() {
         }
         self.assertEqual(
             fallback_mappings["route"],
-            {"kind": "getField", "path": "CTX.fallback_route_choice"},
+            {"kind": "getField", "path": "CTX.fallback_route_choice.result"},
         )
         done_mappings = {
             m["output"]: m["expression"]
@@ -14877,6 +14941,7 @@ func main() {
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
+    _NATIVE_ROUTE_PREREQ_COMMIT = "543ef8ee9260b250a936958f82639618196158e1"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
@@ -15174,7 +15239,7 @@ func main() {
         landed = self._candidate_diff_bytes(
             self._PHASE6_BASE_COMMIT, self._PHASE6_LANDED_COMMIT
         )
-        followup = self._candidate_diff_bytes(self._PHASE6_LANDED_COMMIT)
+        followup = self._candidate_diff_bytes(self._NATIVE_ROUTE_PREREQ_COMMIT)
         if landed is None or followup is None:
             self.skipTest("phase 6 review boundaries are not reachable from this checkout")
         self.assertGreater(landed, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
@@ -16873,7 +16938,7 @@ func main() {
         self.assertEqual(edges["e_rn2_out"]["target"], "record_rn2")
         self.assertEqual(edges["e31c"]["target"], "record3")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
-        self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.launcher }}")
+        self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.result.launcher }}")
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
         self.assertIn("CTX.fallback_receipt.session_identity.launcher", agent2["config"]["launcher"])
         self.assertIn("CTX.receipt.session_identity.launcher", agent2["config"]["launcher"])
@@ -20629,7 +20694,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "64891b9cb894a3133373ac04324e1fcac0c3244351b041f7a206ea4de04476a8")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "0ce08ba2f8dae852d3261188b6619d756fe2c533bfab4c763ccfb411653b03cd")
 
 
 class InstallTests(unittest.TestCase):
