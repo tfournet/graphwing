@@ -1522,7 +1522,18 @@
           "max_attempts": { "type": "integer" },
           "auto_merge": { "type": "boolean" },
           "kick_url": { "type": "string", "description": "https Rewst webhook for the next attempt" },
-          "kick_token": { "type": "string" }
+          "kick_token": { "type": "string" },
+          "run_control": { "$ref": "#/components/schemas/PrContinueRunControl" }
+        }
+      },
+      "PrContinueRunControl": {
+        "type": "object", "additionalProperties": false,
+        "description": "Closed run-control continuity forwarded verbatim to the kicked run as CTX.INPUT.run_control; authorization_id must be rca1-<run hex>-<attempt hex>",
+        "required": ["run_control_id", "attempt_id", "authorization_id"],
+        "properties": {
+          "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},
+          "attempt_id": {"$ref": "#/components/schemas/RunControlAttemptId"},
+          "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"}
         }
       },
       "RouteExecutionProfile": {

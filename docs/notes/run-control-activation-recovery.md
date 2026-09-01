@@ -56,3 +56,11 @@ attempt continuity: `run_control_id`, attempt identity, and prior reservation
 reference, validated and echoed so run N+1 receives them as `CTX.INPUT`. Server
 and `test_server.py` only, no graph edits, no launch wiring. Estimate ≤100 lines
 including tests.
+
+Landed on `feature/run-control-activation`: `/v1/pr/continue` accepts an optional
+closed `run_control` object (`run_control_id` rc1-hex, `attempt_id` att1-hex,
+`authorization_id` rca1-<run hex>-<attempt hex>, all three required and
+agreeing) and forwards it verbatim in the kick payload as `CTX.INPUT.run_control`.
+Omitting it leaves the kick payload unchanged. Next milestone: run N+1 settles
+that reservation from its live `wait` webhook body, then authority-loss
+reconciliation for a kick that never starts.
