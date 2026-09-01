@@ -12,6 +12,7 @@ import json
 import re
 import threading
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 
@@ -37,13 +38,46 @@ def _deep(value: Any) -> Any:
 
 
 class DurableRunControlModel:
-    """Thread-safe executable oracle for the native KV/Records state machine."""
+    """Provider-free executor grounded in the published native graph contracts.
 
-    def __init__(self) -> None:
+    Records upsert remains deliberately unconditional here; safety comes from the
+    graph's pointer journal, exact existing-byte check, and mandatory readback.
+    """
+
+    def __init__(self, graph_root: Path | None = None) -> None:
         self.pointer: dict[str, Any] | None = None
         self.pointer_version = 0
         self.records: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self.production_contract: dict[str, Any] = {}
+        if graph_root is not None:
+            required = {
+                "transition.target_upsert": ("run-control-transition", "target_upsert"),
+                "transition.prepare_cas": ("run-control-transition", "prepare_cas"),
+                "state.evaluate": ("run-control-state", "evaluate"),
+            }
+            loaded: dict[str, dict[str, Any]] = {}
+            for graph_name in {
+                "run-control-initialize", "run-control-state", "run-control-transition",
+                "run-control-reconcile", "run-control-consume",
+                "run-control-consume-authorization",
+            }:
+                path = graph_root / f"{graph_name}.json"
+                loaded[graph_name] = json.loads(path.read_text(encoding="utf-8"))
+            for label, (graph_name, node_id) in required.items():
+                graph_nodes = {node["id"]: node for node in loaded[graph_name]["spec"]["nodes"]}
+                if node_id not in graph_nodes:
+                    raise ValueError(f"production graph missing {graph_name}:{node_id}")
+                self.production_contract[label] = graph_nodes[node_id]["type"]
+            all_nodes = [node for value in loaded.values() for node in value["spec"]["nodes"]]
+            self.production_contract["all_dormant"] = all(
+                value["spec"]["meta"].get("dormant") is True for value in loaded.values()
+            )
+            self.production_contract["no_launch_nodes"] = not any(
+                node["type"].startswith(("action.graphwing.POST:/v1/agent",
+                                         "action.graphwing.POST:/v1/review"))
+                for node in all_nodes
+            )
 
     @staticmethod
     def _validate_budgets(budgets: Any) -> dict[str, Any]:
@@ -294,15 +328,40 @@ class DurableRunControlModel:
                     "launch_descriptor_sha256": descriptor_hash}
 
     def mark_authorization_consumed(self, challenge: str, consumed_version: int,
-                                    consumed_value_sha256: str) -> dict[str, Any]:
+                                    consumed_value_sha256: str, *,
+                                    authorization_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             state = self.load_verified()
             reservation = state.get("outstanding_reservation")
-            if not isinstance(reservation, dict) or reservation.get("phase") != "reserved":
+            if not isinstance(reservation, dict):
                 raise RunControlConflict("no reserved authorization")
             descriptor = reservation["launch_descriptor"]
+            expected_authorization_id = descriptor.get("authorization_id")
+            supplied_authorization_id = authorization_id or expected_authorization_id
+            evidence_hash = _sha({"authorization_id": supplied_authorization_id,
+                                  "challenge": challenge,
+                                  "consumed_version": consumed_version,
+                                  "consumed_value_sha256": consumed_value_sha256})
+            if supplied_authorization_id != expected_authorization_id:
+                self._persist_fence(state, "authorization_id_drift", evidence_hash)
+                raise RunControlConflict("authorization id mismatch")
+            if reservation.get("phase") == "authorization_consumed":
+                existing = reservation.get("authorization")
+                expected = {
+                    "authorization_id": expected_authorization_id,
+                    "challenge": challenge, "consumed_kv_version": consumed_version,
+                    "consumed_value_sha256": consumed_value_sha256,
+                }
+                if existing == expected:
+                    return {"consumed": False, "attempt_id": reservation["attempt_id"]}
+                self._persist_fence(state, "authorization_consumption_drift", evidence_hash)
+                raise RunControlConflict("authorization consumption mismatch")
+            if reservation.get("phase") != "reserved":
+                self._persist_fence(state, "authorization_state_drift", evidence_hash)
+                raise RunControlConflict("authorization state mismatch")
             if (challenge != descriptor.get("server_instance_challenge")
                     or consumed_version != 2 or not _HEX.fullmatch(consumed_value_sha256)):
+                self._persist_fence(state, "authorization_consumption_drift", evidence_hash)
                 raise RunControlConflict("authorization consumption mismatch")
             request_hash = _sha({"attempt_id": reservation["attempt_id"],
                                  "challenge": challenge,
@@ -334,6 +393,9 @@ class DurableRunControlModel:
                     "launch_descriptor_sha256", "job_id", "terminal_status", "route",
                     "usage", "progress", "constraint_signals", "verified_outcome"}
         if not isinstance(receipt, dict) or set(receipt) != required:
+            with self._lock:
+                if self.load_verified().get("outstanding_reservation") is not None:
+                    return self.reconcile_authority_loss("malformed_terminal_receipt")
             raise ValueError("terminal receipt must be closed")
         receipt_hash = _sha(receipt)
         with self._lock:
@@ -359,25 +421,33 @@ class DurableRunControlModel:
                 "route": reservation["route"],
             }
             if any(receipt.get(key) != value for key, value in bindings.items()):
+                self._persist_fence(state, "receipt_binding_mismatch", receipt_hash)
                 raise RunControlConflict("receipt binding mismatch")
             if receipt["terminal_status"] not in {"succeeded", "failed", "cancelled", "timed_out"}:
-                raise ValueError("invalid terminal status")
+                return self.reconcile_authority_loss("malformed_terminal_receipt")
+            progress = receipt["progress"]
+            if (not isinstance(progress, dict) or set(progress) != {
+                    "checkpoint", "failing_regression_present", "production_diff_bytes",
+                    "focused_tests_green", "diff_fingerprint"}
+                    or not isinstance(receipt["constraint_signals"], list)
+                    or not isinstance(receipt["verified_outcome"], bool)):
+                return self.reconcile_authority_loss("malformed_terminal_receipt")
             usage = receipt["usage"]
             if not isinstance(usage, dict) or set(usage) != {
                     "turns", "wall_seconds", "tokens", "provider_cost_usd"}:
-                raise ValueError("invalid terminal usage")
+                return self.reconcile_authority_loss("unknown_or_partial_usage")
             if any(value is None for value in usage.values()):
                 return self.reconcile_authority_loss("unknown_or_partial_usage")
             envelope = reservation["envelope"]
             for key in ("turns", "wall_seconds", "tokens"):
                 if (isinstance(usage[key], bool) or not isinstance(usage[key], int)
                         or usage[key] < 0 or usage[key] > envelope[key]):
-                    raise RunControlConflict("receipt exceeds reservation")
+                    return self.reconcile_authority_loss("receipt_usage_outside_reservation")
             cost = usage["provider_cost_usd"]
             if not isinstance(cost, str) or not _DECIMAL.fullmatch(cost):
-                raise RunControlConflict("receipt exceeds reservation")
+                return self.reconcile_authority_loss("receipt_usage_outside_reservation")
             if Decimal(cost) > Decimal(envelope["provider_cost_usd"]):
-                raise RunControlConflict("receipt exceeds reservation")
+                return self.reconcile_authority_loss("receipt_usage_outside_reservation")
             return self._append_reconciliation(
                 state, reservation, receipt_hash,
                 {"kind": "terminal_receipt", "receipt_id": receipt["receipt_id"],

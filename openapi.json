@@ -918,6 +918,30 @@
     "/v1/code-off/audit": {"get":{"operationId":"codeOffAudit","tags":["code-off"],"summary":"Return compact audit fields and the seed commitment; never the seed, raw prompts/logs/paths, or a reconstructing private blind map.","parameters":[{"name":"experiment_id","in":"query","required":true,"schema":{"type":"string","pattern":"^[a-z0-9][a-z0-9-]{7,63}$"}}],"responses":{"200":{"description":"sanitized audit","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffCompact"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"404":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
     "/v1/code-off/cleanup": {"post":{"operationId":"codeOffCleanup","tags":["code-off"],"summary":"Remove opaque workspaces only after terminal finalization; preserve the scientific record.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffExperimentRequest"}}}},"responses":{"200":{"description":"bounded code-off receipt","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffCompact"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"422":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
     "/v1/code-off/terminal": {"post":{"operationId":"codeOffTerminal","tags":["code-off"],"summary":"Make a graph terminal outcome durable. Failure parks an active experiment; success only confirms prior completed finalization.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalRequest"}}}},"responses":{"200":{"description":"durable terminal state","content":{"application/json":{"schema":{"$ref":"#/components/schemas/CodeOffTerminalResult"}}}},"400":{"$ref":"#/components/responses/Error"},"401":{"$ref":"#/components/responses/Unauthorized"},"409":{"$ref":"#/components/responses/Error"},"500":{"$ref":"#/components/responses/Error"}}}},
+    "/v1/run/control/validate-initialize": {
+      "post": {
+        "operationId": "runControlValidateInitialize",
+        "tags": ["agent"],
+        "summary": "Validate and canonicalize the closed immutable run-control initialization contract",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlInitializeRequest"}}}},
+        "responses": {
+          "200": {"description": "canonical immutable initialization", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlInitializeValidation"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"}
+        }
+      }
+    },
+    "/v1/run/control/validate-receipt": {
+      "post": {
+        "operationId": "runControlValidateReceipt",
+        "tags": ["agent"],
+        "summary": "Classify complete fixed-decimal receipt usage against its reservation",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["usage", "envelope"], "properties": {"usage": {"$ref": "#/components/schemas/RunControlUsage"}, "envelope": {"$ref": "#/components/schemas/RunControlUsage"}}}}}},
+        "responses": {
+          "200": {"description": "closed usage classification", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["version", "valid", "reason"], "properties": {"version": {"type": "string", "const": "run-control-receipt-validation-v1"}, "valid": {"type": "boolean"}, "reason": {"type": ["string", "null"], "enum": ["unknown_or_oversized_usage", null]}}}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"}
+        }
+      }
+    },
     "/v1/run/control/evaluate": {
       "post": {
         "operationId": "runControlEvaluate",
@@ -1923,7 +1947,38 @@
       },
       "RunControlCost": {
         "type": "string",
-        "pattern": "^(0|[1-9][0-9]{0,4}|100000)(\\.[0-9]{1,12})?$"
+        "pattern": "^(?:0|[1-9][0-9]{0,5})(?:\\.[0-9]{1,12})?$",
+        "x-maximum-decimal": "100000"
+      },
+      "RunControlRootIdentity": {
+        "type": "object", "additionalProperties": false,
+        "required": ["root_workflow_id", "root_workflow_version_id", "root_workflow_run_id", "purpose"],
+        "properties": {
+          "root_workflow_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "root_workflow_version_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "root_workflow_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "purpose": {"type": "string", "enum": ["implement_slice", "pr_drive", "code_off"]}
+        }
+      },
+      "RunControlInitializeRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["root_workflow_id", "root_workflow_version_id", "root_workflow_run_id", "purpose", "budgets", "initial_route"],
+        "properties": {
+          "root_workflow_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "root_workflow_version_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "root_workflow_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
+          "purpose": {"type": "string", "enum": ["implement_slice", "pr_drive", "code_off"]},
+          "budgets": {"$ref": "#/components/schemas/RunControlBudgets"},
+          "initial_route": {"$ref": "#/components/schemas/RunControlRoute"}
+        }
+      },
+      "RunControlInitializeValidation": {
+        "type": "object", "additionalProperties": false,
+        "required": ["version", "canonical"],
+        "properties": {
+          "version": {"type": "string", "const": "run-control-initialize-validation-v1"},
+          "canonical": {"$ref": "#/components/schemas/RunControlInitializeRequest"}
+        }
       },
       "RunControlBudgets": {
         "type": "object",
@@ -2352,7 +2407,7 @@
         "properties": {
           "run_id": {
             "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            "pattern": "^rc1-[0-9a-f]{64}$"
           },
           "route": {
             "$ref": "#/components/schemas/RunControlRoute"

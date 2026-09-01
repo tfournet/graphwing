@@ -2667,6 +2667,8 @@ RUN_CONTROL_NEXT_ENVELOPE_FIELDS = frozenset({
     "attempt_id", "turns", "wall_seconds", "tokens", "provider_cost_usd",
 })
 RUN_CONTROL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+RUN_CONTROL_REWST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+RUN_CONTROL_RUN_ID_RE = re.compile(r"rc1-[0-9a-f]{64}")
 RUN_CONTROL_COST_RE = re.compile(r"(0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?")
 
 
@@ -2738,6 +2740,76 @@ def _run_control_route(value: Any) -> dict[str, str] | None:
     return {key: value[key] for key in sorted(RUN_CONTROL_ROUTE_FIELDS)}
 
 
+def run_control_validate_initialize(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Validate and canonicalize the complete immutable initialization contract."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    required = {
+        "root_workflow_id", "root_workflow_version_id", "root_workflow_run_id",
+        "purpose", "budgets", "initial_route",
+    }
+    if set(data) != required:
+        return _run_control_error("bad_initialize", "initialize request must be a closed object")
+    if data.get("purpose") not in {"implement_slice", "pr_drive", "code_off"}:
+        return _run_control_error("bad_purpose", "purpose is outside the closed run-control contract")
+    for field in ("root_workflow_id", "root_workflow_version_id", "root_workflow_run_id"):
+        value = data.get(field)
+        if not isinstance(value, str) or RUN_CONTROL_REWST_ID_RE.fullmatch(value) is None:
+            return _run_control_error("bad_root_identity", "root identity uses an invalid Rewst identifier")
+    budgets = data.get("budgets")
+    if not isinstance(budgets, dict) or set(budgets) != RUN_CONTROL_BUDGET_FIELDS:
+        return _run_control_error("bad_budgets", "all aggregate budgets are required")
+    attempts = _run_control_uint(budgets.get("attempts"), RUN_CONTROL_MAX_ATTEMPTS)
+    turns = _run_control_uint(budgets.get("turns"), 10000)
+    wall = _run_control_uint(budgets.get("wall_seconds"), 86400)
+    tokens = _run_control_uint(budgets.get("tokens"), 1_000_000_000)
+    cost = _run_control_cost(budgets.get("provider_cost_usd"))
+    if None in (attempts, turns, wall, tokens, cost) or not attempts:
+        return _run_control_error("bad_budgets", "budgets are outside run-control limits")
+    route = _run_control_route(data.get("initial_route"))
+    if route is None:
+        return _run_control_error("bad_route", "initial_route must be a complete approved route")
+    assert cost is not None
+    canonical = {
+        "root_workflow_id": data["root_workflow_id"],
+        "root_workflow_version_id": data["root_workflow_version_id"],
+        "root_workflow_run_id": data["root_workflow_run_id"],
+        "purpose": data["purpose"],
+        "budgets": {
+            "attempts": attempts, "turns": turns, "wall_seconds": wall,
+            "tokens": tokens, "provider_cost_usd": _run_control_cost_text(cost),
+        },
+        "initial_route": route,
+    }
+    return 200, {"version": "run-control-initialize-validation-v1", "canonical": canonical}
+
+
+def run_control_validate_receipt(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Classify complete fixed-decimal usage against its exact reservation."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    valid = set(data) == {"usage", "envelope"}
+    usage, envelope = data.get("usage"), data.get("envelope")
+    valid = valid and all(isinstance(value, dict) and set(value) == RUN_CONTROL_USAGE_FIELDS
+                          for value in (usage, envelope))
+    if valid:
+        assert isinstance(usage, dict) and isinstance(envelope, dict)
+        limits = {"turns": 10000, "wall_seconds": 86400, "tokens": 1_000_000_000}
+        for field, maximum in limits.items():
+            actual = _run_control_uint(usage.get(field), maximum)
+            reserved = _run_control_uint(envelope.get(field), maximum)
+            valid = valid and actual is not None and reserved is not None and actual <= reserved
+        actual_cost = _run_control_cost(usage.get("provider_cost_usd"))
+        reserved_cost = _run_control_cost(envelope.get("provider_cost_usd"))
+        valid = valid and actual_cost is not None and reserved_cost is not None and actual_cost <= reserved_cost
+    return 200, {"version": "run-control-receipt-validation-v1", "valid": bool(valid),
+                 "reason": None if valid else "unknown_or_oversized_usage"}
+
+
 def _run_control_checkpoint(attempt: dict[str, Any]) -> tuple[int, bool]:
     progress = attempt["progress"]
     checkpoint = progress["checkpoint"]
@@ -2765,8 +2837,8 @@ def run_control_evaluate(body: bytes) -> tuple[int, dict[str, Any]]:
     required = {"run_id", "route", "budgets", "attempts", "next_attempt", "next_envelope"}
     if not required <= set(data):
         return _run_control_error("missing_run_control_evidence", "complete run-control evidence is required")
-    if not _run_control_id(data.get("run_id")):
-        return _run_control_error("bad_run_id", "run_id must use the closed durable identifier grammar")
+    if not isinstance(data.get("run_id"), str) or RUN_CONTROL_RUN_ID_RE.fullmatch(data["run_id"]) is None:
+        return _run_control_error("bad_run_id", "run_id must be a non-path rc1 SHA-256 identifier")
     route = _run_control_route(data.get("route"))
     next_route = _run_control_route(data.get("next_route")) if "next_route" in data else route
     if route is None or next_route is None:
@@ -11377,6 +11449,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/evaluate":
         status, payload = run_control_evaluate(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/validate-initialize":
+        status, payload = run_control_validate_initialize(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/validate-receipt":
+        status, payload = run_control_validate_receipt(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route":
         status, payload = slice_route(body)
