@@ -56,7 +56,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 
 | Workflow | You pass | It does |
 |---|---|---|
-| `graphwing-run-control-authorize` | `record_key` | Inert foundation helper: native exact durable-record readback/hash binding and one-time issued-to-consumed KV CAS. Existing launch graphs do not call it yet. |
+| `graphwing-run-control-authorize` | `record_key`, `server_instance_challenge` | Inert foundation helper: native exact durable-record readback/hash binding, exact descriptor/challenge input gate, and challenge-bound one-time issued-to-consumed KV CAS. Existing launch graphs do not call it yet. |
 | `graphwing-implement-slice` | `repo`, `branch`, `index`, `ticket`, `commit_message`, `test`, `iters_left`, `class`, `work_kind`, `size`, `ac_count`, `seams`, `kick_url`, `kick_token`, `e2e`, `recovery_version`, `prior_primary_route`, `prior_primary_receipt`, `prior_fallback_route`, `prior_fallback_receipt`, `fresh_primary_receipt` | One ticket: route, write, named test, opposing review, complete, commit, push. `diagnostic-v1` receipts are bounded; `provider-recovery-v1` is a later-invocation evidence check, never an active-session switch. |
 | `graphwing-verify-stack` | `stack`, `port` | Check the stack then one port and retain compact diagnostics. |
 | `graphwing-pr-status` | `pr` | Read remote-only PR state through an API start. Webhook starts remain disabled. |

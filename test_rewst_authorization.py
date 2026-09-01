@@ -20,7 +20,12 @@ import server
 import install
 
 ROOT = Path(__file__).resolve().parent
-def authorized_body(*, auth_overrides=None, descriptor_overrides=None, request=None):
+
+
+def authorized_body(
+    *, challenge=None, auth_overrides=None, descriptor_overrides=None, request=None,
+):
+    challenge = challenge or server.REWST_SERVER_INSTANCE_CHALLENGE
     request = dict(request or {})
     request_hash = hashlib.sha256(json.dumps(
         request, sort_keys=True, separators=(",", ":")
@@ -39,6 +44,7 @@ def authorized_body(*, auth_overrides=None, descriptor_overrides=None, request=N
         permission_profile="workspace-write-v1", authorization_id="auth-1",
         consumed_version=2, record_key="run-1", record_version=7,
         payload_sha256="5" * 64, request_sha256=request_hash,
+        server_instance_challenge=challenge,
     )
     descriptor.update(descriptor_overrides or {})
     authorization = dict(
@@ -48,14 +54,24 @@ def authorized_body(*, auth_overrides=None, descriptor_overrides=None, request=N
         expires_at=1700000100, collection="graphwing_run_control_v1",
         record_key="run-1", record_found=True, record_version=7,
         payload_sha256="5" * 64, descriptor=descriptor,
+        server_instance_challenge=challenge,
     )
     authorization.update(auth_overrides or {})
     return json.dumps({**request, "rewst_authorization": authorization},
                       sort_keys=True, separators=(",", ":")).encode()
 
 
-def signed_headers(body, *, timestamp=1700000000, nonce="a" * 64, secret=b"r" * 32):
-    prefix = str(timestamp).encode() + b"." + nonce.encode() + b"." + body
+def signed_headers(
+    body, *, challenge=None, timestamp=1700000000, nonce="a" * 64, secret=b"r" * 32,
+):
+    challenge = challenge or server.REWST_SERVER_INSTANCE_CHALLENGE
+    prefix = (
+        b"graphwing-rewst-request-v2\n"
+        + challenge.encode("ascii") + b"\n"
+        + str(timestamp).encode("ascii") + b"\n"
+        + nonce.encode("ascii") + b"\n"
+        + body
+    )
     return {
         "X-Graphwing-Rewst-Timestamp": str(timestamp),
         "X-Graphwing-Rewst-Nonce": nonce,
@@ -85,6 +101,89 @@ def verify(body, headers=None):
 class RewstAuthorizationFoundationTests(unittest.TestCase):
     def setUp(self):
         server.reset_rewst_authority_registry_for_test()
+
+    def test_server_instance_challenge_is_256_bit_and_endpoint_requires_only_api_key(self):
+        self.assertRegex(server.REWST_SERVER_INSTANCE_CHALLENGE, r"^[0-9a-f]{64}$")
+        with mock.patch.object(server.secrets, "token_hex", return_value="c" * 64) as token_hex:
+            self.assertEqual(server._new_rewst_server_instance_challenge(), "c" * 64)
+        token_hex.assert_called_once_with(32)
+
+        with mock.patch.object(
+            server, "load_rewst_issuer_secret", side_effect=AssertionError("HMAC not required")
+        ):
+            denied = server.dispatch("GET", "/v1/rewst/server-challenge", {}, False, b"")
+            allowed = server.dispatch("GET", "/v1/rewst/server-challenge", {}, True, b"")
+        self.assertEqual(denied[:2], (
+            401, {"error": "invalid or missing X-Graphwing-Key", "code": "unauthorized"},
+        ))
+        self.assertEqual(allowed[:2], (200, {
+            "challenge_version": "graphwing-server-instance-challenge-v1",
+            "server_instance_challenge": server.REWST_SERVER_INSTANCE_CHALLENGE,
+        }))
+
+    def test_restart_rotation_rejects_identical_still_fresh_request_before_claim(self):
+        first_challenge = "a" * 64
+        next_challenge = "b" * 64
+        body = authorized_body(challenge=first_challenge)
+        headers = signed_headers(body, challenge=first_challenge, nonce="d" * 64)
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", first_challenge):
+            authority, error = verify(body, headers)
+        self.assertIsNone(error)
+        self.assertEqual(authority["server_instance_challenge"], first_challenge)
+
+        server.reset_rewst_authority_registry_for_test()
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", next_challenge):
+            replayed, failure = verify(body, headers)
+        self.assertIsNone(replayed)
+        self.assertEqual(failure[1]["code"], "rewst_authorization_invalid")
+        self.assertEqual(server._REWST_AUTHORITIES, {})
+
+    def test_challenge_equality_is_rechecked_at_claim_and_both_consume_boundaries(self):
+        first_challenge = "6" * 64
+        next_challenge = "7" * 64
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", first_challenge):
+            first, error = verify(authorized_body(challenge=first_challenge))
+        self.assertIsNone(error)
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", next_challenge):
+            self.assertFalse(server.claim_rewst_launch_authority(first, "prelaunch-job"))
+
+        server.reset_rewst_authority_registry_for_test()
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", first_challenge):
+            claimed, error = verify(authorized_body(
+                challenge=first_challenge,
+            ), signed_headers(
+                authorized_body(challenge=first_challenge),
+                challenge=first_challenge,
+                nonce="8" * 64,
+            ))
+            self.assertIsNone(error)
+            self.assertTrue(server.claim_rewst_launch_authority(claimed, "claimed-job"))
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", next_challenge):
+            self.assertFalse(server.consume_rewst_authority_for_job("claimed-job"))
+            self.assertFalse(server.consume_rewst_launch_authority(claimed, "claimed-job"))
+
+    def test_challenge_drift_and_malformed_challenges_fail_closed(self):
+        current = "c" * 64
+        cases = (
+            ({"server_instance_challenge": "d" * 64}, {}),
+            ({}, {"server_instance_challenge": "d" * 64}),
+            ({"server_instance_challenge": "short"},
+             {"server_instance_challenge": "short"}),
+            ({"server_instance_challenge": "D" * 64},
+             {"server_instance_challenge": "D" * 64}),
+        )
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", current):
+            for index, (auth_drift, descriptor_drift) in enumerate(cases):
+                body = authorized_body(
+                    challenge=current,
+                    auth_overrides=auth_drift,
+                    descriptor_overrides=descriptor_drift,
+                )
+                server.reset_rewst_authority_registry_for_test()
+                _, failure = verify(
+                    body, signed_headers(body, challenge=current, nonce=f"{index + 1:064x}")
+                )
+                self.assertEqual(failure[1]["code"], "rewst_authorization_invalid")
 
     def test_exact_body_hmac_timestamp_nonce_replay_and_saturation_fail_closed(self):
         body = authorized_body()
@@ -247,6 +346,83 @@ class RewstAuthorizationFoundationTests(unittest.TestCase):
         self.assertEqual((issue["namespace"], issue["expectedVersion"], consume["expectedVersion"]),
                          ("graphwing_run_authorizations_v1", 0, 1))
         self.assertLessEqual(max(issue["ttlSeconds"], consume["ttlSeconds"]), 300)
+
+    def test_openapi_has_exact_authenticated_non_launching_challenge_contract(self):
+        spec = json.loads((ROOT / "openapi.json").read_text())
+        operation = spec["paths"]["/v1/rewst/server-challenge"]["get"]
+        self.assertEqual(operation["operationId"], "rewstServerChallenge")
+        self.assertNotIn("security", operation)
+        self.assertEqual(
+            operation["responses"]["200"]["content"]["application/json"]["schema"],
+            {"$ref": "#/components/schemas/RewstServerChallenge"},
+        )
+        self.assertEqual(operation["responses"]["401"],
+                         {"$ref": "#/components/responses/Unauthorized"})
+        self.assertEqual(spec["components"]["schemas"]["RewstServerChallenge"], {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["challenge_version", "server_instance_challenge"],
+            "properties": {
+                "challenge_version": {
+                    "type": "string",
+                    "enum": ["graphwing-server-instance-challenge-v1"],
+                },
+                "server_instance_challenge": {
+                    "type": "string", "pattern": "^[0-9a-f]{64}$",
+                },
+            },
+        })
+        for name in ("RewstConsumedAuthorization", "RewstLaunchDescriptor"):
+            schema = spec["components"]["schemas"][name]
+            self.assertIn("server_instance_challenge", schema["required"])
+            self.assertEqual(schema["properties"]["server_instance_challenge"],
+                             {"type": "string", "pattern": "^[0-9a-f]{64}$"})
+
+    def test_native_helper_binds_challenge_input_into_descriptor_cas_and_output(self):
+        graph = json.loads((ROOT / "graphs/run-control-authorize.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        mappings = lambda node: {item["output"]: item["expression"]
+                                 for item in nodes[node]["config"]["mappings"]}
+        initial = mappings("initial_check")
+        self.assertEqual(initial["challenge_matches"], {
+            "kind": "binary", "operator": "==",
+            "left": {"kind": "getField",
+                     "path": "TASKS.load.data.descriptor.server_instance_challenge"},
+            "right": {"kind": "getField", "path": "CTX.INPUT.server_instance_challenge"},
+        })
+        self.assertIn(
+            {"path": "challenge_matches", "op": "equals", "value": True},
+            nodes["initial_gate"]["config"]["rules"],
+        )
+        self.assertEqual(mappings("state")["server_instance_challenge"],
+                         {"kind": "getField", "path": "CTX.INPUT.server_instance_challenge"})
+        for node in ("issue", "consume"):
+            self.assertEqual(nodes[node]["config"]["value"]["serverInstanceChallenge"],
+                             "{{ CTX.state.server_instance_challenge }}")
+        self.assertEqual(mappings("authorization")["server_instance_challenge"],
+                         {"kind": "getField", "path": "CTX.state.server_instance_challenge"})
+
+    def test_request_credential_uses_exact_challenge_bound_v2_canonical_bytes(self):
+        credential = json.loads(
+            (ROOT / "examples/rewst-request-hmac-credential.json").read_text()
+        )
+        steps = {step["output"]: step for step in credential["steps"] if "output" in step}
+        self.assertEqual(steps["server_instance_challenge"], {
+            "kind": "request_value",
+            "path": "request.body.rewst_authorization.server_instance_challenge",
+            "output": "server_instance_challenge",
+        })
+        self.assertEqual(steps["signed_bytes"], {
+            "kind": "concat",
+            "parts": [
+                "graphwing-rewst-request-v2\n",
+                "server_instance_challenge", "\n",
+                "timestamp", "\n",
+                "nonce", "\n",
+                {"kind": "request", "path": "request.body"},
+            ],
+            "output": "signed_bytes",
+        })
 
     def test_openapi_rewst_identifiers_have_exact_runtime_grammar_parity(self):
         spec = json.loads((ROOT / "openapi.json").read_text())
