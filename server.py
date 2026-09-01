@@ -2326,6 +2326,63 @@ def slice_complete(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
 PR_MAX_ATTEMPTS = int(os.environ.get("GRAPHWING_PR_MAX_ATTEMPTS", "3"))
 
 
+def _pr_continue_parse(
+    data: dict[str, Any], repos: dict[str, str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate a kick request; the parsed view names why it would not kick."""
+    name, resolved = repo_from_body(data, repos)
+    if name is None:
+        return None, resolved
+    number = str(data.get("pr") or data.get("number") or "").strip()
+    if not number:
+        return None, {"error": "pr is required", "code": "missing_pr"}
+    attempt, aerr = parse_optional_int(data, "attempt", 0, 99)
+    if aerr:
+        return None, aerr
+    attempt = attempt or 1
+    ceiling, cerr = parse_optional_int(data, "max_attempts", 1, 99)
+    if cerr:
+        return None, cerr
+    ceiling = ceiling or PR_MAX_ATTEMPTS
+    kick_url = data.get("kick_url")
+    if isinstance(kick_url, str) and kick_url.strip() and not valid_webhook_url(kick_url):
+        return None, {"error": "kick_url must be https", "code": "bad_kick_url"}
+    if attempt >= ceiling:
+        code: str | None = "attempts_exhausted"
+    elif not kick_url:
+        code = "no_kick_url"
+    else:
+        code = None
+    return {"repo": name, "pr": number, "attempt": attempt, "max_attempts": ceiling,
+            "kick_url": kick_url if code is None else None, "code": code}, None
+
+
+def pr_continue_fingerprint(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Fingerprint the kick a reserving run is about to send, without sending it.
+
+    The run-control reservation descriptor binds exact_request_body_sha256 of
+    the kick. The reserving run renders the kick request, asks for this
+    fingerprint, reserves with it, then sends the same fields plus
+    run_control. Both hashes are computed here, so they agree by construction
+    and the graph never canonicalizes JSON itself. would_kick lets the run
+    skip reserving for a kick pr_continue would refuse.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if "run_control" in data:
+        return 400, {"error": "fingerprint the kick before continuity exists; run_control is not allowed",
+                     "code": "unexpected_fields", "fields": ["run_control"]}
+    parsed, perr = _pr_continue_parse(data, repos)
+    if perr:
+        return 400, perr
+    assert parsed is not None
+    return 200, {"ok": True, "repo": parsed["repo"], "pr": parsed["pr"], "attempt": parsed["attempt"],
+                 "max_attempts": parsed["max_attempts"], "would_kick": parsed["code"] is None,
+                 "code": parsed["code"], "kick_request_sha256": run_control_kick_request_sha256(data)}
+
+
 def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     """Kick the next pr-drive attempt, or stop at the ceiling.
 
@@ -2341,25 +2398,12 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     if err:
         return 400, err
     assert data is not None
-    name, resolved = repo_from_body(data, repos)
-    if name is None:
-        return 400, resolved
-    number = str(data.get("pr") or data.get("number") or "").strip()
-    if not number:
-        return 400, {"error": "pr is required", "code": "missing_pr"}
-
-    attempt, aerr = parse_optional_int(data, "attempt", 0, 99)
-    if aerr:
-        return 400, aerr
-    attempt = attempt or 1
-    ceiling, cerr = parse_optional_int(data, "max_attempts", 1, 99)
-    if cerr:
-        return 400, cerr
-    ceiling = ceiling or PR_MAX_ATTEMPTS
-
-    kick_url = data.get("kick_url")
-    if isinstance(kick_url, str) and kick_url.strip() and not valid_webhook_url(kick_url):
-        return 400, {"error": "kick_url must be https", "code": "bad_kick_url"}
+    parsed, perr = _pr_continue_parse(data, repos)
+    if perr:
+        return 400, perr
+    assert parsed is not None
+    name, number, attempt, ceiling = parsed["repo"], parsed["pr"], parsed["attempt"], parsed["max_attempts"]
+    kick_url = parsed["kick_url"]
     continuity = None
     if "run_control" in data:
         continuity = run_control_continuity(data["run_control"])
@@ -2372,10 +2416,10 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
            "max_attempts": ceiling, "kicked": False}
     if continuity is not None:
         out["run_control"] = continuity
-    if attempt >= ceiling:
+    if parsed["code"] == "attempts_exhausted":
         return 200, {**out, "code": "attempts_exhausted",
                      "error": f"{attempt} of {ceiling} attempts used"}
-    if not kick_url:
+    if parsed["code"] == "no_kick_url":
         return 200, {**out, "code": "no_kick_url"}
 
     token = data.get("kick_token") or None
@@ -11971,6 +12015,9 @@ def dispatch_inner(
 
     if method == "POST" and path == "/v1/pr/continue":
         status, payload = pr_continue(body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/pr/continue/fingerprint":
+        status, payload = pr_continue_fingerprint(body, repos)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/gh/pr/merge":
         status, payload = gh_pr_merge(body, repos)

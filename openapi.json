@@ -669,6 +669,21 @@
         }
       }
     },
+    "/v1/pr/continue/fingerprint": {
+      "post": {
+        "operationId": "prContinueFingerprint",
+        "tags": ["gh"],
+        "summary": "Fingerprint the exact kick a reserving run is about to send, without kicking; the same hash /v1/pr/continue records with the kick",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrContinueRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "kick fingerprint and whether pr_continue would kick", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrContinueFingerprint" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
     "/v1/pr/continue": {
       "post": {
         "operationId": "prContinue",
@@ -1550,6 +1565,20 @@
           "kick_url": { "type": "string", "description": "https Rewst webhook for the next attempt" },
           "kick_token": { "type": "string" },
           "run_control": { "$ref": "#/components/schemas/PrContinueRunControl" }
+        }
+      },
+      "PrContinueFingerprint": {
+        "type": "object", "additionalProperties": false,
+        "required": ["ok", "repo", "pr", "attempt", "max_attempts", "would_kick", "code", "kick_request_sha256"],
+        "properties": {
+          "ok": {"type": "boolean", "const": true},
+          "repo": {"type": "string"},
+          "pr": {"type": "string"},
+          "attempt": {"type": "integer"},
+          "max_attempts": {"type": "integer"},
+          "would_kick": {"type": "boolean"},
+          "code": {"type": ["string", "null"], "enum": ["attempts_exhausted", "no_kick_url", null]},
+          "kick_request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical kick request minus run_control and kick_token; the reservation descriptor's exact_request_body_sha256 for the continue leg."}
         }
       },
       "PrContinueRunControl": {

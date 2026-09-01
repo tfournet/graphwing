@@ -146,20 +146,58 @@ reservation now binds what run N does know, and the daemon binds the rest:
   envelope as `launched_run_never_settled`. The kick-only grace path still
   covers a kick whose run never launched.
 
+## Enabled shape, authored 2026-09-01
+
+`graphs/pr-drive-run-control.json` (slug `graphwing-pr-drive-run-control`) is
+pr-drive's topology plus the run-control legs, kept as a separate dormant slug
+so `graphs/pr-drive.json` stays byte-identical to `main`.
+`PrDriveRunControlGraphTests` pins the exact node and edge deltas, the child
+pins, the fenced failures, and that the fingerprinted kick and the sent kick
+are the same request.
+
+- **Start.** API only, `{ "input": { ...pr-drive inputs..., "run_control": {four
+  fields} } }`. Form and webhook triggers are disabled. Run 0 is an operator
+  initialize + state + consume; every later run is kicked by its predecessor.
+- **Agent leg.** `agent` carries `run_control` verbatim; the daemon pins the job
+  to the reservation. `wait out` now goes `rc_settle` (`/v1/run/control/settle`
+  with `TASKS.wait.request.body`) → `rc_reconcile` (pinned reconcile child fed
+  the settle result) → `receipt`. Wait timeout and failure keep their original
+  edges; a launched reservation the run cannot settle is closed later by the
+  timer through `/v1/run/control/authority-loss`.
+- **Continue leg.** `if_green2 fail` → `rc_kick_fingerprint`
+  (`/v1/pr/continue/fingerprint`, the same fields as the kick minus
+  `kick_token`) → `rc_kick_gate` on `would_kick` (no reservation for a kick
+  `pr_continue` would refuse) → task and callback hashes → `rc_continue_state`
+  (reserve with `exact_request_body_sha256` = the fingerprint, endpoint
+  `/v1/pr/continue`, candidate route from `TASKS.route.data`, a literal
+  per-attempt envelope of 50 turns, 600 s, 2,000,000 tokens, USD 25) →
+  `rc_continue_consume` → `rc_continuity` (four fields from the state child's
+  outputs) → `continue` with `run_control`. Kick failure → `rc_continue_loss`
+  (daemon authority-loss; `continuation_kick_failed` for a recorded failure)
+  → reconcile; if the daemon never saw the kick → reconcile
+  `continuation_action_failed` directly, which run N does know first-hand.
+- **Fence.** Every run-control action and child routes failure to
+  `rc_failure_join` → `rc_failure`, the same hard fence the durable graphs use.
+- **Publish.** `publish_graphs.py --only pr-drive-run-control` republishes the
+  durable chain first (transition, consume-authorization, state, consume,
+  reconcile), pins the child IDs, then publishes the slug. `--only all`
+  includes it last, like every dormant graph (the catalog contract publishes
+  every graph file once); `--only pr-drive` never reaches it.
+
+Runtime assumptions this checkout cannot verify: `logic.filter` after an action
+reads `data.*`; subworkflow outputs read as `TASKS.<alias>.result.<child alias>`;
+an action config value that renders an object (`{{ CTX.INPUT.run_control }}`,
+`{{ TASKS.wait.request.body }}`) is sent as that object. All three follow the
+shipped graphs' existing usage; import in the isolated tenant is the proof.
+
 ## Next bounded task
 
-Author the enabled pr-drive shape as a separate dormant catalog graph
-(`graphs/pr-drive-run-control.json`, slug `graphwing-pr-drive-run-control`) that
-`publish_graphs.py` publishes only when asked by name, never with `--only all`
-or `--only pr-drive`. Under a carried `CTX.INPUT.run_control` the agent leg must
-not reserve again (the state graph refuses a second outstanding reservation); it
-launches the writer, settles through `/v1/run/control/settle` from
-`TASKS.wait.request.body`, and feeds the result to the pinned reconcile child.
-The continue leg renders the kick request first, hashes it as
-`kick_request_sha256` above for the reservation's `exact_request_body_sha256`,
-reserves, consumes, sends exactly that request with the four-field continuity
-built from the state subworkflow's outputs, and on kick failure closes through
-`/v1/run/control/authority-loss`. The agent leg passes the carried continuity
-to `/v1/agent/run`. Prove the shape with provider-free structural tests;
-`graphs/pr-drive.json` stays untouched. Do not publish until the flag-off
-traversal test and both suites are green and an isolated tenant is available.
+Validation step 3 in the isolated tenant: publish with
+`--only pr-drive-run-control`, run the existing pr-drive smoke against the
+shipped `graphwing-pr-drive`, and assert zero writes to any
+`graphwing_run_control_*` namespace. Then step 4 with a stub launcher:
+initialize + state + consume for run 0, start `graphwing-pr-drive-run-control`
+with that continuity, and verify reserve → launch pin → settle → reconcile
+across two chained runs, then authority loss on a lost kick and on a launched
+run that never settled. Nothing here is pushed, published, or deployed; the
+shipped pr-drive graph is unchanged.
