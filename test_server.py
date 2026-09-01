@@ -6346,7 +6346,8 @@ while True:
         # reservation it settles, so the trio rides CTX.INPUT.run_control.
         continuity = {"run_control_id": "rc1-" + "a" * 64,
                       "attempt_id": "att1-" + "b" * 64,
-                      "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64}
+                      "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64,
+                      "launch_descriptor_sha256": "d" * 64}
         status, out, posted = self._pr_continue_with({"run_control": continuity})
         self.assertEqual(status, 200, out)
         self.assertTrue(out["kicked"])
@@ -6355,7 +6356,8 @@ while True:
 
     def test_pr_continue_rejects_malformed_continuity_before_kicking(self):
         good = {"run_control_id": "rc1-" + "a" * 64, "attempt_id": "att1-" + "b" * 64,
-                "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64}
+                "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64,
+                "launch_descriptor_sha256": "d" * 64}
         bad_cases = {
             "null": None,
             "string": "rc1-" + "a" * 64,
@@ -6367,6 +6369,8 @@ while True:
             "bad_attempt_grammar": {**good, "attempt_id": "att2-" + "b" * 64},
             "bad_auth_grammar": {**good, "authorization_id": "rca1-" + "a" * 64},
             "contradictory_auth": {**good, "authorization_id": "rca1-" + "a" * 64 + "-" + "c" * 64},
+            "no_descriptor": {k: v for k, v in good.items() if k != "launch_descriptor_sha256"},
+            "bad_descriptor": {**good, "launch_descriptor_sha256": "D" * 64},
         }
         for label, continuity in bad_cases.items():
             with self.subTest(label):
@@ -20934,11 +20938,12 @@ class RunControlSettlementTests(unittest.TestCase):
         clock.start()
         self.addCleanup(clock.stop)
 
-    def trio(self, run_hex=None, attempt_hex=None):
+    def trio(self, run_hex=None, attempt_hex=None, descriptor=None):
         run_hex = run_hex or self.RUN_HEX
         attempt_hex = attempt_hex or self.ATTEMPT_HEX
         return {"run_control_id": f"rc1-{run_hex}", "attempt_id": f"att1-{attempt_hex}",
-                "authorization_id": f"rca1-{run_hex}-{attempt_hex}"}
+                "authorization_id": f"rca1-{run_hex}-{attempt_hex}",
+                "launch_descriptor_sha256": descriptor or self.DESCRIPTOR}
 
     def sealed_receipt(self, job_hex="c", *, status="ok", failure_code="none",
                        usage="default", usage_diagnostic=None, role=None):
@@ -20969,8 +20974,7 @@ class RunControlSettlementTests(unittest.TestCase):
         return receipt
 
     def settle(self, receipt, trio=None, descriptor=None, **overrides):
-        body = {"run_control": trio or self.trio(),
-                "launch_descriptor_sha256": descriptor or self.DESCRIPTOR,
+        body = {"run_control": trio or self.trio(descriptor=descriptor),
                 "receipt": receipt, **overrides}
         status, payload, _ = server.dispatch(
             "POST", "/v1/run/control/settle", {}, True, json.dumps(body).encode()
@@ -21079,8 +21083,8 @@ class RunControlSettlementTests(unittest.TestCase):
             "not_terminal_receipt_unknown_code": dict(receipt={**receipt, "failure_code": "made_up"}),
             "receipt_authority_mismatch": dict(receipt={**receipt, "usage": {**receipt["usage"], "output_tokens": 999}}),
             "bad_run_control_continuity": dict(trio={**good_trio, "authorization_id": "rca1-" + "a" * 64}),
-            "bad_launch_descriptor_sha256": dict(descriptor="D" * 64),
-            "unexpected_fields": dict(kind="terminal_receipt"),
+            "bad_run_control_continuity_descriptor": dict(descriptor="D" * 64),
+            "unexpected_fields": dict(launch_descriptor_sha256=self.DESCRIPTOR),
         }
         expected_codes = {
             "kick_ack_is_not_a_receipt_bare": "kick_ack_is_not_a_receipt",
@@ -21088,6 +21092,7 @@ class RunControlSettlementTests(unittest.TestCase):
             "not_terminal_receipt_status": "not_terminal_receipt",
             "not_terminal_receipt_scalar": "not_terminal_receipt",
             "not_terminal_receipt_unknown_code": "not_terminal_receipt",
+            "bad_run_control_continuity_descriptor": "bad_run_control_continuity",
         }
         for label, kwargs in cases.items():
             with self.subTest(label):
@@ -21218,7 +21223,10 @@ class RunControlSettlementTests(unittest.TestCase):
         schemas = spec["components"]["schemas"]
         settle_request = schemas["RunControlSettleRequest"]
         self.assertIs(settle_request["additionalProperties"], False)
-        self.assertEqual(set(settle_request["required"]), {"run_control", "launch_descriptor_sha256", "receipt"})
+        self.assertEqual(set(settle_request["required"]), {"run_control", "receipt"})
+        continuity = schemas["PrContinueRunControl"]
+        self.assertEqual(set(continuity["required"]),
+                         {"run_control_id", "attempt_id", "authorization_id", "launch_descriptor_sha256"})
         self.assertEqual(settle_request["properties"]["run_control"]["$ref"], "#/components/schemas/PrContinueRunControl")
         loss_request = schemas["RunControlAuthorityLossRequest"]
         self.assertEqual(set(loss_request["required"]), {"run_control"})
@@ -21240,6 +21248,80 @@ class RunControlSettlementTests(unittest.TestCase):
         for status in ("400", "409"):
             self.assertIn(status, settle["responses"])
             self.assertIn(status, loss["responses"])
+
+
+class PrDriveFlagOffTraversalTests(unittest.TestCase):
+    """Validation step 2: pr-drive's flag-off traversal equals merged main.
+
+    Every node in graphs/pr-drive.json executes when run_control_enabled is
+    unset or false, so the whole published graph is the flag-off traversal.
+    Any gate inserted into the shipped path is itself a difference, which is
+    the regression the blocked wiring commit failed: gating belongs at publish
+    time or in a separate slug, never inside the shipped pr-drive path.
+    """
+
+    _MERGED_MAIN_COMMIT = "f242c90c310ad8c4a7b7fc97e2146fed73f95177"
+
+    @staticmethod
+    def traversal(spec):
+        nodes = {node["id"]: (node["type"], node.get("config", {})) for node in spec["nodes"]}
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"], edge.get("targetHandle"))
+                 for edge in spec["edges"]}
+        return nodes, edges
+
+    def merged_main_spec(self):
+        repo = str(Path(server.__file__).resolve().parent)
+        shown = subprocess.run(
+            ["git", "-C", repo, "show", f"{self._MERGED_MAIN_COMMIT}:graphs/pr-drive.json"],
+            capture_output=True,
+        )
+        if shown.returncode != 0:
+            self.skipTest("merged main pr-drive graph is not reachable from this checkout")
+        return json.loads(shown.stdout)["spec"]
+
+    def test_pr_drive_flag_off_traversal_is_identical_to_merged_main(self):
+        current = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())["spec"]
+        main_nodes, main_edges = self.traversal(self.merged_main_spec())
+        nodes, edges = self.traversal(current)
+        self.assertEqual(nodes, main_nodes)
+        self.assertEqual(edges, main_edges)
+        self.assertIn(("wait", "pending", "agent", "in"), edges)
+        self.assertIn(("if_green2", "fail", "continue", "in"), edges)
+        self.assertFalse(any(node_id.startswith("rc_") for node_id in nodes))
+        self.assertNotIn("run_control_enabled", json.dumps(current))
+
+    def test_flag_off_check_catches_the_blocked_inline_gate_shape(self):
+        # The archived wiring routed wait.pending through mode/switch/join
+        # before agent. Rebuild that shape on merged main and prove the
+        # structural comparison rejects it even though the enabled path is
+        # never taken.
+        gated = deepcopy(self.merged_main_spec())
+        main_nodes, main_edges = self.traversal(gated)
+        gated["nodes"] += [
+            {"id": "rc_agent_mode", "type": "transforms.objectBuilder", "config": {
+                "alias": "rc_agent_mode", "version": 1, "mappings": [{
+                    "id": "m1", "output": "enabled",
+                    "expression": {"kind": "getField", "path": "CTX.INPUT.run_control_enabled"},
+                }]}},
+            {"id": "rc_agent_switch", "type": "logic.switch", "config": {
+                "mode": "rules",
+                "cases": [{"label": "enabled", "rules": [{"path": "enabled", "op": "equals", "value": "true"}]}],
+                "default": {"label": "disabled"}}},
+            {"id": "rc_agent_launch_join", "type": "logic.join.any", "config": {"stopOnFirst": True}},
+        ]
+        gated["edges"] = [edge for edge in gated["edges"]
+                          if (edge["source"], edge.get("sourceHandle"), edge["target"]) != ("wait", "pending", "agent")]
+        gated["edges"] += [
+            {"id": "g1", "source": "wait", "sourceHandle": "pending", "target": "rc_agent_mode", "targetHandle": "in"},
+            {"id": "g2", "source": "rc_agent_mode", "sourceHandle": "out", "target": "rc_agent_switch", "targetHandle": "in"},
+            {"id": "g3", "source": "rc_agent_switch", "sourceHandle": "default", "target": "rc_agent_launch_join", "targetHandle": "in"},
+            {"id": "g4", "source": "rc_agent_launch_join", "sourceHandle": "out", "target": "agent", "targetHandle": "in"},
+        ]
+        nodes, edges = self.traversal(gated)
+        self.assertNotEqual(nodes, main_nodes)
+        self.assertNotEqual(edges, main_edges)
+        self.assertNotIn(("wait", "pending", "agent", "in"), edges)
+        self.assertEqual(set(nodes) - set(main_nodes), {"rc_agent_mode", "rc_agent_switch", "rc_agent_launch_join"})
 
 
 if __name__ == "__main__":
