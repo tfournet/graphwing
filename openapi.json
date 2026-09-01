@@ -942,6 +942,32 @@
         }
       }
     },
+    "/v1/run/control/settle": {
+      "post": {
+        "operationId": "runControlSettle",
+        "tags": ["agent"],
+        "summary": "Settle one named run-control reservation from the live terminal wait webhook receipt; the synchronous /v1/pr/continue acknowledgment is never usage",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlSettleRequest"}}}},
+        "responses": {
+          "200": {"description": "closed reconcile request for graphwing-run-control-reconcile; replay repeats an identical prior settlement", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlSettlement"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "409": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/run/control/authority-loss": {
+      "post": {
+        "operationId": "runControlAuthorityLoss",
+        "tags": ["agent"],
+        "summary": "Conservatively close a kicked reservation whose run never settled; a definite kick failure closes at once, an accepted kick only after the grace window",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlAuthorityLossRequest"}}}},
+        "responses": {
+          "200": {"description": "closed authority-loss reconcile request", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunControlSettlement"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "409": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/v1/run/control/evaluate": {
       "post": {
         "operationId": "runControlEvaluate",
@@ -1534,6 +1560,54 @@
           "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},
           "attempt_id": {"$ref": "#/components/schemas/RunControlAttemptId"},
           "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"}
+        }
+      },
+      "RunControlSettleRequest": {
+        "type": "object", "additionalProperties": false,
+        "description": "Run N+1 settlement of the reservation named by CTX.INPUT.run_control from its own live wait webhook body. launch_descriptor_sha256 is verified by the reconcile graph against durable state.",
+        "required": ["run_control", "launch_descriptor_sha256", "receipt"],
+        "properties": {
+          "run_control": {"$ref": "#/components/schemas/PrContinueRunControl"},
+          "launch_descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "receipt": {"$ref": "#/components/schemas/AgentReceipt", "description": "The exact terminal agent receipt delivered to the wait webhook; only a receipt this daemon sealed is usage."}
+        }
+      },
+      "RunControlAuthorityLossRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["run_control"],
+        "properties": {
+          "run_control": {"$ref": "#/components/schemas/PrContinueRunControl"}
+        }
+      },
+      "RunControlSettledReceipt": {
+        "type": "object", "additionalProperties": false,
+        "description": "The closed receipt graphwing-run-control-reconcile accepts as kind terminal_receipt, in the exact key order its canonical hash expects.",
+        "required": ["receipt_id", "attempt_id", "run_control_id", "authorization_id", "launch_descriptor_sha256", "job_id", "terminal_status", "route", "usage", "progress", "constraint_signals", "verified_outcome"],
+        "properties": {
+          "receipt_id": {"type": "string", "pattern": "^rec1-[0-9a-f]{32}$"},
+          "attempt_id": {"$ref": "#/components/schemas/RunControlAttemptId"},
+          "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},
+          "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"},
+          "launch_descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "terminal_status": {"type": "string", "enum": ["succeeded", "failed"]},
+          "route": {"$ref": "#/components/schemas/RunControlRoute"},
+          "usage": {"$ref": "#/components/schemas/RunControlUsage"},
+          "progress": {"$ref": "#/components/schemas/RunControlProgress"},
+          "constraint_signals": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
+          "verified_outcome": {"type": "boolean", "const": false}
+        }
+      },
+      "RunControlSettlement": {
+        "type": "object", "additionalProperties": false,
+        "required": ["version", "run_control_id", "kind", "receipt", "authority_loss_reason", "replay"],
+        "properties": {
+          "version": {"type": "string", "const": "run-control-settlement-v1"},
+          "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},
+          "kind": {"type": "string", "enum": ["terminal_receipt", "authority_lost"]},
+          "receipt": {"anyOf": [{"$ref": "#/components/schemas/RunControlSettledReceipt"}, {"type": "null"}]},
+          "authority_loss_reason": {"type": ["string", "null"], "enum": ["receipt_authority_unavailable", "receipt_route_unresolvable", "continuation_kick_failed", "kicked_run_never_settled", null]},
+          "replay": {"type": "boolean"}
         }
       },
       "RouteExecutionProfile": {

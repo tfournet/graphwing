@@ -27,7 +27,7 @@ from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal, DecimalException
+from decimal import ROUND_CEILING, Decimal, DecimalException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal
@@ -46,6 +46,7 @@ REWST_ISSUER_SECRET_PATH = HOME / "rewst-hmac.key"
 JOBS_DIR = HOME / "jobs"
 CODEOFFS_DIR = HOME / "codeoffs"
 CODEOFF_WORKSPACES_DIR = HOME / "codeoff-workspaces"
+RUN_CONTROL_DIR = HOME / "run-control"
 RUNS_PATH = HOME / "workflow-runs.jsonl"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("GRAPHWING_PORT", "8645"))
@@ -2378,6 +2379,10 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         return 200, {**out, "code": "no_kick_url"}
 
     token = data.get("kick_token") or None
+    if continuity is not None:
+        claim_err = run_control_claim_kick(continuity)
+        if claim_err is not None:
+            return claim_err[0], {**out, "ok": False, **claim_err[1]}
     payload = {
         "repo": name,
         # The next run reads this as CTX.INPUT.pr_number. A plain `pr` key never
@@ -2398,6 +2403,8 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     hook = post_receipt(kick_url, payload, token=token)
     out["kicked"] = bool(hook.get("ok"))
     out["kick"] = hook
+    if continuity is not None:
+        run_control_record_kick_result(continuity, out["kicked"])
     if not out["kicked"]:
         return 502, {**out, "ok": False, "error": "kick failed", "code": "kick_failed"}
     return 200, out
@@ -2703,6 +2710,276 @@ def run_control_continuity(value: Any) -> dict[str, str] | None:
             or auth_id != f"rca1-{run_id[4:]}-{attempt_id[5:]}"):
         return None
     return {"run_control_id": run_id, "attempt_id": attempt_id, "authorization_id": auth_id}
+
+
+RUN_CONTROL_SETTLEMENT_VERSION = "run-control-settlement-v1"
+RUN_CONTROL_LEDGER_VERSION = "run-control-ledger-v1"
+# A kicked pr-drive run bounds itself by three 960 s webhook waits plus action
+# timeouts, roughly 3,000 s end to end. Loss of an accepted kick is claimable
+# only after twice that, so a slow but live run is never charged twice.
+RUN_CONTROL_KICK_LOSS_GRACE_SECONDS = 7200
+RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
+    "receipt_authority_unavailable", "receipt_route_unresolvable",
+    "continuation_kick_failed", "kicked_run_never_settled",
+)
+RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "launch_descriptor_sha256", "receipt"})
+# The closed AgentReceipt failure_code vocabulary: none on success, every
+# classified launcher code, and the structured provider availability codes.
+RUN_CONTROL_TERMINAL_FAILURE_CODES = frozenset(
+    {"none"} | (set(FAILURE_CLASS_BY_CODE) - {"success"})
+    | {name for name, _ in PROVIDER_FAILURE_GROUPS}
+)
+RUN_CONTROL_LEDGER_LOCK = threading.Lock()
+
+
+def _run_control_now() -> int:
+    return int(time.time())
+
+
+def _run_control_ledger_path(authorization_id: str) -> Path:
+    return RUN_CONTROL_DIR / "reservations" / f"{authorization_id}.json"
+
+
+def _run_control_job_path(job_id: str) -> Path:
+    return RUN_CONTROL_DIR / "jobs" / f"{job_id}.json"
+
+
+def _run_control_ledger_read(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _run_control_ledger_write(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(record, indent=2) + "\n")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _run_control_ledger_record(continuity: dict[str, str]) -> dict[str, Any]:
+    return {"ledger_version": RUN_CONTROL_LEDGER_VERSION, **continuity, "kick": None, "settlement": None}
+
+
+def run_control_claim_kick(continuity: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    """Claim a reservation's single kick before posting it.
+
+    The durable ledger is the only record on this host that run N kicked a
+    reservation. It is written before the kick so a crash between post and
+    bookkeeping leaves an unknown kick result, which authority loss treats
+    like an accepted kick, never like a failed one.
+    """
+    with RUN_CONTROL_LEDGER_LOCK:
+        path = _run_control_ledger_path(continuity["authorization_id"])
+        if _run_control_ledger_read(path) is not None:
+            return 409, {"error": "run-control continuity was already kicked or settled",
+                         "code": "continuity_already_used"}
+        record = _run_control_ledger_record(continuity)
+        record["kick"] = {"requested_at": _run_control_now(), "kicked": None}
+        _run_control_ledger_write(path, record)
+    return None
+
+
+def run_control_record_kick_result(continuity: dict[str, str], kicked: bool) -> None:
+    with RUN_CONTROL_LEDGER_LOCK:
+        path = _run_control_ledger_path(continuity["authorization_id"])
+        record = _run_control_ledger_read(path)
+        if record is None or not isinstance(record.get("kick"), dict):
+            return
+        record["kick"]["kicked"] = bool(kicked)
+        _run_control_ledger_write(path, record)
+
+
+def _run_control_usage_projection(usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Aggregate a closed normalized usage record into run-control usage."""
+    if usage is None:
+        return {"turns": None, "wall_seconds": None, "tokens": None, "provider_cost_usd": None}
+    cost = usage.get("provider_cost_usd")
+    cost_text = None
+    if cost is not None:
+        # Ceiling at the contract's 12-place precision: a rounded-down cost
+        # could fit a reservation the real spend exceeded.
+        exact = Decimal(repr(cost)).quantize(Decimal("0.000000000001"), rounding=ROUND_CEILING)
+        cost_text = _run_control_cost_text(exact)
+    return {
+        "turns": usage.get("turns_observed"),
+        "wall_seconds": math.floor(usage["wall_seconds"]),
+        "tokens": sum(usage[key] for key in (
+            "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+            "output_tokens", "reasoning_tokens",
+        )),
+        "provider_cost_usd": cost_text,
+    }
+
+
+def _run_control_receipt_sha256(receipt: dict[str, Any]) -> str:
+    payload = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _run_control_settled_receipt(
+    continuity: dict[str, str], descriptor: str, receipt: dict[str, Any],
+    usage: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project the live terminal agent receipt onto the closed reconcile receipt.
+
+    Key order is part of the contract: graphwing-run-control-reconcile
+    re-serializes the receipt in exactly this order and compares hashes.
+    """
+    role = receipt.get("role")
+    route = _run_control_route({
+        "route_version": FALLBACK_ROUTE_VERSION if role == "availability_fallback" else ROUTE_VERSION,
+        "launcher": receipt.get("launcher"), "provider": receipt.get("provider"),
+        "model": receipt.get("model"),
+    })
+    if route is None:
+        return None
+    succeeded = receipt["status"] == "ok" and receipt["failure_code"] == "none"
+    return {
+        "receipt_id": f"rec1-{receipt['job_id']}",
+        "attempt_id": continuity["attempt_id"],
+        "run_control_id": continuity["run_control_id"],
+        "authorization_id": continuity["authorization_id"],
+        "launch_descriptor_sha256": descriptor,
+        "job_id": receipt["job_id"],
+        "terminal_status": "succeeded" if succeeded else "failed",
+        "route": route,
+        "usage": _run_control_usage_projection(usage),
+        "progress": {
+            "checkpoint": 0, "failing_regression_present": True, "production_diff_bytes": 0,
+            "focused_tests_green": False, "diff_fingerprint": _run_control_receipt_sha256(receipt),
+        },
+        "constraint_signals": [],
+        "verified_outcome": False,
+    }
+
+
+def _run_control_settlement_result(
+    continuity: dict[str, str], kind: str, receipt: dict[str, Any] | None, reason: str | None,
+) -> dict[str, Any]:
+    return {"version": RUN_CONTROL_SETTLEMENT_VERSION, "run_control_id": continuity["run_control_id"],
+            "kind": kind, "receipt": receipt, "authority_loss_reason": reason}
+
+
+def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Settle one named reservation from the live terminal `wait` webhook body.
+
+    Only a receipt this daemon sealed at the job's terminal transition is
+    usage. Authority lost to a restart, or a receipt whose route is outside
+    the run-control policy, closes the reservation as a full-envelope
+    authority loss instead of inventing usage. The settlement is one-time per
+    reservation and per job; an identical repeat is a replay, anything else a
+    conflict.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != RUN_CONTROL_SETTLE_FIELDS:
+        return _run_control_error("unexpected_fields", "settle requires exactly run_control, launch_descriptor_sha256, receipt")
+    continuity = run_control_continuity(data["run_control"])
+    if continuity is None:
+        return _run_control_error("bad_run_control_continuity",
+                                  "run_control must be the closed continuity trio run_control_id, attempt_id, authorization_id")
+    descriptor = data["launch_descriptor_sha256"]
+    if not _valid_sha256(descriptor):
+        return _run_control_error("bad_launch_descriptor_sha256", "launch_descriptor_sha256 must be 64 lowercase hex characters")
+    receipt = data["receipt"]
+    if isinstance(receipt, dict) and (
+            "kicked" in receipt or "kick" in receipt
+            or {"ok", "repo", "pr", "attempt", "max_attempts"} <= set(receipt)):
+        return _run_control_error("kick_ack_is_not_a_receipt",
+                                  "the synchronous /v1/pr/continue acknowledgment is not an attempt outcome")
+    if (not isinstance(receipt, dict)
+            or receipt.get("status") not in ("ok", "error", "timeout")
+            or not isinstance(receipt.get("job_id"), str) or not JOB_ID_RE.fullmatch(receipt["job_id"])
+            or receipt.get("failure_code") not in RUN_CONTROL_TERMINAL_FAILURE_CODES):
+        return _run_control_error("not_terminal_receipt", "receipt must be a terminal agent receipt")
+    usage, diagnostic = authorized_receipt_usage("agent", receipt)
+    if diagnostic == "usage_authority_mismatch":
+        return _run_control_error("receipt_authority_mismatch", "receipt is not the terminal receipt this daemon sealed")
+    job_id = receipt["job_id"]
+    if diagnostic == "usage_authority_unavailable":
+        projected, reason = None, "receipt_authority_unavailable"
+    else:
+        projected = _run_control_settled_receipt(continuity, descriptor, receipt, usage)
+        reason = None if projected is not None else "receipt_route_unresolvable"
+    kind = "terminal_receipt" if projected is not None else "authority_lost"
+    settlement = {
+        "kind": kind, "job_id": job_id, "receipt_sha256": _run_control_receipt_sha256(receipt),
+        "launch_descriptor_sha256": descriptor, "settled_at": _run_control_now(),
+        "result": _run_control_settlement_result(continuity, kind, projected, reason),
+    }
+    with RUN_CONTROL_LEDGER_LOCK:
+        path = _run_control_ledger_path(continuity["authorization_id"])
+        record = _run_control_ledger_read(path) or _run_control_ledger_record(continuity)
+        existing = record.get("settlement")
+        if isinstance(existing, dict):
+            if all(existing.get(key) == settlement[key]
+                   for key in ("job_id", "receipt_sha256", "launch_descriptor_sha256")):
+                return 200, {**existing["result"], "replay": True}
+            return 409, {"error": "reservation is already settled by different evidence",
+                         "code": "settlement_conflict"}
+        job_marker = _run_control_ledger_read(_run_control_job_path(job_id))
+        if job_marker is not None and job_marker.get("authorization_id") != continuity["authorization_id"]:
+            return 409, {"error": "job already settled a different reservation", "code": "settlement_conflict"}
+        record["settlement"] = settlement
+        _run_control_ledger_write(path, record)
+        _run_control_ledger_write(_run_control_job_path(job_id),
+                                  {"job_id": job_id, "authorization_id": continuity["authorization_id"]})
+    return 200, {**settlement["result"], "replay": False}
+
+
+def run_control_authority_loss(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Close a kicked reservation whose run never settled, conservatively.
+
+    Driven by a durable timer or the next initialize, never by the run that
+    died. Only a kick this daemon recorded can be declared lost, a definite
+    kick failure is lost at once, and an accepted or unknown kick waits out
+    the grace window first.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"run_control"}:
+        return _run_control_error("unexpected_fields", "authority loss requires exactly run_control")
+    continuity = run_control_continuity(data["run_control"])
+    if continuity is None:
+        return _run_control_error("bad_run_control_continuity",
+                                  "run_control must be the closed continuity trio run_control_id, attempt_id, authorization_id")
+    with RUN_CONTROL_LEDGER_LOCK:
+        path = _run_control_ledger_path(continuity["authorization_id"])
+        record = _run_control_ledger_read(path)
+        existing = record.get("settlement") if record is not None else None
+        if isinstance(existing, dict):
+            if existing.get("kind") == "authority_lost":
+                return 200, {**existing["result"], "replay": True}
+            return 409, {"error": "reservation was settled by a terminal receipt", "code": "already_settled"}
+        kick = record.get("kick") if record is not None else None
+        if not isinstance(kick, dict):
+            return _run_control_error("unknown_kick", "this daemon has no kick record for that reservation")
+        if kick.get("kicked") is False:
+            reason = "continuation_kick_failed"
+        else:
+            not_before = int(kick.get("requested_at") or 0) + RUN_CONTROL_KICK_LOSS_GRACE_SECONDS
+            if _run_control_now() < not_before:
+                return 409, {"error": "the kicked run may still be running", "code": "kick_within_grace",
+                             "not_before": not_before}
+            reason = "kicked_run_never_settled"
+        assert record is not None
+        record["settlement"] = {
+            "kind": "authority_lost", "job_id": None, "receipt_sha256": None,
+            "launch_descriptor_sha256": None, "settled_at": _run_control_now(),
+            "result": _run_control_settlement_result(continuity, "authority_lost", None, reason),
+        }
+        _run_control_ledger_write(path, record)
+    return 200, {**record["settlement"]["result"], "replay": False}
 
 
 def _run_control_error(code: str, message: str) -> tuple[int, dict[str, Any]]:
@@ -11488,6 +11765,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/validate-receipt":
         status, payload = run_control_validate_receipt(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/settle":
+        status, payload = run_control_settle(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/authority-loss":
+        status, payload = run_control_authority_loss(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route":
         status, payload = slice_route(body)

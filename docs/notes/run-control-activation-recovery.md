@@ -69,13 +69,47 @@ local commits ahead of `origin/main`; nothing is pushed, deployed, or published.
 The rejected wiring remains archived only at
 `archive/pr-drive-run-control-wiring-98c5d69-blocked`.
 
+## Settlement ops (this checkpoint)
+
+Two provider-free deterministic ops close the cross-run lifecycle on this host.
+Neither touches a graph; `graphwing-run-control-reconcile` stays the durable
+authority and verifies every field it is handed against Rewst datastore state.
+
+- `POST /v1/run/control/settle` takes `{run_control, launch_descriptor_sha256,
+  receipt}` where `receipt` is the exact body the `wait` webhook received, and
+  returns the closed reconcile request (`kind`, `run_control_id`, `receipt`,
+  `authority_loss_reason`, `replay`). The projected receipt uses the exact key
+  order the reconcile graph's canonical hash expects. Only a receipt this daemon
+  sealed at the job's terminal transition is usage (`authorized_receipt_usage`);
+  a tampered body is refused, the `/v1/pr/continue` ACK is refused by shape, and
+  a receipt whose authority a restart erased, or whose route is outside the
+  run-control policy, closes as `authority_lost` rather than inventing usage.
+  Settlement is one-time per reservation and per job in a durable ledger under
+  `$GRAPHWING_HOME/run-control/`: an identical repeat replays, anything else is
+  `409 settlement_conflict`.
+- `POST /v1/run/control/authority-loss` takes `{run_control}`. `pr_continue`
+  claims the reservation's single kick in the same ledger before posting
+  (`409 continuity_already_used` on a second kick) and records the kick result
+  after. A definite kick failure is lost at once
+  (`continuation_kick_failed`); an accepted or unknown-result kick waits out
+  `RUN_CONTROL_KICK_LOSS_GRACE_SECONDS` (7,200 s, twice a pr-drive run's bound)
+  before `kicked_run_never_settled`, so a slow live run is never charged twice.
+  Kicks this daemon never recorded cannot be declared lost by it.
+
+Open design point, not resolved here: the reconcile graph requires
+`receipt.launch_descriptor_sha256` to equal the reservation's, and the kicked
+run only receives the continuity trio. The settle op therefore takes the hash as
+an input the workflow must obtain; the wiring phase has to decide whether the
+kick payload carries it or run N+1 reads it back from durable state. The graph
+verifies whatever is supplied, so a wrong value fails closed.
+
 ## Next bounded task
 
-Implement provider-free run N+1 settlement of the named reservation from the live
-terminal `wait` webhook receipt. Prove exact `run_control_id`/`attempt_id`/
-`authorization_id` binding, one-time reconciliation, malformed receipt rejection,
-and that the synchronous `/v1/pr/continue` ACK is never accepted as terminal
-usage. Then implement conservative authority-loss reconciliation for an accepted
-kick whose new run never starts. Do not activate or rewire production graphs until
-both lifecycle paths are proven and the flag-off graph traversal remains identical
-to merged `main`.
+Graph-structural proof, still provider-free: with `run_control_enabled` unset or
+false, the traversed pr-drive node/edge sequence must be identical to merged
+`main`'s graph (validation step 2). Design the run N+1 wiring so the agent leg
+under a carried trio does not reserve again (the state graph refuses a second
+outstanding reservation), settles through `/v1/run/control/settle` from
+`TASKS.wait.request.body`, and resolves the descriptor-hash source above. Do not
+activate or rewire production graphs until both lifecycle paths are proven in an
+isolated tenant and the flag-off traversal remains identical to merged `main`.
