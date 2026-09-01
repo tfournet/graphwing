@@ -1554,21 +1554,21 @@
       },
       "PrContinueRunControl": {
         "type": "object", "additionalProperties": false,
-        "description": "Closed run-control continuity forwarded verbatim to the kicked run as CTX.INPUT.run_control; authorization_id must be rca1-<run hex>-<attempt hex>",
-        "required": ["run_control_id", "attempt_id", "authorization_id"],
+        "description": "Closed run-control continuity forwarded verbatim to the kicked run as CTX.INPUT.run_control; authorization_id must be rca1-<run hex>-<attempt hex> and launch_descriptor_sha256 is the reservation's persisted descriptor hash, carried from the reserving run because the reconcile graph verifies it against durable state",
+        "required": ["run_control_id", "attempt_id", "authorization_id", "launch_descriptor_sha256"],
         "properties": {
           "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},
           "attempt_id": {"$ref": "#/components/schemas/RunControlAttemptId"},
-          "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"}
+          "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"},
+          "launch_descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
         }
       },
       "RunControlSettleRequest": {
         "type": "object", "additionalProperties": false,
-        "description": "Run N+1 settlement of the reservation named by CTX.INPUT.run_control from its own live wait webhook body. launch_descriptor_sha256 is verified by the reconcile graph against durable state.",
-        "required": ["run_control", "launch_descriptor_sha256", "receipt"],
+        "description": "Run N+1 settlement of the reservation named by CTX.INPUT.run_control from its own live wait webhook body.",
+        "required": ["run_control", "receipt"],
         "properties": {
           "run_control": {"$ref": "#/components/schemas/PrContinueRunControl"},
-          "launch_descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
           "receipt": {"$ref": "#/components/schemas/AgentReceipt", "description": "The exact terminal agent receipt delivered to the wait webhook; only a receipt this daemon sealed is usage."}
         }
       },

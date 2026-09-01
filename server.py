@@ -2364,8 +2364,8 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     if "run_control" in data:
         continuity = run_control_continuity(data["run_control"])
         if continuity is None:
-            return 400, {"error": "run_control must be the closed continuity trio "
-                                  "run_control_id, attempt_id, authorization_id",
+            return 400, {"error": "run_control must be the closed continuity run_control_id, "
+                                  "attempt_id, authorization_id, launch_descriptor_sha256",
                          "code": "bad_run_control_continuity"}
 
     out = {"ok": True, "repo": name, "pr": number, "attempt": attempt,
@@ -2691,25 +2691,34 @@ RUN_CONTROL_REWST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 RUN_CONTROL_RUN_ID_RE = re.compile(r"rc1-[0-9a-f]{64}")
 RUN_CONTROL_ATTEMPT_ID_RE = re.compile(r"att1-[0-9a-f]{64}")
 RUN_CONTROL_COST_RE = re.compile(r"(0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?")
-RUN_CONTROL_CONTINUITY_FIELDS = frozenset({"run_control_id", "attempt_id", "authorization_id"})
+RUN_CONTROL_CONTINUITY_FIELDS = frozenset({
+    "run_control_id", "attempt_id", "authorization_id", "launch_descriptor_sha256",
+})
 
 
 def run_control_continuity(value: Any) -> dict[str, str] | None:
-    """Validate the closed cross-run continuity trio a kicked run settles.
+    """Validate the closed cross-run continuity a kicked run settles.
 
     The state graph reserves under run_control_id (rc1-hash) and attempt_id
-    (att1-hash) and names the reservation authorization rca1-<run>-<attempt>.
-    All three are required, closed, and must agree, or run N+1 could settle
-    someone else's reservation.
+    (att1-hash), names the reservation authorization rca1-<run>-<attempt>,
+    and hashes the launch descriptor it persisted. The reconcile graph
+    compares the settling receipt's descriptor hash to durable state, so the
+    hash must travel from the reserving run: a value run N+1 read back from
+    that same state would bind nothing. All four are required, closed, and
+    must agree, or run N+1 could settle someone else's reservation.
     """
     if not isinstance(value, dict) or set(value) != RUN_CONTROL_CONTINUITY_FIELDS:
         return None
-    run_id, attempt_id, auth_id = (value[k] for k in ("run_control_id", "attempt_id", "authorization_id"))
+    run_id, attempt_id, auth_id, descriptor = (value[k] for k in (
+        "run_control_id", "attempt_id", "authorization_id", "launch_descriptor_sha256",
+    ))
     if (not isinstance(run_id, str) or RUN_CONTROL_RUN_ID_RE.fullmatch(run_id) is None
             or not isinstance(attempt_id, str) or RUN_CONTROL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None
-            or auth_id != f"rca1-{run_id[4:]}-{attempt_id[5:]}"):
+            or auth_id != f"rca1-{run_id[4:]}-{attempt_id[5:]}"
+            or not _valid_sha256(descriptor)):
         return None
-    return {"run_control_id": run_id, "attempt_id": attempt_id, "authorization_id": auth_id}
+    return {"run_control_id": run_id, "attempt_id": attempt_id, "authorization_id": auth_id,
+            "launch_descriptor_sha256": descriptor}
 
 
 RUN_CONTROL_SETTLEMENT_VERSION = "run-control-settlement-v1"
@@ -2722,7 +2731,7 @@ RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
     "receipt_authority_unavailable", "receipt_route_unresolvable",
     "continuation_kick_failed", "kicked_run_never_settled",
 )
-RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "launch_descriptor_sha256", "receipt"})
+RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "receipt"})
 # The closed AgentReceipt failure_code vocabulary: none on success, every
 # classified launcher code, and the structured provider availability codes.
 RUN_CONTROL_TERMINAL_FAILURE_CODES = frozenset(
@@ -2823,8 +2832,7 @@ def _run_control_receipt_sha256(receipt: dict[str, Any]) -> str:
 
 
 def _run_control_settled_receipt(
-    continuity: dict[str, str], descriptor: str, receipt: dict[str, Any],
-    usage: dict[str, Any] | None,
+    continuity: dict[str, str], receipt: dict[str, Any], usage: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Project the live terminal agent receipt onto the closed reconcile receipt.
 
@@ -2845,7 +2853,7 @@ def _run_control_settled_receipt(
         "attempt_id": continuity["attempt_id"],
         "run_control_id": continuity["run_control_id"],
         "authorization_id": continuity["authorization_id"],
-        "launch_descriptor_sha256": descriptor,
+        "launch_descriptor_sha256": continuity["launch_descriptor_sha256"],
         "job_id": receipt["job_id"],
         "terminal_status": "succeeded" if succeeded else "failed",
         "route": route,
@@ -2881,14 +2889,12 @@ def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
         return 400, err
     assert data is not None
     if set(data) != RUN_CONTROL_SETTLE_FIELDS:
-        return _run_control_error("unexpected_fields", "settle requires exactly run_control, launch_descriptor_sha256, receipt")
+        return _run_control_error("unexpected_fields", "settle requires exactly run_control and receipt")
     continuity = run_control_continuity(data["run_control"])
     if continuity is None:
         return _run_control_error("bad_run_control_continuity",
-                                  "run_control must be the closed continuity trio run_control_id, attempt_id, authorization_id")
-    descriptor = data["launch_descriptor_sha256"]
-    if not _valid_sha256(descriptor):
-        return _run_control_error("bad_launch_descriptor_sha256", "launch_descriptor_sha256 must be 64 lowercase hex characters")
+                                  "run_control must be the closed continuity run_control_id, attempt_id, "
+                                  "authorization_id, launch_descriptor_sha256")
     receipt = data["receipt"]
     if isinstance(receipt, dict) and (
             "kicked" in receipt or "kick" in receipt
@@ -2907,12 +2913,12 @@ def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
     if diagnostic == "usage_authority_unavailable":
         projected, reason = None, "receipt_authority_unavailable"
     else:
-        projected = _run_control_settled_receipt(continuity, descriptor, receipt, usage)
+        projected = _run_control_settled_receipt(continuity, receipt, usage)
         reason = None if projected is not None else "receipt_route_unresolvable"
     kind = "terminal_receipt" if projected is not None else "authority_lost"
     settlement = {
         "kind": kind, "job_id": job_id, "receipt_sha256": _run_control_receipt_sha256(receipt),
-        "launch_descriptor_sha256": descriptor, "settled_at": _run_control_now(),
+        "launch_descriptor_sha256": continuity["launch_descriptor_sha256"], "settled_at": _run_control_now(),
         "result": _run_control_settlement_result(continuity, kind, projected, reason),
     }
     with RUN_CONTROL_LEDGER_LOCK:
@@ -2952,7 +2958,8 @@ def run_control_authority_loss(body: bytes) -> tuple[int, dict[str, Any]]:
     continuity = run_control_continuity(data["run_control"])
     if continuity is None:
         return _run_control_error("bad_run_control_continuity",
-                                  "run_control must be the closed continuity trio run_control_id, attempt_id, authorization_id")
+                                  "run_control must be the closed continuity run_control_id, attempt_id, "
+                                  "authorization_id, launch_descriptor_sha256")
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
         record = _run_control_ledger_read(path)

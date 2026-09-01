@@ -58,6 +58,8 @@ The first bounded task is complete on `feature/run-control-activation`:
   `run_control_id`, `attempt_id`, and the matching `authorization_id`. It validates
   the trio before `kick_url`, forwards it as `CTX.INPUT.run_control`, preserves
   the legacy payload when omitted, and never treats the kick ACK as a receipt.
+  The settlement checkpoint below widens the closed set to four fields by adding
+  `launch_descriptor_sha256`.
 - `86cb6e0` resets the fixed review-size boundary to merged foundation `f242c90`.
   It does not raise the 258,048-byte limit; new changes are measured independently
   from the already-reviewed foundation.
@@ -75,8 +77,8 @@ Two provider-free deterministic ops close the cross-run lifecycle on this host.
 Neither touches a graph; `graphwing-run-control-reconcile` stays the durable
 authority and verifies every field it is handed against Rewst datastore state.
 
-- `POST /v1/run/control/settle` takes `{run_control, launch_descriptor_sha256,
-  receipt}` where `receipt` is the exact body the `wait` webhook received, and
+- `POST /v1/run/control/settle` takes `{run_control, receipt}` where `receipt`
+  is the exact body the `wait` webhook received, and
   returns the closed reconcile request (`kind`, `run_control_id`, `receipt`,
   `authority_loss_reason`, `replay`). The projected receipt uses the exact key
   order the reconcile graph's canonical hash expects. Only a receipt this daemon
@@ -96,20 +98,35 @@ authority and verifies every field it is handed against Rewst datastore state.
   before `kicked_run_never_settled`, so a slow live run is never charged twice.
   Kicks this daemon never recorded cannot be declared lost by it.
 
-Open design point, not resolved here: the reconcile graph requires
-`receipt.launch_descriptor_sha256` to equal the reservation's, and the kicked
-run only receives the continuity trio. The settle op therefore takes the hash as
-an input the workflow must obtain; the wiring phase has to decide whether the
-kick payload carries it or run N+1 reads it back from durable state. The graph
-verifies whatever is supplied, so a wrong value fails closed.
+Descriptor-hash source, resolved: the reconcile graph requires
+`receipt.launch_descriptor_sha256` to equal the reservation's persisted hash. A
+value run N+1 read back from that same durable state would pass trivially and
+bind nothing, so the hash travels from the reserving run. The closed continuity
+is now four fields, `run_control_id`, `attempt_id`, `authorization_id`,
+`launch_descriptor_sha256`, validated identically by `/v1/pr/continue`, settle,
+and authority-loss, and forwarded verbatim as `CTX.INPUT.run_control`.
+
+Validation step 2 is a standing test, `PrDriveFlagOffTraversalTests`: every
+node in `graphs/pr-drive.json` executes when `run_control_enabled` is unset or
+false, so the whole graph is the flag-off traversal and it must equal merged
+`main`'s (`f242c90`) node-by-node and edge-by-edge. The test also rebuilds the
+blocked inline mode/switch/join shape on `main`'s graph and proves the check
+rejects it. Consequence: run-control gating cannot live inside the shipped
+pr-drive path. It goes in a separate slug or a publish-time render, so the
+shipped `graphwing-pr-drive` stays byte-identical and step 3's zero-write
+assertion means something.
 
 ## Next bounded task
 
-Graph-structural proof, still provider-free: with `run_control_enabled` unset or
-false, the traversed pr-drive node/edge sequence must be identical to merged
-`main`'s graph (validation step 2). Design the run N+1 wiring so the agent leg
-under a carried trio does not reserve again (the state graph refuses a second
-outstanding reservation), settles through `/v1/run/control/settle` from
-`TASKS.wait.request.body`, and resolves the descriptor-hash source above. Do not
-activate or rewire production graphs until both lifecycle paths are proven in an
-isolated tenant and the flag-off traversal remains identical to merged `main`.
+Author the enabled pr-drive shape as a separate dormant catalog graph
+(`graphs/pr-drive-run-control.json`, slug `graphwing-pr-drive-run-control`) that
+`publish_graphs.py` publishes only when asked by name, never with `--only all`
+or `--only pr-drive`. Under a carried `CTX.INPUT.run_control` the agent leg must
+not reserve again (the state graph refuses a second outstanding reservation); it
+launches the writer, settles through `/v1/run/control/settle` from
+`TASKS.wait.request.body`, and feeds the result to the pinned reconcile child.
+The continue leg reserves, consumes, kicks with the four-field continuity built
+from the state subworkflow's outputs, and on kick failure closes through
+`/v1/run/control/authority-loss`. Prove the shape with provider-free structural
+tests; `graphs/pr-drive.json` stays untouched. Do not publish until the flag-off
+traversal test and both suites are green and an isolated tenant is available.
