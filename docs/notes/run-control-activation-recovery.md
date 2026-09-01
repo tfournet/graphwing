@@ -49,18 +49,33 @@ Provider-free first, isolated tenant second, real provider last:
    receipt across two chained runs, then authority-loss on a lost kick.
 5. Real provider in the isolated tenant only after 1–4 are green.
 
-## First bounded task
+## Current checkpoint
 
-Extend the `/v1/pr/continue` kick payload and input contract to carry run-control
-attempt continuity: `run_control_id`, attempt identity, and prior reservation
-reference, validated and echoed so run N+1 receives them as `CTX.INPUT`. Server
-and `test_server.py` only, no graph edits, no launch wiring. Estimate ≤100 lines
-including tests.
+The first bounded task is complete on `feature/run-control-activation`:
 
-Landed on `feature/run-control-activation`: `/v1/pr/continue` accepts an optional
-closed `run_control` object (`run_control_id` rc1-hex, `attempt_id` att1-hex,
-`authorization_id` rca1-<run hex>-<attempt hex>, all three required and
-agreeing) and forwards it verbatim in the kick payload as `CTX.INPUT.run_control`.
-Omitting it leaves the kick payload unchanged. Next milestone: run N+1 settles
-that reservation from its live `wait` webhook body, then authority-loss
-reconciliation for a kick that never starts.
+- `7d725e5` records this recovery plan.
+- `7ed66b7` adds optional closed `/v1/pr/continue` continuity:
+  `run_control_id`, `attempt_id`, and the matching `authorization_id`. It validates
+  the trio before `kick_url`, forwards it as `CTX.INPUT.run_control`, preserves
+  the legacy payload when omitted, and never treats the kick ACK as a receipt.
+- `86cb6e0` resets the fixed review-size boundary to merged foundation `f242c90`.
+  It does not raise the 258,048-byte limit; new changes are measured independently
+  from the already-reviewed foundation.
+
+Verified at `86cb6e0`: focused continuity and size-boundary tests 4/4, normal suite
+589/589, missing-launcher suite 589/589, Python compilation, 13 JSON parses,
+`actionlint`, `git diff --check`, and gitleaks. The worktree is clean and three
+local commits ahead of `origin/main`; nothing is pushed, deployed, or published.
+The rejected wiring remains archived only at
+`archive/pr-drive-run-control-wiring-98c5d69-blocked`.
+
+## Next bounded task
+
+Implement provider-free run N+1 settlement of the named reservation from the live
+terminal `wait` webhook receipt. Prove exact `run_control_id`/`attempt_id`/
+`authorization_id` binding, one-time reconciliation, malformed receipt rejection,
+and that the synchronous `/v1/pr/continue` ACK is never accepted as terminal
+usage. Then implement conservative authority-loss reconciliation for an accepted
+kick whose new run never starts. Do not activate or rewire production graphs until
+both lifecycle paths are proven and the flag-off graph traversal remains identical
+to merged `main`.
