@@ -690,18 +690,25 @@ def load_rewst_issuer_secret() -> bytes:
     if env.strip():
         raw = env.strip()
     else:
+        descriptor = -1
         try:
-            metadata = REWST_ISSUER_SECRET_PATH.lstat()
+            descriptor = os.open(
+                REWST_ISSUER_SECRET_PATH,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077):
+                raise RuntimeError("Rewst issuer secret is unavailable")
+            with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                descriptor = -1
+                raw = stream.read().strip()
         except OSError as exc:
             raise RuntimeError("Rewst issuer secret is unavailable") from exc
-        if (not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) & 0o077):
-            raise RuntimeError("Rewst issuer secret is unavailable")
-        try:
-            raw = REWST_ISSUER_SECRET_PATH.read_bytes().strip()
-        except OSError as exc:
-            raise RuntimeError("Rewst issuer secret is unavailable") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     if len(raw) < 32:
         raise RuntimeError("Rewst issuer secret is unavailable")
     return raw
@@ -757,6 +764,16 @@ def _reject_rewst_json_constant(_value: str) -> None:
     raise ValueError("non-JSON number")
 
 
+def _rewst_canonical_json_bytes(value: Any) -> bytes | None:
+    """Serialize one Rewst authority value without leaking encoder failures."""
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except Exception:
+        return None
+
+
 def _validate_rewst_consumed_authorization(
     path: str, body: bytes, timestamp: int,
 ) -> dict[str, Any] | None:
@@ -801,11 +818,10 @@ def _validate_rewst_consumed_authorization(
         return None
     request = dict(data)
     request.pop("rewst_authorization", None)
-    request_hash = hashlib.sha256(
-        json.dumps(
-            request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    ).hexdigest()
+    canonical_request = _rewst_canonical_json_bytes(request)
+    if canonical_request is None:
+        return None
+    request_hash = hashlib.sha256(canonical_request).hexdigest()
     text_fields = (
         "route_version", "role", "work_kind", "work_class", "effective_size",
         "profile_version", "launcher", "provider", "model", "requested_effort",
@@ -916,16 +932,12 @@ def rewst_descriptor_matches(authority: Any, expected: Any) -> bool:
     descriptor = authority.get("descriptor")
     if not isinstance(descriptor, dict) or set(descriptor) != REWST_DESCRIPTOR_FIELDS:
         return False
-    actual_hash = hashlib.sha256(
-        json.dumps(
-            descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    ).digest()
-    expected_hash = hashlib.sha256(
-        json.dumps(
-            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    ).digest()
+    actual = _rewst_canonical_json_bytes(descriptor)
+    wanted = _rewst_canonical_json_bytes(expected)
+    if actual is None or wanted is None:
+        return False
+    actual_hash = hashlib.sha256(actual).digest()
+    expected_hash = hashlib.sha256(wanted).digest()
     return hmac.compare_digest(actual_hash, expected_hash)
 
 
@@ -934,11 +946,8 @@ def _rewst_authority_digest(authority: Any) -> bytes | None:
         "nonce", "timestamp", "method", "path", "body_sha256", "authorization", "descriptor",
     }:
         return None
-    try:
-        canonical = json.dumps(
-            authority, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()
-    except (TypeError, ValueError, UnicodeEncodeError):
+    canonical = _rewst_canonical_json_bytes(authority)
+    if canonical is None:
         return None
     return hashlib.sha256(canonical).digest()
 

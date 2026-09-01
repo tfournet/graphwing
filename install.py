@@ -8,6 +8,7 @@ never installed. Named Cloudflare tunnel is optional.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import secrets
@@ -147,25 +148,52 @@ def ensure_key(home: Path) -> Path:
 
 
 def ensure_rewst_hmac_secret(home: Path) -> Path:
-    """Create or preserve the distinct Rewst issuer secret as a private seat file."""
+    """Create or preserve one descriptor-pinned private Rewst issuer secret."""
     path = home / "rewst-hmac.key"
-    if path.exists():
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SystemExit(f"refusing non-regular Rewst HMAC secret path: {path}")
-        if len(path.read_bytes().strip()) < 32:
-            raise SystemExit(f"existing Rewst HMAC secret is shorter than 32 bytes: {path}")
-        path.chmod(0o600)
-        return path
     supplied = os.environ.get("GRAPHWING_REWST_HMAC_SECRET", "").strip()
     if supplied and len(supplied.encode()) < 32:
         raise SystemExit("GRAPHWING_REWST_HMAC_SECRET must be at least 32 bytes")
-    raw = (supplied or secrets.token_hex(32)) + "\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor, created = -1, None
+    flags = os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        os.write(descriptor, raw.encode())
+        try:
+            descriptor = os.open(path, os.O_RDONLY | flags)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise SystemExit(f"refusing unsafe Rewst HMAC secret: {path}") from exc
+            created = ((supplied or secrets.token_hex(32)) + "\n").encode()
+            try:
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                                     0o600)
+            except OSError as create_exc:
+                raise SystemExit(f"unable to create Rewst HMAC secret: {path}") from create_exc
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise SystemExit(f"refusing unsafe Rewst HMAC secret: {path}")
+        os.fchmod(descriptor, 0o600)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+            raise SystemExit(f"unable to secure Rewst HMAC secret: {path}")
+        if created is not None:
+            while created:
+                written = os.write(descriptor, created)
+                if written <= 0:
+                    raise OSError("short write")
+                created = created[written:]
+            os.fsync(descriptor)
+        else:
+            raw = os.read(descriptor, 65537)
+            if len(raw) > 65536 or len(raw.strip()) < 32:
+                raise SystemExit(f"existing Rewst HMAC secret is invalid: {path}")
+        try:
+            final = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise SystemExit(f"Rewst HMAC secret changed during install: {path}") from exc
+        if (not stat.S_ISREG(final.st_mode)
+                or (final.st_dev, final.st_ino) != (metadata.st_dev, metadata.st_ino)):
+            raise SystemExit(f"Rewst HMAC secret changed during install: {path}")
     finally:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
     return path
 
 

@@ -1,18 +1,17 @@
 # Rewst launch-authorization foundation
 
-This prerequisite is intentionally inert. Ordinary agent, review, and continuation launches still use their existing contracts; no current endpoint or graph requires or consumes this authorization yet. The final workflow-enforcement change will connect the two independent trust domains: the existing Graphwing API key and a Rewst-only exact-request signature. Never put either secret in a graph export or this repository.
+This prerequisite is intentionally inert: launch contracts are unchanged, and no endpoint or graph consumes it. A later phase combines the API key with a Rewst-only exact-request signature. Secrets never belong in exports or this repository.
 
 ## Provisioning
 
-`install.py` creates `$GRAPHWING_HOME/rewst-hmac.key` mode `0600`. To supply a managed secret on first install, set `GRAPHWING_REWST_HMAC_SECRET` to at least 32 bytes; an existing valid seat file is preserved. Configure the corresponding Rewst credential field `rewst_hmac_secret` through the tenant secret manager. The API key is a separate credential field.
+`install.py` creates owner-only `$GRAPHWING_HOME/rewst-hmac.key`. A first install may use a 32-byte `GRAPHWING_REWST_HMAC_SECRET`; a valid file is preserved.
 
-Import `examples/rewst-request-hmac-credential.json` as a request-aware credential template. Adapt field wiring to the installed Riftwing version, preserving these exact semantics:
+Import `examples/rewst-request-hmac-credential.json` and preserve:
 
-1. Unix timestamp.
-2. 64 lowercase hexadecimal random characters (256-bit nonce).
-3. HMAC-SHA256 over the exact bytes `timestamp + "." + nonce + "." + request.body`—the already serialized outbound body, without parsing or reserialization.
-4. Lowercase hexadecimal signature in `X-Graphwing-Rewst-Signature`, with timestamp and nonce in their named headers.
+1. A Unix timestamp and 64-character lowercase hexadecimal nonce.
+2. HMAC-SHA256 over exact bytes `timestamp + "." + nonce + "." + request.body`, without reserialization.
+3. A lowercase signature plus timestamp and nonce headers.
 
-The signature is fresh for five minutes and one-time. Retries must create a new native KV authorization and a new nonce. A request lost after CAS consumption is intentionally burned.
+Signatures are fresh for five minutes and one-time. Each retry needs a new authorization and nonce; consumed requests stay burned.
 
-`scripts/publish_graphs.py --only all --no-run` registers `graphwing-run-control-authorize` first, and `--only run-control-authorize --no-run` selects it directly. Publishing this inert helper does not connect it to launch routing. The publisher does not provision or print the HMAC secret.
+`publish_graphs.py` registers the helper for `--only all` or `--only run-control-authorize`. Publication stays inert and never provisions the secret.
