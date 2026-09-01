@@ -13,6 +13,7 @@ import math
 import os
 import re
 import select
+import secrets
 import shutil
 import signal
 import stat
@@ -67,6 +68,13 @@ HERDR_JOB_TAB_MAX = 8
 HERDR_TAB_LINGER_SECONDS = int(os.environ.get("GRAPHWING_HERDR_TAB_LINGER", "180"))
 HERDR_LOCK = threading.Lock()
 
+
+def _new_rewst_server_instance_challenge() -> str:
+    return secrets.token_hex(32)
+
+
+REWST_SERVER_INSTANCE_CHALLENGE = _new_rewst_server_instance_challenge()
+
 # Dormant Rewst launch-authorization primitives. Existing request dispatch does
 # not call these until the workflow-enforcement phase lands.
 REWST_SIGNATURE_MAX_SKEW_SECONDS = 300
@@ -78,6 +86,7 @@ REWST_AUTHORIZATION_FIELDS = frozenset({
     "authorization_version", "authorization_id", "state", "ok", "swapped",
     "expected_version", "consumed_version", "issued_at", "expires_at", "collection",
     "record_key", "record_found", "record_version", "payload_sha256", "descriptor",
+    "server_instance_challenge",
 })
 REWST_DESCRIPTOR_FIELDS = frozenset({
     "descriptor_version", "operation", "route_version", "role", "work_kind", "work_class",
@@ -86,7 +95,7 @@ REWST_DESCRIPTOR_FIELDS = frozenset({
     "branch", "starting_head", "prompt_sha256", "diff_sha256", "resume_parent_job_id",
     "max_turns", "wall_seconds", "max_tokens", "max_cost_usd", "callback_sha256",
     "permission_profile", "authorization_id", "consumed_version", "record_key",
-    "record_version", "payload_sha256", "request_sha256",
+    "record_version", "payload_sha256", "request_sha256", "server_instance_challenge",
 })
 REWST_OPERATION_BY_PATH = {
     "/v1/agent/run": "agent_run",
@@ -751,6 +760,14 @@ def _valid_sha256(value: Any, *, nullable: bool = False) -> bool:
     )
 
 
+def _rewst_challenge_is_current(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and REWST_SIGNATURE_RE.fullmatch(value)
+        and hmac.compare_digest(value, REWST_SERVER_INSTANCE_CHALLENGE)
+    )
+
+
 def _rewst_unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -796,6 +813,8 @@ def _validate_rewst_consumed_authorization(
     expected_version = auth.get("expected_version")
     consumed_version = auth.get("consumed_version")
     issued_at, expires_at = auth.get("issued_at"), auth.get("expires_at")
+    auth_challenge = auth.get("server_instance_challenge")
+    descriptor_challenge = descriptor.get("server_instance_challenge")
     if (auth.get("authorization_version") != "graphwing-rewst-authorization-v1"
             or auth.get("state") != "consumed"
             or auth.get("ok") is not True
@@ -814,7 +833,13 @@ def _validate_rewst_consumed_authorization(
             or not _valid_rewst_id(auth.get("authorization_id"))
             or auth.get("collection") != "graphwing_run_control_v1"
             or not _valid_rewst_id(auth.get("record_key"))
-            or not _valid_sha256(auth.get("payload_sha256"))):
+            or not _valid_sha256(auth.get("payload_sha256"))
+            or not isinstance(auth_challenge, str)
+            or REWST_SIGNATURE_RE.fullmatch(auth_challenge) is None
+            or not isinstance(descriptor_challenge, str)
+            or REWST_SIGNATURE_RE.fullmatch(descriptor_challenge) is None
+            or not hmac.compare_digest(auth_challenge, descriptor_challenge)
+            or not hmac.compare_digest(auth_challenge, REWST_SERVER_INSTANCE_CHALLENGE)):
         return None
     request = dict(data)
     request.pop("rewst_authorization", None)
@@ -885,7 +910,13 @@ def verify_rewst_issuer_request(
         secret = load_rewst_issuer_secret()
     except (OSError, RuntimeError):
         return None, _rewst_auth_error("rewst_authorization_invalid")
-    signed = timestamp_text.encode("ascii") + b"." + nonce.encode("ascii") + b"." + body
+    signed = (
+        b"graphwing-rewst-request-v2\n"
+        + REWST_SERVER_INSTANCE_CHALLENGE.encode("ascii") + b"\n"
+        + timestamp_text.encode("ascii") + b"\n"
+        + nonce.encode("ascii") + b"\n"
+        + body
+    )
     expected = hmac.new(secret, signed, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
         return None, _rewst_auth_error("rewst_authorization_invalid")
@@ -898,6 +929,7 @@ def verify_rewst_issuer_request(
         "method": method,
         "path": path,
         "body_sha256": hashlib.sha256(body).hexdigest(),
+        "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
         "authorization": validated["authorization"],
         "descriptor": validated["descriptor"],
     }
@@ -917,6 +949,7 @@ def verify_rewst_issuer_request(
             return None, _rewst_auth_error("rewst_authorization_invalid")
         _REWST_AUTHORITIES[nonce] = {
             "timestamp": timestamp,
+            "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
             "authority_sha256": authority_digest,
             "state": "verified",
             "job_id": None,
@@ -943,7 +976,8 @@ def rewst_descriptor_matches(authority: Any, expected: Any) -> bool:
 
 def _rewst_authority_digest(authority: Any) -> bytes | None:
     if not isinstance(authority, dict) or set(authority) != {
-        "nonce", "timestamp", "method", "path", "body_sha256", "authorization", "descriptor",
+        "nonce", "timestamp", "method", "path", "body_sha256",
+        "server_instance_challenge", "authorization", "descriptor",
     }:
         return None
     canonical = _rewst_canonical_json_bytes(authority)
@@ -964,6 +998,8 @@ def claim_rewst_launch_authority(authority: Any, job_id: str) -> bool:
         stored_digest = stored.get("authority_sha256") if stored is not None else None
         if (stored is None
                 or stored.get("state") != "verified"
+                or not _rewst_challenge_is_current(authority.get("server_instance_challenge"))
+                or not _rewst_challenge_is_current(stored.get("server_instance_challenge"))
                 or not isinstance(stored_digest, bytes)
                 or not hmac.compare_digest(stored_digest, authority_digest)):
             return False
@@ -981,7 +1017,8 @@ def consume_rewst_authority_for_job(job_id: str, *, required: bool = True) -> bo
         if len(matching) != 1:
             return not required and not matching
         stored = matching[0]
-        if stored.get("state") != "claimed":
+        if (stored.get("state") != "claimed"
+                or not _rewst_challenge_is_current(stored.get("server_instance_challenge"))):
             return False
         stored["state"] = "consumed"
         return True
@@ -999,6 +1036,8 @@ def consume_rewst_launch_authority(authority: Any, job_id: str) -> bool:
         if (stored is None
                 or stored.get("state") != "claimed"
                 or stored.get("job_id") != job_id
+                or not _rewst_challenge_is_current(authority.get("server_instance_challenge"))
+                or not _rewst_challenge_is_current(stored.get("server_instance_challenge"))
                 or not isinstance(stored_digest, bytes)
                 or not hmac.compare_digest(stored_digest, authority_digest)):
             return False
@@ -10776,6 +10815,12 @@ def dispatch_inner(
 
     if not authed:
         return json_out(401, {"error": "invalid or missing X-Graphwing-Key", "code": "unauthorized"})
+
+    if method == "GET" and path == "/v1/rewst/server-challenge":
+        return json_out(200, {
+            "challenge_version": "graphwing-server-instance-challenge-v1",
+            "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
+        })
 
     if method == "GET" and path == "/v1/units/status":
         out = units_status()
