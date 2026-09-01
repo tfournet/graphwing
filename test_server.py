@@ -9781,8 +9781,10 @@ while True:
             for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
                 with self.subTest(walk_id=walk_id):
                     config = nodes[walk_id]["config"]
-                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.fresh_primary_receipt }}}}")
-                    self.assertIn("'fresh_primary_receipt': ''", nodes[alias]["config"]["code"]["code"])
+                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.result.fresh_primary_receipt }}}}")
+                    self.assertEqual(nodes[alias]["type"], "transforms.lookupTable")
+                    fresh = nodes[alias]["config"]["entries"][0]["value"]["properties"]["fresh_primary_receipt"]
+                    self.assertEqual(fresh, {"kind": "literal", "value": ""})
                     with mock.patch.object(server, "JOBS_DIR", jobs):
                         next_status, retained = server.derive_slice_recovery_route(
                             continuation
@@ -9945,17 +9947,19 @@ while True:
             nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.route.data",
         )
+        self.assertEqual(nodes["selected_route"]["type"], "transforms.objectBuilder")
         self.assertEqual(
-            nodes["selected_route"]["config"]["code"]["code"],
-            "{{ CTX.recovery_selection.route | default(CTX.normal_primary_candidate.route) | tojson }}",
+            nodes["selected_route_pick"]["config"]["defaultValue"],
+            {"kind": "getField", "path": "CTX.normal_primary_candidate.route"},
         )
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.fallback_route.data",
         )
+        self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
         self.assertEqual(
-            nodes["fallback_route_choice"]["config"]["code"]["code"],
-            "{{ CTX.normal_fallback_candidate.route | default(CTX.recovery_selection.route) | tojson }}",
+            nodes["fallback_route_choice_pick"]["config"]["defaultValue"],
+            {"kind": "getField", "path": "CTX.recovery_selection.route"},
         )
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             self.assertNotIn("TASKS.route", nodes[node_id]["config"]["effort"], node_id)
@@ -12722,7 +12726,8 @@ func main() {
         self.assertEqual(nodes["join_receipt_fail"]["type"], "logic.join.any")
         self.assertTrue(any(e["source"] == "join_receipt_fail" and e["target"] == "receipt_fail" for e in edges))
         self.assertEqual(nodes["join_writer_success"]["type"], "logic.join.any")
-        self.assertTrue(any(e["source"] == "join_writer_success" and e["target"] == "active_route" for e in edges))
+        self.assertTrue(any(e["source"] == "join_writer_success" and e["target"] == "active_route_pick" for e in edges))
+        self.assertTrue(any(e["source"] == "active_route_pick" and e["target"] == "active_route" for e in edges))
 
     def test_native_retry_writers_use_recorded_receipts_only(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -12778,28 +12783,277 @@ func main() {
         })
         self.assertIn(("fallback_route", "success", "normal_fallback_candidate"), triples)
         self.assertIn(("normal_fallback_candidate", "out", "join_fallback_start"), triples)
-        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
+        self.assertIn(("join_fallback_start", "out", "fallback_route_choice_pick"), triples)
+        self.assertIn(("fallback_route_choice_pick", "out", "fallback_route_choice"), triples)
         self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
         self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), triples)
         self.assertNotIn("session_identity", nodes["agent_fallback"]["config"])
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
             self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
 
-    def test_implement_slice_fallback_templates_resolve_the_actual_later_route(self):
+    def test_implement_slice_route_materialization_is_native_and_exactly_wired(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        triples = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["spec"]["edges"]
+        }
+        replaced = {
+            "fallback_route_choice", "selected_route", "walk_recovery_input",
+            "walk_e2e_recovery_input", "active_route",
+        }
+        helpers = {
+            "selected_route_pick", "fallback_route_choice_pick",
+            "active_route_pick", "continuation_primary_pick",
+        }
         self.assertEqual(
-            nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
-            "TASKS.fallback_route.data",
+            {node_id: nodes[node_id]["type"] for node_id in replaced},
+            {
+                "fallback_route_choice": "transforms.objectBuilder",
+                "selected_route": "transforms.objectBuilder",
+                "walk_recovery_input": "transforms.lookupTable",
+                "walk_e2e_recovery_input": "transforms.lookupTable",
+                "active_route": "transforms.objectBuilder",
+            },
         )
-        self.assertEqual(nodes["selected_route"]["config"]["code"]["code"], "{{ CTX.recovery_selection.route | default(CTX.normal_primary_candidate.route) | tojson }}")
-        self.assertEqual(nodes["active_route"]["config"]["code"]["code"], "{{ CTX.fallback_receipt.route | default(CTX.receipt.route) | tojson }}")
-        choice = nodes["fallback_route_choice"]
-        self.assertEqual(choice["type"], "transforms.codeExpression")
         self.assertEqual(
-            choice["config"]["code"]["code"],
-            "{{ CTX.normal_fallback_candidate.route | default(CTX.recovery_selection.route) | tojson }}",
+            {node_id: nodes[node_id]["type"] for node_id in helpers},
+            {node_id: "transforms.lookupTable" for node_id in helpers},
         )
+        replacement_dump = json.dumps([nodes[node_id] for node_id in sorted(replaced | helpers)])
+        self.assertNotIn("transforms.codeExpression", replacement_dump)
+        self.assertNotIn('"language": "jinja"', replacement_dump)
+        self.assertNotRegex(replacement_dump, r"{[%{].*(?:default|tojson|set|if)")
+
+        self.assertEqual(
+            nodes["selected_route_pick"]["config"],
+            {
+                "alias": "selected_route_pick",
+                "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
+                "entries": [
+                    {"key": route_version, "value": {
+                        "kind": "getField", "path": "CTX.recovery_selection.route",
+                    }}
+                    for route_version in ("normal-v1", "availability-fallback-v1")
+                ],
+                "defaultValue": {"kind": "getField", "path": "CTX.normal_primary_candidate.route"},
+                "caseSensitive": True,
+            },
+        )
+        self.assertEqual(
+            nodes["fallback_route_choice_pick"]["config"],
+            {
+                "alias": "fallback_route_choice_pick",
+                "input": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route.route_version"},
+                "entries": [
+                    {"key": route_version, "value": {
+                        "kind": "getField", "path": "CTX.normal_fallback_candidate.route",
+                    }}
+                    for route_version in ("normal-v1", "availability-fallback-v1")
+                ],
+                "defaultValue": {"kind": "getField", "path": "CTX.recovery_selection.route"},
+                "caseSensitive": True,
+            },
+        )
+        self.assertEqual(
+            nodes["active_route_pick"]["config"],
+            {
+                "alias": "active_route_pick",
+                "input": {"kind": "getField", "path": "CTX.fallback_receipt.route.route_version"},
+                "entries": [
+                    {"key": route_version, "value": {
+                        "kind": "getField", "path": "CTX.fallback_receipt.route",
+                    }}
+                    for route_version in ("normal-v1", "availability-fallback-v1")
+                ],
+                "defaultValue": {"kind": "getField", "path": "CTX.receipt.route"},
+                "caseSensitive": True,
+            },
+        )
+        self.assertEqual(
+            nodes["continuation_primary_pick"]["config"],
+            {
+                "alias": "continuation_primary_pick",
+                "input": {"kind": "getField", "path": "CTX.receipt.route.route_version"},
+                "entries": [
+                    {"key": route_version, "value": {"kind": "object", "properties": {
+                        "prior_primary_route": {"kind": "getField", "path": "CTX.receipt.route"},
+                        "prior_primary_receipt": {"kind": "getField", "path": "CTX.receipt"},
+                    }}}
+                    for route_version in ("normal-v1", "availability-fallback-v1")
+                ],
+                "defaultValue": {"kind": "object", "properties": {
+                    "prior_primary_route": {"kind": "getField", "path": "CTX.INPUT.prior_primary_route"},
+                    "prior_primary_receipt": {"kind": "getField", "path": "CTX.INPUT.prior_primary_receipt"},
+                }},
+                "caseSensitive": True,
+            },
+        )
+        self.assertTrue({
+            ("join_primary_start", "out", "selected_route_pick"),
+            ("selected_route_pick", "out", "selected_route"),
+            ("selected_route", "out", "wait"),
+            ("join_fallback_start", "out", "fallback_route_choice_pick"),
+            ("fallback_route_choice_pick", "out", "fallback_route_choice"),
+            ("fallback_route_choice", "out", "wait_fallback"),
+            ("join_writer_success", "out", "active_route_pick"),
+            ("active_route_pick", "out", "active_route"),
+            ("active_route", "out", "continuation_primary_pick"),
+            ("continuation_primary_pick", "out", "wait_test"),
+            ("push", "success", "walk_recovery_input"),
+            ("walk_recovery_input", "out", "walk"),
+            ("switch_e2e", "case-2", "walk_e2e_recovery_input"),
+            ("walk_e2e_recovery_input", "out", "walk_e2e"),
+        }.issubset(triples), triples)
+        for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
+            for field in (
+                "recovery_version", "prior_primary_route", "prior_primary_receipt",
+                "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
+            ):
+                self.assertEqual(nodes[walk_id]["config"][field], f"{{{{ CTX.{alias}.result.{field} }}}}")
+
+    def test_implement_slice_native_route_materialization_preserves_legacy_fallback_semantics(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertTrue({
+            "selected_route_pick", "fallback_route_choice_pick",
+            "active_route_pick", "continuation_primary_pick",
+        }.issubset(nodes), "native selection helpers are missing")
+        missing = object()
+
+        def get_path(context, path):
+            current = context
+            for part in path.split("."):
+                if not isinstance(current, dict) or part not in current:
+                    return missing
+                current = current[part]
+            return current
+
+        def evaluate(expression, context):
+            if expression["kind"] == "getField":
+                return get_path(context, expression["path"])
+            if expression["kind"] == "literal":
+                return expression["value"]
+            if expression["kind"] == "object":
+                return {
+                    key: evaluate(value, context)
+                    for key, value in expression["properties"].items()
+                }
+            self.fail(f"unsupported fixture AST: {expression}")
+
+        def run_node(node_id, context):
+            node = nodes[node_id]
+            if node["type"] == "transforms.lookupTable":
+                config = node["config"]
+                selected = next(
+                    (entry["value"] for entry in config["entries"]
+                     if evaluate(config["input"], context) == entry["key"]),
+                    config["defaultValue"],
+                )
+                result = evaluate(selected, context)
+                context.setdefault("CTX", {})[config["alias"]] = {"result": result}
+                return result
+            if node["type"] == "transforms.objectBuilder":
+                result = {
+                    mapping["output"]: evaluate(mapping["expression"], context)
+                    for mapping in node["config"]["mappings"]
+                }
+                context.setdefault("CTX", {})[node["config"]["alias"]] = result
+                return result
+            self.fail(f"unsupported fixture node: {node}")
+
+        primary = {
+            "route_version": "normal-v1", "class": "mechanical", "work_kind": "go_coding",
+            "effective_size": "M", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "effort": "high", "max_turns": 40,
+            "run_budget_seconds": 600, "writer_execution_profile": {"role": "writer"},
+            "reviewer1_effort": "medium", "reviewer1_execution_profile": {"role": "reviewer1"},
+            "reviewer1_launcher": "claude", "reviewer1_provider": "anthropic",
+            "reviewer1_model": "claude-opus-5", "reviewer2_effort": "none",
+            "reviewer2_execution_profile": None, "reviewer2_launcher": "none",
+            "reviewer2_provider": "none", "reviewer2_model": "none",
+        }
+        recovered_primary = {**primary, "model": "gpt-5.6-sol-recovered"}
+        normal_fallback = {
+            **primary, "route_version": "availability-fallback-v1", "launcher": "claude",
+            "provider": "anthropic", "model": "claude-opus-5", "effort": "default",
+        }
+        retained_fallback = {**normal_fallback, "model": "claude-opus-5-retained"}
+
+        cases = (
+            ("selected_route_pick", "selected_route", {
+                "CTX": {"normal_primary_candidate": {"route": primary}},
+            }, primary),
+            ("selected_route_pick", "selected_route", {"CTX": {
+                "normal_primary_candidate": {"route": primary},
+                "recovery_selection": {"route": recovered_primary},
+            }}, recovered_primary),
+            # Legacy default() gave a newly computed fallback priority even when
+            # recovery evidence was also present. This catches marker-based picks.
+            ("fallback_route_choice_pick", "fallback_route_choice", {"CTX": {
+                "normal_fallback_candidate": {"route": normal_fallback},
+                "recovery_selection": {"route": recovered_primary},
+            }}, normal_fallback),
+            ("fallback_route_choice_pick", "fallback_route_choice", {"CTX": {
+                "recovery_selection": {"route": retained_fallback},
+            }}, retained_fallback),
+            ("active_route_pick", "active_route", {"CTX": {
+                "receipt": {"route": primary},
+            }}, primary),
+            ("active_route_pick", "active_route", {"CTX": {
+                "receipt": {"route": primary},
+                "fallback_receipt": {"status": "ok", "route": normal_fallback},
+            }}, normal_fallback),
+        )
+        for picker, builder, context, expected in cases:
+            with self.subTest(picker=picker, expected=expected["model"]):
+                run_node(picker, context)
+                materialized = run_node(builder, context)
+                self.assertEqual(
+                    materialized,
+                    {field: expected[field] for field in materialized},
+                )
+
+        prior_receipt = {"status": "error", "job_id": "primary-now", "route": primary}
+        prior_input_receipt = {"status": "error", "job_id": "primary-before", "route": recovered_primary}
+        fallback_receipt = {"status": "ok", "job_id": "fallback", "route": normal_fallback}
+        expected_blank = {
+            "recovery_version": "", "prior_primary_route": "", "prior_primary_receipt": "",
+            "prior_fallback_route": "", "prior_fallback_receipt": "", "fresh_primary_receipt": "",
+        }
+        for walk_picker in ("walk_recovery_input", "walk_e2e_recovery_input"):
+            with self.subTest(walk_picker=walk_picker, source="current-primary"):
+                context = {"CTX": {
+                    "INPUT": {"prior_primary_route": recovered_primary,
+                              "prior_primary_receipt": prior_input_receipt},
+                    "receipt": prior_receipt, "fallback_receipt": fallback_receipt,
+                }}
+                run_node("continuation_primary_pick", context)
+                self.assertEqual(run_node(walk_picker, context), {
+                    "recovery_version": "provider-recovery-v1",
+                    "prior_primary_route": primary, "prior_primary_receipt": prior_receipt,
+                    "prior_fallback_route": normal_fallback,
+                    "prior_fallback_receipt": fallback_receipt, "fresh_primary_receipt": "",
+                })
+            with self.subTest(walk_picker=walk_picker, source="prior-invocation"):
+                context = {"CTX": {
+                    "INPUT": {"prior_primary_route": recovered_primary,
+                              "prior_primary_receipt": prior_input_receipt},
+                    "fallback_receipt": fallback_receipt,
+                }}
+                run_node("continuation_primary_pick", context)
+                self.assertEqual(run_node(walk_picker, context), {
+                    "recovery_version": "provider-recovery-v1",
+                    "prior_primary_route": recovered_primary,
+                    "prior_primary_receipt": prior_input_receipt,
+                    "prior_fallback_route": normal_fallback,
+                    "prior_fallback_receipt": fallback_receipt, "fresh_primary_receipt": "",
+                })
+            with self.subTest(walk_picker=walk_picker, source="no-fallback"):
+                context = {"CTX": {"INPUT": {}, "receipt": prior_receipt}}
+                run_node("continuation_primary_pick", context)
+                self.assertEqual(run_node(walk_picker, context), expected_blank)
+
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
             self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.{field} }}}}")
 
@@ -12846,9 +13100,11 @@ func main() {
         })
         self.assertIn(("switch_recovery_route", "case-0", "join_fallback_start"), triples)
         self.assertIn(("switch_recovery_route", "default", "join_primary_start"), triples)
-        self.assertIn(("join_primary_start", "out", "selected_route"), triples)
+        self.assertIn(("join_primary_start", "out", "selected_route_pick"), triples)
+        self.assertIn(("selected_route_pick", "out", "selected_route"), triples)
         self.assertIn(("selected_route", "out", "wait"), triples)
-        self.assertIn(("join_fallback_start", "out", "fallback_route_choice"), triples)
+        self.assertIn(("join_fallback_start", "out", "fallback_route_choice_pick"), triples)
+        self.assertIn(("fallback_route_choice_pick", "out", "fallback_route_choice"), triples)
         self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
         self.assertIn(("recovery_route", "failure", "recovery_route_fail"), triples)
         self.assertEqual(
@@ -12958,12 +13214,20 @@ func main() {
         for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
             config = nodes[walk_id]["config"]
             for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt", "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
-                self.assertEqual(config[field], f"{{{{ CTX.{alias}.{field} }}}}")
-            code = nodes[alias]["config"]["code"]["code"]
-            self.assertIn("{% if fallback.status | default('') == 'ok' %}", code)
-            self.assertIn("'recovery_version': 'provider-recovery-v1'", code)
-            self.assertIn("{% else %}{{ {'recovery_version': ''", code)
-            self.assertIn("'fresh_primary_receipt': ''", code)
+                self.assertEqual(config[field], f"{{{{ CTX.{alias}.result.{field} }}}}")
+            picker = nodes[alias]
+            self.assertEqual(picker["type"], "transforms.lookupTable")
+            self.assertEqual(picker["config"]["input"], {
+                "kind": "getField", "path": "CTX.fallback_receipt.status",
+            })
+            self.assertEqual(picker["config"]["entries"][0]["key"], "ok")
+            props = picker["config"]["entries"][0]["value"]["properties"]
+            self.assertEqual(props["recovery_version"], {
+                "kind": "literal", "value": "provider-recovery-v1",
+            })
+            self.assertEqual(props["fresh_primary_receipt"], {
+                "kind": "literal", "value": "",
+            })
 
     def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -16587,7 +16851,8 @@ func main() {
         self.assertEqual(edges["e_normal_primary_candidate"]["target"], "ticket_head")
         self.assertEqual(edges["e7b"]["source"], "ticket_head")
         self.assertEqual(edges["e7b"]["target"], "recovery_marker")
-        self.assertEqual(edges["e_primary_start"]["target"], "selected_route")
+        self.assertEqual(edges["e_primary_start"]["target"], "selected_route_pick")
+        self.assertEqual(edges["e_selected_route_pick"]["target"], "selected_route")
         self.assertEqual(edges["e_selected_route"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
@@ -20364,7 +20629,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "f5ebdd51a46a33f3bb129612e301b4d12f46d3d48aa1545d35349194e7bf8db9")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "64891b9cb894a3133373ac04324e1fcac0c3244351b041f7a206ea4de04476a8")
 
 
 class InstallTests(unittest.TestCase):
