@@ -1943,12 +1943,30 @@
               "grok-4.6"
             ]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"launcher": {"const": "codex"}}},
+            "then": {"properties": {"provider": {"const": "openai"}, "model": {"const": "gpt-5.6-sol"}}}
+          },
+          {
+            "if": {"properties": {"launcher": {"const": "claude"}}},
+            "then": {"properties": {"provider": {"const": "anthropic"}, "model": {"enum": ["claude-opus-5", "claude-sonnet-5"]}}}
+          },
+          {
+            "if": {"properties": {"launcher": {"const": "grok"}}},
+            "then": {"properties": {"provider": {"const": "xai"}, "model": {"const": "grok-4.6"}}}
+          }
+        ]
       },
       "RunControlCost": {
         "type": "string",
-        "pattern": "^(?:0|[1-9][0-9]{0,5})(?:\\.[0-9]{1,12})?$",
+        "pattern": "^(?:100000(?:\\.0{1,12})?|(?:0|[1-9][0-9]{0,4})(?:\\.[0-9]{1,12})?)$",
         "x-maximum-decimal": "100000"
+      },
+      "RunControlAttemptId": {
+        "type": "string",
+        "pattern": "^att1-[0-9a-f]{64}$"
       },
       "RunControlRootIdentity": {
         "type": "object", "additionalProperties": false,
@@ -2119,8 +2137,7 @@
             "maximum": 10
           },
           "attempt_id": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            "$ref": "#/components/schemas/RunControlAttemptId"
           },
           "route_version": {
             "type": "string",
@@ -2370,8 +2387,7 @@
         ],
         "properties": {
           "attempt_id": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            "$ref": "#/components/schemas/RunControlAttemptId"
           },
           "turns": {
             "type": "integer",

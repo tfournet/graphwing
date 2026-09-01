@@ -2669,6 +2669,7 @@ RUN_CONTROL_NEXT_ENVELOPE_FIELDS = frozenset({
 RUN_CONTROL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 RUN_CONTROL_REWST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 RUN_CONTROL_RUN_ID_RE = re.compile(r"rc1-[0-9a-f]{64}")
+RUN_CONTROL_ATTEMPT_ID_RE = re.compile(r"att1-[0-9a-f]{64}")
 RUN_CONTROL_COST_RE = re.compile(r"(0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?")
 
 
@@ -2870,7 +2871,7 @@ def run_control_evaluate(body: bytes) -> tuple[int, dict[str, Any]]:
             or set(next_envelope) != RUN_CONTROL_NEXT_ENVELOPE_FIELDS):
         return _run_control_error("bad_next_envelope", "the complete next-job reservation is required")
     assert isinstance(next_envelope, dict)
-    if not _run_control_id(next_envelope.get("attempt_id")):
+    if not isinstance(next_envelope.get("attempt_id"), str) or RUN_CONTROL_ATTEMPT_ID_RE.fullmatch(next_envelope["attempt_id"]) is None:
         return _run_control_error("bad_next_envelope", "reserved attempt_id is invalid")
     reserved_turns = _run_control_uint(next_envelope.get("turns"), 10000)
     reserved_wall = _run_control_uint(next_envelope.get("wall_seconds"), 86400)
@@ -2903,7 +2904,7 @@ def run_control_evaluate(body: bytes) -> tuple[int, dict[str, Any]]:
             return _run_control_error("bad_attempt", "attempt evidence is incomplete or has unknown fields")
         assert isinstance(raw, dict)
         attempt_id = raw.get("attempt_id")
-        if not _run_control_id(attempt_id) or attempt_id in seen_ids:
+        if not isinstance(attempt_id, str) or RUN_CONTROL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None or attempt_id in seen_ids:
             return _run_control_error("bad_attempt_id", "attempt IDs must use the unique closed durable grammar")
         if raw.get("sequence") != sequence:
             return _run_control_error("noncanonical_attempt_order", "attempt sequence must be canonical and contiguous")
