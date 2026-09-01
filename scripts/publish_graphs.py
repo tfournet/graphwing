@@ -132,23 +132,44 @@ def must(st, body, ok=(200, 201, 202), label=""):
     return body
 
 
-def subst_instance(obj, instance: str, hook_secret: str = "", status_repo: str = ""):
+def subst_instance(obj, instance: str, hook_secret: str = "", status_repo: str = "",
+                   workflow_pins: dict[str, str] | None = None):
+    workflow_pins = workflow_pins or {}
     if isinstance(obj, str):
-        return (
+        value = (
             obj.replace("$GRAPHWING_INSTANCE", instance)
             .replace("$GRAPHWING_HOOK_SECRET", hook_secret)
             .replace("$GRAPHWING_STATUS_REPO", status_repo)
         )
+        for placeholder, exact_id in workflow_pins.items():
+            value = value.replace(placeholder, exact_id)
+        return value
     if isinstance(obj, list):
-        return [subst_instance(x, instance, hook_secret, status_repo) for x in obj]
+        return [subst_instance(x, instance, hook_secret, status_repo, workflow_pins) for x in obj]
     if isinstance(obj, dict):
-        return {k: subst_instance(v, instance, hook_secret, status_repo) for k, v in obj.items()}
+        return {k: subst_instance(v, instance, hook_secret, status_repo, workflow_pins)
+                for k, v in obj.items()}
     return obj
 
 
-def load_graph(name: str, instance: str, hook_secret: str = "", status_repo: str = "") -> dict:
+def assert_pinned_subworkflows(graph: dict) -> None:
+    for node in graph.get("spec", {}).get("nodes", []):
+        if node.get("type") != "action.subworkflow":
+            continue
+        config = node.get("config") or {}
+        if not config.get("workflowId") or not config.get("workflowVersionId"):
+            raise SystemExit(f"{graph.get('slug')}:{node.get('id')} lacks exact child pin")
+        if "versionSelection" in config or "$GRAPHWING_" in json.dumps(config):
+            raise SystemExit(f"{graph.get('slug')}:{node.get('id')} has unresolved/latest child")
+
+
+def load_graph(name: str, instance: str, hook_secret: str = "", status_repo: str = "",
+               workflow_pins: dict[str, str] | None = None) -> dict:
     raw = json.loads((GRAPHS / f"{name}.json").read_text())
-    return subst_instance(raw, instance, hook_secret, status_repo)
+    graph = subst_instance(raw, instance, hook_secret, status_repo, workflow_pins)
+    if workflow_pins is not None:
+        assert_pinned_subworkflows(graph)
+    return graph
 
 
 def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict):
@@ -250,8 +271,10 @@ def main():
     hook_secret = os.environ.get("GRAPHWING_HOOK_SECRET") or install.get("hook_secret") or ""
     integration = install.get("custom_integration_id")
     catalog = [
-        "run-control-authorize", "verify-stack", "implement-slice",
-        "pr-drive", "pr-status", "code-off",
+        "run-control-transition", "run-control-consume-authorization",
+        "run-control-initialize", "run-control-state", "run-control-reconcile",
+        "run-control-consume", "run-control-authorize", "verify-stack",
+        "implement-slice", "pr-drive", "pr-status", "code-off",
     ]
     stems = catalog if args.only == "all" else [args.only]
     status_repo = (
@@ -267,10 +290,25 @@ def main():
     mcp = rewst_mcp(install)
     print("openapi", public_openapi_url())
     published = {}
+    workflow_pins: dict[str, str] = {}
     for stem in stems:
-        g = load_graph(stem, instance, hook_secret, status_repo)
+        g = load_graph(stem, instance, hook_secret, status_repo, workflow_pins)
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
+        if stem == "run-control-transition":
+            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
+                raise SystemExit("run-control transition publication returned no exact IDs")
+            workflow_pins.update({
+                "$GRAPHWING_RUN_CONTROL_TRANSITION_WORKFLOW_ID": wid,
+                "$GRAPHWING_RUN_CONTROL_TRANSITION_VERSION_ID": vid,
+            })
+        if stem == "run-control-consume-authorization":
+            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
+                raise SystemExit("run-control authorization publication returned no exact IDs")
+            workflow_pins.update({
+                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": wid,
+                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_VERSION_ID": vid,
+            })
     if not args.no_run and "pr-drive" in published:
         repo = (os.environ.get("GRAPHWING_SMOKE_REPO") or install.get("smoke_repo") or "").strip()
         if not repo:
@@ -297,6 +335,18 @@ def main():
         install["code_off"] = {**(install.get("code_off") or {}), **published["code-off"]}
     if "run-control-authorize" in published:
         install["run_control_authorize"] = published["run-control-authorize"]
+    if "run-control-transition" in published:
+        install["run_control_transition"] = published["run-control-transition"]
+    if "run-control-state" in published:
+        install["run_control_state"] = published["run-control-state"]
+    if "run-control-initialize" in published:
+        install["run_control_initialize"] = published["run-control-initialize"]
+    if "run-control-reconcile" in published:
+        install["run_control_reconcile"] = published["run-control-reconcile"]
+    if "run-control-consume-authorization" in published:
+        install["run_control_consume_authorization"] = published["run-control-consume-authorization"]
+    if "run-control-consume" in published:
+        install["run_control_consume"] = published["run-control-consume"]
     save_install(install)
     print("=== DONE ===")
     print(json.dumps(published, indent=2))

@@ -2635,6 +2635,481 @@ def routing_policy_v2_candidate(
     }
 
 
+RUN_CONTROL_VERSION = "run-control-v1"
+RUN_CONTROL_MAX_ATTEMPTS = 10
+RUN_CONTROL_CONSTRAINT_SIGNALS = frozenset({
+    "test_deleted", "test_moved", "test_compressed", "test_weakened",
+    "unrelated_docs_churn", "unapproved_safety_limit_change",
+    "unapproved_size_limit_change", "diff_size_manipulation",
+    "size_limit_conflict",
+})
+RUN_CONTROL_GAMING_SIGNALS = RUN_CONTROL_CONSTRAINT_SIGNALS - {"size_limit_conflict"}
+RUN_CONTROL_ROUTE_FIELDS = frozenset({"route_version", "launcher", "provider", "model"})
+RUN_CONTROL_BUDGET_FIELDS = frozenset({
+    "attempts", "turns", "wall_seconds", "tokens", "provider_cost_usd",
+})
+RUN_CONTROL_ATTEMPT_FIELDS = frozenset({
+    "sequence", "attempt_id", "route_version", "launcher", "provider", "model", "usage", "progress",
+    "constraint_signals", "verified_outcome", "reservation", "terminal_state",
+})
+RUN_CONTROL_USAGE_FIELDS = frozenset({
+    "turns", "wall_seconds", "tokens", "provider_cost_usd",
+})
+RUN_CONTROL_PROGRESS_FIELDS = frozenset({
+    "checkpoint", "failing_regression_present", "production_diff_bytes",
+    "focused_tests_green", "diff_fingerprint",
+})
+RUN_CONTROL_REQUEST_FIELDS = frozenset({
+    "run_id", "route", "budgets", "attempts", "next_attempt", "next_route",
+    "next_envelope",
+})
+RUN_CONTROL_NEXT_ENVELOPE_FIELDS = frozenset({
+    "attempt_id", "turns", "wall_seconds", "tokens", "provider_cost_usd",
+})
+RUN_CONTROL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+RUN_CONTROL_COST_RE = re.compile(r"(0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?")
+
+
+def _run_control_error(code: str, message: str) -> tuple[int, dict[str, Any]]:
+    return 400, {"error": message, "code": code}
+
+
+def _run_control_closed(value: Any, allowed: frozenset[str]) -> bool:
+    return isinstance(value, dict) and set(value) <= allowed
+
+
+def _run_control_text(value: Any, *, limit: int = 128) -> bool:
+    return bool(isinstance(value, str) and value and len(value) <= limit
+                and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value))
+
+
+def _run_control_id(value: Any) -> bool:
+    return bool(isinstance(value, str) and RUN_CONTROL_ID_RE.fullmatch(value)
+                and ".." not in value
+                and not value.lower().startswith(("secret", "token", "key")))
+
+
+def _run_control_uint(value: Any, maximum: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        return None
+    return value
+
+
+def _run_control_cost(value: Any) -> Decimal | None:
+    # String-only plain decimals avoid JSON-number underflow and exponent-driven
+    # fixed-point amplification in durable Rewst records.
+    if not isinstance(value, str) or RUN_CONTROL_COST_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (DecimalException, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0 or parsed > Decimal("100000"):
+        return None
+    return parsed
+
+
+def _run_control_cost_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _run_control_ratio_text(value: Decimal) -> str:
+    """Render policy metrics with the public contract's 12-place ceiling."""
+    return _run_control_cost_text(value.quantize(Decimal("0.000000000001")))
+
+
+def _run_control_route(value: Any) -> dict[str, str] | None:
+    if not _run_control_closed(value, RUN_CONTROL_ROUTE_FIELDS):
+        return None
+    assert isinstance(value, dict)
+    if set(value) != RUN_CONTROL_ROUTE_FIELDS:
+        return None
+    if any(not _run_control_text(value.get(key), limit=128) for key in RUN_CONTROL_ROUTE_FIELDS):
+        return None
+    launcher = value["launcher"]
+    native = NATIVE_LAUNCHERS.get(launcher)
+    if (value["route_version"] not in {"normal-v1", "availability-fallback-v1"}
+            or native is None or value["provider"] != native["provider"]
+            or value["model"] not in native["models"]):
+        return None
+    return {key: value[key] for key in sorted(RUN_CONTROL_ROUTE_FIELDS)}
+
+
+def _run_control_checkpoint(attempt: dict[str, Any]) -> tuple[int, bool]:
+    progress = attempt["progress"]
+    checkpoint = progress["checkpoint"]
+    valid = (
+        (checkpoint < 1 or progress["failing_regression_present"])
+        and (checkpoint < 2 or progress["production_diff_bytes"] > 0)
+        and (checkpoint < 3 or progress["focused_tests_green"])
+    )
+    return checkpoint, valid
+
+
+def run_control_evaluate(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Evaluate deterministic aggregate policy for native launch control.
+
+    The operation is provider-free and does not itself launch work. Its receipt
+    becomes authority only when immutable Rewst state, exact readback/hash, KV
+    issued-to-consumed CAS, and the request HMAC bind the reserved launch.
+    """
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if not _run_control_closed(data, RUN_CONTROL_REQUEST_FIELDS):
+        return _run_control_error("unexpected_fields", "run-control request is closed")
+    required = {"run_id", "route", "budgets", "attempts", "next_attempt", "next_envelope"}
+    if not required <= set(data):
+        return _run_control_error("missing_run_control_evidence", "complete run-control evidence is required")
+    if not _run_control_id(data.get("run_id")):
+        return _run_control_error("bad_run_id", "run_id must use the closed durable identifier grammar")
+    route = _run_control_route(data.get("route"))
+    next_route = _run_control_route(data.get("next_route")) if "next_route" in data else route
+    if route is None or next_route is None:
+        return _run_control_error("bad_route", "route identities must be complete closed objects")
+
+    budgets = data.get("budgets")
+    if not _run_control_closed(budgets, RUN_CONTROL_BUDGET_FIELDS) or set(budgets) != RUN_CONTROL_BUDGET_FIELDS:
+        return _run_control_error("bad_budgets", "all aggregate budgets are required")
+    assert isinstance(budgets, dict)
+    budget_attempts = _run_control_uint(budgets.get("attempts"), RUN_CONTROL_MAX_ATTEMPTS)
+    budget_turns = _run_control_uint(budgets.get("turns"), 10000)
+    budget_wall = _run_control_uint(budgets.get("wall_seconds"), 86400)
+    budget_tokens = _run_control_uint(budgets.get("tokens"), 1_000_000_000)
+    budget_cost = _run_control_cost(budgets.get("provider_cost_usd"))
+    if None in (budget_attempts, budget_turns, budget_wall, budget_tokens, budget_cost) or not budget_attempts:
+        return _run_control_error("bad_budgets", "budgets are outside run-control limits")
+    assert budget_turns is not None and budget_wall is not None and budget_tokens is not None
+    assert budget_cost is not None
+
+    attempts = data.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) > RUN_CONTROL_MAX_ATTEMPTS:
+        return _run_control_error("bad_attempts", "attempts must be a bounded array")
+    next_attempt = _run_control_uint(data.get("next_attempt"), RUN_CONTROL_MAX_ATTEMPTS + 1)
+    if next_attempt is None or next_attempt != len(attempts) + 1:
+        return _run_control_error("bad_next_attempt", "next_attempt must follow the supplied history")
+
+    next_envelope = data.get("next_envelope")
+    if (not _run_control_closed(next_envelope, RUN_CONTROL_NEXT_ENVELOPE_FIELDS)
+            or set(next_envelope) != RUN_CONTROL_NEXT_ENVELOPE_FIELDS):
+        return _run_control_error("bad_next_envelope", "the complete next-job reservation is required")
+    assert isinstance(next_envelope, dict)
+    if not _run_control_id(next_envelope.get("attempt_id")):
+        return _run_control_error("bad_next_envelope", "reserved attempt_id is invalid")
+    reserved_turns = _run_control_uint(next_envelope.get("turns"), 10000)
+    reserved_wall = _run_control_uint(next_envelope.get("wall_seconds"), 86400)
+    reserved_tokens = _run_control_uint(next_envelope.get("tokens"), 1_000_000_000)
+    reserved_cost = _run_control_cost(next_envelope.get("provider_cost_usd"))
+    if None in (reserved_turns, reserved_wall, reserved_tokens, reserved_cost):
+        return _run_control_error("bad_next_envelope", "next-job reservation is outside run-control limits")
+    assert reserved_turns is not None and reserved_wall is not None and reserved_tokens is not None
+    assert reserved_cost is not None
+
+    total_turns: int | None = 0
+    total_tokens: int | None = 0
+    total_wall = 0
+    total_cost = Decimal("0")
+    cost_known = True
+    checkpoints: list[int] = []
+    fingerprints: list[str] = []
+    constraint_codes: set[str] = set()
+    seen_ids: set[str] = set()
+    verified_outcomes = 0
+    route_attempts = 0
+    route_tokens: int | None = 0
+    route_cost = Decimal("0")
+    route_cost_known = True
+    route_verified = 0
+    prior_checkpoint = -1
+    reconciliation_codes: set[str] = set()
+    for sequence, raw in enumerate(attempts, 1):
+        if not _run_control_closed(raw, RUN_CONTROL_ATTEMPT_FIELDS) or set(raw) != RUN_CONTROL_ATTEMPT_FIELDS:
+            return _run_control_error("bad_attempt", "attempt evidence is incomplete or has unknown fields")
+        assert isinstance(raw, dict)
+        attempt_id = raw.get("attempt_id")
+        if not _run_control_id(attempt_id) or attempt_id in seen_ids:
+            return _run_control_error("bad_attempt_id", "attempt IDs must use the unique closed durable grammar")
+        if raw.get("sequence") != sequence:
+            return _run_control_error("noncanonical_attempt_order", "attempt sequence must be canonical and contiguous")
+        seen_ids.add(attempt_id)
+        identity = {key: raw.get(key) for key in ("launcher", "provider", "model")}
+        if any(not _run_control_text(value, limit=128) for value in identity.values()):
+            return _run_control_error("bad_attempt_identity", "attempt identity is invalid")
+        native_identity = NATIVE_LAUNCHERS.get(identity["launcher"])
+        if (native_identity is None or identity["provider"] != native_identity["provider"]
+                or identity["model"] not in native_identity["models"]):
+            return _run_control_error("bad_attempt_identity", "attempt identity is not an approved native profile")
+        if raw.get("route_version") not in {"normal-v1", "availability-fallback-v1"}:
+            return _run_control_error("bad_attempt_identity", "attempt route_version is invalid")
+        reservation = raw.get("reservation")
+        if (not isinstance(reservation, dict)
+                or not _run_control_closed(reservation, RUN_CONTROL_NEXT_ENVELOPE_FIELDS)
+                or set(reservation) != RUN_CONTROL_NEXT_ENVELOPE_FIELDS
+                or reservation.get("attempt_id") != attempt_id):
+            return _run_control_error("bad_attempt_reservation", "attempt reservation is incomplete or mismatched")
+        envelope_turns = _run_control_uint(reservation.get("turns"), 10000)
+        envelope_wall = _run_control_uint(reservation.get("wall_seconds"), 86400)
+        envelope_tokens = _run_control_uint(reservation.get("tokens"), 1_000_000_000)
+        envelope_cost = _run_control_cost(reservation.get("provider_cost_usd"))
+        if None in (envelope_turns, envelope_wall, envelope_tokens, envelope_cost):
+            return _run_control_error("bad_attempt_reservation", "attempt reservation is outside run-control limits")
+        assert envelope_turns is not None and envelope_wall is not None and envelope_tokens is not None
+        assert envelope_cost is not None
+        terminal_state = raw.get("terminal_state")
+        if terminal_state not in {"terminal", "authority_lost"}:
+            return _run_control_error("bad_terminal_state", "terminal state is outside the closed reconciliation protocol")
+        usage = raw.get("usage")
+        if not _run_control_closed(usage, RUN_CONTROL_USAGE_FIELDS) or set(usage) != RUN_CONTROL_USAGE_FIELDS:
+            return _run_control_error("bad_attempt_usage", "attempt usage must include every aggregate")
+        assert isinstance(usage, dict)
+        turns = (_run_control_uint(usage.get("turns"), 10000)
+                 if usage.get("turns") is not None else None)
+        wall = (_run_control_uint(usage.get("wall_seconds"), 86400)
+                if usage.get("wall_seconds") is not None else None)
+        tokens = (_run_control_uint(usage.get("tokens"), 1_000_000_000)
+                  if usage.get("tokens") is not None else None)
+        cost = (_run_control_cost(usage.get("provider_cost_usd"))
+                if usage.get("provider_cost_usd") is not None else None)
+        if ((usage.get("wall_seconds") is not None and wall is None)
+                or (usage.get("turns") is not None and turns is None)
+                or (usage.get("tokens") is not None and tokens is None)
+                or (usage.get("provider_cost_usd") is not None and cost is None)):
+            return _run_control_error("bad_attempt_usage", "attempt usage is outside run-control limits")
+        if terminal_state == "authority_lost":
+            if any(usage.get(key) is not None for key in RUN_CONTROL_USAGE_FIELDS):
+                return _run_control_error("bad_attempt_usage", "authority loss cannot claim a terminal receipt")
+            turns, wall, tokens, cost = envelope_turns, envelope_wall, envelope_tokens, envelope_cost
+            reconciliation_codes.add("authority_loss_full_envelope_charged")
+        elif wall is None:
+            return _run_control_error("bad_attempt_usage", "terminal receipt must include wall time")
+        elif ((turns is not None and turns > envelope_turns) or wall > envelope_wall
+              or (tokens is not None and tokens > envelope_tokens)
+              or (cost is not None and cost > envelope_cost)):
+            return _run_control_error("receipt_exceeds_reservation", "terminal usage exceeds its immutable reservation")
+        progress = raw.get("progress")
+        if not _run_control_closed(progress, RUN_CONTROL_PROGRESS_FIELDS) or set(progress) != RUN_CONTROL_PROGRESS_FIELDS:
+            return _run_control_error("bad_progress", "progress evidence must be complete and closed")
+        assert isinstance(progress, dict)
+        checkpoint = _run_control_uint(progress.get("checkpoint"), 3)
+        production_bytes = _run_control_uint(progress.get("production_diff_bytes"), 100_000_000)
+        fingerprint = progress.get("diff_fingerprint")
+        if (checkpoint is None or production_bytes is None
+                or not isinstance(progress.get("failing_regression_present"), bool)
+                or not isinstance(progress.get("focused_tests_green"), bool)
+                or not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
+            return _run_control_error("bad_progress", "progress fields are invalid")
+        signals = raw.get("constraint_signals")
+        if (not isinstance(signals, list) or len(signals) > len(RUN_CONTROL_CONSTRAINT_SIGNALS)
+                or any(not isinstance(item, str) or item not in RUN_CONTROL_CONSTRAINT_SIGNALS for item in signals)
+                or len(set(signals)) != len(signals)):
+            return _run_control_error("bad_constraint_signals", "constraint signals must use the closed vocabulary")
+        if not isinstance(raw.get("verified_outcome"), bool):
+            return _run_control_error("bad_verified_outcome", "verified_outcome must be boolean")
+        checkpoint_value, checkpoint_valid = _run_control_checkpoint(raw)
+        if not checkpoint_valid:
+            return _run_control_error("inconsistent_checkpoint", "checkpoint claims lack required deterministic evidence")
+        if checkpoint_value < prior_checkpoint:
+            return _run_control_error("noncanonical_attempt_order", "checkpoint history cannot move backwards")
+        prior_checkpoint = checkpoint_value
+        total_turns = None if total_turns is None or turns is None else total_turns + turns
+        total_wall += wall
+        total_tokens = None if total_tokens is None or tokens is None else total_tokens + tokens
+        if cost is None:
+            cost_known = False
+        else:
+            total_cost += cost
+        checkpoints.append(checkpoint_value)
+        fingerprints.append(fingerprint)
+        constraint_codes.update(signals)
+        verified_outcomes += int(raw["verified_outcome"])
+        attempt_route = {
+            "route_version": raw["route_version"], "launcher": identity["launcher"],
+            "provider": identity["provider"], "model": identity["model"],
+        }
+        if attempt_route == next_route:
+            route_attempts += 1
+            route_tokens = None if route_tokens is None or tokens is None else route_tokens + tokens
+            route_verified += int(raw["verified_outcome"])
+            if cost is None:
+                route_cost_known = False
+            else:
+                route_cost += cost
+
+    aggregate = {
+        "attempts_completed": len(attempts), "turns": total_turns,
+        "wall_seconds": total_wall, "tokens": total_tokens,
+        "provider_cost_usd": _run_control_cost_text(total_cost) if cost_known else None,
+        "verified_outcomes": verified_outcomes,
+    }
+    limit_view = {
+        "attempts": budget_attempts, "turns": budget_turns,
+        "wall_seconds": budget_wall, "tokens": budget_tokens,
+        "provider_cost_usd": _run_control_cost_text(budget_cost),
+    }
+    evidence_codes: set[str] = set(reconciliation_codes)
+    if len(attempts) >= budget_attempts:
+        evidence_codes.add("attempts_exhausted")
+    if total_turns is None:
+        evidence_codes.add("turns_unknown")
+    elif total_turns >= budget_turns:
+        evidence_codes.add("turns_exhausted")
+    if total_wall >= budget_wall:
+        evidence_codes.add("wall_seconds_exhausted")
+    if total_tokens is None:
+        evidence_codes.add("tokens_unknown")
+    elif total_tokens >= budget_tokens:
+        evidence_codes.add("tokens_exhausted")
+    if not cost_known:
+        evidence_codes.add("provider_cost_unknown")
+    elif total_cost >= budget_cost:
+        evidence_codes.add("provider_cost_exhausted")
+
+    projected = {
+        "attempts": len(attempts) + 1,
+        "turns": None if total_turns is None else total_turns + reserved_turns,
+        "wall_seconds": total_wall + reserved_wall,
+        "tokens": None if total_tokens is None else total_tokens + reserved_tokens,
+        "provider_cost_usd": (
+            _run_control_cost_text(total_cost + reserved_cost) if cost_known else None
+        ),
+    }
+    if projected["attempts"] > budget_attempts:
+        evidence_codes.add("attempts_reservation_exceeds_remaining")
+    if projected["turns"] is not None and projected["turns"] > budget_turns:
+        evidence_codes.add("turns_reservation_exceeds_remaining")
+    if projected["wall_seconds"] > budget_wall:
+        evidence_codes.add("wall_seconds_reservation_exceeds_remaining")
+    if projected["tokens"] is not None and projected["tokens"] > budget_tokens:
+        evidence_codes.add("tokens_reservation_exceeds_remaining")
+    if cost_known and total_cost + reserved_cost > budget_cost:
+        evidence_codes.add("provider_cost_reservation_exceeds_remaining")
+
+    repeated_diff = bool(
+        len(fingerprints) >= 2
+        and fingerprints[-1] == fingerprints[-2]
+        and checkpoints[-1] <= checkpoints[-2]
+        and not (attempts[-1]["verified_outcome"] and not attempts[-2]["verified_outcome"])
+    )
+    if repeated_diff:
+        evidence_codes.add("materially_unchanged_diff")
+    checkpoint = max(checkpoints, default=0)
+    required_checkpoint = 0
+    if attempts:
+        required_checkpoint = 1
+    if len(attempts) * 2 >= budget_attempts:
+        required_checkpoint = 2
+    if len(attempts) * 3 >= budget_attempts * 2:
+        required_checkpoint = 3
+    checkpoint_missed = checkpoint < required_checkpoint
+    if checkpoint_missed:
+        evidence_codes.add(("failing_regression_checkpoint_missed", "production_diff_checkpoint_missed",
+                            "focused_green_checkpoint_missed")[max(0, required_checkpoint - 1)])
+    no_progress = repeated_diff or checkpoint_missed
+    gaming = sorted(constraint_codes & RUN_CONTROL_GAMING_SIGNALS)
+    if gaming:
+        evidence_codes.add("constraint_gaming_detected")
+        no_progress = True
+    size_conflict = "size_limit_conflict" in constraint_codes
+    budget_exhausted = any(code.endswith("_exhausted") for code in evidence_codes)
+    incomplete_usage = not cost_known or total_turns is None or total_tokens is None
+    reservation_exceeded = any("reservation_exceeds_remaining" in code for code in evidence_codes)
+
+    route_identities = [(a["launcher"], a["provider"], a["model"]) for a in attempts]
+    same_model_continuations = sum(
+        route_identities[index] == route_identities[index - 1]
+        for index in range(1, len(route_identities))
+    )
+    if attempts:
+        last_route = {
+            "route_version": attempts[-1]["route_version"],
+            "launcher": attempts[-1]["launcher"], "provider": attempts[-1]["provider"],
+            "model": attempts[-1]["model"],
+        }
+        if route != last_route:
+            return _run_control_error("route_history_mismatch", "current route must equal the last authorized attempt route")
+    next_is_same = (
+        next_route["launcher"], next_route["provider"], next_route["model"]
+    ) == (route["launcher"], route["provider"], route["model"])
+
+    classification: str | None = None
+    retryable: bool | None = None
+    if gaming:
+        decision = "terminate"
+        classification = "constraint_gaming"
+        retryable = False
+    elif incomplete_usage:
+        decision = "terminate"
+        classification = "incomplete_usage_accounting"
+        retryable = False
+    elif size_conflict:
+        decision = "restructure"
+        classification = "size_limit_conflict"
+        retryable = False
+        evidence_codes.add("split_or_approve_limit_change")
+    elif budget_exhausted and no_progress:
+        decision = "terminate"
+        classification = "budget_exhausted_no_progress"
+        retryable = False
+    elif budget_exhausted:
+        decision = "terminate"
+        classification = "budget_exhausted"
+        retryable = False
+    elif reservation_exceeded:
+        decision = "terminate"
+        classification = "next_envelope_exceeds_remaining_budget"
+        retryable = False
+    elif next_is_same and same_model_continuations >= 1:
+        decision = "handoff_cross_model"
+        evidence_codes.add("same_model_continuation_exhausted")
+    elif not next_is_same:
+        decision = "handoff_cross_model"
+    else:
+        decision = "continue_same_model"
+
+    checkpoint_name = ("none", "failing_regression", "production_diff", "focused_green")[checkpoint]
+    route_reason_codes = []
+    if route_verified == 0:
+        route_reason_codes.append("no_verified_outcome")
+    if no_progress:
+        route_reason_codes.append("no_progress")
+    if gaming:
+        route_reason_codes.append("constraint_gaming")
+    route_eligible = route_verified > 0 and not no_progress and not gaming
+    return 200, {
+        "version": RUN_CONTROL_VERSION, "decision": decision,
+        "classification": classification, "retryable": retryable,
+        "aggregate": aggregate, "limits": limit_view, "projected": projected,
+        "checkpoint": checkpoint_name,
+        "required_checkpoint": ("none", "failing_regression", "production_diff", "focused_green")[required_checkpoint],
+        "no_progress": no_progress, "loop_detected": repeated_diff,
+        "constraint_gaming": {"detected": bool(gaming), "codes": gaming},
+        "same_model_continuations_used": same_model_continuations,
+        "evidence_codes": sorted(evidence_codes),
+        "route_eligibility": {
+            "version": "verified-efficiency-v1", "eligible": route_eligible,
+            "verified_outcomes": route_verified,
+            "attempts_per_verified_outcome": (
+                _run_control_ratio_text(Decimal(route_attempts) / Decimal(route_verified))
+                if route_verified else None
+            ),
+            "tokens_per_verified_outcome": (
+                route_tokens // route_verified
+                if route_verified and route_tokens is not None else None
+            ),
+            "provider_cost_per_verified_outcome_usd": (
+                _run_control_ratio_text(route_cost / Decimal(route_verified))
+                if route_verified and route_cost_known else None
+            ),
+            "reason_codes": route_reason_codes,
+        },
+    }
+
+
+
 def slice_route_lookup(
     class_name: str,
     size_floor: str,
@@ -10899,6 +11374,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/rewst/fire":
         status, payload = rewst_fire(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/evaluate":
+        status, payload = run_control_evaluate(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route":
         status, payload = slice_route(body)
