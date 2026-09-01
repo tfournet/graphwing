@@ -2380,7 +2380,8 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
 
     token = data.get("kick_token") or None
     if continuity is not None:
-        claim_err = run_control_claim_kick(continuity)
+        out["kick_request_sha256"] = run_control_kick_request_sha256(data)
+        claim_err = run_control_claim_kick(continuity, out["kick_request_sha256"])
         if claim_err is not None:
             return claim_err[0], {**out, "ok": False, **claim_err[1]}
     payload = {
@@ -2729,7 +2730,7 @@ RUN_CONTROL_LEDGER_VERSION = "run-control-ledger-v1"
 RUN_CONTROL_KICK_LOSS_GRACE_SECONDS = 7200
 RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
     "receipt_authority_unavailable", "receipt_route_unresolvable",
-    "continuation_kick_failed", "kicked_run_never_settled",
+    "continuation_kick_failed", "kicked_run_never_settled", "launched_run_never_settled",
 )
 RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "receipt"})
 # The closed AgentReceipt failure_code vocabulary: none on success, every
@@ -2772,10 +2773,30 @@ def _run_control_ledger_write(path: Path, record: dict[str, Any]) -> None:
 
 
 def _run_control_ledger_record(continuity: dict[str, str]) -> dict[str, Any]:
-    return {"ledger_version": RUN_CONTROL_LEDGER_VERSION, **continuity, "kick": None, "settlement": None}
+    return {"ledger_version": RUN_CONTROL_LEDGER_VERSION, **continuity,
+            "kick": None, "launch": None, "settlement": None}
 
 
-def run_control_claim_kick(continuity: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+def _run_control_record_continuity(record: dict[str, Any]) -> dict[str, Any]:
+    return {key: record.get(key) for key in sorted(RUN_CONTROL_CONTINUITY_FIELDS)}
+
+
+def run_control_kick_request_sha256(data: dict[str, Any]) -> str:
+    """Fingerprint the one request the reserving run renders and sends.
+
+    The reservation descriptor's exact_request_body_sha256 is this value for
+    the continue leg. run_control is excluded because its descriptor hash
+    covers this fingerprint, and kick_token because a secret never belongs in
+    a durable descriptor.
+    """
+    material = {key: value for key, value in data.items() if key not in ("run_control", "kick_token")}
+    payload = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def run_control_claim_kick(
+    continuity: dict[str, str], kick_request_sha256: str,
+) -> tuple[int, dict[str, Any]] | None:
     """Claim a reservation's single kick before posting it.
 
     The durable ledger is the only record on this host that run N kicked a
@@ -2789,7 +2810,36 @@ def run_control_claim_kick(continuity: dict[str, str]) -> tuple[int, dict[str, A
             return 409, {"error": "run-control continuity was already kicked or settled",
                          "code": "continuity_already_used"}
         record = _run_control_ledger_record(continuity)
-        record["kick"] = {"requested_at": _run_control_now(), "kicked": None}
+        record["kick"] = {"requested_at": _run_control_now(), "kicked": None,
+                          "kick_request_sha256": kick_request_sha256}
+        _run_control_ledger_write(path, record)
+    return None
+
+
+def run_control_claim_launch(continuity: dict[str, str], job_id: str) -> tuple[int, dict[str, Any]] | None:
+    """Pin one writer launch to the reservation it was kicked under.
+
+    The kicked run forwards CTX.INPUT.run_control verbatim; it must equal
+    what this daemon kicked, field for field. A reservation launches once,
+    never after a definite kick failure, and never after settlement. A
+    reservation this daemon never kicked (the same-run agent leg) may still
+    launch once; the trio itself is the unguessable binding there.
+    """
+    with RUN_CONTROL_LEDGER_LOCK:
+        path = _run_control_ledger_path(continuity["authorization_id"])
+        record = _run_control_ledger_read(path)
+        if record is None:
+            record = _run_control_ledger_record(continuity)
+        elif _run_control_record_continuity(record) != _run_control_record_continuity(continuity):
+            return 409, {"error": "run_control differs from the kicked reservation", "code": "run_control_mismatch"}
+        if record.get("settlement") is not None:
+            return 409, {"error": "reservation is already settled", "code": "reservation_already_settled"}
+        if record.get("launch") is not None:
+            return 409, {"error": "reservation already launched a writer", "code": "reservation_already_launched"}
+        kick = record.get("kick")
+        if isinstance(kick, dict) and kick.get("kicked") is False:
+            return 409, {"error": "the continuation kick for this reservation failed", "code": "continuation_kick_failed"}
+        record["launch"] = {"job_id": job_id, "launched_at": _run_control_now()}
         _run_control_ledger_write(path, record)
     return None
 
@@ -2934,6 +2984,9 @@ def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
         job_marker = _run_control_ledger_read(_run_control_job_path(job_id))
         if job_marker is not None and job_marker.get("authorization_id") != continuity["authorization_id"]:
             return 409, {"error": "job already settled a different reservation", "code": "settlement_conflict"}
+        launch = record.get("launch")
+        if isinstance(launch, dict) and launch.get("job_id") != job_id:
+            return 409, {"error": "reservation was launched as a different job", "code": "settlement_conflict"}
         record["settlement"] = settlement
         _run_control_ledger_write(path, record)
         _run_control_ledger_write(_run_control_job_path(job_id),
@@ -2969,9 +3022,20 @@ def run_control_authority_loss(body: bytes) -> tuple[int, dict[str, Any]]:
                 return 200, {**existing["result"], "replay": True}
             return 409, {"error": "reservation was settled by a terminal receipt", "code": "already_settled"}
         kick = record.get("kick") if record is not None else None
-        if not isinstance(kick, dict):
+        launch = record.get("launch") if record is not None else None
+        if isinstance(launch, dict):
+            job = read_job(str(launch.get("job_id") or ""))
+            if isinstance(job, dict) and job.get("status") in ("queued", "running"):
+                return 409, {"error": "the launched writer is still running", "code": "run_started",
+                             "job_id": launch.get("job_id")}
+            not_before = int(launch.get("launched_at") or 0) + RUN_CONTROL_KICK_LOSS_GRACE_SECONDS
+            if _run_control_now() < not_before:
+                return 409, {"error": "the launched run may still settle", "code": "launch_within_grace",
+                             "not_before": not_before}
+            reason = "launched_run_never_settled"
+        elif not isinstance(kick, dict):
             return _run_control_error("unknown_kick", "this daemon has no kick record for that reservation")
-        if kick.get("kicked") is False:
+        elif kick.get("kicked") is False:
             reason = "continuation_kick_failed"
         else:
             not_before = int(kick.get("requested_at") or 0) + RUN_CONTROL_KICK_LOSS_GRACE_SECONDS
@@ -11336,11 +11400,20 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
         "session_identity", "resume_job_id", "cwd", "response_webhook_url",
         "response_webhook_token", "resume_url", "codeoff_workspace", "effort",
-        "route_execution_profile",
+        "route_execution_profile", "run_control",
     }
     unexpected = sorted(set(data) - allowed)
     if unexpected:
         return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
+    continuity: dict[str, str] | None = None
+    if "run_control" in data:
+        continuity = run_control_continuity(data["run_control"])
+        if continuity is None:
+            return 400, {"error": "run_control must be the closed continuity run_control_id, attempt_id, "
+                                  "authorization_id, launch_descriptor_sha256",
+                         "code": "bad_run_control_continuity"}
+        if data.get("codeoff_workspace") is not None:
+            return 400, {"error": "code-off jobs are not run-control attempts", "code": "bad_run_control_continuity"}
     codeoff: dict[str, Any] | None = None
     if data.get("codeoff_workspace") is not None:
         if data.get("prompt") not in (None, "") or data.get("cwd") not in (None, ""):
@@ -11567,6 +11640,10 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
+        if continuity is not None:
+            launch_err = run_control_claim_launch(continuity, job_id)
+            if launch_err is not None:
+                return launch_err
         log_ref = str(job_dir(job_id) / "stdout.log")
         job = {
             "job_id": job_id,
@@ -11597,6 +11674,8 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             "error": None,
             "webhook": None,
         }
+        if continuity is not None:
+            job["run_control"] = continuity
         if git_baseline is not None:
             job["git_baseline"] = git_baseline
             job["writer_parent_paths"] = writer_parent_paths
