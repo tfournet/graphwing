@@ -14992,12 +14992,13 @@ func main() {
     # MAX_ARG_STRLEN, under the current maximum. It is a fixture dimension, not a
     # measurement of the patch under review, so it never goes stale.
     _LARGE_CANDIDATE_DIFF_BYTES = 224 * 1024
-    # The merged Phase 6 candidate remains fixed at this reviewed boundary.
-    # Follow-up patches are measured independently from the landed commit rather
+    # Landed candidates remain fixed at their reviewed boundaries. Follow-up
+    # patches are measured independently from the latest landed boundary rather
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
-    _NATIVE_ROUTE_PREREQ_COMMIT = "e44e5d49dda2db1557aa0ec55f4a674689dc3dcd"
+    _DURABLE_FOUNDATION_BASE_COMMIT = "e44e5d49dda2db1557aa0ec55f4a674689dc3dcd"
+    _DURABLE_FOUNDATION_LANDED_COMMIT = "f242c90c310ad8c4a7b7fc97e2146fed73f95177"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
@@ -15292,14 +15293,19 @@ func main() {
                 self.assertNotIn("241,008", text)
 
     def test_landed_phase6_and_followup_candidates_fit_the_review_maximum(self):
-        landed = self._candidate_diff_bytes(
+        phase6 = self._candidate_diff_bytes(
             self._PHASE6_BASE_COMMIT, self._PHASE6_LANDED_COMMIT
         )
-        followup = self._candidate_diff_bytes(self._NATIVE_ROUTE_PREREQ_COMMIT)
-        if landed is None or followup is None:
-            self.skipTest("phase 6 review boundaries are not reachable from this checkout")
-        self.assertGreater(landed, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
-        self.assertLessEqual(landed, server.REVIEW_MAX_DIFF_BYTES)
+        foundation = self._candidate_diff_bytes(
+            self._DURABLE_FOUNDATION_BASE_COMMIT,
+            self._DURABLE_FOUNDATION_LANDED_COMMIT,
+        )
+        followup = self._candidate_diff_bytes(self._DURABLE_FOUNDATION_LANDED_COMMIT)
+        if phase6 is None or foundation is None or followup is None:
+            self.skipTest("review boundaries are not reachable from this checkout")
+        self.assertGreater(phase6, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(phase6, server.REVIEW_MAX_DIFF_BYTES)
+        self.assertLessEqual(foundation, server.REVIEW_MAX_DIFF_BYTES)
         self.assertLessEqual(followup, server.REVIEW_MAX_DIFF_BYTES)
 
     def test_large_review_diff_launches_with_the_prompt_off_argv(self):
