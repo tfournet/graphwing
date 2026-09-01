@@ -6324,7 +6324,9 @@ while True:
             posted.append(payload)
             return {"ok": True}
 
-        with mock.patch.object(server, "post_receipt", fake_post):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "RUN_CONTROL_DIR", Path(td)), \
+                mock.patch.object(server, "post_receipt", fake_post):
             status, out = server.pr_continue(json.dumps({
                 "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
                 "kick_url": "https://app.rewst.ai/api/hooks/x", **extra,
@@ -20905,6 +20907,339 @@ class InstallTests(unittest.TestCase):
             self.assertIn("not starting", proc.stdout)
             self.assertIn("native model launchers must already be installed", proc.stdout)
             self.assertNotIn("installing herdr", proc.stdout)
+
+
+class RunControlSettlementTests(unittest.TestCase):
+    """Provider-free run N+1 settlement of a kicked reservation.
+
+    Run N reserves attempt k+1, consumes its authorization, and kicks run N+1
+    with the continuity trio. Run N+1 launches the writer, receives the live
+    terminal receipt on its `wait` webhook, and settles the named reservation
+    from that body. The synchronous /v1/pr/continue ACK is never usage.
+    """
+
+    RUN_HEX = "a" * 64
+    ATTEMPT_HEX = "b" * 64
+    DESCRIPTOR = "d" * 64
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.ledger = Path(self._td.name)
+        patcher = mock.patch.object(server, "RUN_CONTROL_DIR", self.ledger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = [1_800_000_000]
+        clock = mock.patch.object(server, "_run_control_now", lambda: self.now[0])
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def trio(self, run_hex=None, attempt_hex=None):
+        run_hex = run_hex or self.RUN_HEX
+        attempt_hex = attempt_hex or self.ATTEMPT_HEX
+        return {"run_control_id": f"rc1-{run_hex}", "attempt_id": f"att1-{attempt_hex}",
+                "authorization_id": f"rca1-{run_hex}-{attempt_hex}"}
+
+    def sealed_receipt(self, job_hex="c", *, status="ok", failure_code="none",
+                       usage="default", usage_diagnostic=None, role=None):
+        if usage == "default":
+            usage = {
+                "usage_version": "normalized-usage-v1",
+                "fresh_input_tokens": 100, "cached_input_tokens": 20,
+                "cache_write_tokens": 3, "output_tokens": 40,
+                "reasoning_tokens": 7, "provider_cost_usd": 0.0125,
+                "wall_seconds": 12.9, "turns_observed": 4,
+            }
+        receipt = {
+            "status": status, "job_id": job_hex * 32,
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "session_identity": {"repo": "r"}, "requested_effort": "default",
+            "effective_effort": "default", "effort_source": "launcher_default",
+            "launcher_version": "sha256:" + "e" * 64,
+            "summary": "done",
+            "failure_class": "none" if failure_code == "none" else server.FAILURE_CLASS_BY_CODE[failure_code],
+            "failure_code": failure_code, "failover_eligible": False,
+            "diagnostic": {"code": failure_code, "summary": "done"},
+            "usage": usage, "usage_diagnostic": usage_diagnostic,
+        }
+        if role is not None:
+            receipt["role"] = role
+        server.seal_terminal_receipt_authority("agent", receipt)
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", receipt["job_id"])
+        return receipt
+
+    def settle(self, receipt, trio=None, descriptor=None, **overrides):
+        body = {"run_control": trio or self.trio(),
+                "launch_descriptor_sha256": descriptor or self.DESCRIPTOR,
+                "receipt": receipt, **overrides}
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/run/control/settle", {}, True, json.dumps(body).encode()
+        )
+        return status, payload
+
+    def authority_loss(self, trio=None, **overrides):
+        body = {"run_control": trio or self.trio(), **overrides}
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/run/control/authority-loss", {}, True, json.dumps(body).encode()
+        )
+        return status, payload
+
+    def kick(self, trio=None, *, ok=True):
+        posted = []
+
+        def fake_post(url, payload, token=None):
+            posted.append(payload)
+            return {"ok": ok}
+
+        with mock.patch.object(server, "post_receipt", fake_post):
+            status, out = server.pr_continue(json.dumps({
+                "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                "kick_url": "https://app.rewst.ai/api/hooks/x",
+                "run_control": trio or self.trio(),
+            }).encode(), {"r": str(Path(server.__file__).parent)})
+        return status, out, posted
+
+    def test_settle_binds_trio_and_projects_the_live_wait_body(self):
+        receipt = self.sealed_receipt()
+        status, out = self.settle(receipt)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["version"], "run-control-settlement-v1")
+        self.assertEqual(out["kind"], "terminal_receipt")
+        self.assertEqual(out["run_control_id"], self.trio()["run_control_id"])
+        self.assertIsNone(out["authority_loss_reason"])
+        self.assertFalse(out["replay"])
+        projected = out["receipt"]
+        # The reconcile graph re-serializes the receipt in exactly this key
+        # order and compares hashes; any other order fails its closed gate.
+        self.assertEqual(list(projected), [
+            "receipt_id", "attempt_id", "run_control_id", "authorization_id",
+            "launch_descriptor_sha256", "job_id", "terminal_status", "route",
+            "usage", "progress", "constraint_signals", "verified_outcome",
+        ])
+        self.assertEqual(projected["receipt_id"], "rec1-" + receipt["job_id"])
+        self.assertEqual(projected["job_id"], receipt["job_id"])
+        for key, value in self.trio().items():
+            self.assertEqual(projected[key], value)
+        self.assertEqual(projected["launch_descriptor_sha256"], self.DESCRIPTOR)
+        self.assertEqual(projected["terminal_status"], "succeeded")
+        self.assertEqual(projected["route"], {
+            "launcher": "codex", "model": "gpt-5.6-sol", "provider": "openai",
+            "route_version": "normal-v1",
+        })
+        self.assertEqual(projected["usage"], {
+            "turns": 4, "wall_seconds": 12, "tokens": 170, "provider_cost_usd": "0.0125",
+        })
+        body_sha = hashlib.sha256(json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        self.assertEqual(projected["progress"], {
+            "checkpoint": 0, "failing_regression_present": True,
+            "production_diff_bytes": 0, "focused_tests_green": False,
+            "diff_fingerprint": body_sha,
+        })
+        self.assertEqual(projected["constraint_signals"], [])
+        self.assertIs(projected["verified_outcome"], False)
+        # The projection is itself valid run-control receipt evidence.
+        status, verdict = server.run_control_validate_receipt(json.dumps({
+            "usage": projected["usage"],
+            "envelope": {"turns": 50, "wall_seconds": 600, "tokens": 1000, "provider_cost_usd": "1"},
+        }).encode())
+        self.assertEqual((status, verdict["valid"]), (200, True))
+
+    def test_settle_projects_failure_and_fallback_faithfully(self):
+        receipt = self.sealed_receipt(
+            job_hex="f", status="error", failure_code="run_budget_exceeded",
+            usage=None, usage_diagnostic="usage_not_reported", role="availability_fallback",
+        )
+        status, out = self.settle(receipt)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["kind"], "terminal_receipt")
+        projected = out["receipt"]
+        self.assertEqual(projected["terminal_status"], "failed")
+        self.assertEqual(projected["route"]["route_version"], "availability-fallback-v1")
+        # Missing native usage is passed through as nulls: the reconcile graph
+        # charges the full envelope for unusable evidence, never this op.
+        self.assertEqual(projected["usage"], {
+            "turns": None, "wall_seconds": None, "tokens": None, "provider_cost_usd": None,
+        })
+
+    def test_settle_never_accepts_the_continue_ack_or_malformed_receipts(self):
+        receipt = self.sealed_receipt()
+        status, ack, _ = self.kick()
+        self.assertEqual(status, 200, ack)
+        self.assertTrue(ack["kicked"])
+        ledger_before = sorted(p.name for p in self.ledger.rglob("*.json"))
+        good_trio = self.trio()
+        cases = {
+            "kick_ack_is_not_a_receipt": dict(receipt=ack),
+            "kick_ack_is_not_a_receipt_bare": dict(receipt={k: v for k, v in ack.items() if k != "run_control"}),
+            "not_terminal_receipt_no_job": dict(receipt={k: v for k, v in receipt.items() if k != "job_id"}),
+            "not_terminal_receipt_status": dict(receipt={**receipt, "status": "succeeded"}),
+            "not_terminal_receipt_scalar": dict(receipt="ok"),
+            "not_terminal_receipt_unknown_code": dict(receipt={**receipt, "failure_code": "made_up"}),
+            "receipt_authority_mismatch": dict(receipt={**receipt, "usage": {**receipt["usage"], "output_tokens": 999}}),
+            "bad_run_control_continuity": dict(trio={**good_trio, "authorization_id": "rca1-" + "a" * 64}),
+            "bad_launch_descriptor_sha256": dict(descriptor="D" * 64),
+            "unexpected_fields": dict(kind="terminal_receipt"),
+        }
+        expected_codes = {
+            "kick_ack_is_not_a_receipt_bare": "kick_ack_is_not_a_receipt",
+            "not_terminal_receipt_no_job": "not_terminal_receipt",
+            "not_terminal_receipt_status": "not_terminal_receipt",
+            "not_terminal_receipt_scalar": "not_terminal_receipt",
+            "not_terminal_receipt_unknown_code": "not_terminal_receipt",
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                kwargs = dict(kwargs)
+                body_receipt = kwargs.pop("receipt", receipt)
+                status, out = self.settle(body_receipt, **kwargs)
+                self.assertEqual(status, 400, (label, out))
+                self.assertEqual(out["code"], expected_codes.get(label, label))
+        # Refusals never touch the durable ledger.
+        self.assertEqual(sorted(p.name for p in self.ledger.rglob("*.json")), ledger_before)
+        # The ACK carries the trio, so a naive caller could name the
+        # reservation; that is exactly why it must be refused by shape.
+        self.assertEqual(ack["run_control"], good_trio)
+
+    def test_settlement_is_one_time_per_reservation_and_per_job(self):
+        receipt = self.sealed_receipt()
+        status, first = self.settle(receipt)
+        self.assertEqual(status, 200, first)
+        status, again = self.settle(receipt)
+        self.assertEqual(status, 200, again)
+        self.assertTrue(again["replay"])
+        self.assertEqual({k: v for k, v in again.items() if k != "replay"},
+                         {k: v for k, v in first.items() if k != "replay"})
+        # A different job cannot settle the same reservation.
+        other = self.sealed_receipt(job_hex="9")
+        status, conflict = self.settle(other)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "settlement_conflict")
+        # The same job cannot settle a second reservation.
+        status, conflict = self.settle(receipt, trio=self.trio(attempt_hex="5" * 64))
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "settlement_conflict")
+        # A different descriptor for the same reservation is a conflict, not a replay.
+        status, conflict = self.settle(receipt, descriptor="1" * 64)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "settlement_conflict")
+        # Settled reservations cannot be reported lost afterwards.
+        status, out = self.authority_loss()
+        self.assertEqual(status, 409, out)
+        self.assertEqual(out["code"], "already_settled")
+
+    def test_settle_after_restart_is_conservative_authority_loss(self):
+        receipt = self.sealed_receipt()
+        server.clear_terminal_receipt_authority("agent", receipt["job_id"])
+        status, out = self.settle(receipt)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["kind"], "authority_lost")
+        self.assertIsNone(out["receipt"])
+        self.assertEqual(out["authority_loss_reason"], "receipt_authority_unavailable")
+        # The fence is durable: a re-sealed identical receipt replays the loss
+        # and is never promoted to usage; different evidence is a conflict.
+        server.seal_terminal_receipt_authority("agent", receipt)
+        status, replay = self.settle(receipt)
+        self.assertEqual(status, 200, replay)
+        self.assertEqual((replay["kind"], replay["replay"]), ("authority_lost", True))
+        self.assertIsNone(replay["receipt"])
+        status, conflict = self.settle(receipt, descriptor="1" * 64)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "settlement_conflict")
+        status, replay = self.authority_loss()
+        self.assertEqual(status, 200, replay)
+        self.assertTrue(replay["replay"])
+        self.assertEqual(replay["authority_loss_reason"], "receipt_authority_unavailable")
+
+    def test_kick_is_recorded_once_and_loss_waits_out_the_grace_window(self):
+        status, out, posted = self.kick()
+        self.assertEqual(status, 200, out)
+        self.assertEqual(len(posted), 1)
+        status, again, posted = self.kick()
+        self.assertEqual(status, 409, again)
+        self.assertEqual(again["code"], "continuity_already_used")
+        self.assertEqual(posted, [])
+        # Within the grace window the kicked run may still be alive.
+        status, early = self.authority_loss()
+        self.assertEqual(status, 409, early)
+        self.assertEqual(early["code"], "kick_within_grace")
+        self.assertEqual(early["not_before"], self.now[0] + server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS)
+        self.now[0] += server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS - 1
+        status, early = self.authority_loss()
+        self.assertEqual(status, 409, early)
+        self.now[0] += 1
+        status, lost = self.authority_loss()
+        self.assertEqual(status, 200, lost)
+        self.assertEqual(lost["version"], "run-control-settlement-v1")
+        self.assertEqual(lost["kind"], "authority_lost")
+        self.assertEqual(lost["run_control_id"], self.trio()["run_control_id"])
+        self.assertIsNone(lost["receipt"])
+        self.assertEqual(lost["authority_loss_reason"], "kicked_run_never_settled")
+        self.assertFalse(lost["replay"])
+        status, replay = self.authority_loss()
+        self.assertEqual((status, replay["replay"]), (200, True))
+        # A late live receipt for the lost reservation is fenced, not charged twice.
+        receipt = self.sealed_receipt()
+        status, conflict = self.settle(receipt)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["code"], "settlement_conflict")
+
+    def test_failed_kick_is_lost_immediately_and_unknown_kicks_are_refused(self):
+        status, out, posted = self.kick(ok=False)
+        self.assertEqual(status, 502, out)
+        self.assertEqual(len(posted), 1)
+        status, lost = self.authority_loss()
+        self.assertEqual(status, 200, lost)
+        self.assertEqual(lost["kind"], "authority_lost")
+        self.assertEqual(lost["authority_loss_reason"], "continuation_kick_failed")
+        # Nothing this daemon kicked cannot be declared lost by it.
+        status, unknown = self.authority_loss(trio=self.trio(attempt_hex="7" * 64))
+        self.assertEqual(status, 400, unknown)
+        self.assertEqual(unknown["code"], "unknown_kick")
+        status, bad = self.authority_loss(trio={"run_control_id": "x"})
+        self.assertEqual((status, bad["code"]), (400, "bad_run_control_continuity"))
+        status, bad = self.authority_loss(reason="whatever")
+        self.assertEqual((status, bad["code"]), (400, "unexpected_fields"))
+        # A settled reservation before any kick record still refuses a second kick.
+        receipt = self.sealed_receipt(job_hex="8")
+        trio = self.trio(attempt_hex="8" * 64)
+        status, settled = self.settle(receipt, trio=trio)
+        self.assertEqual(status, 200, settled)
+        status, refused, posted = self.kick(trio=trio)
+        self.assertEqual((status, refused["code"], posted), (409, "continuity_already_used", []))
+
+    def test_settlement_ops_are_declared_in_openapi(self):
+        spec = json.loads(server.openapi_bytes())
+        settle = spec["paths"]["/v1/run/control/settle"]["post"]
+        loss = spec["paths"]["/v1/run/control/authority-loss"]["post"]
+        self.assertEqual(settle["operationId"], "runControlSettle")
+        self.assertEqual(loss["operationId"], "runControlAuthorityLoss")
+        schemas = spec["components"]["schemas"]
+        settle_request = schemas["RunControlSettleRequest"]
+        self.assertIs(settle_request["additionalProperties"], False)
+        self.assertEqual(set(settle_request["required"]), {"run_control", "launch_descriptor_sha256", "receipt"})
+        self.assertEqual(settle_request["properties"]["run_control"]["$ref"], "#/components/schemas/PrContinueRunControl")
+        loss_request = schemas["RunControlAuthorityLossRequest"]
+        self.assertEqual(set(loss_request["required"]), {"run_control"})
+        self.assertIs(loss_request["additionalProperties"], False)
+        settlement = schemas["RunControlSettlement"]
+        self.assertEqual(settlement["properties"]["version"]["const"], "run-control-settlement-v1")
+        self.assertEqual(set(settlement["properties"]["kind"]["enum"]), {"terminal_receipt", "authority_lost"})
+        self.assertEqual(
+            set(settlement["properties"]["authority_loss_reason"]["enum"]),
+            set(server.RUN_CONTROL_AUTHORITY_LOSS_REASONS) | {None},
+        )
+        projected = schemas["RunControlSettledReceipt"]
+        self.assertIs(projected["additionalProperties"], False)
+        self.assertEqual(list(projected["properties"]), [
+            "receipt_id", "attempt_id", "run_control_id", "authorization_id",
+            "launch_descriptor_sha256", "job_id", "terminal_status", "route",
+            "usage", "progress", "constraint_signals", "verified_outcome",
+        ])
+        for status in ("400", "409"):
+            self.assertIn(status, settle["responses"])
+            self.assertIn(status, loss["responses"])
 
 
 if __name__ == "__main__":
