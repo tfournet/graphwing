@@ -6317,6 +6317,62 @@ while True:
         self.assertEqual(body["pr_number"], "1")
         self.assertTrue(body["auto_merge"])
 
+    def _pr_continue_with(self, extra):
+        posted = []
+
+        def fake_post(url, payload, token=None):
+            posted.append(payload)
+            return {"ok": True}
+
+        with mock.patch.object(server, "post_receipt", fake_post):
+            status, out = server.pr_continue(json.dumps({
+                "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                "kick_url": "https://app.rewst.ai/api/hooks/x", **extra,
+            }).encode(), {"r": str(Path(server.__file__).parent)})
+        return status, out, posted
+
+    def test_pr_continue_without_continuity_adds_no_run_control_key(self):
+        # Run control is dormant. A request that omits continuity must kick
+        # the same payload it always did, with no run_control key at all.
+        status, out, posted = self._pr_continue_with({})
+        self.assertEqual(status, 200, out)
+        self.assertNotIn("run_control", posted[0])
+        self.assertNotIn("run_control", out)
+
+    def test_pr_continue_forwards_closed_run_control_continuity(self):
+        # Run N reserves and kicks; run N+1 must be able to name the
+        # reservation it settles, so the trio rides CTX.INPUT.run_control.
+        continuity = {"run_control_id": "rc1-" + "a" * 64,
+                      "attempt_id": "att1-" + "b" * 64,
+                      "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64}
+        status, out, posted = self._pr_continue_with({"run_control": continuity})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["kicked"])
+        self.assertEqual(posted[0]["run_control"], continuity)
+        self.assertEqual(out["run_control"], continuity)
+
+    def test_pr_continue_rejects_malformed_continuity_before_kicking(self):
+        good = {"run_control_id": "rc1-" + "a" * 64, "attempt_id": "att1-" + "b" * 64,
+                "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64}
+        bad_cases = {
+            "null": None,
+            "string": "rc1-" + "a" * 64,
+            "empty": {},
+            "partial": {k: v for k, v in good.items() if k != "authorization_id"},
+            "extra_field": {**good, "reservation": "x"},
+            "wrong_type": {**good, "attempt_id": 7},
+            "bad_run_grammar": {**good, "run_control_id": "rc1-" + "A" * 64},
+            "bad_attempt_grammar": {**good, "attempt_id": "att2-" + "b" * 64},
+            "bad_auth_grammar": {**good, "authorization_id": "rca1-" + "a" * 64},
+            "contradictory_auth": {**good, "authorization_id": "rca1-" + "a" * 64 + "-" + "c" * 64},
+        }
+        for label, continuity in bad_cases.items():
+            with self.subTest(label):
+                status, out, posted = self._pr_continue_with({"run_control": continuity})
+                self.assertEqual(status, 400, (label, out))
+                self.assertEqual(out["code"], "bad_run_control_continuity")
+                self.assertEqual(posted, [])
+
     def test_pr_continue_refuses_a_non_https_kick(self):
         status, out = server.pr_continue(json.dumps({
             "repo": "r", "pr": 1, "attempt": 1, "kick_url": "http://evil.example/x",

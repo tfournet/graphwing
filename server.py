@@ -2359,9 +2359,18 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     kick_url = data.get("kick_url")
     if isinstance(kick_url, str) and kick_url.strip() and not valid_webhook_url(kick_url):
         return 400, {"error": "kick_url must be https", "code": "bad_kick_url"}
+    continuity = None
+    if "run_control" in data:
+        continuity = run_control_continuity(data["run_control"])
+        if continuity is None:
+            return 400, {"error": "run_control must be the closed continuity trio "
+                                  "run_control_id, attempt_id, authorization_id",
+                         "code": "bad_run_control_continuity"}
 
     out = {"ok": True, "repo": name, "pr": number, "attempt": attempt,
            "max_attempts": ceiling, "kicked": False}
+    if continuity is not None:
+        out["run_control"] = continuity
     if attempt >= ceiling:
         return 200, {**out, "code": "attempts_exhausted",
                      "error": f"{attempt} of {ceiling} attempts used"}
@@ -2382,6 +2391,10 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         "kick_url": kick_url,
         "kick_token": token,
     }
+    if continuity is not None:
+        # Run N+1 reads this as CTX.INPUT.run_control. The kick ack below is
+        # not a receipt; the attempt outcome does not exist yet.
+        payload["run_control"] = continuity
     hook = post_receipt(kick_url, payload, token=token)
     out["kicked"] = bool(hook.get("ok"))
     out["kick"] = hook
@@ -2671,6 +2684,25 @@ RUN_CONTROL_REWST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 RUN_CONTROL_RUN_ID_RE = re.compile(r"rc1-[0-9a-f]{64}")
 RUN_CONTROL_ATTEMPT_ID_RE = re.compile(r"att1-[0-9a-f]{64}")
 RUN_CONTROL_COST_RE = re.compile(r"(0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?")
+RUN_CONTROL_CONTINUITY_FIELDS = frozenset({"run_control_id", "attempt_id", "authorization_id"})
+
+
+def run_control_continuity(value: Any) -> dict[str, str] | None:
+    """Validate the closed cross-run continuity trio a kicked run settles.
+
+    The state graph reserves under run_control_id (rc1-hash) and attempt_id
+    (att1-hash) and names the reservation authorization rca1-<run>-<attempt>.
+    All three are required, closed, and must agree, or run N+1 could settle
+    someone else's reservation.
+    """
+    if not isinstance(value, dict) or set(value) != RUN_CONTROL_CONTINUITY_FIELDS:
+        return None
+    run_id, attempt_id, auth_id = (value[k] for k in ("run_control_id", "attempt_id", "authorization_id"))
+    if (not isinstance(run_id, str) or RUN_CONTROL_RUN_ID_RE.fullmatch(run_id) is None
+            or not isinstance(attempt_id, str) or RUN_CONTROL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None
+            or auth_id != f"rca1-{run_id[4:]}-{attempt_id[5:]}"):
+        return None
+    return {"run_control_id": run_id, "attempt_id": attempt_id, "authorization_id": auth_id}
 
 
 def _run_control_error(code: str, message: str) -> tuple[int, dict[str, Any]]:
