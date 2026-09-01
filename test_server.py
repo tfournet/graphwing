@@ -3538,7 +3538,7 @@ class DispatchTests(unittest.TestCase):
 import json, os, sys, tempfile, time
 cfg = json.loads(os.environ.get("ACP_TEST_FIXTURE", "{}"))
 capture = os.environ["ACP_TEST_CAPTURE"]
-seen = {"pid":os.getpid(), "argv":sys.argv[1:], "cwd":os.getcwd(), "env":{key:os.environ.get(key) for key in ["GROK_DISABLE_AUTOUPDATER","PWD","TERMINAL_CWD","GRAPHWING_JOB_ID","GIT_TERMINAL_PROMPT","GH_PROMPT_DISABLED"]}, "requests":[]}
+seen = {"pid":os.getpid(), "argv":sys.argv[1:], "cwd":os.getcwd(), "env":{key:os.environ.get(key) for key in ["GROK_DISABLE_AUTOUPDATER","PWD","TERMINAL_CWD","GRAPHWING_JOB_ID","GIT_TERMINAL_PROMPT","GH_PROMPT_DISABLED","HOME"]}, "requests":[]}
 def save():
     with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(capture), prefix=os.path.basename(capture) + ".", delete=False) as fh:
         json.dump(seen, fh)
@@ -3589,6 +3589,7 @@ while True:
     if method == "initialize":
         auth_methods = cfg["auth_methods"] if "auth_methods" in cfg else [{"id":"xai.api_key"},{"id":"cached_token"}]
         result = {"protocolVersion":cfg.get("protocol_version", 1),"authMethods":auth_methods,"agentCapabilities":{"loadSession":cfg.get("load_session", True)}}
+        if "initialize_meta" in cfg: result["_meta"] = cfg["initialize_meta"]
         if cfg.get("omit_auth_methods"):
             result.pop("authMethods")
         if cfg.get("omit_protocol_version"):
@@ -3644,7 +3645,7 @@ while True:
 
     def _run_grok_fixture(
         self, cfg=None, resume=False, api_key=True, prompt="fixture prompt", model="grok-4.6",
-        adapter_results=None,
+        adapter_results=None, grok_home=None,
     ):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -3682,6 +3683,8 @@ while True:
         }
         if api_key:
             env["XAI_API_KEY"] = "fixture-key"
+        if grok_home is not None:
+            env["GRAPHWING_GROK_HOME"] = str(grok_home)
         env["GRAPHWING_GROK_BIN"] = str(fixture)
         native_launchers = deepcopy(server.NATIVE_LAUNCHERS)
         native_launchers["grok"]["models"] = tuple(dict.fromkeys(
@@ -3711,9 +3714,12 @@ while True:
 
                 with mock.patch.object(server, "run_grok_acp", side_effect=capture_adapter_result):
                     server.run_agent_job(job_id)
-        return json.loads((jdir / "job.json").read_text()), json.loads(capture.read_text()), jdir
+        captured = json.loads(capture.read_text()) if capture.exists() else {}
+        return json.loads((jdir / "job.json").read_text()), captured, jdir
 
-    def _run_grok_review_fixture(self, cfg=None, **context_kwargs):
+    def _run_grok_review_fixture(
+        self, cfg=None, api_key=True, grok_home=None, **context_kwargs,
+    ):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -3729,16 +3735,22 @@ while True:
         env = {
             "ACP_TEST_FIXTURE": json.dumps(fixture_cfg),
             "ACP_TEST_CAPTURE": str(capture),
-            "XAI_API_KEY": "fixture-key",
         }
+        if api_key:
+            env["XAI_API_KEY"] = "fixture-key"
+        if grok_home is not None:
+            env["GRAPHWING_GROK_HOME"] = str(grok_home)
         env["GRAPHWING_GROK_BIN"] = str(fixture)
         with mock.patch.object(server, "JOBS_DIR", jobs), \
              mock.patch.dict(os.environ, env, clear=False):
+            if not api_key:
+                os.environ.pop("XAI_API_KEY", None)
             with self._native_review_context(
                 "grok", "xai", "grok-4.6", fixture, **context_kwargs
             ) as context:
                 result = server.native_review_result(context)
-        return result, json.loads(capture.read_text())
+        captured = json.loads(capture.read_text()) if capture.exists() else {}
+        return result, captured
 
     def test_grok_acp_exact_argv_env_wire_and_successful_receipt(self):
         saved, capture, jdir = self._run_grok_fixture({"usage": {
@@ -3754,6 +3766,7 @@ while True:
             "GROK_DISABLE_AUTOUPDATER": "1", "PWD": str(jdir.parent.parent.resolve()),
             "TERMINAL_CWD": str(jdir.parent.parent.resolve()), "GRAPHWING_JOB_ID": "12" * 16,
             "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1",
+            "HOME": os.environ.get("HOME"),
         })
         requests = capture["requests"]
         self.assertEqual([r["jsonrpc"] for r in requests], ["2.0"] * 4)
@@ -4036,19 +4049,55 @@ while True:
         self.assertEqual(auth["params"]["methodId"], "cached_token")
         self.assertEqual(saved["status"], "completed")
 
-    def test_grok_acp_uses_grok_com_cached_oauth_without_api_key(self):
-        saved, capture, _ = self._run_grok_fixture({
-            "auth_methods": [{"id": "grok.com", "name": "Grok", "description": "Sign in with Grok"}],
-        }, api_key=False)
-        requests = capture["requests"]
-        self.assertEqual([r["method"] for r in requests], [
-            "initialize", "authenticate", "session/new", "session/prompt",
-        ])
-        self.assertEqual(requests[1]["params"], {
-            "methodId": "grok.com", "_meta": {"headless": True},
-        })
+    def test_grok_acp_uses_initialized_default_cached_oauth(self):
+        cfg = {
+            "auth_methods": [{"id": "cached_token"}, {"id": "grok.com"}],
+            "initialize_meta": {"defaultAuthMethodId": "cached_token"},
+        }
+        saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
         self.assertEqual(saved["status"], "completed")
-        self.assertNotIn("cached_token", json.dumps(requests))
+        auth = next(r for r in capture["requests"] if r["method"] == "authenticate")
+        self.assertEqual(auth["params"], {
+            "methodId": "cached_token", "_meta": {"headless": True},
+        })
+        reviewed, review_capture = self._run_grok_review_fixture(cfg, api_key=False)
+        self.assertEqual(reviewed["verdict"], "PASS")
+        review_auth = next(r for r in review_capture["requests"] if r["method"] == "authenticate")
+        self.assertEqual(review_auth["params"]["methodId"], "cached_token")
+
+    def test_grok_acp_rejects_nonnull_default_without_advertised_auth_methods(self):
+        for auth_methods_state in ("omitted", "empty"):
+            for default_auth_method in ("grok.com", "cached_token", "unknown"):
+                with self.subTest(
+                    auth_methods_state=auth_methods_state,
+                    default_auth_method=default_auth_method,
+                ):
+                    cfg: dict[str, Any] = {
+                        "initialize_meta": {"defaultAuthMethodId": default_auth_method},
+                    }
+                    if auth_methods_state == "omitted":
+                        cfg["omit_auth_methods"] = True
+                    else:
+                        cfg["auth_methods"] = []
+                    saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
+                    self.assertEqual(saved["status"], "failed")
+                    self.assertEqual(
+                        saved["receipt"]["failure_code"],
+                        "adapter_contract_invalid",
+                    )
+                    self.assertEqual(
+                        [request["method"] for request in capture["requests"]],
+                        ["initialize"],
+                    )
+
+    def test_grok_acp_rejects_interactive_only_cached_oauth(self):
+        saved, capture, _ = self._run_grok_fixture({
+            "auth_methods": [{"id": "grok.com"}],
+            "initialize_meta": {"defaultAuthMethodId": None},
+        }, api_key=False)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["receipt"]["failure_code"], "adapter_contract_invalid")
+        self.assertEqual([r["method"] for r in capture["requests"]], ["initialize"])
 
     def test_grok_acp_api_key_mode_selects_xai_api_key_exactly(self):
         saved, capture, _ = self._run_grok_fixture({
@@ -4057,6 +4106,7 @@ while True:
                 {"id": "xai.api_key"},
                 {"id": "cached_token"},
             ],
+            "initialize_meta": {"defaultAuthMethodId": "cached_token"},
         })
         auth = next(r for r in capture["requests"] if r["method"] == "authenticate")
         self.assertEqual(auth["params"], {"methodId": "xai.api_key", "_meta": {"headless": True}})
@@ -4070,14 +4120,45 @@ while True:
         self.assertEqual(auth["params"], {"methodId": "cached_token", "_meta": {"headless": True}})
         self.assertEqual(saved["status"], "completed")
 
-    def test_grok_acp_rejects_ambiguous_unknown_duplicate_and_malformed_cached_auth(self):
+    def test_grok_acp_rejects_auth_default_drift_and_malformed_meta(self):
         cases = {
-            "ambiguous": [{"id": "grok.com"}, {"id": "cached_token"}],
+            "ambiguous without default": {
+                "auth_methods": [{"id": "grok.com"}, {"id": "cached_token"}],
+            },
+            "default absent": {
+                "auth_methods": [{"id": "cached_token"}],
+                "initialize_meta": {"defaultAuthMethodId": "grok.com"},
+            },
+            "interactive default": {
+                "auth_methods": [{"id": "cached_token"}, {"id": "grok.com"}],
+                "initialize_meta": {"defaultAuthMethodId": "grok.com"},
+            },
+            "api key default in cached mode": {
+                "auth_methods": [{"id": "cached_token"}, {"id": "xai.api_key"}],
+                "initialize_meta": {"defaultAuthMethodId": "xai.api_key"},
+            },
+            "malformed meta": {
+                "auth_methods": [{"id": "cached_token"}], "initialize_meta": [],
+            },
+            "malformed default": {
+                "auth_methods": [{"id": "cached_token"}],
+                "initialize_meta": {"defaultAuthMethodId": 7},
+            },
+        }
+        for name, cfg in cases.items():
+            with self.subTest(name=name):
+                saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["failure_code"], "adapter_contract_invalid")
+                self.assertEqual([r["method"] for r in capture["requests"]], ["initialize"])
+
+    def test_grok_acp_rejects_unknown_duplicate_and_malformed_cached_auth(self):
+        cases = {
             "unknown": [{"id": "other"}],
             "supported plus unknown": [{"id": "grok.com"}, {"id": "other"}],
             "duplicate": [{"id": "grok.com"}, {"id": "grok.com"}],
             "malformed": [{"id": ""}],
-            "terminal": [{"id": "grok.com", "type": "terminal"}],
+            "terminal": [{"id": "cached_token", "type": "terminal"}],
         }
         for name, auth_methods in cases.items():
             with self.subTest(name=name):
@@ -4093,7 +4174,7 @@ while True:
 
     def test_grok_acp_authenticate_failure_does_not_open_session(self):
         saved, capture, _ = self._run_grok_fixture({
-            "auth_methods": [{"id": "grok.com", "name": "Grok", "description": "Sign in with Grok"}],
+            "auth_methods": [{"id": "cached_token"}],
             "error_method": "authenticate",
         }, api_key=False)
         methods = [r["method"] for r in capture["requests"]]
@@ -4101,15 +4182,53 @@ while True:
         self.assertEqual(saved["error"], saved["receipt"]["diagnostic"]["summary"])
         self.assertIn("authenticate", methods)
         self.assertEqual(capture["requests"][1]["params"], {
-            "methodId": "grok.com", "_meta": {"headless": True},
+            "methodId": "cached_token", "_meta": {"headless": True},
         })
         self.assertNotIn("session/new", methods)
         self.assertNotIn("session/prompt", methods)
 
-    def test_grok_acp_allows_omitted_auth_methods_without_authenticate(self):
-        saved, capture, _ = self._run_grok_fixture({"omit_auth_methods": True})
+    def test_grok_acp_uses_grok_only_credential_home_for_writer_and_review(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        credential_home = Path(td.name).resolve()
+        inherited_home = os.environ.get("HOME")
+        saved, capture, _ = self._run_grok_fixture(grok_home=credential_home)
         self.assertEqual(saved["status"], "completed")
-        self.assertNotIn("authenticate", [r["method"] for r in capture["requests"]])
+        self.assertEqual(capture["env"]["HOME"], str(credential_home))
+        reviewed, review_capture = self._run_grok_review_fixture(grok_home=credential_home)
+        self.assertEqual(reviewed["verdict"], "PASS")
+        self.assertEqual(review_capture["env"]["HOME"], str(credential_home))
+        self.assertEqual(os.environ.get("HOME"), inherited_home)
+
+    def test_grok_acp_rejects_invalid_credential_home_before_spawn(self):
+        cases = ("relative-home", Path(tempfile.gettempdir()) / "definitely-missing-grok-home")
+        for grok_home in cases:
+            with self.subTest(grok_home=str(grok_home)):
+                saved, capture, _ = self._run_grok_fixture(grok_home=grok_home)
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["receipt"]["failure_code"], "adapter_contract_invalid")
+                self.assertEqual(capture, {})
+
+    def test_grok_acp_allows_no_auth_methods_with_absent_or_null_default(self):
+        for auth_methods_state in ("omitted", "empty"):
+            for default_auth_method_state in ("absent", "null"):
+                with self.subTest(
+                    auth_methods_state=auth_methods_state,
+                    default_auth_method_state=default_auth_method_state,
+                ):
+                    cfg: dict[str, Any] = {}
+                    if auth_methods_state == "omitted":
+                        cfg["omit_auth_methods"] = True
+                    else:
+                        cfg["auth_methods"] = []
+                    if default_auth_method_state == "null":
+                        cfg["initialize_meta"] = {"defaultAuthMethodId": None}
+                    saved, capture, _ = self._run_grok_fixture(cfg, api_key=False)
+                    self.assertEqual(saved["status"], "completed")
+                    self.assertEqual(
+                        [request["method"] for request in capture["requests"]],
+                        ["initialize", "session/new", "session/prompt"],
+                    )
 
     def test_grok_acp_rejects_malformed_auth_methods(self):
         malformed = [
