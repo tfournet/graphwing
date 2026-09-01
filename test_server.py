@@ -19930,6 +19930,20 @@ class CodeOffTests(unittest.TestCase):
             {"$ref": "#/components/schemas/CodeOffEconomics"}, {"type": "null"},
         ])
 
+    def test_codeoff_graph_exact_catalog_snapshot(self):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )
+        canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(),
+            "75376763e610ee0fdfa76519535a294efbbc0b2b3ecf9d6f6a665fc551a58240",
+        )
+        self.assertEqual(len(graph["spec"]["nodes"]), 54)
+        self.assertEqual(len(graph["spec"]["edges"]), 94)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 54)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 94)
+
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
         self.assertEqual(graph["slug"], "graphwing-code-off")
