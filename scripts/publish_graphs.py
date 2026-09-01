@@ -257,6 +257,32 @@ def save_install(install: dict) -> None:
     path.write_text(json.dumps(install, indent=2) + "\n")
 
 
+CATALOG = [
+    "run-control-transition", "run-control-consume-authorization",
+    "run-control-initialize", "run-control-state", "run-control-reconcile",
+    "run-control-consume", "run-control-authorize", "verify-stack",
+    "implement-slice", "pr-drive", "pr-status", "code-off",
+    # Dormant run-control sibling of pr-drive. Last so every child pin it
+    # embeds already exists; nothing kicks it unless an operator starts it.
+    "pr-drive-run-control",
+]
+# Publishing the sibling by name republishes its durable chain first so no
+# stale child version can be pinned. "--only pr-drive" never reaches it: the
+# shipped pr-drive stays byte-identical and has no children.
+DURABLE_CHAIN = [
+    "run-control-transition", "run-control-consume-authorization",
+    "run-control-state", "run-control-consume", "run-control-reconcile",
+]
+
+
+def publish_stems(only: str) -> list[str]:
+    if only == "all":
+        return list(CATALOG)
+    if only == "pr-drive-run-control":
+        return DURABLE_CHAIN + ["pr-drive-run-control"]
+    return [only]
+
+
 def main():
     global TENANT
     ap = argparse.ArgumentParser()
@@ -270,13 +296,7 @@ def main():
         raise SystemExit("rewst-install.json missing instance_id")
     hook_secret = os.environ.get("GRAPHWING_HOOK_SECRET") or install.get("hook_secret") or ""
     integration = install.get("custom_integration_id")
-    catalog = [
-        "run-control-transition", "run-control-consume-authorization",
-        "run-control-initialize", "run-control-state", "run-control-reconcile",
-        "run-control-consume", "run-control-authorize", "verify-stack",
-        "implement-slice", "pr-drive", "pr-status", "code-off",
-    ]
-    stems = catalog if args.only == "all" else [args.only]
+    stems = publish_stems(args.only)
     status_repo = (
         os.environ.get("GRAPHWING_STATUS_REPO")
         or install.get("pr_status_repo")
@@ -308,6 +328,14 @@ def main():
             workflow_pins.update({
                 "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": wid,
                 "$GRAPHWING_RUN_CONTROL_AUTHORIZE_VERSION_ID": vid,
+            })
+        if stem in {"run-control-state", "run-control-consume", "run-control-reconcile"}:
+            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
+                raise SystemExit(f"{stem} publication returned no exact IDs")
+            prefix = stem.removeprefix("run-control-").replace("-", "_").upper()
+            workflow_pins.update({
+                f"$GRAPHWING_RUN_CONTROL_{prefix}_WORKFLOW_ID": wid,
+                f"$GRAPHWING_RUN_CONTROL_{prefix}_VERSION_ID": vid,
             })
     if not args.no_run and "pr-drive" in published:
         repo = (os.environ.get("GRAPHWING_SMOKE_REPO") or install.get("smoke_repo") or "").strip()
@@ -347,6 +375,8 @@ def main():
         install["run_control_consume_authorization"] = published["run-control-consume-authorization"]
     if "run-control-consume" in published:
         install["run_control_consume"] = published["run-control-consume"]
+    if "pr-drive-run-control" in published:
+        install["pr_drive_run_control"] = published["pr-drive-run-control"]
     save_install(install)
     print("=== DONE ===")
     print(json.dumps(published, indent=2))

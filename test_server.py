@@ -2,6 +2,7 @@
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -7061,7 +7062,7 @@ while True:
     def test_pr_graph_action_configs_match_openapi_request_shapes(self):
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
         ignored = {"integrationInstanceId", "timeout", "_comment"}
-        for filename in ("pr-drive.json", "pr-status.json"):
+        for filename in ("pr-drive.json", "pr-status.json", "pr-drive-run-control.json"):
             graph = json.loads((Path(server.__file__).parent / "graphs" / filename).read_text())
             for node in graph["spec"]["nodes"]:
                 match = re.fullmatch(r"action\.graphwing\.(GET|POST):(.+)", node["type"])
@@ -12525,6 +12526,11 @@ func main() {
                 },
             },
             "pr-drive.json": {
+                "route_nodes": {"route"},
+                "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
+                "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
+            },
+            "pr-drive-run-control.json": {
                 "route_nodes": {"route"},
                 "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
                 "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
@@ -21270,6 +21276,41 @@ class RunControlSettlementTests(unittest.TestCase):
         self.assertEqual(status, 200, legacy)
         self.assertNotIn("kick_request_sha256", legacy)
 
+    def fingerprint(self, request):
+        with mock.patch.object(server, "load_repos", return_value={"r": str(Path(server.__file__).parent)}):
+            status, out, _ = server.dispatch(
+                "POST", "/v1/pr/continue/fingerprint", {}, True, json.dumps(request).encode(),
+            )
+        return status, out
+
+    def test_kick_fingerprint_matches_the_kick_and_never_touches_the_ledger(self):
+        # The reserving run asks the daemon for the fingerprint of the exact
+        # kick it is about to send, reserves with it, then sends that kick.
+        # Both hashes are computed server-side, so they agree by construction.
+        request = self.kick_request(with_trio=False)
+        status, out = self.fingerprint(request)
+        self.assertEqual(status, 200, out)
+        self.assertEqual({k: out[k] for k in ("would_kick", "code")}, {"would_kick": True, "code": None})
+        self.assertFalse((self.ledger / "reservations").exists())
+        status, ack, _ = self.kick()
+        self.assertEqual(status, 200, ack)
+        self.assertEqual(out["kick_request_sha256"], ack["kick_request_sha256"])
+        for label, extra, code in (
+            ("exhausted", {"attempt": 3}, "attempts_exhausted"),
+            ("no_kick_url", {"kick_url": ""}, "no_kick_url"),
+        ):
+            with self.subTest(label):
+                status, out = self.fingerprint({**request, **extra})
+                self.assertEqual(status, 200, out)
+                self.assertEqual((out["would_kick"], out["code"]), (False, code))
+        status, refused = self.fingerprint(self.kick_request())
+        self.assertEqual((status, refused["code"]), (400, "unexpected_fields"))
+        spec = json.loads(server.openapi_bytes())
+        op = spec["paths"]["/v1/pr/continue/fingerprint"]["post"]
+        self.assertEqual(op["operationId"], "prContinueFingerprint")
+        result = spec["components"]["schemas"]["PrContinueFingerprint"]
+        self.assertEqual(set(result["required"]), {"ok", "repo", "pr", "attempt", "max_attempts", "would_kick", "code", "kick_request_sha256"})
+
     def test_agent_run_pins_the_launch_to_the_kicked_reservation(self):
         status, ack, _ = self.kick()
         self.assertEqual(status, 200, ack)
@@ -21459,6 +21500,162 @@ class PrDriveFlagOffTraversalTests(unittest.TestCase):
         self.assertNotEqual(edges, main_edges)
         self.assertNotIn(("wait", "pending", "agent", "in"), edges)
         self.assertEqual(set(nodes) - set(main_nodes), {"rc_agent_mode", "rc_agent_switch", "rc_agent_launch_join"})
+
+
+class PrDriveRunControlGraphTests(unittest.TestCase):
+    """The enabled pr-drive shape lives in its own dormant slug.
+
+    graphs/pr-drive.json stays byte-identical to main (PrDriveFlagOffTraversalTests).
+    This graph is that topology plus the run-control legs: the writer launches
+    under the carried reservation and settles it from the live wait body; the
+    continue leg fingerprints the kick, reserves, consumes, kicks with the
+    four-field continuity, and closes a failed kick as authority loss.
+    """
+
+    PINS = {
+        "state": ("$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID", "$GRAPHWING_RUN_CONTROL_STATE_VERSION_ID"),
+        "consume": ("$GRAPHWING_RUN_CONTROL_CONSUME_WORKFLOW_ID", "$GRAPHWING_RUN_CONTROL_CONSUME_VERSION_ID"),
+        "reconcile": ("$GRAPHWING_RUN_CONTROL_RECONCILE_WORKFLOW_ID", "$GRAPHWING_RUN_CONTROL_RECONCILE_VERSION_ID"),
+    }
+
+    @staticmethod
+    def load(name):
+        return json.loads((Path(server.__file__).parent / "graphs" / name).read_text())
+
+    @staticmethod
+    def edges(spec):
+        return {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+
+    def test_graph_is_pr_drive_plus_enumerated_run_control_deltas(self):
+        base = self.load("pr-drive.json")
+        enabled = self.load("pr-drive-run-control.json")
+        self.assertEqual(enabled["slug"], "graphwing-pr-drive-run-control")
+        self.assertEqual(enabled["name"], "graphwing-pr-drive-run-control")
+        self.assertIs(enabled["spec"]["meta"]["dormant"], True)
+        base_nodes = {n["id"]: n for n in base["spec"]["nodes"]}
+        nodes = {n["id"]: n for n in enabled["spec"]["nodes"]}
+        rc = {node_id for node_id in nodes if node_id.startswith("rc_")}
+        self.assertEqual(set(nodes) - rc, set(base_nodes))
+        expected_deltas = {
+            "agent": {**base_nodes["agent"]["config"], "run_control": "{{ CTX.INPUT.run_control }}"},
+            "continue": {**base_nodes["continue"]["config"], "run_control": "{{ CTX.rc_continuity.run_control }}"},
+            "form": {**base_nodes["form"]["config"], "enabled": False},
+            "hook": {**base_nodes["hook"]["config"], "enabled": False},
+        }
+        for node_id, node in base_nodes.items():
+            with self.subTest(node=node_id):
+                self.assertEqual(nodes[node_id]["type"], node["type"])
+                self.assertEqual(nodes[node_id]["config"], expected_deltas.get(node_id, node["config"]))
+        removed = {("wait", "out", "receipt"), ("if_green2", "fail", "continue"), ("continue", "failure", "join_continue")}
+        added = {
+            ("wait", "out", "rc_settle"), ("rc_settle", "success", "rc_reconcile"),
+            ("rc_reconcile", "success", "receipt"),
+            ("rc_settle", "failure", "rc_failure_join"), ("rc_reconcile", "failure", "rc_failure_join"),
+            ("if_green2", "fail", "rc_kick_fingerprint"),
+            ("rc_kick_fingerprint", "success", "rc_kick_gate"), ("rc_kick_fingerprint", "failure", "rc_failure_join"),
+            ("rc_kick_gate", "fail", "join_continue"), ("rc_kick_gate", "pass", "rc_task_material"),
+            ("rc_task_material", "out", "rc_task_hash"), ("rc_task_hash", "out", "rc_callback_hash"),
+            ("rc_callback_hash", "out", "rc_continue_state"),
+            ("rc_continue_state", "success", "rc_continue_consume"), ("rc_continue_state", "failure", "rc_failure_join"),
+            ("rc_continue_consume", "success", "rc_continuity"), ("rc_continue_consume", "failure", "rc_failure_join"),
+            ("rc_continuity", "out", "continue"),
+            ("continue", "failure", "rc_continue_loss"),
+            ("rc_continue_loss", "success", "rc_continue_loss_reconcile"), ("rc_continue_loss", "failure", "rc_continue_action_loss"),
+            ("rc_continue_loss_reconcile", "success", "join_continue"), ("rc_continue_loss_reconcile", "failure", "rc_failure_join"),
+            ("rc_continue_action_loss", "success", "join_continue"), ("rc_continue_action_loss", "failure", "rc_failure_join"),
+            ("rc_failure_join", "out", "rc_failure"),
+        }
+        self.assertEqual(self.edges(enabled["spec"]), (self.edges(base["spec"]) - removed) | added)
+        self.assertEqual(rc, {t for triple in added for t in (triple[0], triple[2]) if t.startswith("rc_")})
+        # The writer and the kick both stay on their original edges; they just carry continuity.
+        self.assertIn(("wait", "pending", "agent"), self.edges(enabled["spec"]))
+        self.assertIn(("continue", "success", "join_continue"), self.edges(enabled["spec"]))
+
+    def test_run_control_children_are_exactly_pinned_and_failures_are_fenced(self):
+        spec = self.load("pr-drive-run-control.json")["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        expected_children = {
+            "rc_continue_state": "state", "rc_continue_consume": "consume",
+            "rc_reconcile": "reconcile", "rc_continue_loss_reconcile": "reconcile",
+            "rc_continue_action_loss": "reconcile",
+        }
+        for node_id, node in nodes.items():
+            if node["type"] != "action.subworkflow":
+                continue
+            with self.subTest(node=node_id):
+                self.assertIn(node_id, expected_children)
+                wid, vid = self.PINS[expected_children[node_id]]
+                self.assertEqual((node["config"]["workflowId"], node["config"]["workflowVersionId"]), (wid, vid))
+                self.assertNotIn("versionSelection", node["config"])
+        self.assertEqual(set(expected_children), {n for n, node in nodes.items() if node["type"] == "action.subworkflow"})
+        edges = self.edges(spec)
+        for node_id in nodes:
+            if node_id.startswith("rc_") and nodes[node_id]["type"].startswith("action."):
+                with self.subTest(node=node_id):
+                    failure_targets = {t for s, h, t in edges if s == node_id and h == "failure"}
+                    self.assertEqual(len(failure_targets), 1)
+                    self.assertIn(failure_targets.pop(), {"rc_failure_join", "rc_continue_action_loss"})
+        self.assertEqual(nodes["rc_failure"]["type"], "transforms.regexReplace")
+        self.assertEqual(nodes["rc_failure"]["config"]["input"], "graphwing_pr_drive_run_control_fenced")
+        self.assertEqual(nodes["rc_failure_join"]["type"], "logic.join.any")
+
+    def test_reservation_binds_the_fingerprinted_kick_and_settles_from_the_wait_body(self):
+        spec = self.load("pr-drive-run-control.json")["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        kick = nodes["continue"]["config"]
+        fingerprint = nodes["rc_kick_fingerprint"]["config"]
+        self.assertEqual(nodes["rc_kick_fingerprint"]["type"], "action.graphwing.POST:/v1/pr/continue/fingerprint")
+        self.assertEqual(fingerprint, {k: v for k, v in kick.items() if k not in ("kick_token", "run_control")})
+        self.assertEqual(nodes["rc_kick_gate"]["config"]["rules"], [{"path": "data.would_kick", "op": "equals", "value": True}])
+        state_inputs = nodes["rc_continue_state"]["config"]["inputMapping"]["values"]
+        self.assertEqual(state_inputs["exact_request_body_sha256"]["value"], "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}")
+        self.assertEqual(state_inputs["endpoint"]["value"], "/v1/pr/continue")
+        self.assertEqual(state_inputs["run_control_id"]["value"], "{{ CTX.INPUT.run_control.run_control_id }}")
+        self.assertEqual(set(state_inputs), {
+            "run_control_id", "candidate_route", "next_envelope", "launcher_fingerprint", "endpoint",
+            "exact_request_body_sha256", "repository", "branch", "head_sha", "task_sha256",
+            "permission_profile", "callback_binding_sha256", "handoff",
+        })
+        continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
+        self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
+            "run_control_id": "CTX.INPUT.run_control.run_control_id",
+            "attempt_id": "TASKS.rc_continue_state.result.attempt_identity.attempt_id",
+            "authorization_id": "TASKS.rc_continue_state.result.attempt_identity.authorization_id",
+            "launch_descriptor_sha256": "TASKS.rc_continue_state.result.descriptor_hash.value",
+        })
+        settle = nodes["rc_settle"]["config"]
+        self.assertEqual(nodes["rc_settle"]["type"], "action.graphwing.POST:/v1/run/control/settle")
+        self.assertEqual((settle["run_control"], settle["receipt"]),
+                         ("{{ CTX.INPUT.run_control }}", "{{ TASKS.wait.request.body }}"))
+        reconcile = nodes["rc_reconcile"]["config"]["inputMapping"]["values"]
+        self.assertEqual({k: v["value"] for k, v in reconcile.items()}, {
+            "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+            "kind": "{{ TASKS.rc_settle.data.kind }}",
+            "receipt": "{{ TASKS.rc_settle.data.receipt }}",
+            "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}",
+        })
+        loss = nodes["rc_continue_loss"]["config"]
+        self.assertEqual(nodes["rc_continue_loss"]["type"], "action.graphwing.POST:/v1/run/control/authority-loss")
+        self.assertEqual(loss["run_control"], "{{ CTX.rc_continuity.run_control }}")
+        action_loss = nodes["rc_continue_action_loss"]["config"]["inputMapping"]["values"]
+        self.assertEqual((action_loss["kind"]["value"], action_loss["authority_loss_reason"]["value"], action_loss["receipt"]["value"]),
+                         ("authority_lost", "continuation_action_failed", None))
+
+    def test_publish_registers_the_slug_behind_its_durable_chain(self):
+        spec = importlib.util.spec_from_file_location(
+            "publish_graphs", Path(server.__file__).parent / "scripts" / "publish_graphs.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Catalog contract: "all" publishes every graph file once, dormant ones
+        # included, and the sibling comes after every child it pins.
+        everything = module.publish_stems("all")
+        self.assertEqual(everything[-1], "pr-drive-run-control")
+        self.assertEqual(module.publish_stems("pr-drive"), ["pr-drive"])
+        self.assertEqual(module.publish_stems("pr-drive-run-control"), [
+            "run-control-transition", "run-control-consume-authorization", "run-control-state",
+            "run-control-consume", "run-control-reconcile", "pr-drive-run-control",
+        ])
 
 
 if __name__ == "__main__":
