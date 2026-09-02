@@ -503,8 +503,58 @@ are removed. Nine `herdr_*` diagnostic-noop node labels lost during the loop
 graph's original construction are restored (only `herdr_final_fail` had kept
 one); they are what make a failed run's stopping point legible in the trace.
 
+## Live proof and two real defects, 2026-09-02 evening
+
+Recreated the disposable validation harness (`/home/tim/work/gw-rc-validation-clone`,
+a fresh clone of this repo; `graphwing-rc-validation` in `repos.json`;
+`rc-validation-proof` in `tests.json`) that a prior session's cleanup had
+removed, mirroring PR #168's pattern: a throwaway draft PR (#172, closed) with
+one posted blocking finding whose remedy is a one-line, easily-checked fix.
+
+First proof attempt (route resolved to codex by default for `go_coding`;
+reran with `--work-kind typescript_coding` to get claude, since #151 already
+found codex infeasible under the pinned launcher) surfaced a real defect:
+`switch_needs_fix` read `TASKS.iter_findings.data.all_green`, which
+`/v1/gh/pr/findings` folds in from GitHub check status alone, not the
+findings-derived `blocking` verdict. A red PR with a passing CI check read as
+green; every attempt slot skipped it. This predates activation (already in
+`pr-drive-loop.json`) but the first loop proof (run `5fcecaed`, PR #168)
+happened to fail its own CI check for an unrelated reason (invalid graph
+JSON fixtures), so `all_green` was coincidentally false there and the bug
+never showed. Fixed: `iter_snap` now maps `needs_fix` from `.data.blocking`.
+
+Second attempt (after republishing) correctly identified the PR as needing a
+fix and completed two full reserve→launch→settle→reconcile→test cycles, but
+hit an HTTP 502 launching the writer on the third — a transient Rewst
+gateway error. `agent` had no outgoing edges at all, so the loop iteration
+died there uncaught instead of reaching `rc_failure` like every sibling
+action node's failure handle already does. Fixed: `agent failure ->
+rc_failure_join`.
+
+Third attempt's own test recipe was wrong, not graphwing: `rc-validation-proof`
+used `cwd: "."`, which runs against the daemon's own process directory, not
+the target repo — `cwd` in a `tests.json` recipe is a repo *name*, resolved
+through `repos.json` the same way `riftwing-local-gates` does it
+(`cwd: "riftwing"`). Fixed the recipe, not the graph.
+
+Fourth attempt, both fixes and the corrected recipe in place, run `4e9c5b39`:
+slot 1 reserved an attempt, launched a real claude-opus-5 writer, which read
+the finding, added the fix, passed the named test, committed (`b3cd7489`),
+and pushed — the complete cycle, through the activated single front door.
+Slots 2-3 correctly saw the PR as still "blocking" (the throwaway finding
+comment never gets cleared without a real reviewer re-grading it) and
+correctly no-op'd once there was nothing left to commit. The final tail
+correctly refused merge evidence because the proof PR was a draft
+(`"PR is not remotely ready for final evidence"`) — expected behavior for a
+draft PR, not a bug. Closed #172 without merging.
+
+Landed as their own PRs (#173, #174) rather than folded into the activation
+PR, since each was found and fixed after #171 had already merged.
+
 ## Next bounded task
 
 Launcher identity work (#151, spike verdict: codex infeasible under the
-pinned memfd launcher, route `go_coding` to claude) and the MCP
-build-and-export loop for the catalog.
+pinned memfd launcher; `NORMAL_WRITER_ROUTES` still sends `go_coding` to
+codex by default — `--work-kind typescript_coding` is an operator
+workaround, not a policy change) and the MCP build-and-export loop for the
+catalog.
