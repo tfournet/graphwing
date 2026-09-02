@@ -15003,8 +15003,8 @@ func main() {
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
-    _DURABLE_FOUNDATION_BASE_COMMIT = "e44e5d49dda2db1557aa0ec55f4a674689dc3dcd"
-    _DURABLE_FOUNDATION_LANDED_COMMIT = "f242c90c310ad8c4a7b7fc97e2146fed73f95177"
+    _DURABLE_FOUNDATION_BASE_COMMIT = "f242c90c310ad8c4a7b7fc97e2146fed73f95177"
+    _DURABLE_FOUNDATION_LANDED_COMMIT = "c737cd2a02959901601a991ac650264290efb6fd"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
