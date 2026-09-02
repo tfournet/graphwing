@@ -402,9 +402,34 @@ procedure rule learned again: after any `openapi.json` change, run
 `scripts/reimport_integration.py` before the tenant proof, or Rewst drops the
 new request fields on the floor (run 6b9a77a3 lost the route inputs that way).
 
+## Phase 4 proof and two platform findings, 2026-09-02
+
+The #141 proof (implement-slice with every launcher stubbed to a missing
+binary, one-ticket slice on PR branch `rc-validation/slice-phase4-20260902`)
+never reached the fallback gate: run cf127daf died at `agent` with
+"launcher is required". Cause: Riftwing's `transforms.lookupTable` returns a
+matched entry `value` verbatim (`rewst-go/services/worker/nodes/
+lookup_table.go`), evaluating only `input` and `defaultValue`. All nine lookup
+nodes the Sep 1 routing refactor (543ef8e) added to implement-slice hold AST
+values, so every implement-slice run since then has failed at `agent`. The
+fixture interpreter in `test_server.py` evaluates the selected entry, which is
+why the suite never saw it. Tracked as the "lookupTable entry value" issue;
+the fix converts the nine nodes to objectBuilder conditional chains and adds a
+lint. The #141 proof reruns after it lands.
+
+Codex spike (#151): not feasible. Codex run from a sealed memfd fails every
+`exec_command` and `apply_patch` verification with "No such file or
+directory", with or without an external code-mode host; its internal
+sandboxed re-exec resolves its own executable to the deleted memfd path. The
+app-server JSON-RPC protocol itself works and exposes thread id, final
+message, and a full token breakdown. Decision pending: same-uid private-copy
+pinning for codex only, or an upstream codex issue. `go_coding` should route
+to claude until then.
+
 ## Next bounded task
 
-Phase 4's tenant proof (implement-slice reaches `fallback_route` with the codex
-route stubbed to a missing binary), the #151 spike verdict, and then the
-activation decision: whether `graphwing-pr-drive` becomes the run-control
-sibling and `scripts/rc-drive-pr.py` the documented start.
+Land the lookupTable conversion, republish, rerun the #141 proof (expect
+`fallback_route` reached with launchers stubbed). Then the activation
+decision: whether `graphwing-pr-drive` becomes the run-control sibling and
+`scripts/rc-drive-pr.py` the documented start, and whether `go_coding` routes
+to claude while #151 is open.
