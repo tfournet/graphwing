@@ -2788,9 +2788,13 @@ RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
 RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "receipt"})
 # The closed AgentReceipt failure_code vocabulary: none on success, every
 # classified launcher code, and the structured provider availability codes.
+# Built from PROVIDER_AVAILABILITY_CODES (not just the PROVIDER_FAILURE_GROUPS
+# names) so provider_http_5xx is included: a hand-picked subset here once
+# rejected a genuine sealed receipt with that failure_code as
+# not_terminal_receipt, blocking settlement and forcing every 5xx-provider
+# attempt down the full-envelope authority-loss path instead.
 RUN_CONTROL_TERMINAL_FAILURE_CODES = frozenset(
-    {"none"} | (set(FAILURE_CLASS_BY_CODE) - {"success"})
-    | {name for name, _ in PROVIDER_FAILURE_GROUPS}
+    {"none"} | (set(FAILURE_CLASS_BY_CODE) - {"success"}) | PROVIDER_AVAILABILITY_CODES
 )
 RUN_CONTROL_LEDGER_LOCK = threading.Lock()
 
@@ -2807,12 +2811,27 @@ def _run_control_job_path(job_id: str) -> Path:
     return RUN_CONTROL_DIR / "jobs" / f"{job_id}.json"
 
 
+class RunControlLedgerCorrupt(RuntimeError):
+    """A reservation or job ledger file exists but is not readable JSON.
+
+    Distinct from a missing file: several callers overwrite a missing record
+    with a fresh one, which would silently erase kick/launch/settlement
+    fencing if a corrupt-but-present file were treated the same way.
+    """
+
+
 def _run_control_ledger_read(path: Path) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        text = path.read_text()
+    except OSError:
         return None
-    return data if isinstance(data, dict) else None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise RunControlLedgerCorrupt(str(path)) from None
+    if not isinstance(data, dict):
+        raise RunControlLedgerCorrupt(str(path))
+    return data
 
 
 def _run_control_ledger_write(path: Path, record: dict[str, Any]) -> None:
@@ -2859,7 +2878,12 @@ def run_control_claim_kick(
     """
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
-        if _run_control_ledger_read(path) is not None:
+        try:
+            existing = _run_control_ledger_read(path)
+        except RunControlLedgerCorrupt:
+            return 409, {"error": "reservation ledger is unreadable; refusing to reuse it",
+                         "code": "ledger_unreadable"}
+        if existing is not None:
             return 409, {"error": "run-control continuity was already kicked or settled",
                          "code": "continuity_already_used"}
         record = _run_control_ledger_record(continuity)
@@ -2880,7 +2904,11 @@ def run_control_claim_launch(continuity: dict[str, str], job_id: str) -> tuple[i
     """
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
-        record = _run_control_ledger_read(path)
+        try:
+            record = _run_control_ledger_read(path)
+        except RunControlLedgerCorrupt:
+            return 409, {"error": "reservation ledger is unreadable; refusing to launch",
+                         "code": "ledger_unreadable"}
         if record is None:
             record = _run_control_ledger_record(continuity)
         elif _run_control_record_continuity(record) != _run_control_record_continuity(continuity):
@@ -2900,7 +2928,13 @@ def run_control_claim_launch(continuity: dict[str, str], job_id: str) -> tuple[i
 def run_control_record_kick_result(continuity: dict[str, str], kicked: bool) -> None:
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
-        record = _run_control_ledger_read(path)
+        try:
+            record = _run_control_ledger_read(path)
+        except RunControlLedgerCorrupt:
+            # Bookkeeping only: leave kicked unresolved (None) rather than
+            # guess. Authority loss already treats an unresolved kick like an
+            # accepted one and waits out the grace window.
+            return
         if record is None or not isinstance(record.get("kick"), dict):
             return
         record["kick"]["kicked"] = bool(kicked)
@@ -3026,7 +3060,11 @@ def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
     }
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
-        record = _run_control_ledger_read(path) or _run_control_ledger_record(continuity)
+        try:
+            record = _run_control_ledger_read(path) or _run_control_ledger_record(continuity)
+        except RunControlLedgerCorrupt:
+            return 409, {"error": "reservation ledger is unreadable; refusing to settle",
+                         "code": "ledger_unreadable"}
         existing = record.get("settlement")
         if isinstance(existing, dict):
             if all(existing.get(key) == settlement[key]
@@ -3034,7 +3072,11 @@ def run_control_settle(body: bytes) -> tuple[int, dict[str, Any]]:
                 return 200, {**existing["result"], "replay": True}
             return 409, {"error": "reservation is already settled by different evidence",
                          "code": "settlement_conflict"}
-        job_marker = _run_control_ledger_read(_run_control_job_path(job_id))
+        try:
+            job_marker = _run_control_ledger_read(_run_control_job_path(job_id))
+        except RunControlLedgerCorrupt:
+            return 409, {"error": "job ledger is unreadable; refusing to settle",
+                         "code": "ledger_unreadable"}
         if job_marker is not None and job_marker.get("authorization_id") != continuity["authorization_id"]:
             return 409, {"error": "job already settled a different reservation", "code": "settlement_conflict"}
         launch = record.get("launch")
@@ -3068,7 +3110,11 @@ def run_control_authority_loss(body: bytes) -> tuple[int, dict[str, Any]]:
                                   "authorization_id, launch_descriptor_sha256")
     with RUN_CONTROL_LEDGER_LOCK:
         path = _run_control_ledger_path(continuity["authorization_id"])
-        record = _run_control_ledger_read(path)
+        try:
+            record = _run_control_ledger_read(path)
+        except RunControlLedgerCorrupt:
+            return 409, {"error": "reservation ledger is unreadable; refusing to declare it lost",
+                         "code": "ledger_unreadable"}
         existing = record.get("settlement") if record is not None else None
         if isinstance(existing, dict):
             if existing.get("kind") == "authority_lost":
