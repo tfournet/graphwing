@@ -22453,5 +22453,245 @@ class ClaudeUsageShapeTests(unittest.TestCase):
         self.assertFalse(server._claude_usage_envelope_is_valid(broken["usage"]))
 
 
+class RcDrivePrScriptTests(unittest.TestCase):
+    """scripts/rc-drive-pr.py's payload builders, exercised as pure functions.
+
+    No network: this only pins argument parsing and payload/hash construction,
+    the same way PrDriveRunControlGraphTests imports the other hyphenated
+    script (importlib, since `import rc-drive-pr` is not valid Python).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "rc_drive_pr", Path(server.__file__).parent / "scripts" / "rc-drive-pr.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.module = module
+
+    def test_canonical_json_is_sorted_and_compact(self):
+        m = self.module
+        self.assertEqual(m.canonical_json({"b": 1, "a": 2}), b'{"a":2,"b":1}')
+        self.assertEqual(m.sha256_hex({"b": 1, "a": 2}), hashlib.sha256(b'{"a":2,"b":1}').hexdigest())
+
+    def test_evaluator_contract_sha256_matches_the_schema_on_disk(self):
+        m = self.module
+        openapi_path = Path(server.__file__).parent / "openapi.json"
+        schema = json.loads(openapi_path.read_text())["components"]["schemas"]["RunControlRequest"]
+        expected = hashlib.sha256(
+            json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(m.evaluator_contract_sha256(openapi_path), expected)
+
+    def test_root_workflow_run_id_and_root_identity(self):
+        m = self.module
+        self.assertEqual(m.root_workflow_run_id("3526", "20260902T000000Z"), "rc-3526-20260902T000000Z")
+        identity = m.build_root_identity("wf-1", "wfv-1", "rc-3526-20260902T000000Z")
+        self.assertEqual(identity, {
+            "root_workflow_id": "wf-1",
+            "root_workflow_version_id": "wfv-1",
+            "root_workflow_run_id": "rc-3526-20260902T000000Z",
+            "purpose": "pr_drive",
+        })
+
+    def test_budgets_and_next_envelope_field_sets_and_defaults(self):
+        m = self.module
+        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
+        self.assertEqual(set(budgets), {"attempts", "turns", "wall_seconds", "tokens", "provider_cost_usd"})
+        self.assertEqual(budgets, {
+            "attempts": 3, "turns": 150, "wall_seconds": 3600, "tokens": 6000000, "provider_cost_usd": "75",
+        })
+        envelope = m.build_next_envelope(50, 660, 2000000, "25")
+        self.assertEqual(set(envelope), {"turns", "wall_seconds", "tokens", "provider_cost_usd"})
+        self.assertEqual(envelope, {"turns": 50, "wall_seconds": 660, "tokens": 2000000, "provider_cost_usd": "25"})
+
+    def test_resolved_falls_back_only_when_none(self):
+        m = self.module
+        self.assertEqual(m.resolved(None, 3), 3)
+        self.assertEqual(m.resolved(0, 3), 0)
+        self.assertEqual(m.resolved(200, 3), 200)
+
+    def test_initialize_input_field_set(self):
+        m = self.module
+        root_identity = m.build_root_identity("wf-1", "wfv-1", "rc-1-x")
+        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
+        route = {"route_version": "normal-v1", "launcher": "claude", "provider": "anthropic",
+                 "model": "claude-opus-5"}
+        payload = m.build_initialize_input(root_identity, budgets, route, "deadbeef")
+        self.assertEqual(set(payload), {"root_identity", "budgets", "initial_route", "evaluator_contract_sha256"})
+        self.assertEqual(payload["initial_route"], route)
+        self.assertEqual(payload["evaluator_contract_sha256"], "deadbeef")
+
+    def test_task_and_callback_material_match_the_graphs_continue_leg_shape(self):
+        m = self.module
+        self.assertEqual(
+            m.build_task_material("riftwing", 3526, "riftwing-local-gates"),
+            {"kind": "pr-drive", "repo": "riftwing", "pr_number": "3526", "test": "riftwing-local-gates"},
+        )
+        self.assertEqual(m.build_callback_material("https://hook.example/x"),
+                          {"kick_url": "https://hook.example/x"})
+
+    def test_pr_drive_fields_field_set_and_types(self):
+        m = self.module
+        fields = m.build_pr_drive_fields(
+            "riftwing", 3526, "riftwing-local-gates", "1", "3", False,
+            "https://hook.example/x", "secret-token", "go_coding", "fix: address review findings",
+        )
+        self.assertEqual(set(fields), {
+            "repo", "pr_number", "test", "attempt", "max_attempts", "auto_merge",
+            "kick_url", "kick_token", "class", "size", "work_kind", "commit_message",
+        })
+        self.assertEqual(fields["pr_number"], "3526")
+        self.assertEqual(fields["auto_merge"], "false")
+        self.assertEqual(fields["class"], "mechanical")
+        self.assertEqual(fields["size"], "M")
+        self.assertNotIn("run_control", fields)
+
+    def test_exact_request_body_sha256_ignores_kick_token(self):
+        m = self.module
+        fields = m.build_pr_drive_fields(
+            "riftwing", 3526, "riftwing-local-gates", "1", "3", False,
+            "https://hook.example/x", "secret-token-a", "go_coding", "fix: address review findings",
+        )
+        other_token = {**fields, "kick_token": "secret-token-b"}
+        self.assertEqual(
+            m.compute_exact_request_body_sha256(fields),
+            m.compute_exact_request_body_sha256(other_token),
+        )
+        hashed = {k: v for k, v in fields.items() if k != "kick_token"}
+        expected = hashlib.sha256(
+            json.dumps({"input": hashed}, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(m.compute_exact_request_body_sha256(fields), expected)
+
+    def test_state_input_field_set(self):
+        m = self.module
+        route = {"route_version": "normal-v1", "launcher": "claude", "provider": "anthropic",
+                 "model": "claude-opus-5"}
+        envelope = m.build_next_envelope(50, 660, 2000000, "25")
+        payload = m.build_state_input(
+            "rc1-abc", route, envelope, "graphwing-operator-start-v1",
+            "/workflows/graphwing-pr-drive-run-control/run", "deadbeef",
+            "riftwing", "main", "headsha", "taskhash", "pr-drive-writer-v1", "callbackhash",
+            {"reason_code": "provider_switch"},
+        )
+        self.assertEqual(set(payload), {
+            "run_control_id", "candidate_route", "next_envelope", "launcher_fingerprint", "endpoint",
+            "exact_request_body_sha256", "repository", "branch", "head_sha", "task_sha256",
+            "permission_profile", "callback_binding_sha256", "handoff",
+        })
+        self.assertEqual(payload["endpoint"], "/workflows/graphwing-pr-drive-run-control/run")
+        self.assertEqual(payload["handoff"], {"reason_code": "provider_switch"})
+
+    def test_consume_input_is_run_control_id_only(self):
+        m = self.module
+        self.assertEqual(m.build_consume_input("rc1-abc"), {"run_control_id": "rc1-abc"})
+
+    def test_start_body_merges_run_control_into_input(self):
+        m = self.module
+        fields = m.build_pr_drive_fields(
+            "riftwing", 3526, "riftwing-local-gates", "1", "3", False,
+            "", "", "go_coding", "fix: address review findings",
+        )
+        run_control = {
+            "run_control_id": "rc1-abc", "attempt_id": "att1-" + "0" * 64,
+            "authorization_id": "rca1-x-y", "launch_descriptor_sha256": "deadbeef",
+        }
+        body = m.build_start_body(fields, run_control)
+        self.assertEqual(set(body), {"input"})
+        self.assertEqual(body["input"]["run_control"], run_control)
+        self.assertEqual(set(body["input"]) - {"run_control"}, set(fields))
+
+    def test_node_output_reads_the_nested_trace_shape(self):
+        m = self.module
+        trace = {"data": {"result": {"trace": [
+            {"nodeId": "identity", "output": {"run_control_id": "rc1-abc"}},
+            {"nodeId": "other", "output": {"x": 1}},
+        ]}}}
+        self.assertEqual(m.node_output(trace, "identity"), {"run_control_id": "rc1-abc"})
+        self.assertIsNone(m.node_output(trace, "missing"))
+
+    def test_node_output_falls_back_to_flat_trace_shape(self):
+        m = self.module
+        trace = {"trace": [{"id": "identity", "status": "completed", "output": {"run_control_id": "rc1-abc"}}]}
+        self.assertEqual(m.node_output(trace, "identity"), {"run_control_id": "rc1-abc"})
+
+    def test_summarize_prints_one_line_per_node(self):
+        m = self.module
+        trace = {"data": {"result": {"trace": [
+            {"nodeId": "identity", "status": "completed"},
+            {"nodeId": "route", "status": "failed", "error": "boom"},
+        ]}}}
+        with mock.patch("builtins.print") as mock_print:
+            m.summarize(trace)
+        lines = [call.args[0] for call in mock_print.call_args_list]
+        self.assertTrue(any("identity" in line and "completed" in line for line in lines))
+        self.assertTrue(any("route" in line and "boom" in line for line in lines))
+
+    def test_workflow_run_title_matches_servers_pr_and_repo_fallback(self):
+        m = self.module
+        self.assertEqual(m.workflow_run_title("pr-drive-run-control", {"pr": "3526"}),
+                          "pr-drive-run-control PR 3526")
+        self.assertEqual(m.workflow_run_title("pr-drive-run-control", {"repo": "riftwing"}),
+                          "pr-drive-run-control riftwing")
+        self.assertEqual(m.workflow_run_title("pr-drive-run-control", {}), "pr-drive-run-control")
+
+    def test_record_workflow_run_writes_the_servers_jsonl_shape_plus_run_control_id(self):
+        m = self.module
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(m.pg, "HOME", Path(tmp)):
+                m.record_workflow_run({
+                    "workflow": "pr-drive-run-control",
+                    "status": "completed",
+                    "source": "rc-operator",
+                    "input": {"repo": "riftwing", "pr": "3526", "test": "riftwing-local-gates"},
+                    "run_id": "run-1",
+                    "run_control_id": "rc1-abc",
+                    "created_at": "2026-09-02T00:00:00Z",
+                })
+                lines = (Path(tmp) / "workflow-runs.jsonl").read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            row = json.loads(lines[0])
+            self.assertEqual(row["workflow"], "pr-drive-run-control")
+            self.assertEqual(row["status"], "completed")
+            self.assertEqual(row["source"], "rc-operator")
+            self.assertEqual(row["run_id"], "run-1")
+            self.assertEqual(row["run_control_id"], "rc1-abc")
+            self.assertEqual(row["title"], "pr-drive-run-control PR 3526")
+
+    def test_argument_parsing_defaults_and_flags(self):
+        m = self.module
+        parser = m.build_arg_parser()
+        args = parser.parse_args(["3526"])
+        self.assertEqual(args.pr, "3526")
+        self.assertEqual(args.repo, "riftwing")
+        self.assertEqual(args.test, "riftwing-local-gates")
+        self.assertEqual(args.work_kind, "go_coding")
+        self.assertFalse(args.kick)
+        self.assertIsNone(args.attempts)
+        self.assertIsNone(args.turns)
+        self.assertIsNone(args.wall_seconds)
+        self.assertIsNone(args.tokens)
+        self.assertIsNone(args.cost)
+        self.assertEqual(args.wait, 1500)
+
+        args2 = parser.parse_args([
+            "3526", "--repo", "gw", "--test", "t1", "--work-kind", "typescript_coding", "--kick",
+            "--attempts", "5", "--turns", "10", "--wall-seconds", "20", "--tokens", "30",
+            "--cost", "40", "--wait", "50",
+        ])
+        self.assertEqual(args2.repo, "gw")
+        self.assertEqual(args2.test, "t1")
+        self.assertEqual(args2.work_kind, "typescript_coding")
+        self.assertTrue(args2.kick)
+        self.assertEqual(args2.attempts, 5)
+        self.assertEqual(args2.turns, 10)
+        self.assertEqual(args2.wall_seconds, 20)
+        self.assertEqual(args2.tokens, 30)
+        self.assertEqual(args2.cost, "40")
+        self.assertEqual(args2.wait, 50)
+
+
 if __name__ == "__main__":
     unittest.main()
