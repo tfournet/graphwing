@@ -313,12 +313,50 @@ Two more findings on the way:
     identity in the allowlisted checkout, because the daemon's `HOME` carries
     none.
 
+## Step 5, real provider, 2026-09-02
+
+Codex first. Under the pinned launcher codex 0.151.0 cannot edit files: it
+resolves its code-mode host as a sibling of the sealed memfd, and on this
+build every tool call routes through that host. Probed outside the daemon:
+no env override, no config key (`--strict-config` rejects every
+`code_mode_host.*`), only `codex app-server --code-mode-host <URL>` accepts an
+external host. Tracked as #151; codex writers on this seat are text-only until
+then. Its run (d7a75bec) still accounted correctly: 49,394 tokens settled,
+full envelope charged, revision 3.
+
+Claude then. Two more seat defects and one daemon defect:
+
+13. **Credentials.** The unit's `HOME` is the clean profile, which holds no
+    codex or claude credentials. Drop-ins `codex.conf`
+    (`CODEX_HOME=/home/tim/.codex`) and `claude.conf`
+    (`CLAUDE_CONFIG_DIR=/home/tim/.claude`) now mirror the existing grok one.
+14. **`--allowedTools` is variadic** on Claude Code 2.1.258. The writer argv
+    put the prompt right after `--allowedTools Bash`, with nothing between
+    when the routed effort is "default", so the prompt was swallowed and
+    claude died with "Input must be provided". It is one token now,
+    `--allowedTools=Bash` (seat job 2d8999db).
+15. **Usage shape.** 2.1.258 adds `usage.output_tokens_details` and
+    `modelUsage.thinkingTokens`; the exact-set validators reported a real
+    opus fix's usage as `usage_malformed`. Both fields are accepted and
+    validated, with the real result as a fixture (seat job 85890fb8).
+
+Results (lifecycles c4 and c5, runs aedd2ddd and 6ea9ae53): a real
+claude-opus-5 writer under a reservation read the blocking finding, deleted the
+bad file, passed the named test, and the daemon committed and pushed; PR #150's
+CI went green on that commit. On c5 settle carried real usage: 92,137 tokens,
+12 s, USD 0.248882. Reconcile still charged the full envelope because `turns`
+is null: `_normalize_native_usage` passes no turn count for any launcher by
+design ("no adapter trusts provider-authored turn counts"), while the reconcile
+contract requires all four aggregates. That is a policy contradiction, not a
+bug in either half. Recommended: charge the envelope only for the dimensions a
+receipt lacks (turns here), keep the real tokens, wall time, and cost, or have
+adapters count turns from their own event streams. Decide before real runs are
+billed.
+
 ## Next bounded task
 
-Step 5: a real provider in the isolated tenant. Everything before it is proven
-with the stub, so the first real run only adds the model. Start a fresh
-lifecycle against a red PR with `kick_url` set to the pr-drive webhook and a
-real kick token, and watch two runs chain. Then fix #141 in the shipped
-implement-slice graph with its own tenant proof, and decide whether webhook
-starts should populate `CTX.INPUT` (the kicked run still dies at `ghPrView`;
-the run-control accounting around it is what this work proved).
+Resolve the turns policy above (reconcile graph `usage_check` and
+`attempt_entry.charged_usage`, plus `run_control_validate_receipt`), then run
+one more real claude lifecycle and confirm `kind: terminal_receipt` with
+partial-envelope charging. Then #151 for codex, #141 for implement-slice, and
+the webhook `CTX.INPUT` gap so a kicked run can actually continue.

@@ -3193,7 +3193,8 @@ class DispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(cmd[cmd.index("--effort") + 1], effort)
                 self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "acceptEdits")
-                self.assertEqual(cmd[cmd.index("--allowedTools") + 1], "Bash")
+                self.assertIn("--allowedTools=Bash", cmd)
+                self.assertNotIn("--allowedTools", cmd)
         default_job = self._adapter_contract_job(
             "claude", "anthropic", "claude-opus-5", "default", "default"
         )
@@ -3204,8 +3205,12 @@ class DispatchTests(unittest.TestCase):
             "--effort",
             default_cmd,
         )
-        self.assertEqual(default_cmd.count("--allowedTools"), 1)
-        self.assertEqual(default_cmd[default_cmd.index("--allowedTools") + 1], "Bash")
+        self.assertEqual(default_cmd.count("--allowedTools=Bash"), 1)
+        self.assertNotIn("--allowedTools", default_cmd)
+        # The prompt must be the last token and never sit right after a bare
+        # variadic flag; with effort "default" nothing separates them.
+        self.assertEqual(default_cmd[-1], "fixture prompt")
+        self.assertTrue(default_cmd[-2].startswith("--") and "=" in default_cmd[-2] or not default_cmd[-2].startswith("--"))
 
     def test_claude_review_uses_reviewer_effort(self):
         job = self._adapter_contract_job(
@@ -3442,10 +3447,9 @@ class DispatchTests(unittest.TestCase):
                             self.assertEqual(len(tokens), 0 if effective == "default" else 1)
                             if tokens:
                                 self.assertLess(tokens[0][0], len(cmd) - 1)
-                            allowed_tools = [i for i, value in enumerate(cmd) if value == "--allowedTools"]
+                            allowed_tools = [i for i, value in enumerate(cmd) if value == "--allowedTools=Bash"]
                             self.assertEqual(len(allowed_tools), 1 if mode == "writer" else 0)
-                            if allowed_tools:
-                                self.assertEqual(cmd[allowed_tools[0] + 1], "Bash")
+                            self.assertNotIn("--allowedTools", cmd)
                         else:
                             cmd = server.grok_acp_command(
                                 job, Path("/fixture/grok"), mode=mode
@@ -11132,7 +11136,7 @@ func main() {
                 "cacheCreationInputTokens", "webSearchRequests", "costUSD",
                 "contextWindow", "maxOutputTokens",
             },
-            "model_usage_optional": {"canonicalModel", "provider", "costBasis"},
+            "model_usage_optional": {"canonicalModel", "provider", "costBasis", "thinkingTokens"},
             "terminal_reasons": {
                 "blocking_limit", "rapid_refill_breaker", "prompt_too_long",
                 "image_error", "model_error", "api_error",
@@ -22275,6 +22279,35 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                         self.assertTrue(handle == "default" or str(handle).startswith("case-"), (node_type, handle))
                     else:
                         self.assertIn(handle, allowed, (edge["source"], node_type))
+
+
+class ClaudeUsageShapeTests(unittest.TestCase):
+    """Claude Code 2.1.258 result shape, captured from seat job 85890fb8.
+
+    That run was a real opus writer under run control that fixed its PR. The
+    daemon reported its usage as usage_malformed because the usage envelope
+    gained output_tokens_details and modelUsage gained thinkingTokens, so the
+    reservation was charged the full envelope instead of what was used.
+    """
+
+    RESULT = '{"duration_api_ms":7313,"stop_reason":"end_turn","session_id":"s-000000000000000000000000000000","total_cost_usd":0.24987299999999998,"usage":{"input_tokens":6,"cache_creation_input_tokens":20470,"cache_read_input_tokens":71336,"output_tokens":379,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":20470,"ephemeral_5m_input_tokens":0},"inference_geo":"not_available","iterations":[{"input_tokens":2,"output_tokens":98,"cache_read_input_tokens":30616,"cache_creation_input_tokens":215,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":215},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5":{"inputTokens":6,"outputTokens":379,"cacheReadInputTokens":71336,"cacheCreationInputTokens":20470,"webSearchRequests":0,"costUSD":0.24987299999999998,"contextWindow":1000000,"maxOutputTokens":64000,"thinkingTokens":0,"canonicalModel":"claude-opus-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":false,"num_turns":3,"subtype":"success","api_error_status":null,"result":"ok","ttft_ms":2925,"type":"result","duration_ms":9039,"uuid":"u-000000000000000000000000000000","ttft_stream_ms":1419,"time_to_request_ms":141,"queued_turn_count":0}'
+
+    def test_2_1_258_result_normalizes_with_tokens_wall_and_cost(self):
+        result = server.strict_json_object(self.RESULT)
+        self.assertTrue(server._claude_success_result_is_valid(result))
+        self.assertTrue(server._claude_usage_envelope_is_valid(result["usage"]))
+        usage, diagnostic = server._normalize_native_usage("claude", self.RESULT, 9.039)
+        self.assertIsNone(diagnostic, usage)
+        self.assertEqual(usage["output_tokens"], 379)
+        self.assertEqual(usage["fresh_input_tokens"] + usage["cached_input_tokens"] + usage["cache_write_tokens"], 6 + 71336 + 20470)
+        self.assertAlmostEqual(usage["provider_cost_usd"], 0.249873, places=6)
+        self.assertEqual(usage["wall_seconds"], 9.039)
+        # Turn counts are not taken from the provider by design; see the note.
+        self.assertIsNone(usage["turns_observed"])
+        # A malformed details object is still refused.
+        broken = server.strict_json_object(self.RESULT)
+        broken["usage"]["output_tokens_details"] = {"thinking_tokens": -1}
+        self.assertFalse(server._claude_usage_envelope_is_valid(broken["usage"]))
 
 
 if __name__ == "__main__":
