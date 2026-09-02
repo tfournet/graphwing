@@ -2,37 +2,79 @@
   "tests": [
     {
       "name": "graphwing-unit",
-      "argv": ["python3", "test_server.py"],
+      "argv": [
+        "python3",
+        "test_server.py"
+      ],
       "cwd": ".",
       "timeout_seconds": 60,
       "async": true
     },
     {
       "name": "graphwing-compile",
-      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py", "install.py", "setup_tunnel.py"],
+      "argv": [
+        "python3",
+        "-m",
+        "py_compile",
+        "server.py",
+        "test_server.py",
+        "install.py",
+        "setup_tunnel.py"
+      ],
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false
     },
     {
       "name": "always-fail",
-      "argv": ["python3", "-c", "raise SystemExit(1)"],
+      "argv": [
+        "python3",
+        "-c",
+        "raise SystemExit(1)"
+      ],
       "cwd": ".",
       "timeout_seconds": 5,
       "async": false
     },
     {
       "name": "catalog-compile",
-      "argv": ["python3", "-m", "py_compile", "server.py", "test_server.py", "install.py", "setup_tunnel.py"],
+      "argv": [
+        "python3",
+        "-m",
+        "py_compile",
+        "server.py",
+        "test_server.py",
+        "install.py",
+        "setup_tunnel.py"
+      ],
       "cwd": ".",
       "timeout_seconds": 15,
       "async": false
     },
     {
       "name": "riftwing-local-gates",
-      "argv": ["env", "RIFTWING_HOOK_NONINTERACTIVE=1", "bash", ".githooks/pre-commit"],
+      "argv": [
+        "env",
+        "RIFTWING_HOOK_NONINTERACTIVE=1",
+        "bash",
+        ".githooks/pre-commit"
+      ],
       "cwd": "riftwing",
       "timeout_seconds": 120,
+      "async": false
+    },
+    {
+      "name": "graphwing-seat-compile",
+      "cwd": ".",
+      "argv": [
+        "python3",
+        "-m",
+        "py_compile",
+        "server.py",
+        "test_server.py",
+        "setup_tunnel.py"
+      ],
+      "timeout_seconds": 15,
       "async": false
     }
   ]
