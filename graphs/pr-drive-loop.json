@@ -239,17 +239,25 @@
         }
       },
       {
-        "id": "if_needs_fix",
-        "type": "logic.filter",
+        "id": "switch_needs_fix",
+        "type": "logic.switch",
         "config": {
-          "group": "AND",
-          "rules": [
+          "mode": "rules",
+          "cases": [
             {
-              "path": "all_green",
-              "op": "equals",
-              "value": false
+              "label": "red",
+              "rules": [
+                {
+                  "path": "all_green",
+                  "op": "equals",
+                  "value": false
+                }
+              ]
             }
-          ]
+          ],
+          "default": {
+            "label": "not_red"
+          }
         }
       },
       {
@@ -644,22 +652,25 @@
         }
       },
       {
-        "id": "if_receipt_ok",
-        "type": "logic.filter",
-        "label": "receipt ok?",
-        "position": {
-          "x": 2200,
-          "y": 240
-        },
+        "id": "switch_receipt_ok",
+        "type": "logic.switch",
         "config": {
-          "group": "AND",
-          "rules": [
+          "mode": "rules",
+          "cases": [
             {
-              "path": "status",
-              "op": "equals",
-              "value": "ok"
+              "label": "ok",
+              "rules": [
+                {
+                  "path": "status",
+                  "op": "equals",
+                  "value": "ok"
+                }
+              ]
             }
-          ]
+          ],
+          "default": {
+            "label": "not_ok"
+          }
         }
       },
       {
@@ -697,22 +708,25 @@
         }
       },
       {
-        "id": "if_fix_test",
-        "type": "logic.filter",
-        "label": "fix test ok?",
-        "position": {
-          "x": 2640,
-          "y": 240
-        },
+        "id": "switch_fix_test",
+        "type": "logic.switch",
         "config": {
-          "group": "AND",
-          "rules": [
+          "mode": "rules",
+          "cases": [
             {
-              "path": "request.body.status",
-              "op": "equals",
-              "value": "ok"
+              "label": "ok",
+              "rules": [
+                {
+                  "path": "request.body.status",
+                  "op": "equals",
+                  "value": "ok"
+                }
+              ]
             }
-          ]
+          ],
+          "default": {
+            "label": "not_ok"
+          }
         }
       },
       {
@@ -894,22 +908,25 @@
         }
       },
       {
-        "id": "if_final_test",
-        "type": "logic.filter",
-        "label": "Final test passed?",
-        "position": {
-          "x": 3540,
-          "y": 240
-        },
+        "id": "switch_final_test",
+        "type": "logic.switch",
         "config": {
-          "group": "AND",
-          "rules": [
+          "mode": "rules",
+          "cases": [
             {
-              "path": "request.body.status",
-              "op": "equals",
-              "value": "ok"
+              "label": "ok",
+              "rules": [
+                {
+                  "path": "request.body.status",
+                  "op": "equals",
+                  "value": "ok"
+                }
+              ]
             }
-          ]
+          ],
+          "default": {
+            "label": "not_ok"
+          }
         }
       },
       {
@@ -1145,20 +1162,20 @@
         "id": "e13",
         "source": "iter_snap",
         "sourceHandle": "out",
-        "target": "if_needs_fix",
+        "target": "switch_needs_fix",
         "targetHandle": "in"
       },
       {
         "id": "e14",
-        "source": "if_needs_fix",
-        "sourceHandle": "fail",
+        "source": "switch_needs_fix",
+        "sourceHandle": "default",
         "target": "iter_skip",
         "targetHandle": "in"
       },
       {
         "id": "e15",
-        "source": "if_needs_fix",
-        "sourceHandle": "pass",
+        "source": "switch_needs_fix",
+        "sourceHandle": "case-0",
         "target": "iter_checkout",
         "targetHandle": "in"
       },
@@ -1292,20 +1309,20 @@
         "id": "e34",
         "source": "receipt",
         "sourceHandle": "out",
-        "target": "if_receipt_ok",
+        "target": "switch_receipt_ok",
         "targetHandle": "in"
       },
       {
         "id": "e35",
-        "source": "if_receipt_ok",
-        "sourceHandle": "pass",
+        "source": "switch_receipt_ok",
+        "sourceHandle": "case-0",
         "target": "wait_fix_test",
         "targetHandle": "in"
       },
       {
         "id": "e36",
-        "source": "if_receipt_ok",
-        "sourceHandle": "fail",
+        "source": "switch_receipt_ok",
+        "sourceHandle": "default",
         "target": "herdr_receipt",
         "targetHandle": "in"
       },
@@ -1320,7 +1337,7 @@
         "id": "e38",
         "source": "wait_fix_test",
         "sourceHandle": "out",
-        "target": "if_fix_test",
+        "target": "switch_fix_test",
         "targetHandle": "in"
       },
       {
@@ -1353,15 +1370,15 @@
       },
       {
         "id": "e43",
-        "source": "if_fix_test",
-        "sourceHandle": "pass",
+        "source": "switch_fix_test",
+        "sourceHandle": "case-0",
         "target": "fix_commit",
         "targetHandle": "in"
       },
       {
         "id": "e44",
-        "source": "if_fix_test",
-        "sourceHandle": "fail",
+        "source": "switch_fix_test",
+        "sourceHandle": "default",
         "target": "herdr_test_fail",
         "targetHandle": "in"
       },
@@ -1432,13 +1449,13 @@
         "id": "e54",
         "source": "final_wait",
         "sourceHandle": "out",
-        "target": "if_final_test",
+        "target": "switch_final_test",
         "targetHandle": "in"
       },
       {
         "id": "e55",
-        "source": "if_final_test",
-        "sourceHandle": "pass",
+        "source": "switch_final_test",
+        "sourceHandle": "case-0",
         "target": "merge_snap",
         "targetHandle": "in"
       },
@@ -1479,8 +1496,8 @@
       },
       {
         "id": "e61",
-        "source": "if_final_test",
-        "sourceHandle": "fail",
+        "source": "switch_final_test",
+        "sourceHandle": "default",
         "target": "join_final_fail",
         "targetHandle": "in"
       },

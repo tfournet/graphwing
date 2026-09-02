@@ -22470,6 +22470,29 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                     self.assertTrue(any(pattern.search(json.dumps(node.get("config", {}))) for node in reachable),
                                     f"{source['id']} has a downstream outcome reporter but nothing reads its output")
 
+    def test_no_filter_downstream_of_a_loop(self):
+        # filter.go buildFilterEffectiveItem: when the payload carries ITEM and
+        # LOOP, a logic.filter judges only the loop item, so any field a body
+        # node emitted is invisible to it. logic.switch reads the raw payload.
+        # Live run d19ba7d2 skipped all three slots on all_green == false.
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            types = {node["id"]: node["type"] for node in spec["nodes"]}
+            adjacency = {}
+            for edge in spec["edges"]:
+                adjacency.setdefault(edge["source"], []).append(edge["target"])
+            for node in spec["nodes"]:
+                if node["type"] != "logic.loop":
+                    continue
+                seen, stack = set(), list(adjacency.get(node["id"], []))
+                while stack:
+                    cur = stack.pop()
+                    if cur in seen:
+                        continue
+                    seen.add(cur); stack.extend(adjacency.get(cur, []))
+                with self.subTest(graph=path.name, loop=node["id"]):
+                    self.assertEqual([n for n in seen if types[n] == "logic.filter"], [])
+
     def test_lookup_table_entries_are_never_ast(self):
         # Riftwing's transforms.lookupTable evaluates input and defaultValue as
         # AST but returns a matched entry value verbatim
@@ -22865,9 +22888,15 @@ class PrDriveLoopGraphTests(unittest.TestCase):
         spec = self.load()["spec"]
         nodes = {n["id"]: n for n in spec["nodes"]}
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
-        self.assertEqual(nodes["if_needs_fix"]["config"]["rules"], [{"path": "all_green", "op": "equals", "value": False}])
-        self.assertIn(("if_needs_fix", "fail", "iter_skip"), edges)
-        self.assertIn(("if_needs_fix", "pass", "iter_checkout"), edges)
+        # Inside a loop a logic.filter judges the loop item only (the engine
+        # rebuilds its input from ITEM and LOOP, filter.go
+        # buildFilterEffectiveItem); logic.switch reads the raw payload. Live
+        # run d19ba7d2 skipped every slot on a filter that compared all_green.
+        self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
+        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "all_green", "op": "equals", "value": False}]}])
+        self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
+        self.assertIn(("switch_needs_fix", "case-0", "iter_checkout"), edges)
+        self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))
         snap = {m["output"]: m["expression"] for m in nodes["iter_snap"]["config"]["mappings"]}
         self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
         task = next(m for m in nodes["rc_task_material"]["config"]["mappings"] if m["output"] == "task")["expression"]["properties"]
