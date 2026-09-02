@@ -7137,7 +7137,7 @@ while True:
     def test_pr_graph_action_configs_match_openapi_request_shapes(self):
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
         ignored = {"integrationInstanceId", "timeout", "_comment"}
-        for filename in ("pr-drive.json", "pr-status.json", "pr-drive-run-control.json"):
+        for filename in ("pr-drive.json", "pr-status.json", "pr-drive-run-control.json", "pr-drive-loop.json"):
             graph = json.loads((Path(server.__file__).parent / "graphs" / filename).read_text())
             for node in graph["spec"]["nodes"]:
                 match = re.fullmatch(r"action\.graphwing\.(GET|POST):(.+)", node["type"])
@@ -12606,6 +12606,11 @@ func main() {
                 "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
             },
             "pr-drive-run-control.json": {
+                "route_nodes": {"route"},
+                "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
+                "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
+            },
+            "pr-drive-loop.json": {
                 "route_nodes": {"route"},
                 "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
                 "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
@@ -22132,7 +22137,9 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         # Catalog contract: "all" publishes every graph file once, dormant ones
         # included, and the sibling comes after every child it pins.
         everything = module.publish_stems("all")
-        self.assertEqual(everything[-1], "pr-drive-run-control")
+        self.assertEqual(everything[-2:], ["pr-drive-run-control", "pr-drive-loop"])
+        self.assertEqual(module.publish_stems("pr-drive-loop")[-1], "pr-drive-loop")
+        self.assertEqual(module.publish_stems("pr-drive-loop")[:-1], module.publish_stems("pr-drive-run-control")[:-1])
         self.assertEqual(module.publish_stems("pr-drive"), ["pr-drive"])
         self.assertEqual(module.publish_stems("pr-drive-run-control"), [
             "run-control-transition", "run-control-consume-authorization", "run-control-state",
@@ -22155,6 +22162,8 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
             return {"pending", "out", "timeout", "failure"}
         if node_type == "logic.filter":
             return {"pass", "fail"}
+        if node_type == "logic.loop":
+            return {"each", "done"}
         if node_type.startswith("logic.switch"):
             return None
         if node_type.startswith(("transforms.", "logic.join", "trigger.")):
@@ -22812,6 +22821,76 @@ class RcDrivePrScriptTests(unittest.TestCase):
         self.assertEqual(args2.tokens, 30)
         self.assertEqual(args2.cost, "40")
         self.assertEqual(args2.wait, 50)
+
+
+class PrDriveLoopGraphTests(unittest.TestCase):
+    """The in-run retry variant: one capped logic.loop instead of a kick chain.
+
+    Riftwing allows no cycles outside logic.loop (E800), requires
+    maxIterations on a loop whose body waits (E812), and forbids body nodes
+    routing back into the loop (E105). Each slot re-checks the PR and does
+    nothing when green; there is no early exit.
+    """
+
+    @staticmethod
+    def load():
+        return json.loads((Path(server.__file__).parent / "graphs" / "pr-drive-loop.json").read_text())
+
+    def test_loop_is_capped_and_body_never_re_enters_it(self):
+        spec = self.load()["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        loop = nodes["attempts"]
+        self.assertEqual(loop["type"], "logic.loop")
+        self.assertEqual(loop["config"]["maxIterations"], 3)
+        self.assertEqual(loop["config"]["arraySource"], "{{ CTX.attempt_slots.slots }}")
+        self.assertEqual(next(m for m in nodes["attempt_slots"]["config"]["mappings"] if m["output"] == "slots")["expression"], {"kind": "literal", "value": [1, 2, 3]})
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn(("attempts", "each", "iter_findings"), edges)
+        self.assertIn(("attempts", "done", "join_final"), edges)
+        # body reachability from each; nothing in it targets the loop node
+        adjacency = {}
+        for s, h, t in edges:
+            adjacency.setdefault(s, []).append(t)
+        seen, stack = set(), ["iter_findings"]
+        while stack:
+            cur = stack.pop()
+            if cur in seen: continue
+            seen.add(cur); stack.extend(adjacency.get(cur, []))
+        self.assertNotIn("attempts", seen)
+        self.assertNotIn("join_final", seen)
+        self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume", "rc_settle", "rc_reconcile", "fix_push"} <= seen)
+        self.assertEqual(sum(1 for s, h, t in edges if t == "attempts"), 1)
+
+    def test_each_slot_skips_when_green_and_reserves_its_own_attempt(self):
+        spec = self.load()["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertEqual(nodes["if_needs_fix"]["config"]["rules"], [{"path": "all_green", "op": "equals", "value": False}])
+        self.assertIn(("if_needs_fix", "fail", "iter_skip"), edges)
+        self.assertIn(("if_needs_fix", "pass", "iter_checkout"), edges)
+        snap = {m["output"]: m["expression"] for m in nodes["iter_snap"]["config"]["mappings"]}
+        self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
+        task = next(m for m in nodes["rc_task_material"]["config"]["mappings"] if m["output"] == "task")["expression"]["properties"]
+        self.assertEqual(task["attempt"], {"kind": "getField", "path": "ITEM"})
+        state = nodes["rc_state"]["config"]["inputMapping"]["values"]
+        self.assertEqual(state["endpoint"], "/v1/agent/run")
+        self.assertEqual(state["exact_request_body_sha256"], "{{ CTX.rc_task_hash.value }}")
+        self.assertEqual(nodes["agent"]["config"]["run_control"], "{{ CTX.rc_continuity.run_control }}")
+        self.assertEqual(nodes["agent"]["config"]["prompt"], "{{ TASKS.iter_findings.data.brief | default(CTX.run_input.prompt) }}")
+        continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
+        self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
+            "run_control_id": "CTX.run_input.run_control_id",
+            "attempt_id": "TASKS.rc_state.result.attempt_identity.attempt_id",
+            "authorization_id": "TASKS.rc_state.result.attempt_identity.authorization_id",
+            "launch_descriptor_sha256": "TASKS.rc_state.result.descriptor_hash.value",
+        })
+        self.assertEqual(nodes["rc_settle"]["config"]["receipt"], "{{ TASKS.wait.request.body }}")
+        self.assertNotIn("kick", json.dumps(spec))
+        self.assertNotIn("/v1/pr/continue", json.dumps(spec))
+        dump = json.dumps(spec)
+        self.assertNotIn("CTX.INPUT.run_control.", dump)
+        self.assertNotIn('"CTX.INPUT.run_control"', dump)
+        self.assertIn("CTX.INPUT.run_control_id", dump)
 
 
 if __name__ == "__main__":
