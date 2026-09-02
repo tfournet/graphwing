@@ -21961,7 +21961,7 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
                          **{f: "{{ CTX.INPUT.%s }}" % f for f in ("class", "size", "work_kind", "prompt", "commit_message")},
                          "run_control": "{{ CTX.rc_continuity.run_control }}"},
             "form": {**base_nodes["form"]["config"], "enabled": False},
-            "hook": {**base_nodes["hook"]["config"], "enabled": False},
+            "hook": {**base_nodes["hook"]["config"], "enabled": True},
         }
         for node_id, node in base_nodes.items():
             with self.subTest(node=node_id):
@@ -22024,8 +22024,9 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         self.assertIn(("join_start", "out", "run_input"), edges)
         self.assertIn(("run_input", "out", "git"), edges)
         self.assertNotIn(("join_start", "out", "git"), edges)
-        # The webhook trigger stays off until the tenant proof enables it.
-        self.assertIs(nodes["hook"]["config"]["enabled"], False)
+        # The webhook trigger is on: the tenant proof kicked a second run
+        # through it, and pr_drive_run_control_hook_url names it.
+        self.assertIs(nodes["hook"]["config"]["enabled"], True)
 
     def test_run_control_children_are_exactly_pinned_and_failures_are_fenced(self):
         spec = self.load("pr-drive-run-control.json")["spec"]
@@ -22377,6 +22378,24 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         self.assertEqual(out["aggregate"]["turns"], 50)
         self.assertEqual(out["aggregate"]["provider_cost_usd"], "0.248882")
         self.assertNotIn("turns_unknown", out["evidence_codes"])
+
+    def test_reconcile_ends_a_lifecycle_only_on_a_verified_outcome(self):
+        # Live run d0aaae1c: the writer's receipt was "succeeded", reconcile
+        # marked the lifecycle terminal, and attempt 2 could not reserve while
+        # the PR's checks were still red. A clean writer exit is not the
+        # outcome; only verified_outcome ends the run.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-reconcile.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        by = {m["output"]: m["expression"] for m in nodes["reconciled_state"]["config"]["mappings"]}
+        for output in ("status", "terminal"):
+            cond = by[output]["condition"]
+            self.assertEqual(cond["operator"], "and")
+            self.assertEqual(cond["right"], {"kind": "binary", "operator": "==",
+                                             "left": {"kind": "getField", "path": "CTX.INPUT.receipt.verified_outcome"},
+                                             "right": {"kind": "literal", "value": True}})
+            self.assertNotIn("terminal_status", json.dumps(cond))
+        reason = next(m for m in nodes["reconcile_mode"]["config"]["mappings"] if m["output"] == "authority_loss_reason")["expression"]
+        self.assertEqual(reason["else"]["then"], {"kind": "literal", "value": None})
 
     def test_no_filter_is_fed_by_another_filter(self):
         # A filter's output is its own verdict object ({input, passed, result,
