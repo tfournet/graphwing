@@ -978,6 +978,11 @@
           "max_attempts": "{{ CTX.run_input.max_attempts }}",
           "auto_merge": "{{ CTX.run_input.auto_merge }}",
           "kick_url": "{{ CTX.run_input.kick_url }}",
+          "class": "{{ CTX.run_input.class }}",
+          "size": "{{ CTX.run_input.size }}",
+          "work_kind": "{{ CTX.run_input.work_kind }}",
+          "prompt": "{{ CTX.run_input.prompt }}",
+          "commit_message": "{{ CTX.run_input.commit_message }}",
           "kick_token": "{{ CTX.run_input.kick_token }}",
           "run_control": "{{ CTX.rc_continuity.run_control }}"
         }
@@ -1552,7 +1557,12 @@
           "attempt": "{{ CTX.run_input.attempt }}",
           "max_attempts": "{{ CTX.run_input.max_attempts }}",
           "auto_merge": "{{ CTX.run_input.auto_merge }}",
-          "kick_url": "{{ CTX.run_input.kick_url }}"
+          "kick_url": "{{ CTX.run_input.kick_url }}",
+          "class": "{{ CTX.run_input.class }}",
+          "size": "{{ CTX.run_input.size }}",
+          "work_kind": "{{ CTX.run_input.work_kind }}",
+          "prompt": "{{ CTX.run_input.prompt }}",
+          "commit_message": "{{ CTX.run_input.commit_message }}"
         }
       },
       {

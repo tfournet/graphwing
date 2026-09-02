@@ -1564,6 +1564,11 @@
           "auto_merge": { "type": "boolean" },
           "kick_url": { "type": "string", "description": "https Rewst webhook for the next attempt" },
           "kick_token": { "type": "string" },
+          "class": { "type": "string", "description": "Forwarded to the kicked run so it computes the reserved route" },
+          "size": { "type": "string", "description": "Forwarded to the kicked run" },
+          "work_kind": { "type": "string", "description": "Forwarded to the kicked run" },
+          "prompt": { "type": "string", "description": "Forwarded to the kicked run" },
+          "commit_message": { "type": "string", "description": "Forwarded to the kicked run" },
           "run_control": { "$ref": "#/components/schemas/PrContinueRunControl" }
         }
       },

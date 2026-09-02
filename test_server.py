@@ -6375,6 +6375,24 @@ while True:
         self.assertNotIn("run_control", posted[0])
         self.assertNotIn("run_control", out)
 
+    def test_pr_continue_forwards_route_inputs_only_when_present(self):
+        # A kicked run recomputes its route from class/size/work_kind; if the
+        # kick drops them the route node falls to defaults (go_coding, codex)
+        # and reconcile's route_matches fails as a conflict against the
+        # reservation made with the run's real route.
+        route = {"class": "mechanical", "size": "M", "work_kind": "typescript_coding",
+                 "prompt": "fix it", "commit_message": "fix: x"}
+        status, out, posted = self._pr_continue_with(route)
+        self.assertEqual(status, 200, out)
+        for key, value in route.items():
+            self.assertEqual(posted[0][key], value)
+        status, out, posted = self._pr_continue_with({"class": None, "size": 7})
+        self.assertEqual(status, 200, out)
+        for key in route:
+            self.assertNotIn(key, posted[0])
+        legacy = {"repo", "pr_number", "test", "attempt", "max_attempts", "auto_merge", "kick_url", "kick_token"}
+        self.assertEqual(set(posted[0]), legacy)
+
     def test_pr_continue_forwards_closed_run_control_continuity(self):
         # Run N reserves and kicks; run N+1 must be able to name the
         # reservation it settles, so the trio rides CTX.INPUT.run_control.
@@ -21932,7 +21950,12 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
             return value
         expected_deltas = {
             "agent": {**base_nodes["agent"]["config"], "run_control": "{{ CTX.INPUT.run_control }}"},
-            "continue": {**base_nodes["continue"]["config"], "run_control": "{{ CTX.rc_continuity.run_control }}"},
+            # The kick carries the route inputs so the kicked run reserves and
+            # computes the same route; the shipped pr-drive does not need them
+            # because its kicked runs never carry a reservation.
+            "continue": {**base_nodes["continue"]["config"],
+                         **{f: "{{ CTX.INPUT.%s }}" % f for f in ("class", "size", "work_kind", "prompt", "commit_message")},
+                         "run_control": "{{ CTX.rc_continuity.run_control }}"},
             "form": {**base_nodes["form"]["config"], "enabled": False},
             "hook": {**base_nodes["hook"]["config"], "enabled": False},
         }
