@@ -426,10 +426,23 @@ message, and a full token breakdown. Decision pending: same-uid private-copy
 pinning for codex only, or an upstream codex issue. `go_coding` should route
 to claude until then.
 
+## Phase 4 proven live, 2026-09-02
+
+After #165 (lookup entries evaluated) and #166 (picks report `value`; the
+publish linter rejects `result` after a write unless something reads that
+write), run 814e4f44 with every launcher stubbed to a missing binary went
+primary writer → `missing_binary` receipt → `fallback_eligibility` →
+`if_initial_fallback_eligible` pass → `fallback_route` (codex, availability
+fallback) → `agent_fallback` launched → `record_fallback`. #141 is closed by
+that run. Two more platform rules are pinned locally now:
+`test_lookup_table_entries_are_never_ast` and
+`test_mutation_outcome_reporters_read_the_write_they_report`.
+
 ## Next bounded task
 
-Land the lookupTable conversion, republish, rerun the #141 proof (expect
-`fallback_route` reached with launchers stubbed). Then the activation
-decision: whether `graphwing-pr-drive` becomes the run-control sibling and
-`scripts/rc-drive-pr.py` the documented start, and whether `go_coding` routes
-to claude while #151 is open.
+The activation decision, which is Tim's: whether `graphwing-pr-drive` becomes
+the run-control sibling (move `graphs/pr-drive-run-control.json` over
+`graphs/pr-drive.json`, retire the `f242c90` flag-off pin deliberately, make
+`scripts/rc-drive-pr.py` the documented start), and whether `go_coding` routes
+to claude while #151 is open. Everything the plan listed before that point is
+merged and proven in the isolated tenant.
