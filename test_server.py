@@ -6347,7 +6347,7 @@ while True:
         # reservation it settles, so the trio rides CTX.INPUT.run_control.
         continuity = {"run_control_id": "rc1-" + "a" * 64,
                       "attempt_id": "att1-" + "b" * 64,
-                      "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64,
+                      "authorization_id": server.run_control_authorization_id("rc1-" + "a" * 64, "att1-" + "b" * 64),
                       "launch_descriptor_sha256": "d" * 64}
         status, out, posted = self._pr_continue_with({"run_control": continuity})
         self.assertEqual(status, 200, out)
@@ -6357,8 +6357,11 @@ while True:
 
     def test_pr_continue_rejects_malformed_continuity_before_kicking(self):
         good = {"run_control_id": "rc1-" + "a" * 64, "attempt_id": "att1-" + "b" * 64,
-                "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64,
+                "authorization_id": server.run_control_authorization_id("rc1-" + "a" * 64, "att1-" + "b" * 64),
                 "launch_descriptor_sha256": "d" * 64}
+        # The raw run hex is the wrong material: the state graph hashes the
+        # JSON-quoted id, and a naive rca1-<run hex>-<attempt hex> must fail.
+        self.assertNotEqual(good["authorization_id"], "rca1-" + "a" * 64 + "-" + "b" * 64)
         bad_cases = {
             "null": None,
             "string": "rc1-" + "a" * 64,
@@ -6369,7 +6372,8 @@ while True:
             "bad_run_grammar": {**good, "run_control_id": "rc1-" + "A" * 64},
             "bad_attempt_grammar": {**good, "attempt_id": "att2-" + "b" * 64},
             "bad_auth_grammar": {**good, "authorization_id": "rca1-" + "a" * 64},
-            "contradictory_auth": {**good, "authorization_id": "rca1-" + "a" * 64 + "-" + "c" * 64},
+            "raw_run_hex_auth": {**good, "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64},
+            "contradictory_auth": {**good, "authorization_id": server.run_control_authorization_id("rc1-" + "a" * 64, "att1-" + "c" * 64)},
             "no_descriptor": {k: v for k, v in good.items() if k != "launch_descriptor_sha256"},
             "bad_descriptor": {**good, "launch_descriptor_sha256": "D" * 64},
         }
@@ -20948,7 +20952,7 @@ class RunControlSettlementTests(unittest.TestCase):
         run_hex = run_hex or self.RUN_HEX
         attempt_hex = attempt_hex or self.ATTEMPT_HEX
         return {"run_control_id": f"rc1-{run_hex}", "attempt_id": f"att1-{attempt_hex}",
-                "authorization_id": f"rca1-{run_hex}-{attempt_hex}",
+                "authorization_id": server.run_control_authorization_id(f"rc1-{run_hex}", f"att1-{attempt_hex}"),
                 "launch_descriptor_sha256": descriptor or self.DESCRIPTOR}
 
     def sealed_receipt(self, job_hex="c", *, status="ok", failure_code="none",
@@ -21128,7 +21132,7 @@ class RunControlSettlementTests(unittest.TestCase):
             "not_terminal_receipt_scalar": dict(receipt="ok"),
             "not_terminal_receipt_unknown_code": dict(receipt={**receipt, "failure_code": "made_up"}),
             "receipt_authority_mismatch": dict(receipt={**receipt, "usage": {**receipt["usage"], "output_tokens": 999}}),
-            "bad_run_control_continuity": dict(trio={**good_trio, "authorization_id": "rca1-" + "a" * 64}),
+            "bad_run_control_continuity": dict(trio={**good_trio, "authorization_id": "rca1-" + "a" * 64 + "-" + "b" * 64}),
             "bad_run_control_continuity_descriptor": dict(descriptor="D" * 64),
             "unexpected_fields": dict(launch_descriptor_sha256=self.DESCRIPTOR),
         }
@@ -21608,9 +21612,9 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         self.assertEqual(fingerprint, {k: v for k, v in kick.items() if k not in ("kick_token", "run_control")})
         self.assertEqual(nodes["rc_kick_gate"]["config"]["rules"], [{"path": "data.would_kick", "op": "equals", "value": True}])
         state_inputs = nodes["rc_continue_state"]["config"]["inputMapping"]["values"]
-        self.assertEqual(state_inputs["exact_request_body_sha256"]["value"], "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}")
-        self.assertEqual(state_inputs["endpoint"]["value"], "/v1/pr/continue")
-        self.assertEqual(state_inputs["run_control_id"]["value"], "{{ CTX.INPUT.run_control.run_control_id }}")
+        self.assertEqual(state_inputs["exact_request_body_sha256"], "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}")
+        self.assertEqual(state_inputs["endpoint"], "/v1/pr/continue")
+        self.assertEqual(state_inputs["run_control_id"], "{{ CTX.INPUT.run_control.run_control_id }}")
         self.assertEqual(set(state_inputs), {
             "run_control_id", "candidate_route", "next_envelope", "launcher_fingerprint", "endpoint",
             "exact_request_body_sha256", "repository", "branch", "head_sha", "task_sha256",
@@ -21628,7 +21632,7 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         self.assertEqual((settle["run_control"], settle["receipt"]),
                          ("{{ CTX.INPUT.run_control }}", "{{ TASKS.wait.request.body }}"))
         reconcile = nodes["rc_reconcile"]["config"]["inputMapping"]["values"]
-        self.assertEqual({k: v["value"] for k, v in reconcile.items()}, {
+        self.assertEqual(reconcile, {
             "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
             "kind": "{{ TASKS.rc_settle.data.kind }}",
             "receipt": "{{ TASKS.rc_settle.data.receipt }}",
@@ -21638,7 +21642,7 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         self.assertEqual(nodes["rc_continue_loss"]["type"], "action.graphwing.POST:/v1/run/control/authority-loss")
         self.assertEqual(loss["run_control"], "{{ CTX.rc_continuity.run_control }}")
         action_loss = nodes["rc_continue_action_loss"]["config"]["inputMapping"]["values"]
-        self.assertEqual((action_loss["kind"]["value"], action_loss["authority_loss_reason"]["value"], action_loss["receipt"]["value"]),
+        self.assertEqual((action_loss["kind"], action_loss["authority_loss_reason"], action_loss["receipt"]),
                          ("authority_lost", "continuation_action_failed", None))
 
     def test_publish_registers_the_slug_behind_its_durable_chain(self):
@@ -21656,6 +21660,196 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
             "run-control-transition", "run-control-consume-authorization", "run-control-state",
             "run-control-consume", "run-control-reconcile", "pr-drive-run-control",
         ])
+
+
+class GraphEdgeHandleVocabularyTests(unittest.TestCase):
+    """Every edge leaves its node on a handle the platform actually emits.
+
+    The first live run of graphwing-run-control-initialize stopped after its
+    validate action: the graph wired that action's success as `out`, which
+    only transforms and joins emit, so the platform found no target on the
+    `success` branch and ended the run as completed with nothing done.
+    """
+
+    @staticmethod
+    def expected_handles(node_type):
+        if node_type == "action.wait.webhook":
+            return {"pending", "out", "timeout", "failure"}
+        if node_type == "logic.filter":
+            return {"pass", "fail"}
+        if node_type.startswith("logic.switch"):
+            return None
+        if node_type.startswith(("transforms.", "logic.join", "trigger.")):
+            return {"out"}
+        if node_type.startswith("action."):
+            return {"success", "failure"}
+        return None
+
+    def test_subworkflow_children_get_enough_temporal_budget_to_start(self):
+        # The engine refused to start a child under a 120 s parent timeout:
+        # "required=7m12s (node maximum=1m5s + settlement margin=6m7s),
+        # remaining=1m59s". Every child needs at least that headroom.
+        # Run c6e82989 then showed the rule compounds: a child that itself
+        # calls a 900 s subworkflow needs "required=27m12s" remaining, so a
+        # parent calling such a child must give it well over that.
+        graphs = {path.name: json.loads(path.read_text())["spec"]
+                  for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json"))}
+        def calls_subworkflows(spec):
+            return any(node["type"] == "action.subworkflow" for node in spec["nodes"])
+        pins = {"$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID": "run-control-state.json",
+                "$GRAPHWING_RUN_CONTROL_CONSUME_WORKFLOW_ID": "run-control-consume.json",
+                "$GRAPHWING_RUN_CONTROL_RECONCILE_WORKFLOW_ID": "run-control-reconcile.json",
+                "$GRAPHWING_RUN_CONTROL_TRANSITION_WORKFLOW_ID": "run-control-transition.json",
+                "$GRAPHWING_RUN_CONTROL_CONSUME_AUTHORIZATION_WORKFLOW_ID": "run-control-consume-authorization.json"}
+        for name, spec in graphs.items():
+            for node in spec["nodes"]:
+                if node["type"] == "action.subworkflow":
+                    with self.subTest(graph=name, node=node["id"]):
+                        child = graphs.get(pins.get(node["config"]["workflowId"], ""))
+                        floor = 2400 if child is not None and calls_subworkflows(child) else 480
+                        self.assertGreaterEqual(node["config"]["timeout"], floor)
+
+    def test_subworkflow_input_mappings_are_plain_templates(self):
+        # The engine renders each inputMapping value as a template and hands
+        # the result to the child as INPUT.<key>. An AST wrapper such as
+        # {"kind": "literal", "value": "{{ ... }}"} arrives as that object,
+        # so every child comparison against INPUT silently fails. The first
+        # live initialize run wrote nothing for exactly this reason.
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            for node in spec["nodes"]:
+                if node["type"] != "action.subworkflow":
+                    continue
+                mapping = node["config"].get("inputMapping") or {}
+                with self.subTest(graph=path.name, node=node["id"]):
+                    self.assertEqual(mapping.get("mode"), "select")
+                    for key, value in mapping.get("values", {}).items():
+                        self.assertFalse(isinstance(value, dict) and "kind" in value, (key, value))
+                    output = node["config"].get("outputMapping") or {}
+                    self.assertEqual(output.get("mode"), "select")
+                    self.assertTrue(output.get("keys"))
+
+    def test_state_graph_only_demands_a_handoff_for_cross_model_reservations(self):
+        # Live run a777cbbc: the evaluator approved continue_same_model and the
+        # reservation then died at handoff_gate, which required cross_model.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-state.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        self.assertEqual(nodes["handoff_gate"]["config"]["rules"], [{"path": "handoff_ok", "op": "equals", "value": True}])
+        by = {m["output"]: m["expression"] for m in nodes["handoff_shape"]["config"]["mappings"]}
+        ok = by["handoff_ok"]
+        self.assertEqual(ok["operator"], "or")
+        # Built from the primitive expressions, never from a same-node alias.
+        self.assertEqual(ok["left"], {"kind": "unary", "operator": "not", "operand": by["cross_model"]})
+        self.assertEqual(ok["right"], {"kind": "binary", "operator": "and", "left": by["closed"], "right": by["reason_allowed"]})
+
+    def test_run_control_graphs_never_compare_objects_with_equality(self):
+        # The engine cannot compare maps: live run 12386f9a's reconcile child
+        # died with "comparing uncomparable type map[string]interface {}" on
+        # receipt.route == outstanding_reservation.route. Compare fields.
+        object_tails = {"route", "envelope", "handoff", "reservation", "launch_descriptor", "receipt",
+                        "progress", "usage", "candidate_route", "current_route", "next_envelope"}
+        def offenders(expr, where, out):
+            if isinstance(expr, dict):
+                if expr.get("kind") == "binary" and expr.get("operator") in ("==", "!="):
+                    sides = (expr.get("left", {}), expr.get("right", {}))
+                    if all(s.get("kind") == "getField" and s["path"].rsplit(".", 1)[-1] in object_tails for s in sides):
+                        out.append((where, sides[0]["path"], sides[1]["path"]))
+                for value in expr.values():
+                    offenders(value, where, out)
+            elif isinstance(expr, list):
+                for value in expr:
+                    offenders(value, where, out)
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("run-control-*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            found = []
+            for node in spec["nodes"]:
+                if node["type"] == "transforms.objectBuilder":
+                    for mapping in node["config"]["mappings"]:
+                        offenders(mapping["expression"], f"{node['id']}.{mapping['output']}", found)
+            with self.subTest(graph=path.name):
+                self.assertEqual(found, [])
+
+    def test_consumed_authorization_records_never_expire(self):
+        # Live reconcile run 845ed190 found no consumed record: consume wrote
+        # it with a 300 s TTL and reconcile ran 306 s later. The consumed
+        # record is the proof an attempt's reconcile verifies after a run that
+        # can last far longer, so only the issued record may expire.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-consume-authorization.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        for node_id in ("consume", "consume_retry"):
+            with self.subTest(node=node_id):
+                self.assertEqual(nodes[node_id]["config"]["ttlSeconds"], 0)
+        self.assertGreater(nodes["issue"]["config"]["ttlSeconds"], 0)
+
+    def test_reconcile_tolerates_closed_reservations_and_keeps_replay_to_receipts(self):
+        # Live run e6de7fbc: a replayed receipt against an already-closed
+        # reservation rendered an empty datastore key and the run died.
+        # Live run e4613652: an authority-loss input committed correctly and
+        # then fell into the receipt replay branch and fenced.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-reconcile.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn("| default('none')", nodes["consumed_authorization"]["config"]["key"])
+        self.assertIn(("consumed_authorization", "failure", "failures"), edges)
+        self.assertIn(("receipt_gate", "fail", "replay_mode"), edges)
+        self.assertIn(("replay_mode_gate", "pass", "receipt_replay_check"), edges)
+        self.assertIn(("replay_mode_gate", "fail", "ignored_branch"), edges)
+        self.assertNotIn(("receipt_gate", "fail", "receipt_replay_check"), edges)
+        # A receipt downgraded to authority loss (unusable usage) still records
+        # its identity, so a replay of that receipt is ignored, not fenced.
+        attempt = next(m for m in nodes["attempt_entry"]["config"]["mappings"] if m["output"] == "attempt")["expression"]
+        downgraded = attempt["properties"]["reconciliation"]["else"]["properties"]
+        self.assertEqual(downgraded["receipt_id"], {"kind": "getField", "path": "CTX.INPUT.receipt.receipt_id"})
+        self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "CTX.receipt_hash.value"})
+
+    def test_no_filter_is_fed_by_another_filter(self):
+        # A filter's output is its own verdict object ({input, passed, result,
+        # ruleCount}), never the payload it judged. Live consume run 488f13fa
+        # died because precheck_gate read consume_replay_gate's verdict.
+        # implement-slice's if_receipt_ok -> if_initial_fallback_eligible has the
+        # same defect in the shipped graph (the provider-availability fallback
+        # can never fire). It is tracked separately and fixed with its own
+        # proof; the shipped graph is not edited during run-control validation.
+        known = {("implement-slice.json", "if_receipt_ok", "if_initial_fallback_eligible")}
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            types = {node["id"]: node["type"] for node in spec["nodes"]}
+            for edge in spec["edges"]:
+                if (path.name, edge["source"], edge["target"]) in known:
+                    continue
+                with self.subTest(graph=path.name, edge=edge["id"]):
+                    self.assertFalse(types[edge["source"]] == "logic.filter" and types[edge["target"]] == "logic.filter",
+                                     (edge["source"], edge["target"]))
+
+    def test_filters_fed_by_object_builders_test_fields_that_builder_emits(self):
+        # Live runs c1697499 (state) and the reconcile design shared one bug:
+        # a filter placed after an identity builder tested decision fields
+        # that builder never emitted, so the commit gate failed by construction.
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            nodes = {node["id"]: node for node in spec["nodes"]}
+            for edge in spec["edges"]:
+                target, source = nodes[edge["target"]], nodes[edge["source"]]
+                if target["type"] != "logic.filter" or source["type"] != "transforms.objectBuilder":
+                    continue
+                emitted = {m["output"] for m in source["config"]["mappings"]}
+                for rule in target["config"].get("rules", []):
+                    with self.subTest(graph=path.name, filter=target["id"], rule=rule["path"]):
+                        self.assertIn(rule["path"].split(".")[0], emitted)
+
+    def test_every_edge_uses_a_handle_its_node_type_emits(self):
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            types = {node["id"]: node["type"] for node in spec["nodes"]}
+            for edge in spec["edges"]:
+                with self.subTest(graph=path.name, edge=edge["id"]):
+                    node_type = types[edge["source"]]
+                    handle = edge.get("sourceHandle")
+                    allowed = self.expected_handles(node_type)
+                    if allowed is None:
+                        self.assertTrue(handle == "default" or str(handle).startswith("case-"), (node_type, handle))
+                    else:
+                        self.assertIn(handle, allowed, (edge["source"], node_type))
 
 
 if __name__ == "__main__":

@@ -1127,22 +1127,10 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.run_control.run_control_id }}"
-              },
-              "kind": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_settle.data.kind }}"
-              },
-              "receipt": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_settle.data.receipt }}"
-              },
-              "authority_loss_reason": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_settle.data.authority_loss_reason }}"
-              }
+              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "kind": "{{ TASKS.rc_settle.data.kind }}",
+              "receipt": "{{ TASKS.rc_settle.data.receipt }}",
+              "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}"
             }
           },
           "outputMapping": {
@@ -1151,7 +1139,7 @@
               "transition_result"
             ]
           },
-          "timeout": 120
+          "timeout": 2400
         }
       },
       {
@@ -1360,58 +1348,19 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.run_control.run_control_id }}"
-              },
-              "candidate_route": {
-                "kind": "literal",
-                "value": "{{ CTX.rc_task_material.candidate_route }}"
-              },
-              "next_envelope": {
-                "kind": "literal",
-                "value": "{{ CTX.rc_task_material.next_envelope }}"
-              },
-              "launcher_fingerprint": {
-                "kind": "literal",
-                "value": "graphwing-pr-continue-v1"
-              },
-              "endpoint": {
-                "kind": "literal",
-                "value": "/v1/pr/continue"
-              },
-              "exact_request_body_sha256": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}"
-              },
-              "repository": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.repo }}"
-              },
-              "branch": {
-                "kind": "literal",
-                "value": "{{ TASKS.view.data.data.headRefName }}"
-              },
-              "head_sha": {
-                "kind": "literal",
-                "value": "{{ TASKS.view.data.data.headRefOid }}"
-              },
-              "task_sha256": {
-                "kind": "literal",
-                "value": "{{ CTX.rc_task_hash.value }}"
-              },
-              "permission_profile": {
-                "kind": "literal",
-                "value": "pr-drive-writer-v1"
-              },
-              "callback_binding_sha256": {
-                "kind": "literal",
-                "value": "{{ CTX.rc_callback_hash.value }}"
-              },
-              "handoff": {
-                "kind": "literal",
-                "value": "{{ CTX.rc_task_material.handoff }}"
-              }
+              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "candidate_route": "{{ CTX.rc_task_material.candidate_route }}",
+              "next_envelope": "{{ CTX.rc_task_material.next_envelope }}",
+              "launcher_fingerprint": "graphwing-pr-continue-v1",
+              "endpoint": "/v1/pr/continue",
+              "exact_request_body_sha256": "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}",
+              "repository": "{{ CTX.INPUT.repo }}",
+              "branch": "{{ TASKS.view.data.data.headRefName }}",
+              "head_sha": "{{ TASKS.view.data.data.headRefOid }}",
+              "task_sha256": "{{ CTX.rc_task_hash.value }}",
+              "permission_profile": "pr-drive-writer-v1",
+              "callback_binding_sha256": "{{ CTX.rc_callback_hash.value }}",
+              "handoff": "{{ CTX.rc_task_material.handoff }}"
             }
           },
           "outputMapping": {
@@ -1423,7 +1372,7 @@
               "descriptor_hash"
             ]
           },
-          "timeout": 120
+          "timeout": 2400
         }
       },
       {
@@ -1441,10 +1390,7 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.run_control.run_control_id }}"
-              }
+              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}"
             }
           },
           "outputMapping": {
@@ -1454,7 +1400,7 @@
               "consume_result"
             ]
           },
-          "timeout": 120
+          "timeout": 2400
         }
       },
       {
@@ -1526,22 +1472,10 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.run_control.run_control_id }}"
-              },
-              "kind": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_continue_loss.data.kind }}"
-              },
-              "receipt": {
-                "kind": "literal",
-                "value": null
-              },
-              "authority_loss_reason": {
-                "kind": "literal",
-                "value": "{{ TASKS.rc_continue_loss.data.authority_loss_reason }}"
-              }
+              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "kind": "{{ TASKS.rc_continue_loss.data.kind }}",
+              "receipt": null,
+              "authority_loss_reason": "{{ TASKS.rc_continue_loss.data.authority_loss_reason }}"
             }
           },
           "outputMapping": {
@@ -1550,7 +1484,7 @@
               "transition_result"
             ]
           },
-          "timeout": 120
+          "timeout": 2400
         }
       },
       {
@@ -1568,22 +1502,10 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": {
-                "kind": "literal",
-                "value": "{{ CTX.INPUT.run_control.run_control_id }}"
-              },
-              "kind": {
-                "kind": "literal",
-                "value": "authority_lost"
-              },
-              "receipt": {
-                "kind": "literal",
-                "value": null
-              },
-              "authority_loss_reason": {
-                "kind": "literal",
-                "value": "continuation_action_failed"
-              }
+              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "kind": "authority_lost",
+              "receipt": null,
+              "authority_loss_reason": "continuation_action_failed"
             }
           },
           "outputMapping": {
@@ -1592,7 +1514,7 @@
               "transition_result"
             ]
           },
-          "timeout": 120
+          "timeout": 2400
         }
       },
       {

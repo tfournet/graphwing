@@ -190,14 +190,111 @@ an action config value that renders an object (`{{ CTX.INPUT.run_control }}`,
 `{{ TASKS.wait.request.body }}`) is sent as that object. All three follow the
 shipped graphs' existing usage; import in the isolated tenant is the proof.
 
+## Live tenant findings, 2026-09-01
+
+Publishing to org `485bb4f1…` (tim-graphwing, not Rewst Internal) after
+deploying this branch's daemon and re-importing the integration (version 22).
+Step 3 held: the published `graphwing-pr-drive` equals the local file node for
+node and edge for edge, and its missing-PR smoke executed five nodes, none a
+datastore operation. There is no datastore read API, so that trace is the
+zero-write evidence.
+
+The first live runs of the dormant chain found three defects in the merged
+foundation, none visible to fixture tests:
+
+1. **Handle names.** `run-control-initialize` and `run-control-reconcile`
+   wired their validate action's success as `out`; the platform emits
+   `success`/`failure` for actions, so the run ended "completed" after the
+   validate call with nothing done. Fixed; `GraphEdgeHandleVocabularyTests`
+   pins every edge to its node type's handle vocabulary.
+2. **Child budget.** Every `action.subworkflow` gave its child 120 s. The
+   engine refuses to start a child whose first node cannot fit in the parent's
+   remaining Temporal budget ("required=7m12s ... remaining=1m59s"). All
+   subworkflow timeouts are now 900 s; the lint floor is 480 s.
+3. **Child inputs.** `inputMapping.values` were AST wrappers
+   (`{"kind": "literal", "value": "{{ ... }}"}`). The engine renders each value
+   as a template and passes the result as `INPUT.<key>`, so the child received
+   objects and every comparison against `INPUT` failed silently; the transition
+   child fell through all its gates and wrote nothing. Values are now plain
+   templates, as the engine's own node docs show (`rewst-go/services/worker/
+   nodes/subworkflow.go`); the lint forbids wrapped values.
+
+After those fixes initialize ran end to end, and the later runs found six more,
+each fixed with a pinning test in `GraphEdgeHandleVocabularyTests`:
+
+4. **Handoff gate.** The state graph forced every reservation through the
+   cross-model handoff gate, so an evaluator-approved same-model continuation
+   could never reserve. The gate now passes when the route is unchanged or the
+   handoff is closed with an allowed reason (run a777cbbc).
+5. **Gate feeders.** Four commit gates (state `post_*`, reconcile `post_*`)
+   and the consume graph's `precheck_gate` read a payload that never carried
+   the fields their rules test (an identity builder or another filter's
+   verdict). Each now reads a builder that re-emits the decision fields. The
+   shipped `implement-slice` has the same defect on its provider-availability
+   fallback gate; that is #141, not edited here (runs c1697499, 488f13fa).
+6. **Object equality.** `receipt.route == reservation.route` crashed the
+   engine ("comparing uncomparable type map"); routes compare field by field
+   (run 12386f9a).
+7. **Authorization id.** The state graph names authorizations
+   `rca1-<sha256 of the JSON-quoted run id>-<attempt hex>`; the daemon's
+   continuity check now derives the same value (`run_control_authorization_id`).
+8. **Consumed-record TTL.** The consumed authorization expired after 300 s and
+   reconcile ran 306 s after consume. Consumed records no longer expire; only
+   the issued record does (run 845ed190).
+9. **Nested budgets.** A child that itself calls a 900 s subworkflow needs
+   about 27 minutes of remaining budget; the sibling gives its children 2400 s
+   (run c6e82989).
+10. **Reconcile routing.** An authority-loss input committed and then fell
+    into the receipt-replay branch and fenced; a replay against a closed
+    reservation rendered an empty datastore key; a receipt downgraded to
+    authority loss recorded no receipt identity, so its replay read as a
+    conflict. All three are routed or recorded correctly now (runs e4613652,
+    e6de7fbc).
+
+## Validation results, 2026-09-01
+
+Steps 3 and 4 are done in the isolated tenant with the codex binary stubbed to
+a missing path (a systemd drop-in, since removed), so no provider ran:
+
+- **Agent leg, twice** (lifecycles a6 and a9): initialize → reserve → consume →
+  `graphwing-pr-drive-run-control` with the four-field continuity. The daemon
+  pinned the launch to the reservation, the stub failed with a sealed
+  `missing_binary` receipt, the wait node received it, `rc_settle` projected
+  the terminal receipt, the in-run reconcile child passed every identity and
+  consumed-authorization check, charged the full envelope as
+  `receipt_evidence_unusable`, and the run ended at `herdr_receipt`.
+- **Replay and conflict** at both layers: an identical settle replays, a
+  different descriptor or a second job conflicts, authority loss on a settled
+  reservation is refused; a replayed reconcile of a closed reservation is
+  ignored rather than fenced.
+- **Lost kick** (lifecycles a7 and a8): reserve → consume → `/v1/pr/continue`
+  to a kick URL that fails → daemon `continuation_kick_failed` → reconcile
+  committed the authority loss; a second kick under the same continuity is
+  refused; the kick fingerprint the daemon recorded equals the one the
+  reservation was made with.
+
+Not exercised live: the grace-window timer path (unit-tested; a live proof
+needs a two-hour wait) and the continue leg inside the sibling, which needs a
+real writer to reach `if_green2`. The evaluator's policy allows one same-model
+continuation per run; attempt 1 consumes it, so attempt 2 must hand off to
+another model. That is policy, worth a look before real-provider runs.
+
 ## Next bounded task
 
-Validation step 3 in the isolated tenant: publish with
-`--only pr-drive-run-control`, run the existing pr-drive smoke against the
-shipped `graphwing-pr-drive`, and assert zero writes to any
-`graphwing_run_control_*` namespace. Then step 4 with a stub launcher:
-initialize + state + consume for run 0, start `graphwing-pr-drive-run-control`
-with that continuity, and verify reserve → launch pin → settle → reconcile
-across two chained runs, then authority loss on a lost kick and on a launched
-run that never settled. Nothing here is pushed, published, or deployed; the
-shipped pr-drive graph is unchanged.
+Land the branch within the 258,048-byte review maximum. The tree is 528 KB
+against `f242c90` because touching a single-line foundation graph costs its
+whole size twice, so it goes in order, bumping
+`_DURABLE_FOUNDATION_LANDED_COMMIT` after each merge:
+
+1. `cbea2da..c364030` (settlement, flag-off test, launch binding): 82 KB.
+2. `e00179d` (fingerprint op, sibling graph, publish registration): 95 KB.
+3. transition, consume-authorization, initialize, consume graph fixes: 187 KB.
+4. reconcile and state graph fixes: 148 KB.
+5. daemon authorization-id derivation, sibling child budgets, the lint tests,
+   docs: about 130 KB. The lints land last because they require every graph
+   fixed.
+
+Then: prove the continue leg inside the sibling with a real writer against a
+red PR (needs a provider), prove the grace-window timer path live, review the
+one-same-model-continuation policy before real-provider runs, and fix #141 in
+the shipped implement-slice graph with its own tenant proof.
