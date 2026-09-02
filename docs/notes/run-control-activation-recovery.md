@@ -382,12 +382,29 @@ revision 3. Cosmetic follow-up: `reconcile_mode.authority_loss_reason` still
 reads `receipt_evidence_unusable` on a terminal receipt and lands in the
 transition delta; it should be null when the kind is `terminal_receipt`.
 
+## Phase 2 proven live, 2026-09-02
+
+Lifecycle p4 (runs 48cb8b73 and 1c84391d, PR #161): run 1's writer fixed one
+of two bad files, checks stayed red, the retry leg reserved attempt 2 and
+kicked the sibling's own webhook (`pr_drive_run_control_hook_url`, trigger
+`0d9c348d…`); run 2 started from the webhook, `run_input` read every field from
+the body including `work_kind`, the daemon launched claude under the carried
+continuity (ledger: kick accepted, launch pinned, settlement terminal), and
+reconcile committed `kind: terminal_receipt` with charged usage
+`{turns: 50 (filled), wall_seconds: 9, tokens: 61423, provider_cost_usd:
+"0.2318755"}` and a null loss reason.
+
+Two fixes on the way: a writer's `succeeded` receipt no longer ends the
+lifecycle (reconcile marks the state terminal only on `verified_outcome`, so
+attempt 2 can reserve while the PR is still red; run d0aaae1c fenced on this),
+and `reconcile_mode.authority_loss_reason` is null on a terminal receipt. One
+procedure rule learned again: after any `openapi.json` change, run
+`scripts/reimport_integration.py` before the tenant proof, or Rewst drops the
+new request fields on the floor (run 6b9a77a3 lost the route inputs that way).
+
 ## Next bounded task
 
-Tenant proof for the kicked continuation: record the sibling's own webhook
-trigger URL in `rewst-install.json` (`pr_drive_run_control_hook_url`; the
-existing `pr_drive_hook_url` is the shipped pr-drive's trigger), enable `hook`
-in the sibling, publish, and run one lifecycle with `kick_url` set to it and a
-red PR the writer cannot fully fix. Expect run N+1 to launch under the carried
-continuity, settle, and reconcile. Then Phase 3 (operator script), #141, and
-the #151 spike verdict, per the remaining-work plan.
+Phase 4's tenant proof (implement-slice reaches `fallback_route` with the codex
+route stubbed to a missing binary), the #151 spike verdict, and then the
+activation decision: whether `graphwing-pr-drive` becomes the run-control
+sibling and `scripts/rc-drive-pr.py` the documented start.

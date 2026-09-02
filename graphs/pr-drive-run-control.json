@@ -98,7 +98,7 @@
           "y": 480
         },
         "config": {
-          "enabled": false,
+          "enabled": true,
           "requireAuthHeader": true,
           "headerKey": "x-rewst-secret",
           "headerValue": "$GRAPHWING_HOOK_SECRET",
