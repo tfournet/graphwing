@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive-run-control",
   "name": "graphwing-pr-drive-run-control",
-  "description": "Dormant run-control variant of graphwing-pr-drive. Same topology; the writer launches under the carried CTX.INPUT.run_control reservation and settles it from the live wait body, and the continue leg fingerprints its kick, reserves, consumes, kicks with four-field continuity, and closes a failed kick as authority loss. API start only with { \"input\": { ..., \"run_control\": {...} } }; form and webhook starts are disabled. Published with --only all like every dormant graph, or by name behind its durable chain; never with --only pr-drive.",
+  "description": "Dormant run-control variant of graphwing-pr-drive. Same topology; the writer launches under the carried CTX.INPUT.run_control reservation and settles it from the live wait body, and the continue leg fingerprints its kick, reserves, consumes, kicks with four-field continuity, and closes a failed kick as authority loss. Start via { \"input\": { ..., \"run_control\": {...} } } or a webhook kick whose body carries the same fields: run_input reads CTX.INPUT when present and CTX.TRIGGER.webhook.body otherwise; the form start is disabled. Published with --only all like every dormant graph, or by name behind its durable chain; never with --only pr-drive.",
   "spec": {
     "meta": {
       "useSearchAttributes": true,
@@ -120,6 +120,399 @@
         }
       },
       {
+        "id": "run_input",
+        "type": "transforms.objectBuilder",
+        "label": "Run input: API start or webhook kick",
+        "position": {
+          "x": 300,
+          "y": 300
+        },
+        "config": {
+          "alias": "run_input",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "repo",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.repo"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.repo"
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "pr_number",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.pr_number"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.pr_number"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "attempt",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.attempt"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.attempt"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "max_attempts",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.max_attempts"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.max_attempts"
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "auto_merge",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.auto_merge"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.auto_merge"
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "kick_url",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.kick_url"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.kick_url"
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "kick_token",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.kick_token"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.kick_token"
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "test",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.test"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.test"
+                }
+              }
+            },
+            {
+              "id": "m9",
+              "output": "class",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.class"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.class"
+                }
+              }
+            },
+            {
+              "id": "m10",
+              "output": "size",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.size"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.size"
+                }
+              }
+            },
+            {
+              "id": "m11",
+              "output": "work_kind",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.work_kind"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.work_kind"
+                }
+              }
+            },
+            {
+              "id": "m12",
+              "output": "prompt",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.prompt"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.prompt"
+                }
+              }
+            },
+            {
+              "id": "m13",
+              "output": "commit_message",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.commit_message"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.commit_message"
+                }
+              }
+            },
+            {
+              "id": "m14",
+              "output": "run_control",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.repo"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.run_control"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.TRIGGER.webhook.body.run_control"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "git",
         "type": "action.graphwing.GET:/v1/git/status",
         "label": "gitStatus",
@@ -130,7 +523,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}"
+          "repo": "{{ CTX.run_input.repo }}"
         }
       },
       {
@@ -144,8 +537,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
         }
       },
       {
@@ -159,8 +552,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
         }
       },
       {
@@ -307,7 +700,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
+          "repo": "{{ CTX.run_input.repo }}",
           "branch": "{{ TASKS.view.data.data.headRefName }}",
           "create": false
         }
@@ -341,8 +734,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "cwd": "{{ CTX.INPUT.repo }}",
-          "prompt": "{{ TASKS.findings.data.brief | default(CTX.INPUT.prompt) }}",
+          "cwd": "{{ CTX.run_input.repo }}",
+          "prompt": "{{ TASKS.findings.data.brief | default(CTX.run_input.prompt) }}",
           "launcher": "{{ TASKS.route.data.launcher }}",
           "provider": "{{ TASKS.route.data.provider }}",
           "model": "{{ TASKS.route.data.model }}",
@@ -353,7 +746,7 @@
           "run_budget_seconds": "600",
           "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}",
-          "run_control": "{{ CTX.INPUT.run_control }}"
+          "run_control": "{{ CTX.run_input.run_control }}"
         }
       },
       {
@@ -441,7 +834,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}",
+          "name": "{{ CTX.run_input.test }}",
           "response_webhook_url": "{{ TASKS.wait_fix_test.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.wait_fix_test.pending.resumeToken }}"
         }
@@ -463,7 +856,7 @@
               "output": "auto_merge",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.INPUT.auto_merge"
+                "path": "CTX.run_input.auto_merge"
               }
             }
           ]
@@ -558,11 +951,11 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}",
-          "auto_merge": "{{ CTX.INPUT.auto_merge }}",
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}",
+          "auto_merge": "{{ CTX.run_input.auto_merge }}",
           "run_id": "{{ WORKFLOW.runId }}",
-          "test": "{{ CTX.INPUT.test }}",
+          "test": "{{ CTX.run_input.test }}",
           "evidence_job_id": "{{ TASKS.final_wait.request.body.job_id }}",
           "merge_method": "squash"
         }
@@ -578,14 +971,14 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "pr": "{{ CTX.INPUT.pr_number }}",
-          "test": "{{ CTX.INPUT.test }}",
-          "attempt": "{{ CTX.INPUT.attempt }}",
-          "max_attempts": "{{ CTX.INPUT.max_attempts }}",
-          "auto_merge": "{{ CTX.INPUT.auto_merge }}",
-          "kick_url": "{{ CTX.INPUT.kick_url }}",
-          "kick_token": "{{ CTX.INPUT.kick_token }}",
+          "repo": "{{ CTX.run_input.repo }}",
+          "pr": "{{ CTX.run_input.pr_number }}",
+          "test": "{{ CTX.run_input.test }}",
+          "attempt": "{{ CTX.run_input.attempt }}",
+          "max_attempts": "{{ CTX.run_input.max_attempts }}",
+          "auto_merge": "{{ CTX.run_input.auto_merge }}",
+          "kick_url": "{{ CTX.run_input.kick_url }}",
+          "kick_token": "{{ CTX.run_input.kick_token }}",
           "run_control": "{{ CTX.rc_continuity.run_control }}"
         }
       },
@@ -636,8 +1029,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
         }
       },
       {
@@ -651,7 +1044,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
+          "repo": "{{ CTX.run_input.repo }}",
           "branch": "{{ TASKS.final_view.data.data.headRefName }}",
           "create": false
         }
@@ -685,10 +1078,10 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "name": "{{ CTX.INPUT.test }}",
+          "name": "{{ CTX.run_input.test }}",
           "evidence_mode": "pr_merge",
-          "repo": "{{ CTX.INPUT.repo }}",
-          "pr": "{{ CTX.INPUT.pr_number }}",
+          "repo": "{{ CTX.run_input.repo }}",
+          "pr": "{{ CTX.run_input.pr_number }}",
           "run_id": "{{ WORKFLOW.runId }}",
           "expected_head": "{{ TASKS.final_view.data.data.headRefOid }}",
           "writer_job_id": "{{ CTX.receipt.job_id | default('') }}",
@@ -768,9 +1161,9 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 15,
-          "class": "{{ CTX.INPUT.class }}",
-          "work_kind": "{{ CTX.INPUT.work_kind | default('go_coding') }}",
-          "size": "{{ CTX.INPUT.size }}"
+          "class": "{{ CTX.run_input.class }}",
+          "work_kind": "{{ CTX.run_input.work_kind | default('go_coding') }}",
+          "size": "{{ CTX.run_input.size }}"
         }
       },
       {
@@ -784,8 +1177,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
         }
       },
       {
@@ -818,8 +1211,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "message": "{{ CTX.INPUT.commit_message | default('fix: address review findings') }}",
+          "repo": "{{ CTX.run_input.repo }}",
+          "message": "{{ CTX.run_input.commit_message | default('fix: address review findings') }}",
           "writer_job_id": "{{ CTX.receipt.job_id }}"
         }
       },
@@ -834,7 +1227,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
+          "repo": "{{ CTX.run_input.repo }}",
           "remote": "origin",
           "ref": "{{ TASKS.view.data.data.headRefName }}"
         }
@@ -850,8 +1243,8 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "number": "{{ CTX.INPUT.pr_number }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
         }
       },
       {
@@ -1108,7 +1501,7 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "run_control": "{{ CTX.INPUT.run_control }}",
+          "run_control": "{{ CTX.run_input.run_control }}",
           "receipt": "{{ TASKS.wait.request.body }}"
         }
       },
@@ -1127,7 +1520,7 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}",
               "kind": "{{ TASKS.rc_settle.data.kind }}",
               "receipt": "{{ TASKS.rc_settle.data.receipt }}",
               "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}"
@@ -1153,13 +1546,13 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "repo": "{{ CTX.INPUT.repo }}",
-          "pr": "{{ CTX.INPUT.pr_number }}",
-          "test": "{{ CTX.INPUT.test }}",
-          "attempt": "{{ CTX.INPUT.attempt }}",
-          "max_attempts": "{{ CTX.INPUT.max_attempts }}",
-          "auto_merge": "{{ CTX.INPUT.auto_merge }}",
-          "kick_url": "{{ CTX.INPUT.kick_url }}"
+          "repo": "{{ CTX.run_input.repo }}",
+          "pr": "{{ CTX.run_input.pr_number }}",
+          "test": "{{ CTX.run_input.test }}",
+          "attempt": "{{ CTX.run_input.attempt }}",
+          "max_attempts": "{{ CTX.run_input.max_attempts }}",
+          "auto_merge": "{{ CTX.run_input.auto_merge }}",
+          "kick_url": "{{ CTX.run_input.kick_url }}"
         }
       },
       {
@@ -1205,15 +1598,15 @@
                   },
                   "repo": {
                     "kind": "getField",
-                    "path": "CTX.INPUT.repo"
+                    "path": "CTX.run_input.repo"
                   },
                   "pr_number": {
                     "kind": "getField",
-                    "path": "CTX.INPUT.pr_number"
+                    "path": "CTX.run_input.pr_number"
                   },
                   "test": {
                     "kind": "getField",
-                    "path": "CTX.INPUT.test"
+                    "path": "CTX.run_input.test"
                   }
                 }
               }
@@ -1226,7 +1619,7 @@
                 "properties": {
                   "kick_url": {
                     "kind": "getField",
-                    "path": "CTX.INPUT.kick_url"
+                    "path": "CTX.run_input.kick_url"
                   }
                 }
               }
@@ -1348,13 +1741,13 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}",
               "candidate_route": "{{ CTX.rc_task_material.candidate_route }}",
               "next_envelope": "{{ CTX.rc_task_material.next_envelope }}",
               "launcher_fingerprint": "graphwing-pr-continue-v1",
               "endpoint": "/v1/pr/continue",
               "exact_request_body_sha256": "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}",
-              "repository": "{{ CTX.INPUT.repo }}",
+              "repository": "{{ CTX.run_input.repo }}",
               "branch": "{{ TASKS.view.data.data.headRefName }}",
               "head_sha": "{{ TASKS.view.data.data.headRefOid }}",
               "task_sha256": "{{ CTX.rc_task_hash.value }}",
@@ -1390,7 +1783,7 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}"
+              "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}"
             }
           },
           "outputMapping": {
@@ -1423,7 +1816,7 @@
                 "properties": {
                   "run_control_id": {
                     "kind": "getField",
-                    "path": "CTX.INPUT.run_control.run_control_id"
+                    "path": "CTX.run_input.run_control.run_control_id"
                   },
                   "attempt_id": {
                     "kind": "getField",
@@ -1472,7 +1865,7 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}",
               "kind": "{{ TASKS.rc_continue_loss.data.kind }}",
               "receipt": null,
               "authority_loss_reason": "{{ TASKS.rc_continue_loss.data.authority_loss_reason }}"
@@ -1502,7 +1895,7 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+              "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}",
               "kind": "authority_lost",
               "receipt": null,
               "authority_loss_reason": "continuation_action_failed"
@@ -1570,7 +1963,7 @@
         "id": "e_start_git",
         "source": "join_start",
         "sourceHandle": "out",
-        "target": "git",
+        "target": "run_input",
         "targetHandle": "in"
       },
       {
@@ -2194,6 +2587,13 @@
         "source": "rc_failure_join",
         "sourceHandle": "out",
         "target": "rc_failure",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_run_input",
+        "source": "run_input",
+        "sourceHandle": "out",
+        "target": "git",
         "targetHandle": "in"
       }
     ]

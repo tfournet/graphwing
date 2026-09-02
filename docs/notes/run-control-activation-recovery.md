@@ -357,10 +357,37 @@ numbers, and `reconciliation.filled` records which dimensions were charged at
 the envelope. `/v1/run/control/validate-receipt` accepts unreported turns and
 cost and returns `filled`. The evaluator is unchanged and never sees nulls.
 
+## Kicked runs read their inputs, 2026-09-02
+
+The engine populates `INPUT` only for form triggers
+(`rewst-go/services/worker/engine/trigger_context.go`); a webhook kick lands
+in `CTX.TRIGGER.webhook.body`, which is why every kicked run died at `ghPrView`.
+`graphs/pr-drive-run-control.json` now starts with a `run_input` builder right
+after `join_start` that emits the thirteen pr-drive inputs plus `run_control`
+from `CTX.INPUT` when `CTX.INPUT.repo` is set and from the webhook body
+otherwise, and every other template reads `CTX.run_input.*` (58 references
+rewritten). The kick body `pr_continue` posts already carries exactly those
+fields. `kick_token` passes through untouched and is never hashed or logged.
+The `hook` trigger stays disabled until the tenant proof enables it. Pinned by
+`test_run_input_is_the_only_reader_of_ctx_input_and_falls_back_to_the_webhook_body`.
+
+## Phase 1 proven live, 2026-09-02
+
+Lifecycle p1 (run 71512ed5, reconcile child via `rc_reconcile`): a real
+claude-opus-5 writer fixed PR #155 and the reconcile committed
+`kind: terminal_receipt`, `terminal_status: succeeded`, `charged_usage`
+`{turns: 50, wall_seconds: 13, tokens: 92280, provider_cost_usd: "0.250434"}`
+with `reconciliation.filled.turns: true`, evaluator evidence `terminal`,
+revision 3. Cosmetic follow-up: `reconcile_mode.authority_loss_reason` still
+reads `receipt_evidence_unusable` on a terminal receipt and lands in the
+transition delta; it should be null when the kind is `terminal_receipt`.
+
 ## Next bounded task
 
-Prove Phase 1 live: one real claude lifecycle must reconcile as
-`kind: terminal_receipt` with `charged_usage` carrying real tokens, wall time,
-and cost and envelope-filled turns. Then Phase 2 (kicked runs read
-`CTX.TRIGGER.webhook.body` through a `run_input` node), Phase 3 (operator
-script), #141, and the #151 spike, per the remaining-work plan.
+Tenant proof for the kicked continuation: record the sibling's own webhook
+trigger URL in `rewst-install.json` (`pr_drive_run_control_hook_url`; the
+existing `pr_drive_hook_url` is the shipped pr-drive's trigger), enable `hook`
+in the sibling, publish, and run one lifecycle with `kick_url` set to it and a
+red PR the writer cannot fully fix. Expect run N+1 to launch under the carried
+continuity, settle, and reconcile. Then Phase 3 (operator script), #141, and
+the #151 spike verdict, per the remaining-work plan.
