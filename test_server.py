@@ -43,7 +43,7 @@ def _lookup_view(node):
         inputs.add(json.dumps(condition["left"], sort_keys=True))
         entries.append({"key": condition["right"]["value"], "value": expression["then"]})
         expression = expression["else"]
-    assert mapping["output"] == "result" and len(inputs) == 1, node["id"]
+    assert mapping["output"] == "value" and len(inputs) == 1, node["id"]
     return {"alias": node["config"]["alias"], "input": json.loads(inputs.pop()), "entries": entries,
             "defaultValue": expression, "caseSensitive": True}
 
@@ -9997,7 +9997,7 @@ while True:
             for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
                 with self.subTest(walk_id=walk_id):
                     config = nodes[walk_id]["config"]
-                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.result.fresh_primary_receipt }}}}")
+                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.value.fresh_primary_receipt }}}}")
                     self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
                     fresh = _lookup_view(nodes[alias])["entries"][0]["value"]["properties"]["fresh_primary_receipt"]
                     self.assertEqual(fresh, {"kind": "literal", "value": ""})
@@ -10122,28 +10122,28 @@ while True:
         )["spec"]
         nodes = {node["id"]: node for node in graph["nodes"]}
         expected_effort = {
-            "agent": "{{ CTX.selected_route.result.effort }}",
-            "agent_fallback": "{{ CTX.fallback_route_choice.result.effort }}",
+            "agent": "{{ CTX.selected_route.value.effort }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.value.effort }}",
             "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
             "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
             "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
             "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
-            "review1": "{{ CTX.active_route.result.reviewer1_effort }}",
-            "review1b": "{{ CTX.active_route.result.reviewer1_effort }}",
-            "review2": "{{ CTX.active_route.result.reviewer2_effort }}",
-            "review2b": "{{ CTX.active_route.result.reviewer2_effort }}",
+            "review1": "{{ CTX.active_route.value.reviewer1_effort }}",
+            "review1b": "{{ CTX.active_route.value.reviewer1_effort }}",
+            "review2": "{{ CTX.active_route.value.reviewer2_effort }}",
+            "review2b": "{{ CTX.active_route.value.reviewer2_effort }}",
         }
         expected_profile = {
-            "agent": "{{ CTX.selected_route.result.writer_execution_profile }}",
-            "agent_fallback": "{{ CTX.fallback_route_choice.result.writer_execution_profile }}",
+            "agent": "{{ CTX.selected_route.value.writer_execution_profile }}",
+            "agent_fallback": "{{ CTX.fallback_route_choice.value.writer_execution_profile }}",
             "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
             "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
             "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
             "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
-            "review1": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
-            "review1b": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
-            "review2": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
-            "review2b": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
+            "review1": "{{ CTX.active_route.value.reviewer1_execution_profile }}",
+            "review1b": "{{ CTX.active_route.value.reviewer1_execution_profile }}",
+            "review2": "{{ CTX.active_route.value.reviewer2_execution_profile }}",
+            "review2b": "{{ CTX.active_route.value.reviewer2_execution_profile }}",
         }
         actual_model_nodes = {
             node_id for node_id, node in nodes.items()
@@ -12576,28 +12576,28 @@ func main() {
             "implement-slice.json": {
                 "route_nodes": {"route", "fallback_route", "recovery_route"},
                 "consumers": {
-                    "agent": "{{ CTX.selected_route.result.effort }}",
-                    "agent_fallback": "{{ CTX.fallback_route_choice.result.effort }}",
+                    "agent": "{{ CTX.selected_route.value.effort }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.value.effort }}",
                     "agent2": "{{ CTX.fallback_receipt.session_identity.requested_effort | default(CTX.receipt.session_identity.requested_effort) }}",
                     "agent3": "{{ CTX.receipt2.session_identity.requested_effort }}",
                     "agent_rn1": "{{ CTX.receipt3.session_identity.requested_effort | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
                     "agent_rn2": "{{ CTX.receipt_rn1.session_identity.requested_effort | default(CTX.receipt3.session_identity.requested_effort) | default(CTX.receipt2.session_identity.requested_effort) | default(CTX.fallback_receipt.session_identity.requested_effort) | default(CTX.receipt.session_identity.requested_effort) }}",
-                    "review1": "{{ CTX.active_route.result.reviewer1_effort }}",
-                    "review1b": "{{ CTX.active_route.result.reviewer1_effort }}",
-                    "review2": "{{ CTX.active_route.result.reviewer2_effort }}",
-                    "review2b": "{{ CTX.active_route.result.reviewer2_effort }}",
+                    "review1": "{{ CTX.active_route.value.reviewer1_effort }}",
+                    "review1b": "{{ CTX.active_route.value.reviewer1_effort }}",
+                    "review2": "{{ CTX.active_route.value.reviewer2_effort }}",
+                    "review2b": "{{ CTX.active_route.value.reviewer2_effort }}",
                 },
                 "profiles": {
-                    "agent": "{{ CTX.selected_route.result.writer_execution_profile }}",
-                    "agent_fallback": "{{ CTX.fallback_route_choice.result.writer_execution_profile }}",
+                    "agent": "{{ CTX.selected_route.value.writer_execution_profile }}",
+                    "agent_fallback": "{{ CTX.fallback_route_choice.value.writer_execution_profile }}",
                     "agent2": "{{ CTX.fallback_receipt.session_identity.route_execution_profile | default(CTX.receipt.session_identity.route_execution_profile) }}",
                     "agent3": "{{ CTX.receipt2.session_identity.route_execution_profile }}",
                     "agent_rn1": "{{ CTX.receipt3.session_identity.route_execution_profile | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
                     "agent_rn2": "{{ CTX.receipt_rn1.session_identity.route_execution_profile | default(CTX.receipt3.session_identity.route_execution_profile) | default(CTX.receipt2.session_identity.route_execution_profile) | default(CTX.fallback_receipt.session_identity.route_execution_profile) | default(CTX.receipt.session_identity.route_execution_profile) }}",
-                    "review1": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
-                    "review1b": "{{ CTX.active_route.result.reviewer1_execution_profile }}",
-                    "review2": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
-                    "review2b": "{{ CTX.active_route.result.reviewer2_execution_profile }}",
+                    "review1": "{{ CTX.active_route.value.reviewer1_execution_profile }}",
+                    "review1b": "{{ CTX.active_route.value.reviewer1_execution_profile }}",
+                    "review2": "{{ CTX.active_route.value.reviewer2_execution_profile }}",
+                    "review2b": "{{ CTX.active_route.value.reviewer2_execution_profile }}",
                 },
             },
             "pr-drive.json": {
@@ -13014,7 +13014,7 @@ func main() {
         self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), triples)
         self.assertNotIn("session_identity", nodes["agent_fallback"]["config"])
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
-            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.result.{field} }}}}")
+            self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.value.{field} }}}}")
 
     def test_implement_slice_route_materialization_is_native_and_exactly_wired(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -13135,7 +13135,7 @@ func main() {
                 "recovery_version", "prior_primary_route", "prior_primary_receipt",
                 "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
             ):
-                self.assertEqual(nodes[walk_id]["config"][field], f"{{{{ CTX.{alias}.result.{field} }}}}")
+                self.assertEqual(nodes[walk_id]["config"][field], f"{{{{ CTX.{alias}.value.{field} }}}}")
 
     def test_implement_slice_full_route_projection_reaches_server_recovery_validation(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -13217,20 +13217,20 @@ func main() {
             }
 
             run_node("selected_route_pick", context)
-            self.assertEqual(run_node("selected_route", context)["result"], primary)
+            self.assertEqual(run_node("selected_route", context)["value"], primary)
             receipt = run_node("record", context)
             self.assertEqual(receipt["route"], primary)
             run_node("fallback_route_choice_pick", context)
-            self.assertEqual(run_node("fallback_route_choice", context)["result"], fallback)
+            self.assertEqual(run_node("fallback_route_choice", context)["value"], fallback)
             fallback_receipt = run_node("record_fallback", context)
             self.assertEqual(fallback_receipt["route"], fallback)
             run_node("active_route_pick", context)
-            self.assertEqual(run_node("active_route", context)["result"], fallback)
+            self.assertEqual(run_node("active_route", context)["value"], fallback)
             run_node("continuation_primary_pick", context)
 
             projected = []
             for walk_node in ("walk_recovery_input", "walk_e2e_recovery_input"):
-                recovery = run_node(walk_node, context)["result"]
+                recovery = run_node(walk_node, context)["value"]
                 self.assertEqual(recovery["prior_primary_route"], primary)
                 self.assertEqual(recovery["prior_primary_receipt"]["route"], primary)
                 self.assertEqual(recovery["prior_fallback_route"], fallback)
@@ -13416,13 +13416,13 @@ func main() {
         ):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                self.assertEqual(value, f"{{{{ CTX.active_route.result.{slot}_{field} }}}}")
+                self.assertEqual(value, f"{{{{ CTX.active_route.value.{slot}_{field} }}}}")
                 self.assertNotIn("TASKS.", value)
 
         for node_id, ordinary in (("agent", "route"), ("agent_fallback", "fallback_route")):
             for field in ("launcher", "provider", "model"):
                 value = nodes[node_id]["config"][field]
-                expected = "CTX.selected_route.result" if node_id == "agent" else "CTX.fallback_route_choice.result"
+                expected = "CTX.selected_route.value" if node_id == "agent" else "CTX.fallback_route_choice.value"
                 self.assertEqual(value, f"{{{{ {expected}.{field} }}}}")
             self.assertNotIn("session_identity", nodes[node_id]["config"])
             self.assertNotIn("resume_job_id", nodes[node_id]["config"])
@@ -13430,7 +13430,7 @@ func main() {
         for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
             config = nodes[walk_id]["config"]
             for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt", "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
-                self.assertEqual(config[field], f"{{{{ CTX.{alias}.result.{field} }}}}")
+                self.assertEqual(config[field], f"{{{{ CTX.{alias}.value.{field} }}}}")
             picker = _lookup_view(nodes[alias])
             self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
             self.assertEqual(picker["input"], {
@@ -13463,12 +13463,12 @@ func main() {
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             cfg = nodes[node_id]["config"]
             for field in ("max_turns", "run_budget_seconds"):
-                expected = f"{{{{ CTX.receipt2.route.{field} }}}}" if node_id == "agent3" else f"{{{{ CTX.active_route.result.{field} }}}}"
+                expected = f"{{{{ CTX.receipt2.route.{field} }}}}" if node_id == "agent3" else f"{{{{ CTX.active_route.value.{field} }}}}"
                 self.assertEqual(cfg[field], expected)
         for node_id, slot in (("review1", "reviewer1"), ("review1b", "reviewer1"), ("review2", "reviewer2"), ("review2b", "reviewer2")):
             cfg = nodes[node_id]["config"]
             for field in ("launcher", "provider", "model"):
-                self.assertEqual(cfg[field], f"{{{{ CTX.active_route.result.{slot}_{field} }}}}")
+                self.assertEqual(cfg[field], f"{{{{ CTX.active_route.value.{slot}_{field} }}}}")
         for node_id, receipts in correction_receipts.items():
             cfg = nodes[node_id]["config"]
             for receipt in receipts:
@@ -13768,18 +13768,18 @@ func main() {
             slot = "reviewer1" if suffix.startswith("1") else "reviewer2"
             config = node["config"]
             self.assertNotIn("reviewer", config)
-            self.assertIn(f"CTX.active_route.result.{slot}_launcher", config["launcher"])
-            self.assertIn(f"CTX.active_route.result.{slot}_launcher", config["launcher"])
-            self.assertIn(f"CTX.active_route.result.{slot}_provider", config["provider"])
-            self.assertIn(f"CTX.active_route.result.{slot}_provider", config["provider"])
-            self.assertIn(f"CTX.active_route.result.{slot}_model", config["model"])
-            self.assertIn(f"CTX.active_route.result.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.value.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.value.{slot}_launcher", config["launcher"])
+            self.assertIn(f"CTX.active_route.value.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.value.{slot}_provider", config["provider"])
+            self.assertIn(f"CTX.active_route.value.{slot}_model", config["model"])
+            self.assertIn(f"CTX.active_route.value.{slot}_model", config["model"])
         for index in (1, 2):
             field = f"reviewer{index}_launcher"
             mapping = nodes[f"map_switch_rev{'' if index == 1 else index}"]["config"]["mappings"]
             self.assertEqual(mapping, [{
                 "id": "m1", "output": field,
-                "expression": {"kind": "getField", "path": f"CTX.active_route.result.{field}"},
+                "expression": {"kind": "getField", "path": f"CTX.active_route.value.{field}"},
             }])
             switch = nodes[f"switch_rev{'' if index == 1 else index}"]["config"]
             self.assertEqual(switch["cases"][0]["rules"], [
@@ -13804,14 +13804,14 @@ func main() {
         implement = json.loads((root / "implement-slice.json").read_text())
         implement_nodes = {n["id"]: n for n in implement["spec"]["nodes"]}
         mappings = {m["output"]: m["expression"] for m in implement_nodes["record"]["config"]["mappings"]}
-        self.assertEqual(mappings["route"], {"kind": "getField", "path": "CTX.selected_route.result"})
+        self.assertEqual(mappings["route"], {"kind": "getField", "path": "CTX.selected_route.value"})
         retry_mappings = {
             m["output"]: m["expression"] for m in implement_nodes["record2"]["config"]["mappings"]
         }
-        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "CTX.active_route.result"})
+        self.assertEqual(retry_mappings["route"], {"kind": "getField", "path": "CTX.active_route.value"})
         self.assertEqual(
             retry_mappings["fallback_route"],
-            {"kind": "getField", "path": "CTX.fallback_route_choice.result"},
+            {"kind": "getField", "path": "CTX.fallback_route_choice.value"},
         )
         fallback_mappings = {
             m["output"]: m["expression"]
@@ -13819,7 +13819,7 @@ func main() {
         }
         self.assertEqual(
             fallback_mappings["route"],
-            {"kind": "getField", "path": "CTX.fallback_route_choice.result"},
+            {"kind": "getField", "path": "CTX.fallback_route_choice.value"},
         )
         done_mappings = {
             m["output"]: m["expression"]
@@ -15093,8 +15093,8 @@ func main() {
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
-    _DURABLE_FOUNDATION_BASE_COMMIT = "9a8a07068dd4dd89ec420ecdf6684b86447b20c3"
-    _DURABLE_FOUNDATION_LANDED_COMMIT = "33f66f421874e662b6e2e25ddfcd7f1398d7397d"
+    _DURABLE_FOUNDATION_BASE_COMMIT = "33f66f421874e662b6e2e25ddfcd7f1398d7397d"
+    _DURABLE_FOUNDATION_LANDED_COMMIT = "f452f73ad5d1973419f80b267e1cccf402775d3f"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
@@ -17096,7 +17096,7 @@ func main() {
         self.assertEqual(edges["e_rn2_out"]["target"], "record_rn2")
         self.assertEqual(edges["e31c"]["target"], "record3")
         agent = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent")
-        self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.result.launcher }}")
+        self.assertEqual(agent["config"]["launcher"], "{{ CTX.selected_route.value.launcher }}")
         agent2 = next(n for n in graph["spec"]["nodes"] if n["id"] == "agent2")
         self.assertIn("CTX.fallback_receipt.session_identity.launcher", agent2["config"]["launcher"])
         self.assertIn("CTX.receipt.session_identity.launcher", agent2["config"]["launcher"])
@@ -20852,7 +20852,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "3681bb572d32726482ac2fec15f04a9cfd163057170d1b5f85d57d36f8deb66d")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "a4bbe173f184745bea547008f7723c3044353d3d1c4208103e385dc7c634ec4b")
 
 
 class InstallTests(unittest.TestCase):
@@ -22421,6 +22421,45 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
             self.assertNotIn("terminal_status", json.dumps(cond))
         reason = next(m for m in nodes["reconcile_mode"]["config"]["mappings"] if m["output"] == "authority_loss_reason")["expression"]
         self.assertEqual(reason["else"]["then"], {"kind": "literal", "value": None})
+
+    def test_mutation_outcome_reporters_read_the_write_they_report(self):
+        # Mirror of Riftwing's publish linter (rewst-go/services/api/domain/
+        # workflows/linter/mutation_contracts.go): after a mutating action
+        # (type contains update/patch/edit/modify/create or .post:/ .put:/
+        # .patch:/ .delete:/), a reachable objectBuilder output named success,
+        # ok, succeeded, result, response, or data is a reported outcome and
+        # some reachable node must read TASKS.<id> or TASKS.<alias>. Publish
+        # of implement-slice failed 422 on this after the lookup conversion.
+        flagged = {"success", "ok", "succeeded", "result", "response", "data"}
+        def mutating(node_type):
+            lower = node_type.strip().lower()
+            return lower.startswith("action.") and any(k in lower for k in (
+                "update", "patch", "edit", "modify", "create", ".post:/", ".put:/", ".patch:/", ".delete:/"))
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            nodes = {node["id"]: node for node in spec["nodes"]}
+            adjacency = {}
+            for edge in spec["edges"]:
+                adjacency.setdefault(edge["source"], []).append(edge["target"])
+            for source in spec["nodes"]:
+                if not mutating(source["type"]):
+                    continue
+                seen, stack, reachable = set(), list(adjacency.get(source["id"], [])), []
+                while stack:
+                    node_id = stack.pop()
+                    if node_id in seen:
+                        continue
+                    seen.add(node_id); reachable.append(nodes[node_id]); stack.extend(adjacency.get(node_id, []))
+                reports = any(node["type"] == "transforms.objectBuilder"
+                              and any(m.get("output", "").strip().lower() in flagged for m in node["config"].get("mappings", []))
+                              for node in reachable)
+                if not reports:
+                    continue
+                refs = ["TASKS." + source["id"]] + (["TASKS." + source["config"]["alias"]] if source.get("config", {}).get("alias") else [])
+                pattern = re.compile(r"\b(?:" + "|".join(re.escape(r) for r in refs) + r")(?:\.[A-Za-z0-9_\-\[\]]+)+\b")
+                with self.subTest(graph=path.name, write=source["id"]):
+                    self.assertTrue(any(pattern.search(json.dumps(node.get("config", {}))) for node in reachable),
+                                    f"{source['id']} has a downstream outcome reporter but nothing reads its output")
 
     def test_lookup_table_entries_are_never_ast(self):
         # Riftwing's transforms.lookupTable evaluates input and defaultValue as
