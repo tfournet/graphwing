@@ -817,7 +817,8 @@
       {"id": "durable_outcome_written", "type": "action.noop", "label": "Durable outcome acknowledged", "position": {"x": 3620, "y": 600}, "config": {}},
       {"id": "durable_outcome_write_failed", "type": "transforms.regexReplace", "label": "FAIL: durable outcome write", "position": {"x": 3340, "y": 760}, "config": {"input": "graphwing_durable_outcome_write_failed", "pattern": "(?=graphwing)", "replacement": ""}},
       {"id": "durable_outcome_readback_failed", "type": "transforms.regexReplace", "label": "FAIL: durable outcome readback", "position": {"x": 3480, "y": 760}, "config": {"input": "graphwing_durable_outcome_readback_failed", "pattern": "(?=graphwing)", "replacement": ""}},
-      {"id": "durable_outcome_readback_mismatch", "type": "transforms.regexReplace", "label": "FAIL: durable outcome readback mismatch", "position": {"x": 3620, "y": 760}, "config": {"input": "graphwing_durable_outcome_readback_mismatch", "pattern": "(?=graphwing)", "replacement": ""}}
+      {"id": "durable_outcome_readback_mismatch", "type": "transforms.regexReplace", "label": "FAIL: durable outcome readback mismatch", "position": {"x": 3620, "y": 760}, "config": {"input": "graphwing_durable_outcome_readback_mismatch", "pattern": "(?=graphwing)", "replacement": ""}},
+      { "id": "fallback_eligibility", "type": "transforms.objectBuilder", "label": "Re-emit receipt fields for fallback gate", "position": { "x": 940, "y": 20 }, "config": { "alias": "fallback_eligibility", "version": 1, "mappings": [{ "id": "m1", "output": "status", "expression": { "kind": "getField", "path": "CTX.receipt.status" } }, { "id": "m2", "output": "role", "expression": { "kind": "getField", "path": "CTX.receipt.role" } }, { "id": "m3", "output": "failure_class", "expression": { "kind": "getField", "path": "CTX.receipt.failure_class" } }, { "id": "m4", "output": "failover_eligible", "expression": { "kind": "getField", "path": "CTX.receipt.failover_eligible" } }] } }
     ],
     "edges": [
       { "id": "e_start_trigger", "source": "trigger", "sourceHandle": "out", "target": "join_start", "targetHandle": "in" },
@@ -870,7 +871,8 @@
       { "id": "e13", "source": "push", "sourceHandle": "failure", "target": "push_fail", "targetHandle": "in" },
       { "id": "e14", "source": "record", "sourceHandle": "out", "target": "if_receipt_ok", "targetHandle": "in" },
       { "id": "e14b", "source": "if_receipt_ok", "sourceHandle": "pass", "target": "join_writer_success", "targetHandle": "in" },
-      { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "if_initial_fallback_eligible", "targetHandle": "in" },
+      { "id": "e14c", "source": "if_receipt_ok", "sourceHandle": "fail", "target": "fallback_eligibility", "targetHandle": "in" },
+      { "id": "e14d", "source": "fallback_eligibility", "sourceHandle": "out", "target": "if_initial_fallback_eligible", "targetHandle": "in" },
       { "id": "e_fb_gate_ok", "source": "if_initial_fallback_eligible", "sourceHandle": "pass", "target": "fallback_route", "targetHandle": "in" }, { "id": "e_fb_gate_bad", "source": "if_initial_fallback_eligible", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       {"id": "e_fb_route_ok", "source": "fallback_route", "sourceHandle": "success", "target": "normal_fallback_candidate", "targetHandle": "in"}, { "id": "e_fb_route_fail", "source": "fallback_route", "sourceHandle": "failure", "target": "fallback_route_fail", "targetHandle": "in" },
       { "id": "e_fb_wait_pending", "source": "wait_fallback", "sourceHandle": "pending", "target": "agent_fallback", "targetHandle": "in" }, { "id": "e_fb_wait_out", "source": "wait_fallback", "sourceHandle": "out", "target": "record_fallback", "targetHandle": "in" },

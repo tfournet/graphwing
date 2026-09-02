@@ -12955,11 +12955,15 @@ func main() {
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
         triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in graph["spec"]["edges"]}
         self.assertIn(("if_initial_fallback_eligible", "pass", "fallback_route"), triples)
-        self.assertIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), triples)
+        self.assertIn(("if_receipt_ok", "fail", "fallback_eligibility"), triples)
+        self.assertIn(("fallback_eligibility", "out", "if_initial_fallback_eligible"), triples)
         self.assertIn(("if_initial_fallback_eligible", "fail", "join_receipt_fail"), triples)
         edges = graph["spec"]["edges"]
         self.assertEqual([(e["source"], e.get("sourceHandle")) for e in edges if e["target"] == "fallback_route"], [("if_initial_fallback_eligible", "pass")])
-        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"if_receipt_ok"})
+        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"fallback_eligibility"})
+        self.assertEqual(nodes["fallback_eligibility"]["type"], "transforms.objectBuilder")
+        self.assertEqual({m["output"] for m in nodes["fallback_eligibility"]["config"]["mappings"]},
+                          {"status", "role", "failure_class", "failover_eligible"})
         def reaches(start, target):
             seen, pending = set(), [start]
             while pending:
@@ -20823,7 +20827,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "0ce08ba2f8dae852d3261188b6619d756fe2c533bfab4c763ccfb411653b03cd")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "1e059e55b325a449fc33c378989c5533215b35fa1cebd7283ba48022d4d27874")
 
 
 class InstallTests(unittest.TestCase):
@@ -22378,20 +22382,38 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         # A filter's output is its own verdict object ({input, passed, result,
         # ruleCount}), never the payload it judged. Live consume run 488f13fa
         # died because precheck_gate read consume_replay_gate's verdict.
-        # implement-slice's if_receipt_ok -> if_initial_fallback_eligible has the
-        # same defect in the shipped graph (the provider-availability fallback
-        # can never fire). It is tracked separately and fixed with its own
-        # proof; the shipped graph is not edited during run-control validation.
-        known = {("implement-slice.json", "if_receipt_ok", "if_initial_fallback_eligible")}
+        # implement-slice's if_receipt_ok -> if_initial_fallback_eligible had
+        # the same defect in the shipped graph (the provider-availability
+        # fallback could never fire). Fixed by routing through
+        # fallback_eligibility, a transforms.objectBuilder that re-emits the
+        # four fields if_initial_fallback_eligible tests from the receipt.
         for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
             spec = json.loads(path.read_text())["spec"]
             types = {node["id"]: node["type"] for node in spec["nodes"]}
             for edge in spec["edges"]:
-                if (path.name, edge["source"], edge["target"]) in known:
-                    continue
                 with self.subTest(graph=path.name, edge=edge["id"]):
                     self.assertFalse(types[edge["source"]] == "logic.filter" and types[edge["target"]] == "logic.filter",
                                      (edge["source"], edge["target"]))
+
+    def test_implement_slice_fallback_eligibility_re_emits_the_gated_fields(self):
+        # if_initial_fallback_eligible tests status, role, failure_class, and
+        # failover_eligible. Those must come from a re-emitting objectBuilder
+        # sitting between if_receipt_ok's fail branch and the gate, not from
+        # if_receipt_ok's own verdict object (see test_no_filter_is_fed_by_
+        # another_filter and issue #141).
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        node = nodes["fallback_eligibility"]
+        self.assertEqual(node["type"], "transforms.objectBuilder")
+        self.assertEqual(node["config"]["alias"], "fallback_eligibility")
+        emitted = {m["output"]: m["expression"] for m in node["config"]["mappings"]}
+        self.assertEqual(set(emitted), {"status", "role", "failure_class", "failover_eligible"})
+        for field in ("status", "role", "failure_class", "failover_eligible"):
+            self.assertEqual(emitted[field], {"kind": "getField", "path": f"CTX.receipt.{field}"})
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn(("if_receipt_ok", "fail", "fallback_eligibility"), edges)
+        self.assertIn(("fallback_eligibility", "out", "if_initial_fallback_eligible"), edges)
+        self.assertNotIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), edges)
 
     def test_filters_fed_by_object_builders_test_fields_that_builder_emits(self):
         # Live runs c1697499 (state) and the reconcile design shared one bug:
