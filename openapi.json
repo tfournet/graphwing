@@ -1583,7 +1583,7 @@
       },
       "PrContinueRunControl": {
         "type": "object", "additionalProperties": false,
-        "description": "Closed run-control continuity forwarded verbatim to the kicked run as CTX.INPUT.run_control; authorization_id must be rca1-<run hex>-<attempt hex> and launch_descriptor_sha256 is the reservation's persisted descriptor hash, carried from the reserving run because the reconcile graph verifies it against durable state",
+        "description": "Closed run-control continuity forwarded verbatim to the kicked run as CTX.INPUT.run_control; authorization_id must be rca1-<sha256 of the JSON-quoted run_control_id>-<attempt hex>, exactly as graphwing-run-control-state names it, and launch_descriptor_sha256 is the reservation's persisted descriptor hash, carried from the reserving run because the reconcile graph verifies it against durable state",
         "required": ["run_control_id", "attempt_id", "authorization_id", "launch_descriptor_sha256"],
         "properties": {
           "run_control_id": {"type": "string", "pattern": "^rc1-[0-9a-f]{64}$"},

@@ -2741,16 +2741,25 @@ RUN_CONTROL_CONTINUITY_FIELDS = frozenset({
 })
 
 
+def run_control_authorization_id(run_control_id: str, attempt_id: str) -> str:
+    """Name a reservation's authorization exactly as graphwing-run-control-state does."""
+    run_hash = hashlib.sha256(json.dumps(run_control_id).encode()).hexdigest()
+    return f"rca1-{run_hash}-{attempt_id[5:]}"
+
+
 def run_control_continuity(value: Any) -> dict[str, str] | None:
     """Validate the closed cross-run continuity a kicked run settles.
 
     The state graph reserves under run_control_id (rc1-hash) and attempt_id
-    (att1-hash), names the reservation authorization rca1-<run>-<attempt>,
-    and hashes the launch descriptor it persisted. The reconcile graph
-    compares the settling receipt's descriptor hash to durable state, so the
-    hash must travel from the reserving run: a value run N+1 read back from
-    that same state would bind nothing. All four are required, closed, and
-    must agree, or run N+1 could settle someone else's reservation.
+    (att1-hash), names the reservation authorization
+    rca1-<sha256 of the JSON-quoted run_control_id>-<attempt hex> (its
+    run_id_hash node hashes the id through json_stringify, so the quotes are
+    part of the material; live run 8ca1d0f5 proved the derivation), and
+    hashes the launch descriptor it persisted. The reconcile graph compares
+    the settling receipt's descriptor hash to durable state, so the hash must
+    travel from the reserving run: a value run N+1 read back from that same
+    state would bind nothing. All four are required, closed, and must agree,
+    or run N+1 could settle someone else's reservation.
     """
     if not isinstance(value, dict) or set(value) != RUN_CONTROL_CONTINUITY_FIELDS:
         return None
@@ -2759,7 +2768,7 @@ def run_control_continuity(value: Any) -> dict[str, str] | None:
     ))
     if (not isinstance(run_id, str) or RUN_CONTROL_RUN_ID_RE.fullmatch(run_id) is None
             or not isinstance(attempt_id, str) or RUN_CONTROL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None
-            or auth_id != f"rca1-{run_id[4:]}-{attempt_id[5:]}"
+            or auth_id != run_control_authorization_id(run_id, attempt_id)
             or not _valid_sha256(descriptor)):
         return None
     return {"run_control_id": run_id, "attempt_id": attempt_id, "authorization_id": auth_id,
