@@ -2441,6 +2441,14 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         "kick_url": kick_url,
         "kick_token": token,
     }
+    # The kicked run must compute the route the reserving run reserved, or the
+    # reconcile graph's route_matches fails as a conflict. Pass the route
+    # inputs through untouched when the caller sent them; absent stays absent
+    # so the legacy kick body is unchanged.
+    for field in ("class", "size", "work_kind", "prompt", "commit_message"):
+        value = data.get(field)
+        if isinstance(value, str):
+            payload[field] = value
     if continuity is not None:
         # Run N+1 reads this as CTX.INPUT.run_control. The kick ack below is
         # not a receipt; the attempt outcome does not exist yet.
