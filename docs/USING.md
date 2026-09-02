@@ -248,24 +248,6 @@ Skipping this fails silently, which is the expensive part. Rewst builds every re
 
 Two parameter names to avoid: the connector treats a query parameter called `path` as the request URL path and overwrites the endpoint with its value. `fileHead` and `gitDiff` use `rel` for that reason.
 
-### Drive a PR under run control
-
-`graphwing-pr-drive-run-control` (published behind its durable chain by `--only pr-drive-run-control`, see above) has no predecessor to reserve its first attempt. `scripts/rc-drive-pr.py` is the operator entry point for that run 0: it resolves the candidate route from the local daemon, reads the PR's head branch/sha with `gh pr view` in the allowlisted repo, then starts `graphwing-run-control-initialize`, `graphwing-run-control-state`, and `graphwing-run-control-consume` in turn before starting the sibling itself with the four-field continuity the state leg reserved.
-
-```bash
-python3 scripts/rc-drive-pr.py 3526 --repo riftwing --test riftwing-local-gates
-```
-
-```
-python3 scripts/rc-drive-pr.py <pr> [--repo NAME] [--test NAME] [--work-kind KIND] [--kick]
-                                     [--attempts N] [--turns N] [--wall-seconds N]
-                                     [--tokens N] [--cost USD] [--wait SECONDS]
-```
-
-Every Rewst call goes through `scripts/publish_graphs.py`'s `api`/`run_slug`, so it needs the same MCP token as publishing: `GRAPHWING_REWST_MCP_TOKEN`, or `mcp_bws_key` in `rewst-install.json` plus `BWS_ACCESS_TOKEN` exported from `~/.config/bws/access_token`. `--attempts`/`--turns`/`--wall-seconds`/`--tokens`/`--cost` size both the lifecycle budget (defaults: attempts 3, turns 150, wall_seconds 3600, tokens 6000000, provider_cost_usd 75) and the first attempt's envelope (defaults: turns 50, wall_seconds 660, tokens 2000000, provider_cost_usd 25); passing one overrides it in both places. `--kick` records `pr_drive_run_control_hook_url` and `hook_secret` from `rewst-install.json` as the reservation's kick target and token so a red PR can chain into a second, kicked run; without it the reservation still binds, but nothing is left to kick. `--wait` (default 1500s) is the poll budget for each of the four Graph starts — subworkflow children take minutes.
-
-The script prints each run's node trace the way `scripts/drive-pr.py` does, then the settle result and the reconcile child's status, and appends a record to `$GRAPHWING_HOME/workflow-runs.jsonl` in the same shape `server.py`'s `record_workflow_run` writes, plus the reserved `run_control_id`.
-
 ## Shortcut from the seat
 
 Legacy seat-side tracker calls use `scripts/sc`; Graphwing model jobs do not depend on it.
