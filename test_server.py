@@ -12795,10 +12795,16 @@ func main() {
                 self.assertIn(rule["path"], produced,
                               f"case {case['label']} reads {rule['path']}, which "
                               f"{feeders[0]} never produces")
-        # The feeder must read the findings payload the loop just fetched,
-        # not a stale or differently-shaped one.
+        # The feeder must read the findings payload's own blocking verdict
+        # (holds, or no grade, or grade below A), not GitHub check status:
+        # /v1/gh/pr/findings's all_green is check status only, folded in
+        # because the checks node's own output is artifact-stubbed, and a PR
+        # with a passing check but an open blocking finding reads all_green
+        # true. Gating on it made every attempt skip a genuinely red PR (live
+        # proof run bdc72f98, PR #172: three slots, zero fixes, one open
+        # blocker).
         by_output = {m["output"]: m["expression"] for m in feeder["config"]["mappings"]}
-        self.assertEqual(by_output["all_green"], {"kind": "getField", "path": "TASKS.iter_findings.data.all_green"})
+        self.assertEqual(by_output["needs_fix"], {"kind": "getField", "path": "TASKS.iter_findings.data.blocking"})
 
     def test_implement_slice_rewst_templates_are_path_valid_and_jinja_lite_safe(self):
         graph = json.loads(
@@ -22588,8 +22594,18 @@ class PrDriveGraphTests(unittest.TestCase):
         # rebuilds its input from ITEM and LOOP, filter.go
         # buildFilterEffectiveItem); logic.switch reads the raw payload. Live
         # run d19ba7d2 skipped every slot on a filter that compared all_green.
+        #
+        # all_green itself is the wrong field to gate on: /v1/gh/pr/findings's
+        # all_green is GitHub check status only (server.py folds it in
+        # separately because the checks node's own output is artifact-
+        # stubbed), not the review-findings verdict. A PR with a passing CI
+        # check and an unresolved blocking finding reads all_green=true, so
+        # every slot skipped it in live proof run bdc72f98 on PR #172: three
+        # attempts, zero fixes, on a PR with one open blocker. blocking (from
+        # pr_findings_from: holds present, or no grade, or grade below A) is
+        # the field that actually means "this needs a writer".
         self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
-        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "all_green", "op": "equals", "value": False}]}])
+        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "needs_fix", "op": "equals", "value": True}]}])
         self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
         self.assertIn(("switch_needs_fix", "case-0", "iter_checkout"), edges)
         self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))

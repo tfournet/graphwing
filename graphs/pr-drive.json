@@ -304,10 +304,10 @@
           "mappings": [
             {
               "id": "m1",
-              "output": "all_green",
+              "output": "needs_fix",
               "expression": {
                 "kind": "getField",
-                "path": "TASKS.iter_findings.data.all_green"
+                "path": "TASKS.iter_findings.data.blocking"
               }
             },
             {
@@ -331,9 +331,9 @@
               "label": "red",
               "rules": [
                 {
-                  "path": "all_green",
+                  "path": "needs_fix",
                   "op": "equals",
-                  "value": false
+                  "value": true
                 }
               ]
             }
