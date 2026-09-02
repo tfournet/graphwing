@@ -22633,6 +22633,16 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertNotIn('"CTX.INPUT.run_control"', dump)
         self.assertIn("CTX.INPUT.run_control_id", dump)
 
+    def test_agent_launch_failure_reaches_the_run_control_failure_fence(self):
+        # Live proof run ba65af2a: an HTTP 502 launching the writer (a
+        # transient Rewst gateway error, not app logic) left the loop
+        # iteration dead with no failure edge to follow, so the whole run
+        # terminated uncaught instead of closing the reservation through
+        # rc_failure like every sibling action node's failure handle does.
+        spec = self.load()["spec"]
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn(("agent", "failure", "rc_failure_join"), edges)
+
 
 if __name__ == "__main__":
     unittest.main()
