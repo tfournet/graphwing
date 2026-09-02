@@ -262,25 +262,12 @@ CATALOG = [
     "run-control-initialize", "run-control-state", "run-control-reconcile",
     "run-control-consume", "run-control-authorize", "verify-stack",
     "implement-slice", "pr-drive", "pr-status", "code-off",
-    # Dormant run-control sibling of pr-drive. Last so every child pin it
-    # embeds already exists; nothing kicks it unless an operator starts it.
-    "pr-drive-run-control",
-    "pr-drive-loop",
-]
-# Publishing the sibling by name republishes its durable chain first so no
-# stale child version can be pinned. "--only pr-drive" never reaches it: the
-# shipped pr-drive stays byte-identical and has no children.
-DURABLE_CHAIN = [
-    "run-control-transition", "run-control-consume-authorization",
-    "run-control-state", "run-control-consume", "run-control-reconcile",
 ]
 
 
 def publish_stems(only: str) -> list[str]:
     if only == "all":
         return list(CATALOG)
-    if only in ("pr-drive-run-control", "pr-drive-loop"):
-        return DURABLE_CHAIN + [only]
     return [only]
 
 
@@ -376,10 +363,6 @@ def main():
         install["run_control_consume_authorization"] = published["run-control-consume-authorization"]
     if "run-control-consume" in published:
         install["run_control_consume"] = published["run-control-consume"]
-    if "pr-drive-run-control" in published:
-        install["pr_drive_run_control"] = published["pr-drive-run-control"]
-    if "pr-drive-loop" in published:
-        install["pr_drive_loop"] = published["pr-drive-loop"]
     save_install(install)
     print("=== DONE ===")
     print(json.dumps(published, indent=2))
