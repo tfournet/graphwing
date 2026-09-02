@@ -263,11 +263,20 @@ CATALOG = [
     "run-control-consume", "run-control-authorize", "verify-stack",
     "implement-slice", "pr-drive", "pr-status", "code-off",
 ]
+# pr-drive embeds exact run-control child pins (every attempt reserves and
+# settles in-run), so publishing it by name republishes its durable chain
+# first so no stale child version can be pinned.
+DURABLE_CHAIN = [
+    "run-control-transition", "run-control-consume-authorization",
+    "run-control-state", "run-control-consume", "run-control-reconcile",
+]
 
 
 def publish_stems(only: str) -> list[str]:
     if only == "all":
         return list(CATALOG)
+    if only == "pr-drive":
+        return DURABLE_CHAIN + ["pr-drive"]
     return [only]
 
 

@@ -462,9 +462,49 @@ settled `terminal_receipt`, reconciled, tested, committed, and pushed; the
 final tail refused the draft PR as designed. The seat-only recipe
 `rc-validation-compile` bound the final test to the validation repo.
 
+## Activation, 2026-09-02
+
+Decided: `pr-drive-loop`'s topology becomes `graphs/pr-drive.json` itself.
+`graphwing-pr-drive` is now run-control reservation-backed end to end, up to
+three in-run attempts, no cross-run kick. Landed in two PRs rather than one
+because the combined diff (280KB) cleared `server.py`'s own
+`REVIEW_MAX_DIFF_BYTES` (258048 bytes) — the same ceiling graphwing enforces
+on diffs it reviews elsewhere applies to its own PRs, since
+`test_landed_phase6_and_followup_candidates_fit_the_review_maximum` measures
+the actual worktree diff, not a fixture.
+
+1. Retire the two dormant siblings first (`graphs/pr-drive-run-control.json`,
+   `graphs/pr-drive-loop.json`, `scripts/rc-drive-pr.py`): pure deletion,
+   `pr-drive.json`'s shipped content untouched.
+2. Swap `pr-drive.json`'s content to the loop shape, rewrite
+   `scripts/drive-pr.py` as the single front door (initialize once, start
+   `graphwing-pr-drive` once; no more outer Python attempt loop, no
+   `--kick`/`--attempts`-as-kick-budget confusion), and update every test
+   that pinned the old flag-off wiring.
+
+Each PR's own diff came in under 145KB, following the precedent in
+`test_server.py`'s `_DURABLE_FOUNDATION_BASE_COMMIT`/`_LANDED_COMMIT`: advance
+both together (`BASE` becomes the previous `LANDED`) so each PR is measured
+from a fresh baseline instead of accumulating the whole history.
+
+Known gap, carried into `docs/USING.md`: nothing waits between one attempt
+slot's push and the next slot's findings read, so a slot can act on a still-
+stale blocking finding right after a push. The old cross-run driver had a
+`wait_for_fresh_review` poll between separate Python-level attempts; an
+in-run loop has no equivalent without its own bounded sub-loop, and building
+one unproven wasn't in scope here. `scripts/drive-pr.py` still runs its own
+pre-run audit-settle check before starting the graph at all, which covers
+the common case (driving a PR whose audit just finished) but not a slot
+racing a reviewer mid-run.
+
+The form's `attempt`/`max_attempts`/`kick_url`/`kick_token` inputs, dead
+leftovers from the old kick-chain shape that nothing in the loop graph reads,
+are removed. Nine `herdr_*` diagnostic-noop node labels lost during the loop
+graph's original construction are restored (only `herdr_final_fail` had kept
+one); they are what make a failed run's stopping point legible in the trace.
+
 ## Next bounded task
 
-Decide the front door. `pr-drive-loop` makes both the shipped pr-drive and
-the run-control sibling redundant for retries; the cross-run kick path stays
-only if a run must exceed one run's budget. Then the launcher identity work
-(#151) and the MCP build-and-export loop for the catalog.
+Launcher identity work (#151, spike verdict: codex infeasible under the
+pinned memfd launcher, route `go_coding` to claude) and the MCP
+build-and-export loop for the catalog.

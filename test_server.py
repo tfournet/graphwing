@@ -7062,7 +7062,6 @@ while True:
     def test_pr_drive_has_one_final_evidence_leg_and_no_merge_bypass(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         description = graph["description"].lower()
-        self.assertIn("remote-ready", description)
         self.assertIn("final head-bound named test", description)
         self.assertIn("evidence gate", description)
         self.assertIn("optional merge", description)
@@ -7070,20 +7069,21 @@ while True:
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
         triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
-        self.assertIn(("switch_review", "case-2", "join_final"), triples)
-        self.assertIn(("switch_review", "default", "herdr_remote_not_ready"), triples)
-        self.assertIn(("if_green2", "pass", "join_final"), triples)
+        # Every in-run attempt ends in the loop; the final evidence leg only
+        # runs once, after the loop's `done` handle, regardless of how many
+        # slots ran or whether any of them did anything.
+        self.assertIn(("attempts", "done", "join_final"), triples)
         self.assertIn(("join_final", "out", "final_view"), triples)
         self.assertIn(("final_view", "success", "final_checkout"), triples)
         self.assertIn(("final_checkout", "success", "final_wait"), triples)
         self.assertIn(("final_wait", "pending", "final_test"), triples)
-        self.assertIn(("final_wait", "out", "if_final_test"), triples)
+        self.assertIn(("final_wait", "out", "switch_final_test"), triples)
         self.assertEqual(nodes["final_test"]["config"]["evidence_mode"], "pr_merge")
         self.assertEqual(nodes["final_test"]["config"]["response_webhook_url"], "{{ TASKS.final_wait.pending.resumeUrl }}")
         self.assertNotIn("evidence_mode", nodes["fix_test"]["config"])
         merge_cfg = nodes["merge"]["config"]
         self.assertEqual(merge_cfg["evidence_job_id"], "{{ TASKS.final_wait.request.body.job_id }}")
-        self.assertEqual(merge_cfg["test"], "{{ CTX.INPUT.test }}")
+        self.assertEqual(merge_cfg["test"], "{{ CTX.run_input.test }}")
         self.assertIn("WORKFLOW.runId", merge_cfg["run_id"])
 
         outgoing = {}
@@ -7108,8 +7108,8 @@ while True:
         paths = merge_paths("join_start")
         self.assertTrue(paths)
         for path in paths:
-            self.assertTrue({"join_final", "final_view", "final_checkout", "final_wait", "if_final_test"} <= set(path), path)
-        for source, handle in (("final_wait", "timeout"), ("final_wait", "failure"), ("if_final_test", "fail"), ("final_test", "failure")):
+            self.assertTrue({"join_final", "final_view", "final_checkout", "final_wait", "switch_final_test"} <= set(path), path)
+        for source, handle in (("final_wait", "timeout"), ("final_wait", "failure"), ("switch_final_test", "default"), ("final_test", "failure")):
             targets = [e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle]
             self.assertTrue(targets, (source, handle))
             self.assertTrue(all(not reaches(target, "merge") for target in targets), (source, handle, targets))
@@ -10220,22 +10220,26 @@ while True:
         self.assertNotIn("session_identity", nodes["agent"]["config"])
         self.assertNotIn("resume_job_id", nodes["agent"]["config"])
 
-        # One API invocation is one bounded attempt: there is no graph cycle,
-        # same-session correction, or second route/writer that can change effort.
-        outgoing = {}
+        # One route call, reused by every in-run attempt: `route` sits outside
+        # the loop body, not inside it, so effort/profile cannot drift between
+        # slots. Only `switch_needs_fix`'s `case-0` (red) handle reaches `agent`;
+        # a same-session correction or a second route call would show up here.
+        adjacency = {}
         for edge in graph["edges"]:
-            outgoing.setdefault(edge["source"], []).append(edge["target"])
-        seen, pending = set(), ["continue"]
-        while pending:
-            current = pending.pop()
-            if current in seen:
+            adjacency.setdefault(edge["source"], []).append((edge.get("sourceHandle"), edge["target"]))
+        loop_body = set()
+        stack = [target for h, target in adjacency.get("attempts", []) if h == "each"]
+        while stack:
+            current = stack.pop()
+            if current in loop_body or current == "attempts":
                 continue
-            seen.add(current)
-            pending.extend(outgoing.get(current, ()))
-        self.assertTrue({"route", "agent"}.isdisjoint(seen))
+            loop_body.add(current)
+            stack.extend(target for _h, target in adjacency.get(current, []))
+        self.assertNotIn("route", loop_body)
+        self.assertIn("agent", loop_body)
         self.assertEqual(
             {edge["source"] for edge in graph["edges"] if edge["target"] == "route"},
-            {"findings"},
+            {"view"},
         )
 
     def test_implement_slice_preserves_only_normalized_usage_for_workflow_outcomes(self):
@@ -12674,24 +12678,29 @@ func main() {
         self.assertTrue(any(e["source"] == "wait_fix_test" and e["sourceHandle"] == "pending"
                             and e["target"] == "fix_test" for e in edges))
         self.assertTrue(any(e["source"] == "wait_fix_test" and e["sourceHandle"] == "out"
-                            and e["target"] == "if_fix_test" for e in edges))
-        self.assertFalse(any(e["source"] == "fix_test" and e["target"] == "if_fix_test"
+                            and e["target"] == "switch_fix_test" for e in edges))
+        self.assertFalse(any(e["source"] == "fix_test" and e["target"] == "switch_fix_test"
                              for e in edges), "fix_test still feeds the gate directly")
         cfg = nodes["fix_test"]["config"]
         self.assertIn("wait_fix_test", cfg.get("response_webhook_url", ""))
-        rules = nodes["if_fix_test"]["config"]["rules"]
+        rules = nodes["switch_fix_test"]["config"]["cases"][0]["rules"]
         self.assertEqual(rules[0]["path"], "request.body.status")
 
     def test_pr_drive_reads_findings_instead_of_a_human_prompt(self):
         # The agent prompt came from CTX.INPUT.prompt, so driving a PR green
         # started with a person reading the review and writing the brief.
+        # Each in-run attempt re-reads findings itself (iter_findings, fed
+        # straight from the loop's `each` handle) rather than a single
+        # pre-loop node, since a later slot must see what the earlier slot's
+        # push changed.
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        self.assertIn("findings", nodes)
-        self.assertTrue(nodes["findings"]["type"].endswith("/v1/gh/pr/findings"))
-        self.assertTrue(any(e["source"] == "checks" and e["target"] == "findings" for e in edges))
-        self.assertIn("findings", nodes["agent"]["config"]["prompt"])
+        self.assertIn("iter_findings", nodes)
+        self.assertTrue(nodes["iter_findings"]["type"].endswith("/v1/gh/pr/findings"))
+        self.assertTrue(any(e["source"] == "attempts" and e.get("sourceHandle") == "each"
+                            and e["target"] == "iter_findings" for e in edges))
+        self.assertIn("iter_findings", nodes["agent"]["config"]["prompt"])
 
     def test_pr_drive_agent_budget_fits_inside_its_wait(self):
         # The agent node passed no budget, so the writer took
@@ -12766,30 +12775,30 @@ func main() {
         self.assertEqual(rule["value"], "true")
 
     def test_pr_drive_switch_can_actually_match_its_input(self):
-        # Inserting findings in front of switch_checks left its rules reading
-        # data.all_green, which lives on the checks payload and not the findings
-        # one, so every case missed and every PR fell through to pending. The
-        # first version of the test above asserted only that the edge existed,
-        # which the broken graph satisfied. Assert the switch can match instead.
+        # Inserting findings in front of a checks-reading switch once left its
+        # rules reading data.all_green, which lives on the checks payload and
+        # not the findings one, so every case missed and every PR fell through
+        # to pending. Assert the switch can actually match what its feeder
+        # produces, not merely that the edge exists.
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
 
-        feeders = [e["source"] for e in edges if e["target"] == "switch_checks"]
+        feeders = [e["source"] for e in edges if e["target"] == "switch_needs_fix"]
         self.assertEqual(len(feeders), 1, feeders)
         feeder = nodes[feeders[0]]
         self.assertEqual(feeder["type"], "transforms.objectBuilder",
                          "a switch reads its immediate input; snapshot the tasks first")
         produced = {m["output"] for m in feeder["config"]["mappings"]}
-        for case in nodes["switch_checks"]["config"]["cases"]:
+        for case in nodes["switch_needs_fix"]["config"]["cases"]:
             for rule in case["rules"]:
                 self.assertIn(rule["path"], produced,
                               f"case {case['label']} reads {rule['path']}, which "
                               f"{feeders[0]} never produces")
-        # A green PR that is still graded down must reach the fix path, so the
-        # blocking case has to be tested before the green one.
-        labels = [c["label"] for c in nodes["switch_checks"]["config"]["cases"]]
-        self.assertLess(labels.index("blocked_by_findings"), labels.index("green"))
+        # The feeder must read the findings payload the loop just fetched,
+        # not a stale or differently-shaped one.
+        by_output = {m["output"]: m["expression"] for m in feeder["config"]["mappings"]}
+        self.assertEqual(by_output["all_green"], {"kind": "getField", "path": "TASKS.iter_findings.data.all_green"})
 
     def test_implement_slice_rewst_templates_are_path_valid_and_jinja_lite_safe(self):
         graph = json.loads(
@@ -13829,7 +13838,7 @@ func main() {
         drive_nodes = {n["id"]: n for n in drive["spec"]["nodes"]}
         self.assertEqual(
             drive_nodes["route"]["config"]["work_kind"],
-            "{{ CTX.INPUT.work_kind | default('go_coding') }}",
+            "{{ CTX.run_input.work_kind | default('go_coding') }}",
         )
         self.assertIn("work_kind", drive_nodes["form"]["config"]["inputs"])
         mappings = drive_nodes["receipt"]["config"]["mappings"]
@@ -15088,8 +15097,8 @@ func main() {
     # than being charged repeatedly for history that main already accepted.
     _PHASE6_BASE_COMMIT = "b9df7c98bd380756ce7a0b8181aea81df6205ec0"
     _PHASE6_LANDED_COMMIT = "fa3042ee05bf6059dad598fd9d66dfdf4c6fc3c5"
-    _DURABLE_FOUNDATION_BASE_COMMIT = "f452f73ad5d1973419f80b267e1cccf402775d3f"
-    _DURABLE_FOUNDATION_LANDED_COMMIT = "d03b80fdaaea221dd73c7c6781abcf45ddccb6e3"
+    _DURABLE_FOUNDATION_BASE_COMMIT = "d03b80fdaaea221dd73c7c6781abcf45ddccb6e3"
+    _DURABLE_FOUNDATION_LANDED_COMMIT = "f20d3a5815f807398c35df3f11c60383d46d6355"
 
     def _candidate_diff_bytes(self, base, head=None):
         """Measure a reachable candidate range, or None when unmeasurable."""
@@ -16899,7 +16908,7 @@ func main() {
 
         pr_drive = json.loads((root / "graphs" / "pr-drive.json").read_text())
         nodes = {node["id"]: node for node in pr_drive["spec"]["nodes"]}
-        self.assertEqual(nodes["view"]["config"]["number"], "{{ CTX.INPUT.pr_number }}")
+        self.assertEqual(nodes["view"]["config"]["number"], "{{ CTX.run_input.pr_number }}")
         self.assertIn(
             "| `graphwing-pr-status` | `pr` | API-started remote-only classification; "
             "webhook starts remain disabled; performs no named-test "
@@ -17040,7 +17049,7 @@ func main() {
         node_types = [node["type"].lower() for node in graph["spec"]["nodes"]]
         self.assertFalse(any("git/restore" in node_type for node_type in node_types))
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
-        self.assertEqual(edges["e18d"]["target"], "herdr_test_fail")
+        self.assertEqual(edges["e44"]["target"], "herdr_test_fail")
         fail = next(node for node in graph["spec"]["nodes"] if node["id"] == "herdr_test_fail")
         self.assertIn("files kept", fail["label"])
         commit = next(node for node in graph["spec"]["nodes"] if node["id"] == "fix_commit")
@@ -21853,80 +21862,6 @@ class RunControlAdversarialTests(unittest.TestCase):
         self.assertEqual((status, out["authority_loss_reason"]), (200, "launched_run_never_settled"))
 
 
-class PrDriveFlagOffTraversalTests(unittest.TestCase):
-    """Validation step 2: pr-drive's flag-off traversal equals merged main.
-
-    Every node in graphs/pr-drive.json executes when run_control_enabled is
-    unset or false, so the whole published graph is the flag-off traversal.
-    Any gate inserted into the shipped path is itself a difference, which is
-    the regression the blocked wiring commit failed: gating belongs at publish
-    time or in a separate slug, never inside the shipped pr-drive path.
-    """
-
-    _MERGED_MAIN_COMMIT = "f242c90c310ad8c4a7b7fc97e2146fed73f95177"
-
-    @staticmethod
-    def traversal(spec):
-        nodes = {node["id"]: (node["type"], node.get("config", {})) for node in spec["nodes"]}
-        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"], edge.get("targetHandle"))
-                 for edge in spec["edges"]}
-        return nodes, edges
-
-    def merged_main_spec(self):
-        repo = str(Path(server.__file__).resolve().parent)
-        shown = subprocess.run(
-            ["git", "-C", repo, "show", f"{self._MERGED_MAIN_COMMIT}:graphs/pr-drive.json"],
-            capture_output=True,
-        )
-        if shown.returncode != 0:
-            self.skipTest("merged main pr-drive graph is not reachable from this checkout")
-        return json.loads(shown.stdout)["spec"]
-
-    def test_pr_drive_flag_off_traversal_is_identical_to_merged_main(self):
-        current = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())["spec"]
-        main_nodes, main_edges = self.traversal(self.merged_main_spec())
-        nodes, edges = self.traversal(current)
-        self.assertEqual(nodes, main_nodes)
-        self.assertEqual(edges, main_edges)
-        self.assertIn(("wait", "pending", "agent", "in"), edges)
-        self.assertIn(("if_green2", "fail", "continue", "in"), edges)
-        self.assertFalse(any(node_id.startswith("rc_") for node_id in nodes))
-        self.assertNotIn("run_control_enabled", json.dumps(current))
-
-    def test_flag_off_check_catches_the_blocked_inline_gate_shape(self):
-        # The archived wiring routed wait.pending through mode/switch/join
-        # before agent. Rebuild that shape on merged main and prove the
-        # structural comparison rejects it even though the enabled path is
-        # never taken.
-        gated = deepcopy(self.merged_main_spec())
-        main_nodes, main_edges = self.traversal(gated)
-        gated["nodes"] += [
-            {"id": "rc_agent_mode", "type": "transforms.objectBuilder", "config": {
-                "alias": "rc_agent_mode", "version": 1, "mappings": [{
-                    "id": "m1", "output": "enabled",
-                    "expression": {"kind": "getField", "path": "CTX.INPUT.run_control_enabled"},
-                }]}},
-            {"id": "rc_agent_switch", "type": "logic.switch", "config": {
-                "mode": "rules",
-                "cases": [{"label": "enabled", "rules": [{"path": "enabled", "op": "equals", "value": "true"}]}],
-                "default": {"label": "disabled"}}},
-            {"id": "rc_agent_launch_join", "type": "logic.join.any", "config": {"stopOnFirst": True}},
-        ]
-        gated["edges"] = [edge for edge in gated["edges"]
-                          if (edge["source"], edge.get("sourceHandle"), edge["target"]) != ("wait", "pending", "agent")]
-        gated["edges"] += [
-            {"id": "g1", "source": "wait", "sourceHandle": "pending", "target": "rc_agent_mode", "targetHandle": "in"},
-            {"id": "g2", "source": "rc_agent_mode", "sourceHandle": "out", "target": "rc_agent_switch", "targetHandle": "in"},
-            {"id": "g3", "source": "rc_agent_switch", "sourceHandle": "default", "target": "rc_agent_launch_join", "targetHandle": "in"},
-            {"id": "g4", "source": "rc_agent_launch_join", "sourceHandle": "out", "target": "agent", "targetHandle": "in"},
-        ]
-        nodes, edges = self.traversal(gated)
-        self.assertNotEqual(nodes, main_nodes)
-        self.assertNotEqual(edges, main_edges)
-        self.assertNotIn(("wait", "pending", "agent", "in"), edges)
-        self.assertEqual(set(nodes) - set(main_nodes), {"rc_agent_mode", "rc_agent_switch", "rc_agent_launch_join"})
-
-
 class GraphEdgeHandleVocabularyTests(unittest.TestCase):
     """Every edge leaves its node on a handle the platform actually emits.
 
@@ -22384,6 +22319,303 @@ class ClaudeUsageShapeTests(unittest.TestCase):
         broken = server.strict_json_object(self.RESULT)
         broken["usage"]["output_tokens_details"] = {"thinking_tokens": -1}
         self.assertFalse(server._claude_usage_envelope_is_valid(broken["usage"]))
+
+
+class DrivePrScriptTests(unittest.TestCase):
+    """scripts/drive-pr.py's pure functions, exercised without a daemon or a
+    Rewst token. Activation folded the old cross-run kick chain into the
+    graph's own capped loop (graphs/pr-drive.json's `attempts` logic.loop),
+    so the operator script now does exactly two things: initialize once
+    (there is no predecessor run to reserve it) and start pr-drive once.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "drive_pr", Path(server.__file__).parent / "scripts" / "drive-pr.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.module = module
+
+    def test_canonical_json_is_sorted_and_compact(self):
+        m = self.module
+        self.assertEqual(m.canonical_json({"b": 1, "a": 2}), b'{"a":2,"b":1}')
+        self.assertEqual(m.sha256_hex({"b": 1, "a": 2}), hashlib.sha256(b'{"a":2,"b":1}').hexdigest())
+
+    def test_evaluator_contract_sha256_matches_the_schema_on_disk(self):
+        m = self.module
+        openapi_path = Path(server.__file__).parent / "openapi.json"
+        schema = json.loads(openapi_path.read_text())["components"]["schemas"]["RunControlRequest"]
+        expected = hashlib.sha256(
+            json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(m.evaluator_contract_sha256(openapi_path), expected)
+
+    def test_root_workflow_run_id_and_root_identity(self):
+        m = self.module
+        self.assertEqual(m.root_workflow_run_id("3526", "20260902T000000Z"), "rc-3526-20260902T000000Z")
+        identity = m.build_root_identity("wf-1", "wfv-1", "rc-3526-20260902T000000Z")
+        self.assertEqual(identity, {
+            "root_workflow_id": "wf-1",
+            "root_workflow_version_id": "wfv-1",
+            "root_workflow_run_id": "rc-3526-20260902T000000Z",
+            "purpose": "pr_drive",
+        })
+
+    def test_budgets_field_set_and_values(self):
+        m = self.module
+        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
+        self.assertEqual(set(budgets), {"attempts", "turns", "wall_seconds", "tokens", "provider_cost_usd"})
+        self.assertEqual(budgets, {
+            "attempts": 3, "turns": 150, "wall_seconds": 3600, "tokens": 6000000, "provider_cost_usd": "75",
+        })
+
+    def test_resolved_falls_back_only_when_none(self):
+        m = self.module
+        self.assertEqual(m.resolved(None, 3), 3)
+        self.assertEqual(m.resolved(0, 3), 0)
+        self.assertEqual(m.resolved(200, 3), 200)
+
+    def test_initialize_input_field_set(self):
+        m = self.module
+        root_identity = m.build_root_identity("wf-1", "wfv-1", "rc-1-x")
+        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
+        route = {"route_version": "normal-v1", "launcher": "claude", "provider": "anthropic",
+                 "model": "claude-opus-5"}
+        payload = m.build_initialize_input(root_identity, budgets, route, "deadbeef")
+        self.assertEqual(set(payload), {"root_identity", "budgets", "initial_route", "evaluator_contract_sha256"})
+        self.assertEqual(payload["initial_route"], route)
+        self.assertEqual(payload["evaluator_contract_sha256"], "deadbeef")
+
+    def test_pr_drive_input_field_set_and_types(self):
+        # No attempt/max_attempts/kick_url/kick_token: nothing crosses runs
+        # any more, the loop reserves and settles every attempt in-run.
+        m = self.module
+        payload = m.build_pr_drive_input(
+            "riftwing", "3526", "riftwing-local-gates", False, "mechanical", "M",
+            "go_coding", "", "fix: address review findings", "rc1-abc",
+        )
+        self.assertEqual(set(payload), {
+            "repo", "pr_number", "test", "auto_merge", "class", "size", "work_kind",
+            "prompt", "commit_message", "run_control_id",
+        })
+        self.assertEqual(payload["pr_number"], "3526")
+        self.assertEqual(payload["auto_merge"], "false")
+        self.assertEqual(payload["run_control_id"], "rc1-abc")
+        self.assertNotIn("attempt", payload)
+        self.assertNotIn("kick_url", payload)
+        self.assertNotIn("run_control", payload)
+
+    def test_trace_entries_reads_the_nested_shape(self):
+        m = self.module
+        trace = {"data": {"result": {"trace": [
+            {"nodeId": "identity", "output": {"run_control_id": "rc1-abc"}},
+            {"nodeId": "other", "output": {"x": 1}},
+        ]}}}
+        entries = m.trace_entries(trace)
+        self.assertEqual([e["nodeId"] for e in entries], ["identity", "other"])
+
+    def test_trace_entries_falls_back_to_flat_shapes(self):
+        m = self.module
+        self.assertEqual(m.trace_entries({"trace": [{"id": "a"}]}), [{"id": "a"}])
+        self.assertEqual(m.trace_entries({"tasks": [{"id": "a"}]}), [{"id": "a"}])
+        self.assertEqual(m.trace_entries([{"id": "a"}]), [{"id": "a"}])
+        self.assertEqual(m.trace_entries({"nothing": "here"}), [])
+        self.assertEqual(m.trace_entries("garbage"), [])
+
+    def test_summarize_prints_one_line_per_node(self):
+        m = self.module
+        trace = {"data": {"result": {"trace": [
+            {"nodeId": "identity", "status": "completed"},
+            {"nodeId": "route", "status": "failed", "error": "boom"},
+        ]}}}
+        with mock.patch("builtins.print") as mock_print:
+            m.summarize(trace)
+        lines = [call.args[0] for call in mock_print.call_args_list]
+        self.assertTrue(any("identity" in line and "completed" in line for line in lines))
+        self.assertTrue(any("route" in line and "boom" in line for line in lines))
+
+    def test_failed_node_finds_the_first_failure(self):
+        m = self.module
+        trace = {"trace": [
+            {"id": "a", "status": "completed"},
+            {"id": "b", "status": "failed", "error": "boom"},
+            {"id": "c", "status": "failed", "error": "second"},
+        ]}
+        self.assertEqual(m.failed_node(trace), ("b", "boom"))
+        self.assertIsNone(m.failed_node({"trace": [{"id": "a", "status": "completed"}]}))
+
+    def test_worst_case_run_seconds_multiplies_body_waits_by_max_iterations(self):
+        # graphs/pr-drive.json's `attempts` loop caps at 3 iterations; its
+        # body reaches `wait` and `wait_fix_test` (960s each) through the
+        # `each` handle, and the tail reaches `final_wait` (960s) through
+        # `done`. (960+960)*3 + 960 + 300s margin = 7020.
+        m = self.module
+        self.assertEqual(m.worst_case_run_seconds(), 7020)
+
+    def test_load_repos_and_resolve_repo_path(self):
+        m = self.module
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "repos.json").write_text(json.dumps({"riftwing": str(home)}))
+            with mock.patch.object(m.pg, "HOME", home):
+                repos = m.load_repos()
+                self.assertEqual(repos, {"riftwing": str(home)})
+                self.assertEqual(m.resolve_repo_path("riftwing", repos), home)
+                with self.assertRaises(SystemExit):
+                    m.resolve_repo_path("unknown", repos)
+
+    def test_workflow_run_title_matches_servers_pr_and_repo_fallback(self):
+        m = self.module
+        self.assertEqual(m.workflow_run_title("pr-drive", {"pr_number": "3526"}), "pr-drive PR 3526")
+        self.assertEqual(m.workflow_run_title("pr-drive", {"repo": "riftwing"}), "pr-drive riftwing")
+        self.assertEqual(m.workflow_run_title("pr-drive", {}), "pr-drive")
+
+    def test_record_workflow_run_writes_the_servers_jsonl_shape_plus_run_control_id(self):
+        m = self.module
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(m.pg, "HOME", Path(tmp)):
+                m.record_workflow_run({
+                    "workflow": "graphwing-pr-drive",
+                    "status": "completed",
+                    "source": "drive-pr",
+                    "input": {"repo": "riftwing", "pr_number": "3526", "test": "riftwing-local-gates"},
+                    "run_id": "run-1",
+                    "run_control_id": "rc1-abc",
+                    "created_at": "2026-09-02T00:00:00Z",
+                })
+                lines = (Path(tmp) / "workflow-runs.jsonl").read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            row = json.loads(lines[0])
+            self.assertEqual(row["workflow"], "graphwing-pr-drive")
+            self.assertEqual(row["status"], "completed")
+            self.assertEqual(row["source"], "drive-pr")
+            self.assertEqual(row["run_id"], "run-1")
+            self.assertEqual(row["run_control_id"], "rc1-abc")
+            self.assertEqual(row["title"], "graphwing-pr-drive PR 3526")
+
+    def test_argument_parsing_defaults_and_flags(self):
+        m = self.module
+        parser = m.build_arg_parser()
+        args = parser.parse_args(["3526"])
+        self.assertEqual(args.pr, "3526")
+        self.assertEqual(args.repo, "riftwing")
+        self.assertEqual(args.test, "riftwing-local-gates")
+        self.assertEqual(args.work_kind, "go_coding")
+        self.assertFalse(args.auto_merge)
+        self.assertIsNone(args.attempts)
+        self.assertIsNone(args.turns)
+        self.assertIsNone(args.wall_seconds)
+        self.assertIsNone(args.tokens)
+        self.assertIsNone(args.cost)
+        self.assertEqual(args.wait, 0)
+
+        args2 = parser.parse_args([
+            "3526", "--repo", "gw", "--test", "t1", "--work-kind", "typescript_coding", "--auto-merge",
+            "--attempts", "5", "--turns", "10", "--wall-seconds", "20", "--tokens", "30",
+            "--cost", "40", "--wait", "50",
+        ])
+        self.assertEqual(args2.repo, "gw")
+        self.assertEqual(args2.test, "t1")
+        self.assertEqual(args2.work_kind, "typescript_coding")
+        self.assertTrue(args2.auto_merge)
+        self.assertEqual(args2.attempts, 5)
+        self.assertEqual(args2.turns, 10)
+        self.assertEqual(args2.wall_seconds, 20)
+        self.assertEqual(args2.tokens, 30)
+        self.assertEqual(args2.cost, "40")
+        self.assertEqual(args2.wait, 50)
+
+    def test_wait_below_the_graphs_worst_case_is_rejected_by_main(self):
+        # A caller who passes --wait under the loop's own worst case would
+        # have run_slug abandon a still-working run while the Rewst run
+        # itself kept going with nothing watching it. main() must refuse
+        # before starting anything rather than let that happen silently.
+        m = self.module
+        with mock.patch.object(sys, "argv", ["drive-pr.py", "3526", "--wait", "10"]):
+            with mock.patch.object(m, "findings") as mock_findings:
+                rc = m.main()
+        mock_findings.assert_not_called()
+        self.assertEqual(rc, 1)
+
+
+class PrDriveGraphTests(unittest.TestCase):
+    """The shipped pr-drive graph: one capped logic.loop instead of a kick
+    chain. Activation replaced the old cross-run kick topology with this one
+    run, up to three in-graph attempts.
+
+    Riftwing allows no cycles outside logic.loop (E800), requires
+    maxIterations on a loop whose body waits (E812), and forbids body nodes
+    routing back into the loop (E105). Each slot re-checks the PR and does
+    nothing when green; there is no early exit.
+    """
+
+    @staticmethod
+    def load():
+        return json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+
+    def test_loop_is_capped_and_body_never_re_enters_it(self):
+        spec = self.load()["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        loop = nodes["attempts"]
+        self.assertEqual(loop["type"], "logic.loop")
+        self.assertEqual(loop["config"]["maxIterations"], 3)
+        self.assertEqual(loop["config"]["arraySource"], "{{ CTX.attempt_slots.slots }}")
+        self.assertEqual(next(m for m in nodes["attempt_slots"]["config"]["mappings"] if m["output"] == "slots")["expression"], {"kind": "literal", "value": [1, 2, 3]})
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn(("attempts", "each", "iter_findings"), edges)
+        self.assertIn(("attempts", "done", "join_final"), edges)
+        # body reachability from each; nothing in it targets the loop node
+        adjacency = {}
+        for s, h, t in edges:
+            adjacency.setdefault(s, []).append(t)
+        seen, stack = set(), ["iter_findings"]
+        while stack:
+            cur = stack.pop()
+            if cur in seen: continue
+            seen.add(cur); stack.extend(adjacency.get(cur, []))
+        self.assertNotIn("attempts", seen)
+        self.assertNotIn("join_final", seen)
+        self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume", "rc_settle", "rc_reconcile", "fix_push"} <= seen)
+        self.assertEqual(sum(1 for s, h, t in edges if t == "attempts"), 1)
+
+    def test_each_slot_skips_when_green_and_reserves_its_own_attempt(self):
+        spec = self.load()["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        # Inside a loop a logic.filter judges the loop item only (the engine
+        # rebuilds its input from ITEM and LOOP, filter.go
+        # buildFilterEffectiveItem); logic.switch reads the raw payload. Live
+        # run d19ba7d2 skipped every slot on a filter that compared all_green.
+        self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
+        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "all_green", "op": "equals", "value": False}]}])
+        self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
+        self.assertIn(("switch_needs_fix", "case-0", "iter_checkout"), edges)
+        self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))
+        snap = {m["output"]: m["expression"] for m in nodes["iter_snap"]["config"]["mappings"]}
+        self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
+        task = next(m for m in nodes["rc_task_material"]["config"]["mappings"] if m["output"] == "task")["expression"]["properties"]
+        self.assertEqual(task["attempt"], {"kind": "getField", "path": "ITEM"})
+        state = nodes["rc_state"]["config"]["inputMapping"]["values"]
+        self.assertEqual(state["endpoint"], "/v1/agent/run")
+        self.assertEqual(state["exact_request_body_sha256"], "{{ CTX.rc_task_hash.value }}")
+        self.assertEqual(nodes["agent"]["config"]["run_control"], "{{ CTX.rc_continuity.run_control }}")
+        self.assertEqual(nodes["agent"]["config"]["prompt"], "{{ TASKS.iter_findings.data.brief | default(CTX.run_input.prompt) }}")
+        continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
+        self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
+            "run_control_id": "CTX.run_input.run_control_id",
+            "attempt_id": "TASKS.rc_state.result.attempt_identity.attempt_id",
+            "authorization_id": "TASKS.rc_state.result.attempt_identity.authorization_id",
+            "launch_descriptor_sha256": "TASKS.rc_state.result.descriptor_hash.value",
+        })
+        self.assertEqual(nodes["rc_settle"]["config"]["receipt"], "{{ TASKS.wait.request.body }}")
+        self.assertNotIn("kick", json.dumps(spec))
+        self.assertNotIn("/v1/pr/continue", json.dumps(spec))
+        dump = json.dumps(spec)
+        self.assertNotIn("CTX.INPUT.run_control.", dump)
+        self.assertNotIn('"CTX.INPUT.run_control"', dump)
+        self.assertIn("CTX.INPUT.run_control_id", dump)
 
 
 if __name__ == "__main__":
