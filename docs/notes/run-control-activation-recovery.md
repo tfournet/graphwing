@@ -438,11 +438,33 @@ that run. Two more platform rules are pinned locally now:
 `test_lookup_table_entries_are_never_ast` and
 `test_mutation_outcome_reporters_read_the_write_they_report`.
 
+## In-run retries: pr-drive-loop, 2026-09-02
+
+Rewst allows no cycles outside `logic.loop` (E800), requires `maxIterations`
+on a loop whose body waits (E812), and forbids body nodes routing back into
+the loop (E105). Within that, `graphs/pr-drive-loop.json` replaces the kick
+chain with one run: route once, then a three-slot loop whose each pass
+re-reads the PR, skips when green, otherwise reserves an attempt through the
+pinned state and consume children, launches the writer under it, settles from
+the `wait` body, reconciles, tests, commits, and pushes; the shipped final
+tail runs once after `done`. Nothing cross-run remains in it: no kick, no
+webhook input fallback, no carried continuity.
+
+Two engine rules learned on the way, both pinned by lints: a `logic.filter`
+downstream of a loop judges only the loop item (`filter.go
+buildFilterEffectiveItem` rebuilds its input from `ITEM` and `LOOP`), so
+loop-adjacent branching uses `logic.switch`, which reads the raw payload; and
+the loop's each and done handles join the handle vocabulary.
+
+Proof (run 5fcecaed, PR #168, stub codex that edits one file and reports
+ok): three slots, three distinct attempt ids, each consumed, launched,
+settled `terminal_receipt`, reconciled, tested, committed, and pushed; the
+final tail refused the draft PR as designed. The seat-only recipe
+`rc-validation-compile` bound the final test to the validation repo.
+
 ## Next bounded task
 
-The activation decision, which is Tim's: whether `graphwing-pr-drive` becomes
-the run-control sibling (move `graphs/pr-drive-run-control.json` over
-`graphs/pr-drive.json`, retire the `f242c90` flag-off pin deliberately, make
-`scripts/rc-drive-pr.py` the documented start), and whether `go_coding` routes
-to claude while #151 is open. Everything the plan listed before that point is
-merged and proven in the isolated tenant.
+Decide the front door. `pr-drive-loop` makes both the shipped pr-drive and
+the run-control sibling redundant for retries; the cross-run kick path stays
+only if a run must exceed one run's budget. Then the launcher identity work
+(#151) and the MCP build-and-export loop for the catalog.
