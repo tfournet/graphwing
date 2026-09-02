@@ -2445,7 +2445,7 @@ def pr_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         # Run N+1 reads this as CTX.INPUT.run_control. The kick ack below is
         # not a receipt; the attempt outcome does not exist yet.
         payload["run_control"] = continuity
-    hook = post_receipt(kick_url, payload, token=token)
+    hook = post_receipt(kick_url, payload, token=token, hook_secret=token)
     out["kicked"] = bool(hook.get("ok"))
     out["kick"] = hook
     if continuity is not None:
@@ -2536,7 +2536,7 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         payload.update(recovery_values)
         if fresh_primary_receipt not in (None, ""):
             payload["fresh_primary_receipt"] = fresh_primary_receipt
-    hook = post_receipt(kick_url, payload, token=token)
+    hook = post_receipt(kick_url, payload, token=token, hook_secret=token)
     out["kicked"] = bool(hook.get("ok"))
     out["kick"] = hook
     if not out["kicked"]:
@@ -2780,7 +2780,7 @@ RUN_CONTROL_LEDGER_VERSION = "run-control-ledger-v1"
 # A kicked pr-drive run bounds itself by three 960 s webhook waits plus action
 # timeouts, roughly 3,000 s end to end. Loss of an accepted kick is claimable
 # only after twice that, so a slow but live run is never charged twice.
-RUN_CONTROL_KICK_LOSS_GRACE_SECONDS = 7200
+RUN_CONTROL_KICK_LOSS_GRACE_SECONDS = int(os.environ.get("GRAPHWING_RUN_CONTROL_GRACE_SECONDS") or 7200)
 RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
     "receipt_authority_unavailable", "receipt_route_unresolvable",
     "continuation_kick_failed", "kicked_run_never_settled", "launched_run_never_settled",
@@ -3614,9 +3614,6 @@ def run_control_evaluate(body: bytes) -> tuple[int, dict[str, Any]]:
         decision = "terminate"
         classification = "next_envelope_exceeds_remaining_budget"
         retryable = False
-    elif next_is_same and same_model_continuations >= 1:
-        decision = "handoff_cross_model"
-        evidence_codes.add("same_model_continuation_exhausted")
     elif not next_is_same:
         decision = "handoff_cross_model"
     else:
@@ -8546,10 +8543,17 @@ def normalize_receipt(
     return rec
 
 
-def post_receipt(url: str, receipt: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+def post_receipt(
+    url: str, receipt: dict[str, Any], token: str | None = None, *, hook_secret: str | None = None,
+) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Rewst-Token"] = token
+    if hook_secret:
+        # A Rewst webhook trigger authenticates on x-rewst-secret, not on the
+        # callback token header; kicks to kick_url need it or the trigger
+        # answers 401 and every continuation reads as a failed kick.
+        headers["x-rewst-secret"] = hook_secret
     try:
         data = json.dumps(receipt).encode()
     except (RecursionError, MemoryError, TypeError, ValueError, OverflowError):

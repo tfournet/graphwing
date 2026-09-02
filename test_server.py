@@ -6295,7 +6295,7 @@ while True:
     def test_pr_continue_kicks_the_next_attempt(self):
         posted = []
 
-        def fake_post(url, payload, token=None):
+        def fake_post(url, payload, token=None, **kwargs):
             posted.append((url, payload))
             return {"ok": True}
 
@@ -6321,7 +6321,7 @@ while True:
     def _pr_continue_with(self, extra):
         posted = []
 
-        def fake_post(url, payload, token=None):
+        def fake_post(url, payload, token=None, **kwargs):
             posted.append(payload)
             return {"ok": True}
 
@@ -6333,6 +6333,35 @@ while True:
                 "kick_url": "https://app.rewst.ai/api/hooks/x", **extra,
             }).encode(), {"r": str(Path(server.__file__).parent)})
         return status, out, posted
+
+    def test_pr_continue_kicks_with_the_webhook_secret_header(self):
+        # Live run ccf0dd9e: the kick to the real pr-drive webhook was refused
+        # because only X-Rewst-Token was sent; the trigger checks x-rewst-secret.
+        seen = {}
+
+        def fake_post(url, payload, token=None, **kwargs):
+            seen.update({"token": token, **kwargs})
+            return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "RUN_CONTROL_DIR", Path(td)), \
+                mock.patch.object(server, "post_receipt", fake_post):
+            status, out = server.pr_continue(json.dumps({
+                "repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                "kick_url": "https://app.rewst.ai/api/hooks/x", "kick_token": "hook-secret",
+            }).encode(), {"r": str(Path(server.__file__).parent)})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(seen, {"token": "hook-secret", "hook_secret": "hook-secret"})
+        captured = {}
+
+        def capture(req, timeout=15):
+            captured["headers"] = dict(req.headers)
+            raise OSError("no network")
+
+        with mock.patch.object(server, "urlopen", side_effect=capture):
+            server.post_receipt("https://app.rewst.ai/api/hooks/x", {"a": 1}, token="t", hook_secret="s")
+        self.assertEqual(captured["headers"].get("X-rewst-token"), "t")
+        self.assertEqual(captured["headers"].get("X-rewst-secret"), "s")
 
     def test_pr_continue_without_continuity_adds_no_run_control_key(self):
         # Run control is dormant. A request that omits continuity must kick
@@ -21008,7 +21037,7 @@ class RunControlSettlementTests(unittest.TestCase):
     def kick(self, trio=None, *, ok=True, with_trio=True):
         posted = []
 
-        def fake_post(url, payload, token=None):
+        def fake_post(url, payload, token=None, **kwargs):
             posted.append(payload)
             return {"ok": ok}
 
@@ -22165,6 +22194,38 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         downgraded = attempt["properties"]["reconciliation"]["else"]["properties"]
         self.assertEqual(downgraded["receipt_id"], {"kind": "getField", "path": "CTX.INPUT.receipt.receipt_id"})
         self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "CTX.receipt_hash.value"})
+
+    def test_same_model_retries_are_bounded_by_the_attempts_budget_only(self):
+        # Policy decision 2026-09-01: the runaway protection is the attempts
+        # budget, not a forced model switch. pr-drive retries the same route.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-state.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        allowed = next(m for m in nodes["decision_check"]["config"]["mappings"] if m["output"] == "reservation_allowed")
+        self.assertNotIn("same_model_continuation_used", json.dumps(allowed["expression"]))
+        route = {"route_version": "normal-v1", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}
+        envelope = {"turns": 50, "wall_seconds": 600, "tokens": 2000000, "provider_cost_usd": "25"}
+        def attempt(seq):
+            return {"sequence": seq, "attempt_id": "att1-" + f"{seq:x}" * 64, **route,
+                    "usage": {"turns": 5, "wall_seconds": 60, "tokens": 1000, "provider_cost_usd": "1"},
+                    "reservation": {"attempt_id": "att1-" + f"{seq:x}" * 64, **envelope},
+                    "terminal_state": "terminal",
+                    "progress": {"checkpoint": 0, "failing_regression_present": True, "production_diff_bytes": 0,
+                                 "focused_tests_green": False, "diff_fingerprint": f"{seq:x}" * 64},
+                    "constraint_signals": [], "verified_outcome": False}
+        status, out = server.run_control_evaluate(json.dumps({
+            "run_id": "rc1-" + "a" * 64, "route": route,
+            "budgets": {"attempts": 5, "turns": 1000, "wall_seconds": 36000, "tokens": 100000000, "provider_cost_usd": "500"},
+            "attempts": [attempt(1), attempt(2)], "next_attempt": 3, "next_route": route,
+            "next_envelope": {"attempt_id": "att1-" + "3" * 64, **envelope},
+        }).encode())
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["decision"], "continue_same_model")
+        self.assertEqual(out["same_model_continuations_used"], 1)
+        self.assertNotIn("same_model_continuation_exhausted", out["evidence_codes"])
+
+    def test_kick_loss_grace_defaults_to_two_hours(self):
+        # GRAPHWING_RUN_CONTROL_GRACE_SECONDS exists for validation runs only.
+        self.assertEqual(server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS, 7200)
 
     def test_no_filter_is_fed_by_another_filter(self):
         # A filter's output is its own verdict object ({input, passed, result,

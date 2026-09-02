@@ -273,28 +273,52 @@ a missing path (a systemd drop-in, since removed), so no provider ran:
   refused; the kick fingerprint the daemon recorded equals the one the
   reservation was made with.
 
-Not exercised live: the grace-window timer path (unit-tested; a live proof
-needs a two-hour wait) and the continue leg inside the sibling, which needs a
-real writer to reach `if_green2`. The evaluator's policy allows one same-model
-continuation per run; attempt 1 consumes it, so attempt 2 must hand off to
-another model. That is policy, worth a look before real-provider runs.
+Policy decision, 2026-09-01: same-model retries are bounded by the attempts
+budget, not by a forced model switch. The evaluator no longer emits
+`same_model_continuation_exhausted` (the code stays in the vocabulary) and the
+state graph's reservation gate no longer requires
+`same_model_continuation_used == false`; the flag is still tracked.
+`GRAPHWING_RUN_CONTROL_GRACE_SECONDS` overrides the two-hour loss grace for
+validation runs only; the default is pinned by a test.
+
+## Retry leg and timer path, simulated 2026-09-01
+
+With the same-model limit relaxed, a stub codex (edits one tracked file,
+prints `thread.started` and an `agent_message` with `status: ok`, no model)
+drove `graphwing-pr-drive-run-control` through its retry leg in one run
+(lifecycle b4, run 75c89e0f): writer receipt ok → settle → in-run reconcile
+(revision 3) → named test → commit → push → checks still red → kick
+fingerprint → `would_kick` gate → reserve attempt 2 on the same route →
+consume → kick to a failing URL → daemon `continuation_kick_failed` →
+reconcile (revision 6) → budget stop. The daemon's recorded kick fingerprint
+equals the one the reservation was made with.
+
+The timer path ran against the real pr-drive webhook with
+`GRAPHWING_RUN_CONTROL_GRACE_SECONDS=120` (lifecycle b7, run 2bb816c3): the
+kick was accepted, the kicked webhook run started and died at `ghPrView`
+(webhook runs still create no `CTX.INPUT`), authority loss was refused inside
+the window (`kick_within_grace`), and after it the daemon returned
+`kicked_run_never_settled` and reconcile committed revision 6.
+
+Two more findings on the way:
+
+11. **Kick header.** `pr_continue` and `slice_continue` posted kicks with only
+    the callback token header; a Rewst webhook trigger checks
+    `x-rewst-secret`, so every real kick was refused. Kicks now send the kick
+    token under both headers (run ccf0dd9e).
+12. **Seat named tests.** Named tests run in the daemon's home, where only
+    `server.py`, `test_server.py`, and `setup_tunnel.py` exist;
+    `graphwing-compile` fails there on `install.py`. `graphwing-seat-compile`
+    compiles what the seat actually has. Writer commits also need a git
+    identity in the allowlisted checkout, because the daemon's `HOME` carries
+    none.
 
 ## Next bounded task
 
-Land the branch within the 258,048-byte review maximum. The tree is 528 KB
-against `f242c90` because touching a single-line foundation graph costs its
-whole size twice, so it goes in order, bumping
-`_DURABLE_FOUNDATION_LANDED_COMMIT` after each merge:
-
-1. `cbea2da..c364030` (settlement, flag-off test, launch binding): 82 KB.
-2. `e00179d` (fingerprint op, sibling graph, publish registration): 95 KB.
-3. transition, consume-authorization, initialize, consume graph fixes: 187 KB.
-4. reconcile and state graph fixes: 148 KB.
-5. daemon authorization-id derivation, sibling child budgets, the lint tests,
-   docs: about 130 KB. The lints land last because they require every graph
-   fixed.
-
-Then: prove the continue leg inside the sibling with a real writer against a
-red PR (needs a provider), prove the grace-window timer path live, review the
-one-same-model-continuation policy before real-provider runs, and fix #141 in
-the shipped implement-slice graph with its own tenant proof.
+Step 5: a real provider in the isolated tenant. Everything before it is proven
+with the stub, so the first real run only adds the model. Start a fresh
+lifecycle against a red PR with `kick_url` set to the pr-drive webhook and a
+real kick token, and watch two runs chain. Then fix #141 in the shipped
+implement-slice graph with its own tenant proof, and decide whether webhook
+starts should populate `CTX.INPUT` (the kicked run still dies at `ghPrView`;
+the run-control accounting around it is what this work proved).
