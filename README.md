@@ -110,3 +110,5 @@ python3 scripts/publish_graphs.py --only all --no-run
 ```
 
 Do not install this on Rewst Internal. Do not ship it as a Rewst platform package.
+
+loop proof stub edit 2026-09-02T19:17:25Z
