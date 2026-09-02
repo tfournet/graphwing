@@ -153,15 +153,31 @@ separate runtime step.
 python3 scripts/drive-pr.py 3526 --message "fix: address review findings [SC-110507]"
 ```
 
-It starts the run through `POST /workflows/{slug}/run` and then prints the node trace,
-which is the only per-node visibility available; the run status endpoint returns nothing
-but `completed`.
+Every attempt is run-control reservation-backed, and there is no predecessor run to
+reserve the first one, so the script does two things: it calls
+`graphwing-run-control-initialize` for a fresh `run_control_id`, then starts
+`graphwing-pr-drive` with it. One Graph run now carries up to three in-run attempts:
+a capped `logic.loop` reserves, launches, settles, and reconciles each attempt slot
+itself, re-reading the PR every pass and doing nothing once it is green. There is no
+outer Python-level retry loop or cross-run kick chain any more; `--wait` defaults to
+the loop's own worst case (`worst_case_run_seconds`, derived from the graph's wait
+timeouts and `maxIterations`, not guessed), and refuses a smaller value rather than
+abandon a run that is still working. The script prints each run's node trace, which is
+the only per-node visibility available; the run status endpoint returns nothing but
+`completed`.
+
+One gap this does not close: between one slot's push and the next slot's findings
+read, nothing waits for the external reviewer to react to the new commit, so a slot can
+read a still-stale blocking finding right after a push. The script still runs its own
+pre-run audit-settle check before starting the graph at all.
 
 **Do not fire this workflow by webhook.** A webhook-triggered run never creates
-`CTX.INPUT` at all, so every `{{ CTX.INPUT.* }}` in the graph resolves empty and the run
-dies at `ghPrView` with no `number` on the query string. Nothing reports it: `repo` still
-arrives, because `openapi.json` declares a default of `riftwing` for that parameter, so
-the request looks half-correct. `fire-pr-drive.sh` posts to the webhook and cannot work.
+`CTX.INPUT` at all, so `run_input` (which reads every field from `{{ CTX.INPUT.* }}`
+once at the top of the graph) resolves empty and every downstream `{{ CTX.run_input.* }}`
+does too; the run dies at `ghPrView` with no `number` on the query string. Nothing
+reports it: `repo` still arrives, because `openapi.json` declares a default of
+`riftwing` for that parameter, so the request looks half-correct. `fire-pr-drive.sh`
+posts to the webhook and cannot work.
 
 `run_slug` wraps the body as `{"input": {...}}`. A bare payload arrives as a manual
 trigger with `body: {}` and fails the same silent way.
@@ -170,14 +186,10 @@ trigger with `body: {}` and fails the same silent way.
 that reaches the commit has already spent a full writer session. The graph defaults it
 too, so a caller that forgets loses nothing.
 
-`kick_url` is generic catalog wiring for a fresh-run webhook, not a working attempt
-loop. Under the recorded current mapping that webhook cannot create `CTX.INPUT`, so it
-cannot continue `pr-drive`. One `/run` invocation is one bounded fix attempt;
-`scripts/drive-pr.py` owns a multi-attempt loop by issuing fresh API runs.
-
-The writer's prompt is not yours to write. A `findings` node reads the reviewers'
-`engineering-findings-json`, dedupes by fingerprint (two reviewers raising one defect
-is one fix), orders by severity, and hands over the remedies without the argument.
+The writer's prompt is not yours to write. Each attempt slot's `iter_findings` node
+reads the reviewers' `engineering-findings-json`, dedupes by fingerprint (two reviewers
+raising one defect is one fix), orders by severity, and hands over the remedies without
+the argument.
 
 Two node-output traps worth knowing before editing this graph. `action.graphwing` results
 are exposed as `TASKS.<node>.data.<field>`, while a `transforms.objectBuilder` publishes
