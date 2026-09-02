@@ -28,6 +28,26 @@ os.environ["GRAPHWING_HERDR"] = "0"
 import server  # noqa: E402
 
 
+def _lookup_view(node):
+    """Read an objectBuilder conditional chain as the lookup table it replaced.
+
+    Riftwing's transforms.lookupTable returns a matched entry value verbatim
+    (rewst-go/services/worker/nodes/lookup_table.go), so AST-valued entries
+    became conditional chains. This view keeps the old pins meaningful.
+    """
+    mapping, = node["config"]["mappings"]
+    expression = mapping["expression"]
+    entries, inputs = [], set()
+    while expression["kind"] == "conditional":
+        condition = expression["condition"]
+        inputs.add(json.dumps(condition["left"], sort_keys=True))
+        entries.append({"key": condition["right"]["value"], "value": expression["then"]})
+        expression = expression["else"]
+    assert mapping["output"] == "result" and len(inputs) == 1, node["id"]
+    return {"alias": node["config"]["alias"], "input": json.loads(inputs.pop()), "entries": entries,
+            "defaultValue": expression, "caseSensitive": True}
+
+
 def _fixture_execution_profile(
     launcher, provider, model, binary=None, requested="default", source="launcher_default"
 ):
@@ -9978,8 +9998,8 @@ while True:
                 with self.subTest(walk_id=walk_id):
                     config = nodes[walk_id]["config"]
                     self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.result.fresh_primary_receipt }}}}")
-                    self.assertEqual(nodes[alias]["type"], "transforms.lookupTable")
-                    fresh = nodes[alias]["config"]["entries"][0]["value"]["properties"]["fresh_primary_receipt"]
+                    self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
+                    fresh = _lookup_view(nodes[alias])["entries"][0]["value"]["properties"]["fresh_primary_receipt"]
                     self.assertEqual(fresh, {"kind": "literal", "value": ""})
                     with mock.patch.object(server, "JOBS_DIR", jobs):
                         next_status, retained = server.derive_slice_recovery_route(
@@ -10143,18 +10163,18 @@ while True:
             nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.route.data",
         )
-        self.assertEqual(nodes["selected_route"]["type"], "transforms.lookupTable")
+        self.assertEqual(nodes["selected_route"]["type"], "transforms.objectBuilder")
         self.assertEqual(
-            nodes["selected_route_pick"]["config"]["defaultValue"],
+            _lookup_view(nodes["selected_route_pick"])["defaultValue"],
             {"kind": "getField", "path": "CTX.normal_primary_candidate.route"},
         )
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
             "TASKS.fallback_route.data",
         )
-        self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.lookupTable")
+        self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
         self.assertEqual(
-            nodes["fallback_route_choice_pick"]["config"]["defaultValue"],
+            _lookup_view(nodes["fallback_route_choice_pick"])["defaultValue"],
             {"kind": "getField", "path": "CTX.recovery_selection.route"},
         )
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
@@ -13014,16 +13034,16 @@ func main() {
         self.assertEqual(
             {node_id: nodes[node_id]["type"] for node_id in replaced},
             {
-                "fallback_route_choice": "transforms.lookupTable",
-                "selected_route": "transforms.lookupTable",
-                "walk_recovery_input": "transforms.lookupTable",
-                "walk_e2e_recovery_input": "transforms.lookupTable",
-                "active_route": "transforms.lookupTable",
+                "fallback_route_choice": "transforms.objectBuilder",
+                "selected_route": "transforms.objectBuilder",
+                "walk_recovery_input": "transforms.objectBuilder",
+                "walk_e2e_recovery_input": "transforms.objectBuilder",
+                "active_route": "transforms.objectBuilder",
             },
         )
         self.assertEqual(
             {node_id: nodes[node_id]["type"] for node_id in helpers},
-            {node_id: "transforms.lookupTable" for node_id in helpers},
+            {node_id: "transforms.objectBuilder" for node_id in helpers},
         )
         replacement_dump = json.dumps([nodes[node_id] for node_id in sorted(replaced | helpers)])
         self.assertNotIn("transforms.codeExpression", replacement_dump)
@@ -13031,7 +13051,7 @@ func main() {
         self.assertNotRegex(replacement_dump, r"{[%{].*(?:default|tojson|set|if)")
 
         self.assertEqual(
-            nodes["selected_route_pick"]["config"],
+            _lookup_view(nodes["selected_route_pick"]),
             {
                 "alias": "selected_route_pick",
                 "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
@@ -13046,7 +13066,7 @@ func main() {
             },
         )
         self.assertEqual(
-            nodes["fallback_route_choice_pick"]["config"],
+            _lookup_view(nodes["fallback_route_choice_pick"]),
             {
                 "alias": "fallback_route_choice_pick",
                 "input": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route.route_version"},
@@ -13061,7 +13081,7 @@ func main() {
             },
         )
         self.assertEqual(
-            nodes["active_route_pick"]["config"],
+            _lookup_view(nodes["active_route_pick"]),
             {
                 "alias": "active_route_pick",
                 "input": {"kind": "getField", "path": "CTX.fallback_receipt.route.route_version"},
@@ -13076,7 +13096,7 @@ func main() {
             },
         )
         self.assertEqual(
-            nodes["continuation_primary_pick"]["config"],
+            _lookup_view(nodes["continuation_primary_pick"]),
             {
                 "alias": "continuation_primary_pick",
                 "input": {"kind": "getField", "path": "CTX.receipt.route.route_version"},
@@ -13140,6 +13160,11 @@ func main() {
                     key: evaluate(value, context)
                     for key, value in expression["properties"].items()
                 }
+            if expression["kind"] == "binary" and expression["operator"] == "==":
+                return evaluate(expression["left"], context) == evaluate(expression["right"], context)
+            if expression["kind"] == "conditional":
+                branch = "then" if evaluate(expression["condition"], context) else "else"
+                return evaluate(expression[branch], context)
             self.fail(f"unsupported graph-projection AST: {expression}")
 
         def run_node(node_id, context):
@@ -13192,20 +13217,20 @@ func main() {
             }
 
             run_node("selected_route_pick", context)
-            self.assertEqual(run_node("selected_route", context), primary)
+            self.assertEqual(run_node("selected_route", context)["result"], primary)
             receipt = run_node("record", context)
             self.assertEqual(receipt["route"], primary)
             run_node("fallback_route_choice_pick", context)
-            self.assertEqual(run_node("fallback_route_choice", context), fallback)
+            self.assertEqual(run_node("fallback_route_choice", context)["result"], fallback)
             fallback_receipt = run_node("record_fallback", context)
             self.assertEqual(fallback_receipt["route"], fallback)
             run_node("active_route_pick", context)
-            self.assertEqual(run_node("active_route", context), fallback)
+            self.assertEqual(run_node("active_route", context)["result"], fallback)
             run_node("continuation_primary_pick", context)
 
             projected = []
             for walk_node in ("walk_recovery_input", "walk_e2e_recovery_input"):
-                recovery = run_node(walk_node, context)
+                recovery = run_node(walk_node, context)["result"]
                 self.assertEqual(recovery["prior_primary_route"], primary)
                 self.assertEqual(recovery["prior_primary_receipt"]["route"], primary)
                 self.assertEqual(recovery["prior_fallback_route"], fallback)
@@ -13406,13 +13431,13 @@ func main() {
             config = nodes[walk_id]["config"]
             for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt", "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
                 self.assertEqual(config[field], f"{{{{ CTX.{alias}.result.{field} }}}}")
-            picker = nodes[alias]
-            self.assertEqual(picker["type"], "transforms.lookupTable")
-            self.assertEqual(picker["config"]["input"], {
+            picker = _lookup_view(nodes[alias])
+            self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
+            self.assertEqual(picker["input"], {
                 "kind": "getField", "path": "CTX.fallback_receipt.status",
             })
-            self.assertEqual(picker["config"]["entries"][0]["key"], "ok")
-            props = picker["config"]["entries"][0]["value"]["properties"]
+            self.assertEqual(picker["entries"][0]["key"], "ok")
+            props = picker["entries"][0]["value"]["properties"]
             self.assertEqual(props["recovery_version"], {
                 "kind": "literal", "value": "provider-recovery-v1",
             })
@@ -20827,7 +20852,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "1e059e55b325a449fc33c378989c5533215b35fa1cebd7283ba48022d4d27874")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "3681bb572d32726482ac2fec15f04a9cfd163057170d1b5f85d57d36f8deb66d")
 
 
 class InstallTests(unittest.TestCase):
@@ -22396,6 +22421,22 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
             self.assertNotIn("terminal_status", json.dumps(cond))
         reason = next(m for m in nodes["reconcile_mode"]["config"]["mappings"] if m["output"] == "authority_loss_reason")["expression"]
         self.assertEqual(reason["else"]["then"], {"kind": "literal", "value": None})
+
+    def test_lookup_table_entries_are_never_ast(self):
+        # Riftwing's transforms.lookupTable evaluates input and defaultValue as
+        # AST but returns a matched entry value verbatim
+        # (rewst-go/services/worker/nodes/lookup_table.go). Live run cf127daf:
+        # implement-slice's selected_route emitted a raw getField object and
+        # the agent node was refused with "launcher is required" (#163).
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
+            spec = json.loads(path.read_text())["spec"]
+            for node in spec["nodes"]:
+                if node["type"] != "transforms.lookupTable":
+                    continue
+                for entry in node["config"].get("entries", []):
+                    with self.subTest(graph=path.name, node=node["id"], key=entry.get("key")):
+                        value = entry.get("value")
+                        self.assertFalse(isinstance(value, dict) and "kind" in value, value)
 
     def test_no_filter_is_fed_by_another_filter(self):
         # A filter's output is its own verdict object ({input, passed, result,
