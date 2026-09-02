@@ -952,7 +952,7 @@
         "summary": "Classify complete fixed-decimal receipt usage against its reservation",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["usage", "envelope"], "properties": {"usage": {"$ref": "#/components/schemas/RunControlUsage"}, "envelope": {"$ref": "#/components/schemas/RunControlUsage"}}}}}},
         "responses": {
-          "200": {"description": "closed usage classification", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["version", "valid", "reason"], "properties": {"version": {"type": "string", "const": "run-control-receipt-validation-v1"}, "valid": {"type": "boolean"}, "reason": {"type": ["string", "null"], "enum": ["unknown_or_oversized_usage", null]}}}}}},
+          "200": {"description": "closed usage classification", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["version", "valid", "reason", "filled"], "properties": {"version": {"type": "string", "const": "run-control-receipt-validation-v1"}, "valid": {"type": "boolean"}, "reason": {"type": ["string", "null"], "enum": ["unknown_or_oversized_usage", null]}, "filled": {"type": "array", "items": {"type": "string", "enum": ["turns", "provider_cost_usd"]}, "description": "Dimensions the receipt did not report and which reconcile charges at the reserved envelope value."}}}}}},
           "400": {"$ref": "#/components/responses/BadRequest"}
         }
       }

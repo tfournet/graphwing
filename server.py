@@ -3276,18 +3276,32 @@ def run_control_validate_receipt(body: bytes) -> tuple[int, dict[str, Any]]:
     usage, envelope = data.get("usage"), data.get("envelope")
     valid = valid and all(isinstance(value, dict) and set(value) == RUN_CONTROL_USAGE_FIELDS
                           for value in (usage, envelope))
+    filled: list[str] = []
     if valid:
         assert isinstance(usage, dict) and isinstance(envelope, dict)
+        # Adapters report wall time and tokens for every launcher but pass no
+        # provider-authored turn count, and cost only when the provider states
+        # it. An unreported turns or cost dimension is charged at its reserved
+        # envelope value rather than voiding the receipt (step 5, run 6ea9ae53).
         limits = {"turns": 10000, "wall_seconds": 86400, "tokens": 1_000_000_000}
         for field, maximum in limits.items():
-            actual = _run_control_uint(usage.get(field), maximum)
             reserved = _run_control_uint(envelope.get(field), maximum)
+            if field == "turns" and usage.get(field) is None:
+                valid = valid and reserved is not None
+                filled.append(field)
+                continue
+            actual = _run_control_uint(usage.get(field), maximum)
             valid = valid and actual is not None and reserved is not None and actual <= reserved
-        actual_cost = _run_control_cost(usage.get("provider_cost_usd"))
         reserved_cost = _run_control_cost(envelope.get("provider_cost_usd"))
-        valid = valid and actual_cost is not None and reserved_cost is not None and actual_cost <= reserved_cost
+        if usage.get("provider_cost_usd") is None:
+            valid = valid and reserved_cost is not None
+            filled.append("provider_cost_usd")
+        else:
+            actual_cost = _run_control_cost(usage.get("provider_cost_usd"))
+            valid = valid and actual_cost is not None and reserved_cost is not None and actual_cost <= reserved_cost
     return 200, {"version": "run-control-receipt-validation-v1", "valid": bool(valid),
-                 "reason": None if valid else "unknown_or_oversized_usage"}
+                 "reason": None if valid else "unknown_or_oversized_usage",
+                 "filled": sorted(filled) if valid else []}
 
 
 def _run_control_checkpoint(attempt: dict[str, Any]) -> tuple[int, bool]:

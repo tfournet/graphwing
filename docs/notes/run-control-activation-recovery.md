@@ -344,19 +344,23 @@ Results (lifecycles c4 and c5, runs aedd2ddd and 6ea9ae53): a real
 claude-opus-5 writer under a reservation read the blocking finding, deleted the
 bad file, passed the named test, and the daemon committed and pushed; PR #150's
 CI went green on that commit. On c5 settle carried real usage: 92,137 tokens,
-12 s, USD 0.248882. Reconcile still charged the full envelope because `turns`
-is null: `_normalize_native_usage` passes no turn count for any launcher by
-design ("no adapter trusts provider-authored turn counts"), while the reconcile
-contract requires all four aggregates. That is a policy contradiction, not a
-bug in either half. Recommended: charge the envelope only for the dimensions a
-receipt lacks (turns here), keep the real tokens, wall time, and cost, or have
-adapters count turns from their own event streams. Decide before real runs are
-billed.
+12 s, USD 0.248882. Reconcile then charged the full envelope because `turns` was null:
+`_normalize_native_usage` passes no turn count for any launcher by design and
+the reconcile contract required all four aggregates.
+
+Decision (Phase 1 of the remaining-work plan): keep the adapters honest and
+charge only what a receipt lacks. `usage_check.complete` needs wall time and
+tokens, the dimensions every adapter reports; a new `usage_fill` node takes
+each dimension from the receipt when reported and from the reservation
+envelope otherwise; `charged_usage` and the evaluator evidence use the filled
+numbers, and `reconciliation.filled` records which dimensions were charged at
+the envelope. `/v1/run/control/validate-receipt` accepts unreported turns and
+cost and returns `filled`. The evaluator is unchanged and never sees nulls.
 
 ## Next bounded task
 
-Resolve the turns policy above (reconcile graph `usage_check` and
-`attempt_entry.charged_usage`, plus `run_control_validate_receipt`), then run
-one more real claude lifecycle and confirm `kind: terminal_receipt` with
-partial-envelope charging. Then #151 for codex, #141 for implement-slice, and
-the webhook `CTX.INPUT` gap so a kicked run can actually continue.
+Prove Phase 1 live: one real claude lifecycle must reconcile as
+`kind: terminal_receipt` with `charged_usage` carrying real tokens, wall time,
+and cost and envelope-filled turns. Then Phase 2 (kicked runs read
+`CTX.TRIGGER.webhook.body` through a `run_input` node), Phase 3 (operator
+script), #141, and the #151 spike, per the remaining-work plan.

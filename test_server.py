@@ -22231,6 +22231,80 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         # GRAPHWING_RUN_CONTROL_GRACE_SECONDS exists for validation runs only.
         self.assertEqual(server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS, 7200)
 
+    def test_reconcile_charges_only_the_dimensions_a_receipt_lacks(self):
+        # Step 5 (run 6ea9ae53): a real receipt with tokens, wall time, and
+        # cost was charged its whole envelope because turns was null. Now
+        # completeness needs only what every adapter reports, and an
+        # unreported turns or cost is charged at the reserved value.
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-reconcile.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        complete = next(m for m in nodes["usage_check"]["config"]["mappings"] if m["output"] == "complete")["expression"]
+        self.assertNotIn("usage.turns", json.dumps(complete))
+        self.assertNotIn("provider_cost_usd", json.dumps(complete))
+        self.assertIn(("reconcile_mode", "out", "usage_fill"), edges)
+        self.assertIn(("usage_fill", "out", "operation_material"), edges)
+        self.assertNotIn(("reconcile_mode", "out", "operation_material"), edges)
+        fill = {m["output"]: m["expression"] for m in nodes["usage_fill"]["config"]["mappings"]}
+        for dim in ("turns", "wall_seconds", "tokens", "provider_cost_usd"):
+            expr = fill[dim]
+            self.assertEqual(expr["kind"], "conditional")
+            self.assertEqual(expr["then"], {"kind": "getField", "path": f"CTX.INPUT.receipt.usage.{dim}"})
+            self.assertEqual(expr["else"], {"kind": "getField", "path": f"TASKS.load_state.data.outstanding_reservation.envelope.{dim}"})
+        attempt = next(m for m in nodes["attempt_entry"]["config"]["mappings"] if m["output"] == "attempt")["expression"]["properties"]
+        self.assertEqual(attempt["charged_usage"]["properties"]["turns"], {"kind": "getField", "path": "CTX.usage_fill.turns"})
+        self.assertIn("filled", attempt["reconciliation"]["then"]["properties"])
+        evidence = next(m for m in nodes["attempt_entry"]["config"]["mappings"] if m["output"] == "evaluator_evidence")["expression"]["properties"]
+        self.assertEqual(evidence["usage"]["then"]["properties"]["provider_cost_usd"], {"kind": "getField", "path": "CTX.usage_fill.provider_cost_usd"})
+
+    def test_validate_receipt_charges_unreported_turns_and_cost_at_the_envelope(self):
+        envelope = {"turns": 50, "wall_seconds": 600, "tokens": 2000000, "provider_cost_usd": "25"}
+
+        def check(usage):
+            status, out = server.run_control_validate_receipt(json.dumps({"usage": usage, "envelope": envelope}).encode())
+            self.assertEqual(status, 200, out)
+            return out
+
+        real = check({"turns": None, "wall_seconds": 12, "tokens": 92137, "provider_cost_usd": "0.248882"})
+        self.assertEqual((real["valid"], real["filled"], real["reason"]), (True, ["turns"], None))
+        both = check({"turns": None, "wall_seconds": 12, "tokens": 92137, "provider_cost_usd": None})
+        self.assertEqual((both["valid"], both["filled"]), (True, ["provider_cost_usd", "turns"]))
+        full = check({"turns": 4, "wall_seconds": 12, "tokens": 170, "provider_cost_usd": "0.0125"})
+        self.assertEqual((full["valid"], full["filled"]), (True, []))
+        for label, usage in (
+            ("no wall", {"turns": None, "wall_seconds": None, "tokens": 1, "provider_cost_usd": None}),
+            ("no tokens", {"turns": None, "wall_seconds": 1, "tokens": None, "provider_cost_usd": None}),
+            ("tokens over", {"turns": None, "wall_seconds": 1, "tokens": 2000001, "provider_cost_usd": None}),
+            ("cost over", {"turns": None, "wall_seconds": 1, "tokens": 1, "provider_cost_usd": "25.000001"}),
+            ("turns over", {"turns": 51, "wall_seconds": 1, "tokens": 1, "provider_cost_usd": None}),
+        ):
+            with self.subTest(label):
+                out = check(usage)
+                self.assertEqual((out["valid"], out["filled"]), (False, []))
+
+    def test_evaluator_continues_on_envelope_filled_turns(self):
+        # The evaluator never sees nulls: reconcile hands it the filled
+        # numbers, so history with reserved-turn charges stays complete.
+        route = {"route_version": "normal-v1", "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5"}
+        envelope = {"turns": 50, "wall_seconds": 660, "tokens": 2000000, "provider_cost_usd": "25"}
+        attempt = {"sequence": 1, "attempt_id": "att1-" + "1" * 64, **route,
+                   "usage": {"turns": 50, "wall_seconds": 12, "tokens": 92137, "provider_cost_usd": "0.248882"},
+                   "reservation": {"attempt_id": "att1-" + "1" * 64, **envelope}, "terminal_state": "terminal",
+                   "progress": {"checkpoint": 0, "failing_regression_present": True, "production_diff_bytes": 0,
+                                "focused_tests_green": False, "diff_fingerprint": "1" * 64},
+                   "constraint_signals": [], "verified_outcome": False}
+        status, out = server.run_control_evaluate(json.dumps({
+            "run_id": "rc1-" + "a" * 64, "route": route,
+            "budgets": {"attempts": 3, "turns": 150, "wall_seconds": 3600, "tokens": 6000000, "provider_cost_usd": "75"},
+            "attempts": [attempt], "next_attempt": 2, "next_route": route,
+            "next_envelope": {"attempt_id": "att1-" + "2" * 64, **envelope},
+        }).encode())
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["decision"], "continue_same_model")
+        self.assertEqual(out["aggregate"]["turns"], 50)
+        self.assertEqual(out["aggregate"]["provider_cost_usd"], "0.248882")
+        self.assertNotIn("turns_unknown", out["evidence_codes"])
+
     def test_no_filter_is_fed_by_another_filter(self):
         # A filter's output is its own verdict object ({input, passed, result,
         # ruleCount}), never the payload it judged. Live consume run 488f13fa
