@@ -21918,7 +21918,18 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         base_nodes = {n["id"]: n for n in base["spec"]["nodes"]}
         nodes = {n["id"]: n for n in enabled["spec"]["nodes"]}
         rc = {node_id for node_id in nodes if node_id.startswith("rc_")}
-        self.assertEqual(set(nodes) - rc, set(base_nodes))
+        self.assertEqual(set(nodes) - rc - {"run_input"}, set(base_nodes))
+        # Every template that read CTX.INPUT now reads CTX.run_input, which
+        # run_input fills from CTX.INPUT on an API start and from the webhook
+        # body on a kick. Compare configs with that one rewrite undone.
+        def undo_run_input(value):
+            if isinstance(value, str):
+                return value.replace("CTX.run_input.", "CTX.INPUT.")
+            if isinstance(value, list):
+                return [undo_run_input(v) for v in value]
+            if isinstance(value, dict):
+                return {k: undo_run_input(v) for k, v in value.items()}
+            return value
         expected_deltas = {
             "agent": {**base_nodes["agent"]["config"], "run_control": "{{ CTX.INPUT.run_control }}"},
             "continue": {**base_nodes["continue"]["config"], "run_control": "{{ CTX.rc_continuity.run_control }}"},
@@ -21928,9 +21939,11 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         for node_id, node in base_nodes.items():
             with self.subTest(node=node_id):
                 self.assertEqual(nodes[node_id]["type"], node["type"])
-                self.assertEqual(nodes[node_id]["config"], expected_deltas.get(node_id, node["config"]))
-        removed = {("wait", "out", "receipt"), ("if_green2", "fail", "continue"), ("continue", "failure", "join_continue")}
+                self.assertEqual(undo_run_input(nodes[node_id]["config"]), expected_deltas.get(node_id, node["config"]))
+        removed = {("wait", "out", "receipt"), ("if_green2", "fail", "continue"), ("continue", "failure", "join_continue"),
+                   ("join_start", "out", "git")}
         added = {
+            ("join_start", "out", "run_input"), ("run_input", "out", "git"),
             ("wait", "out", "rc_settle"), ("rc_settle", "success", "rc_reconcile"),
             ("rc_reconcile", "success", "receipt"),
             ("rc_settle", "failure", "rc_failure_join"), ("rc_reconcile", "failure", "rc_failure_join"),
@@ -21953,6 +21966,39 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         # The writer and the kick both stay on their original edges; they just carry continuity.
         self.assertIn(("wait", "pending", "agent"), self.edges(enabled["spec"]))
         self.assertIn(("continue", "success", "join_continue"), self.edges(enabled["spec"]))
+
+    def test_run_input_is_the_only_reader_of_ctx_input_and_falls_back_to_the_webhook_body(self):
+        # The engine populates INPUT only for form triggers
+        # (rewst-go/services/worker/engine/trigger_context.go); a webhook kick
+        # lands in CTX.TRIGGER.webhook.body. Live runs 58c35abd and later died
+        # at ghPrView because every template read CTX.INPUT.
+        spec = self.load("pr-drive-run-control.json")["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        fields = ["repo", "pr_number", "attempt", "max_attempts", "auto_merge", "kick_url", "kick_token",
+                  "test", "class", "size", "work_kind", "prompt", "commit_message", "run_control"]
+        run_input = nodes["run_input"]
+        self.assertEqual(run_input["type"], "transforms.objectBuilder")
+        self.assertEqual([m["output"] for m in run_input["config"]["mappings"]], fields)
+        for mapping in run_input["config"]["mappings"]:
+            with self.subTest(field=mapping["output"]):
+                expr = mapping["expression"]
+                self.assertEqual(expr["kind"], "conditional")
+                self.assertEqual(expr["condition"], {"kind": "binary", "operator": "!=",
+                                                     "left": {"kind": "getField", "path": "CTX.INPUT.repo"},
+                                                     "right": {"kind": "literal", "value": None}})
+                self.assertEqual(expr["then"], {"kind": "getField", "path": f"CTX.INPUT.{mapping['output']}"})
+                self.assertEqual(expr["else"], {"kind": "getField", "path": f"CTX.TRIGGER.webhook.body.{mapping['output']}"})
+        for node_id, node in nodes.items():
+            if node_id == "run_input":
+                continue
+            with self.subTest(node=node_id):
+                self.assertNotIn("CTX.INPUT.", json.dumps(node.get("config", {})))
+        edges = self.edges(spec)
+        self.assertIn(("join_start", "out", "run_input"), edges)
+        self.assertIn(("run_input", "out", "git"), edges)
+        self.assertNotIn(("join_start", "out", "git"), edges)
+        # The webhook trigger stays off until the tenant proof enables it.
+        self.assertIs(nodes["hook"]["config"]["enabled"], False)
 
     def test_run_control_children_are_exactly_pinned_and_failures_are_fenced(self):
         spec = self.load("pr-drive-run-control.json")["spec"]
@@ -21993,7 +22039,7 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         state_inputs = nodes["rc_continue_state"]["config"]["inputMapping"]["values"]
         self.assertEqual(state_inputs["exact_request_body_sha256"], "{{ TASKS.rc_kick_fingerprint.data.kick_request_sha256 }}")
         self.assertEqual(state_inputs["endpoint"], "/v1/pr/continue")
-        self.assertEqual(state_inputs["run_control_id"], "{{ CTX.INPUT.run_control.run_control_id }}")
+        self.assertEqual(state_inputs["run_control_id"], "{{ CTX.run_input.run_control.run_control_id }}")
         self.assertEqual(set(state_inputs), {
             "run_control_id", "candidate_route", "next_envelope", "launcher_fingerprint", "endpoint",
             "exact_request_body_sha256", "repository", "branch", "head_sha", "task_sha256",
@@ -22001,7 +22047,7 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         })
         continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
         self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
-            "run_control_id": "CTX.INPUT.run_control.run_control_id",
+            "run_control_id": "CTX.run_input.run_control.run_control_id",
             "attempt_id": "TASKS.rc_continue_state.result.attempt_identity.attempt_id",
             "authorization_id": "TASKS.rc_continue_state.result.attempt_identity.authorization_id",
             "launch_descriptor_sha256": "TASKS.rc_continue_state.result.descriptor_hash.value",
@@ -22009,10 +22055,10 @@ class PrDriveRunControlGraphTests(unittest.TestCase):
         settle = nodes["rc_settle"]["config"]
         self.assertEqual(nodes["rc_settle"]["type"], "action.graphwing.POST:/v1/run/control/settle")
         self.assertEqual((settle["run_control"], settle["receipt"]),
-                         ("{{ CTX.INPUT.run_control }}", "{{ TASKS.wait.request.body }}"))
+                         ("{{ CTX.run_input.run_control }}", "{{ TASKS.wait.request.body }}"))
         reconcile = nodes["rc_reconcile"]["config"]["inputMapping"]["values"]
         self.assertEqual(reconcile, {
-            "run_control_id": "{{ CTX.INPUT.run_control.run_control_id }}",
+            "run_control_id": "{{ CTX.run_input.run_control.run_control_id }}",
             "kind": "{{ TASKS.rc_settle.data.kind }}",
             "receipt": "{{ TASKS.rc_settle.data.receipt }}",
             "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}",
