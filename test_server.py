@@ -21432,6 +21432,352 @@ class RunControlSettlementTests(unittest.TestCase):
             self.assertIn(status, loss["responses"])
 
 
+class RunControlAdversarialTests(unittest.TestCase):
+    """Adversarial probes over the merged run-control lifecycle.
+
+    RunControlSettlementTests pins the documented contract. This class tries
+    to break it directly: a corrupt or partially-written ledger file, two
+    settle calls racing for the same reservation, a kick that crashes
+    between the durable post and the bookkeeping that records its result,
+    a receipt whose failure_code or launcher falls outside the closed
+    vocabularies, and float precision at the usage-projection boundary.
+    """
+
+    RUN_HEX = "1" * 64
+    ATTEMPT_HEX = "2" * 64
+    DESCRIPTOR = "3" * 64
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.ledger = Path(self._td.name)
+        patcher = mock.patch.object(server, "RUN_CONTROL_DIR", self.ledger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = [1_900_000_000]
+        clock = mock.patch.object(server, "_run_control_now", lambda: self.now[0])
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def trio(self, run_hex=None, attempt_hex=None, descriptor=None):
+        run_hex = run_hex or self.RUN_HEX
+        attempt_hex = attempt_hex or self.ATTEMPT_HEX
+        return {"run_control_id": f"rc1-{run_hex}", "attempt_id": f"att1-{attempt_hex}",
+                "authorization_id": server.run_control_authorization_id(f"rc1-{run_hex}", f"att1-{attempt_hex}"),
+                "launch_descriptor_sha256": descriptor or self.DESCRIPTOR}
+
+    def sealed_receipt(self, job_hex="c", *, status="ok", failure_code="none",
+                       usage="default", usage_diagnostic=None, launcher="codex",
+                       provider="openai", model="gpt-5.6-sol", job_id=None):
+        if usage == "default":
+            usage = {
+                "usage_version": "normalized-usage-v1",
+                "fresh_input_tokens": 100, "cached_input_tokens": 20,
+                "cache_write_tokens": 3, "output_tokens": 40,
+                "reasoning_tokens": 7, "provider_cost_usd": 0.0125,
+                "wall_seconds": 12.9, "turns_observed": 4,
+            }
+        receipt = {
+            "status": status, "job_id": job_id or job_hex * 32,
+            "launcher": launcher, "provider": provider, "model": model,
+            "session_identity": {"repo": "r"}, "requested_effort": "default",
+            "effective_effort": "default", "effort_source": "launcher_default",
+            "launcher_version": "sha256:" + "e" * 64,
+            "summary": "done",
+            "failure_class": "none" if failure_code == "none" else "provider_availability",
+            "failure_code": failure_code, "failover_eligible": failure_code != "none",
+            "diagnostic": {"code": failure_code, "summary": "done"},
+            "usage": usage, "usage_diagnostic": usage_diagnostic,
+        }
+        server.seal_terminal_receipt_authority("agent", receipt)
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", receipt["job_id"])
+        return receipt
+
+    def settle(self, receipt, trio=None, **overrides):
+        body = {"run_control": trio or self.trio(), "receipt": receipt, **overrides}
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/run/control/settle", {}, True, json.dumps(body).encode()
+        )
+        return status, payload
+
+    def authority_loss(self, trio=None, **overrides):
+        body = {"run_control": trio or self.trio(), **overrides}
+        status, payload, _ = server.dispatch(
+            "POST", "/v1/run/control/authority-loss", {}, True, json.dumps(body).encode()
+        )
+        return status, payload
+
+    def test_corrupt_ledger_file_refuses_rather_than_resetting_the_fence(self):
+        # Guards server.py's _run_control_ledger_read / RunControlLedgerCorrupt:
+        # a reservation ledger that becomes unreadable JSON must never be
+        # treated the same as a missing (fresh) reservation. Before the fix,
+        # a corrupt file after a real settlement let a second, different
+        # receipt settle the SAME reservation as if it had never happened --
+        # a double settlement of a one-time durable fence.
+        first = self.sealed_receipt(job_hex="1")
+        status, out = self.settle(first)
+        self.assertEqual((status, out["kind"], out["replay"]), (200, "terminal_receipt", False))
+        path = server._run_control_ledger_path(self.trio()["authorization_id"])
+        self.assertTrue(path.exists())
+        path.write_text("{not valid json")
+        second = self.sealed_receipt(job_hex="2")
+        status, out = self.settle(second)
+        self.assertEqual((status, out["code"]), (409, "ledger_unreadable"))
+        # The original settlement is untouched: it is not silently replaced.
+        path.write_text(path.read_text())  # no-op; corruption is still in place
+        self.assertIn("{not valid json", path.read_text())
+
+    def test_corrupt_ledger_file_refuses_kick_launch_and_authority_loss_too(self):
+        trio = self.trio()
+        self.assertIsNone(server.run_control_claim_launch(trio, "1234" * 8))
+        path = server._run_control_ledger_path(trio["authorization_id"])
+        self.assertTrue(path.exists())
+        path.write_text("{{{ not json")
+        # A second launch of an already-launched reservation must not be let
+        # through just because the record could no longer be parsed.
+        status, out = server.run_control_claim_launch(trio, "5678" * 8)
+        self.assertEqual((status, out["code"]), (409, "ledger_unreadable"))
+        status, out = server.run_control_claim_kick(trio, "h" * 64)
+        self.assertEqual((status, out["code"]), (409, "ledger_unreadable"))
+        status, out = self.authority_loss(trio)
+        self.assertEqual((status, out["code"]), (409, "ledger_unreadable"))
+        # A corrupt job marker (read inside settle, keyed by job_id) is
+        # refused the same way rather than treated as "no prior claim".
+        other = self.trio(attempt_hex="4" * 64)
+        job_path = server._run_control_job_path("1234" * 8)
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        job_path.write_text("not json either")
+        receipt = self.sealed_receipt(job_id="1234" * 8)
+        status, out = self.settle(receipt, trio=other)
+        self.assertEqual((status, out["code"]), (409, "ledger_unreadable"))
+
+    def test_record_kick_result_degrades_safely_on_a_corrupt_ledger(self):
+        # Unlike claim_kick/claim_launch/settle, recording a kick result is
+        # pure bookkeeping after the kick was already posted: on corruption it
+        # must no-op (leaving "kicked" unresolved) rather than raise out of
+        # pr_continue after the sub-run has already been kicked.
+        trio = self.trio()
+        self.assertIsNone(server.run_control_claim_kick(trio, "h" * 64))
+        path = server._run_control_ledger_path(trio["authorization_id"])
+        path.write_text("not json")
+        server.run_control_record_kick_result(trio, True)  # must not raise
+        self.assertEqual(path.read_text(), "not json")
+
+    def test_concurrent_settle_calls_for_the_same_reservation_have_one_winner(self):
+        # RUN_CONTROL_LEDGER_LOCK must serialize the whole read-check-write in
+        # run_control_settle: several jobs racing to settle the same
+        # reservation must produce exactly one non-replay 200 and a
+        # settlement_conflict for every other distinct receipt, never two
+        # different receipts both recorded as the settlement.
+        trio = self.trio()
+        receipts = [self.sealed_receipt(job_hex=str(i)) for i in range(8)]
+        results: list[tuple[int, dict]] = [None] * 8
+
+        def worker(i):
+            results[i] = self.settle(receipts[i], trio=trio)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        statuses = [status for status, _ in results]
+        self.assertEqual(statuses.count(200), 1, results)
+        self.assertEqual(statuses.count(409), 7, results)
+        winner = next(out for status, out in results if status == 200)
+        self.assertFalse(winner["replay"])
+        for status, out in results:
+            if status == 409:
+                self.assertEqual(out["code"], "settlement_conflict")
+        # The ledger settled exactly one job, and it is the winner's.
+        record = json.loads(
+            (self.ledger / "reservations" / f"{trio['authorization_id']}.json").read_text()
+        )
+        self.assertEqual(record["settlement"]["job_id"], winner["receipt"]["job_id"])
+
+    def test_concurrent_settle_with_identical_evidence_all_replay_safely(self):
+        # The same job settling the same reservation twice, concurrently
+        # (a retried settle after a timeout, say), must never conflict with
+        # itself: exactly one 200 non-replay and the rest 200 replay=True.
+        trio = self.trio()
+        receipt = self.sealed_receipt(job_hex="7")
+        results: list[tuple[int, dict]] = [None] * 8
+
+        def worker(i):
+            results[i] = self.settle(receipt, trio=trio)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertTrue(all(status == 200 for status, _ in results), results)
+        non_replays = [out for _, out in results if not out["replay"]]
+        self.assertEqual(len(non_replays), 1, results)
+
+    def test_concurrent_claim_kick_for_the_same_reservation_has_one_winner(self):
+        trio = self.trio()
+        outcomes: list[Any] = [None] * 8
+
+        def worker(i):
+            outcomes[i] = server.run_control_claim_kick(trio, f"hash-{i}" * 8)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wins = [o for o in outcomes if o is None]
+        losses = [o for o in outcomes if o is not None]
+        self.assertEqual(len(wins), 1, outcomes)
+        self.assertTrue(all(status == 409 and out["code"] == "continuity_already_used"
+                            for status, out in losses), outcomes)
+
+    def test_kick_crash_between_post_and_bookkeeping_leaves_kick_unresolved(self):
+        # pr_continue calls run_control_claim_kick (durable write), posts the
+        # kick, then calls run_control_record_kick_result. A crash between
+        # the post and that final call leaves kicked=None forever unless
+        # something else resolves it. Authority loss must treat that exactly
+        # like an accepted kick -- wait out the grace window, never declare
+        # it lost immediately, never leave it unresolvable.
+        trio = self.trio()
+        self.assertIsNone(server.run_control_claim_kick(trio, "h" * 64))
+        record = json.loads(
+            (self.ledger / "reservations" / f"{trio['authorization_id']}.json").read_text()
+        )
+        self.assertIsNone(record["kick"]["kicked"])
+        status, out = self.authority_loss(trio)
+        self.assertEqual((status, out["code"]), (409, "kick_within_grace"))
+        self.now[0] += server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS - 1
+        status, out = self.authority_loss(trio)
+        self.assertEqual((status, out["code"]), (409, "kick_within_grace"))
+        self.now[0] += 1
+        status, out = self.authority_loss(trio)
+        self.assertEqual((status, out["kind"], out["authority_loss_reason"]),
+                         (200, "authority_lost", "kicked_run_never_settled"))
+
+    def test_settle_accepts_every_run_control_terminal_failure_code(self):
+        # Guards server.py's RUN_CONTROL_TERMINAL_FAILURE_CODES: it must
+        # cover every code classify_agent_failure can actually put on a
+        # sealed receipt, including provider_http_5xx (returned for a
+        # structured 5xx from a provider), which a hand-picked subset of
+        # PROVIDER_FAILURE_GROUPS names once silently excluded, refusing a
+        # legitimate terminal receipt as not_terminal_receipt and forcing the
+        # reservation down the full-envelope authority-loss path instead of
+        # settling with its real (near-zero) usage.
+        self.assertTrue(server.PROVIDER_AVAILABILITY_CODES <= server.RUN_CONTROL_TERMINAL_FAILURE_CODES)
+        for code in sorted(server.RUN_CONTROL_TERMINAL_FAILURE_CODES):
+            with self.subTest(code=code):
+                digest = hashlib.sha256(code.encode()).hexdigest()
+                receipt = self.sealed_receipt(
+                    job_id=digest[:32],
+                    status="ok" if code == "none" else "error",
+                    failure_code=code,
+                    usage=None if code != "none" else "default",
+                    usage_diagnostic="usage_not_reported" if code != "none" else None,
+                )
+                status, out = self.settle(receipt, trio=self.trio(attempt_hex=digest))
+                self.assertEqual(status, 200, (code, out))
+                self.assertIn(out["kind"], ("terminal_receipt", "authority_lost"))
+                self.assertNotEqual(out.get("code"), "not_terminal_receipt", (code, out))
+
+    def test_settle_with_launcher_outside_native_launchers_is_conservative_authority_loss(self):
+        # A receipt honestly sealed by this daemon can still name a launcher
+        # that is no longer in NATIVE_LAUNCHERS (a retired or renamed
+        # launcher). The route cannot resolve; settlement must close the
+        # reservation as a conservative authority loss, never crash and never
+        # invent a route.
+        receipt = self.sealed_receipt(launcher="ghost-launcher", provider="openai", model="gpt-5.6-sol")
+        status, out = self.settle(receipt)
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["kind"], "authority_lost")
+        self.assertIsNone(out["receipt"])
+        self.assertEqual(out["authority_loss_reason"], "receipt_route_unresolvable")
+        # Same result when the launcher is native but provider/model do not
+        # match that launcher's approved identity.
+        mismatched = self.sealed_receipt(job_hex="9", launcher="codex", provider="anthropic", model="gpt-5.6-sol")
+        status, out = self.settle(mismatched, trio=self.trio(attempt_hex="5" * 64))
+        self.assertEqual((status, out["kind"], out["authority_loss_reason"]),
+                         (200, "authority_lost", "receipt_route_unresolvable"))
+
+    def test_usage_projection_cost_ceiling_never_undercharges(self):
+        # _run_control_usage_projection quantizes provider_cost_usd to the
+        # contract's 12-place ceiling. A value with real precision beyond
+        # 12 places (float addition error, or a provider quoting more
+        # decimals than the contract keeps) must round UP, never down: a
+        # rounded-down cost could fit inside a reservation the real spend
+        # exceeded.
+        cases = {
+            1e-13: "0.000000000001",                 # rounds up from zero
+            0.30000000000000004: "0.300000000001",   # classic float sum error
+            0.1: "0.1",                               # exact at 1 place, unaffected
+            100000.0: "100000",                       # the budget ceiling itself
+        }
+        for cost, expected in cases.items():
+            with self.subTest(cost=cost):
+                projected = server._run_control_usage_projection({
+                    "turns_observed": 1, "wall_seconds": 1.0,
+                    "fresh_input_tokens": 0, "cached_input_tokens": 0,
+                    "cache_write_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+                    "provider_cost_usd": cost,
+                })
+                self.assertEqual(projected["provider_cost_usd"], expected)
+
+    def test_usage_projection_wall_seconds_floors_and_tokens_sum_at_the_ceiling(self):
+        projected = server._run_control_usage_projection({
+            "turns_observed": 80, "wall_seconds": 12.999999999999998,
+            "fresh_input_tokens": 1_000_000_000, "cached_input_tokens": 1_000_000_000,
+            "cache_write_tokens": 1_000_000_000, "output_tokens": 1_000_000_000,
+            "reasoning_tokens": 1_000_000_000, "provider_cost_usd": 0,
+        })
+        self.assertEqual(projected["wall_seconds"], 12)
+        self.assertEqual(projected["tokens"], 5_000_000_000)
+        self.assertEqual(projected["provider_cost_usd"], "0")
+        # None usage (a diagnostic-only terminal receipt) projects to an
+        # all-null usage block rather than raising.
+        self.assertEqual(server._run_control_usage_projection(None), {
+            "turns": None, "wall_seconds": None, "tokens": None, "provider_cost_usd": None,
+        })
+
+    def test_pr_continue_never_touches_the_ledger_when_it_will_not_kick(self):
+        # attempts_exhausted and no_kick_url both return before claiming a
+        # kick. A caller that supplies valid run_control continuity on a
+        # request that will not actually kick must not register a
+        # reservation as kicked -- there is no run to settle it.
+        trio = self.trio()
+        for label, extra in (
+            ("attempts_exhausted", {"attempt": 3, "max_attempts": 3}),
+            ("no_kick_url", {"kick_url": ""}),
+        ):
+            with self.subTest(label):
+                body = {"repo": "r", "pr": 1, "attempt": 1, "max_attempts": 3,
+                        "kick_url": "https://app.rewst.ai/api/hooks/x", "kick_token": "secret",
+                        "run_control": trio, **extra}
+                status, out = server.pr_continue(
+                    json.dumps(body).encode(), {"r": str(Path(server.__file__).parent)}
+                )
+                self.assertEqual(status, 200, out)
+                self.assertEqual(out["code"], label)
+                self.assertFalse(out["kicked"])
+        self.assertEqual(list(self.ledger.rglob("*.json")), [])
+
+    def test_authority_loss_launch_grace_boundary_is_exact(self):
+        # One second before the grace window elapses since launch, authority
+        # loss must still refuse; exactly at the boundary it must succeed.
+        # An off-by-one here would either charge a still-runnable job early
+        # or leave a dead reservation stuck open a second too long.
+        trio = self.trio()
+        self.assertIsNone(server.run_control_claim_launch(trio, "9abc" * 8))
+        with mock.patch.object(server, "JOBS_DIR", self.ledger / "jobs"):
+            server.write_job({"job_id": "9abc" * 8, "status": "failed", "kind": "agent"})
+            self.now[0] += server.RUN_CONTROL_KICK_LOSS_GRACE_SECONDS - 1
+            status, out = self.authority_loss(trio)
+            self.assertEqual((status, out["code"]), (409, "launch_within_grace"))
+            self.now[0] += 1
+            status, out = self.authority_loss(trio)
+        self.assertEqual((status, out["authority_loss_reason"]), (200, "launched_run_never_settled"))
+
+
 class PrDriveFlagOffTraversalTests(unittest.TestCase):
     """Validation step 2: pr-drive's flag-off traversal equals merged main.
 
@@ -21696,17 +22042,27 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                   for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json"))}
         def calls_subworkflows(spec):
             return any(node["type"] == "action.subworkflow" for node in spec["nodes"])
+        # run-control-consume.json's "authorize" node called
+        # $GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID, which had no entry
+        # here: an unpinned child silently takes the 480 s floor without ever
+        # being checked for its own nested subworkflow calls. It happens to
+        # call none today, but that was luck, not a checked invariant; the
+        # assertion below now makes an unpinned child a hard failure instead.
         pins = {"$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID": "run-control-state.json",
                 "$GRAPHWING_RUN_CONTROL_CONSUME_WORKFLOW_ID": "run-control-consume.json",
                 "$GRAPHWING_RUN_CONTROL_RECONCILE_WORKFLOW_ID": "run-control-reconcile.json",
                 "$GRAPHWING_RUN_CONTROL_TRANSITION_WORKFLOW_ID": "run-control-transition.json",
-                "$GRAPHWING_RUN_CONTROL_CONSUME_AUTHORIZATION_WORKFLOW_ID": "run-control-consume-authorization.json"}
+                "$GRAPHWING_RUN_CONTROL_CONSUME_AUTHORIZATION_WORKFLOW_ID": "run-control-consume-authorization.json",
+                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": "run-control-authorize.json"}
         for name, spec in graphs.items():
             for node in spec["nodes"]:
                 if node["type"] == "action.subworkflow":
                     with self.subTest(graph=name, node=node["id"]):
-                        child = graphs.get(pins.get(node["config"]["workflowId"], ""))
-                        floor = 2400 if child is not None and calls_subworkflows(child) else 480
+                        workflow_id = node["config"]["workflowId"]
+                        self.assertIn(workflow_id, pins, "every subworkflow child must be pinned so its own "
+                                      "nested subworkflow calls are checked, not silently floored at 480 s")
+                        child = graphs[pins[workflow_id]]
+                        floor = 2400 if calls_subworkflows(child) else 480
                         self.assertGreaterEqual(node["config"]["timeout"], floor)
 
     def test_subworkflow_input_mappings_are_plain_templates(self):
@@ -21746,6 +22102,14 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         # The engine cannot compare maps: live run 12386f9a's reconcile child
         # died with "comparing uncomparable type map[string]interface {}" on
         # receipt.route == outstanding_reservation.route. Compare fields.
+        #
+        # Scoped to run-control-*.json only, this lint was blind to
+        # pr-drive-run-control.json: that graph carries the same run-control
+        # objectBuilder legs (rc_continuity, rc_kick_fingerprint's siblings)
+        # but its filename does not match the glob, so an object-equality
+        # regression there would ship undetected. It has none today (checked
+        # below over every graph, not just the run-control-* ones), so
+        # widening the scan is a pure coverage fix, not a graph change.
         object_tails = {"route", "envelope", "handoff", "reservation", "launch_descriptor", "receipt",
                         "progress", "usage", "candidate_route", "current_route", "next_envelope"}
         def offenders(expr, where, out):
@@ -21759,7 +22123,7 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
             elif isinstance(expr, list):
                 for value in expr:
                     offenders(value, where, out)
-        for path in sorted((Path(server.__file__).parent / "graphs").glob("run-control-*.json")):
+        for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
             spec = json.loads(path.read_text())["spec"]
             found = []
             for node in spec["nodes"]:
