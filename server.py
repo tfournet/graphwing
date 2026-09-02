@@ -7765,8 +7765,13 @@ _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS = {
     "contextWindow", "maxOutputTokens",
 }
 _CLAUDE_MODEL_USAGE_OPTIONAL_FIELDS = {
-    "canonicalModel", "provider", "costBasis",
+    "canonicalModel", "provider", "costBasis", "thinkingTokens",
 }
+# Claude Code 2.1.258 adds usage.output_tokens_details {thinking_tokens} and
+# modelUsage.thinkingTokens. Seat job 85890fb8 was a real opus fix whose usage
+# the exact-set check threw away as usage_malformed.
+_CLAUDE_USAGE_OPTIONAL_FIELDS = {"output_tokens_details"}
+_CLAUDE_OUTPUT_TOKENS_DETAILS_FIELDS = {"thinking_tokens"}
 _CLAUDE_COST_BASES = {"list", "managed", "unknown"}
 _CLAUDE_FAST_MODE_STATES = {"off", "cooldown", "on"}
 _CLAUDE_FAST_MODE_DISABLED_REASONS = {
@@ -7947,10 +7952,23 @@ def _claude_cache_creation_is_valid(value: Any) -> bool:
     )
 
 
+def _claude_output_tokens_details_is_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _CLAUDE_OUTPUT_TOKENS_DETAILS_FIELDS
+        and all(_usage_count(item) is not None for item in value.values())
+    )
+
+
 def _claude_usage_envelope_is_valid(detail: dict[str, Any]) -> bool:
     server_tools = detail.get("server_tool_use")
     if not (
-        set(detail) == _CLAUDE_USAGE_FIELDS
+        _CLAUDE_USAGE_FIELDS <= set(detail)
+        and set(detail) <= _CLAUDE_USAGE_FIELDS | _CLAUDE_USAGE_OPTIONAL_FIELDS
+        and (
+            "output_tokens_details" not in detail
+            or _claude_output_tokens_details_is_valid(detail["output_tokens_details"])
+        )
         and isinstance(server_tools, dict)
         and set(server_tools) == {"web_search_requests", "web_fetch_requests"}
         and all(_usage_count(item) is not None for item in server_tools.values())
@@ -7997,6 +8015,7 @@ def _claude_model_usage_is_valid(value: Any) -> bool:
                 _usage_count(detail.get(field)) is not None
                 for field in _CLAUDE_MODEL_USAGE_REQUIRED_FIELDS - {"costUSD"}
             )
+            and ("thinkingTokens" not in detail or _usage_count(detail["thinkingTokens"]) is not None)
             and _usage_number(detail.get("costUSD")) is not None
             and (
                 "canonicalModel" not in detail
@@ -8639,7 +8658,11 @@ def claude_command(
         "--model", str(job["model"]),
     ]
     if permission_mode == "acceptEdits":
-        command.extend(["--allowedTools", "Bash"])
+        # One token. Claude Code 2.1.258 treats a bare `--allowedTools` as
+        # variadic, so with no `--effort` pair after it the trailing prompt
+        # was swallowed as another tool name and the run died with "Input
+        # must be provided" (seat job 2d8999db).
+        command.append("--allowedTools=Bash")
     if effort is not None:
         command.extend(["--effort", effort])
     session_id = (job.get("session_identity") or {}).get("native_session_id")
