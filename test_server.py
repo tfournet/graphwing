@@ -7457,20 +7457,40 @@ while True:
         out = server.fold_pr_findings_checks(
             held,
             {"ok": True, "all_green": False, "any_red": True,
-             "failing": ["Go Unit Tests / 1/2", "ci-status"]},
+             "failing": ["ci-status", "Go Integration Tests / 2/2",
+                         "Go Unit Tests / 1/2", "pm-review"]},
         )
         self.assertTrue(out["blocking"])
         self.assertTrue(out["needs_fix"])
         self.assertTrue(out["any_red"])
+        self.assertEqual(out["failing"], ["ci-status", "Go Integration Tests / 2/2",
+                                          "Go Unit Tests / 1/2", "pm-review"])
+        self.assertEqual(out["actionable_failing"],
+                         ["Go Integration Tests / 2/2", "Go Unit Tests / 1/2"])
         self.assertIn("Go Unit Tests / 1/2", out["brief"])
-        self.assertIn("ci-status", out["brief"])
+        self.assertIn("Go Integration Tests / 2/2", out["brief"])
+        self.assertNotIn("ci-status", out["brief"])
+        self.assertNotIn("pm-review", out["brief"])
         self.assertNotEqual(out["brief"], "No blocking findings.")
+
+        policy_only = server.fold_pr_findings_checks(
+            server.pr_findings_from(labels=["grade-A-", "hold:pm-review"], comment_bodies=[]),
+            {"ok": True, "all_green": False, "any_red": True,
+             "failing": ["pm-review", "ci-status"]},
+        )
+        self.assertTrue(policy_only["blocking"])
+        self.assertTrue(policy_only["any_red"])
+        self.assertEqual(policy_only["failing"], ["pm-review", "ci-status"])
+        self.assertEqual(policy_only["actionable_failing"], [])
+        self.assertFalse(policy_only["needs_fix"])
+        self.assertEqual(policy_only["brief"], "No blocking findings.")
 
         green = server.fold_pr_findings_checks(
             server.pr_findings_from(labels=["grade-A-", "hold:pm-review"], comment_bodies=[]),
             {"ok": True, "all_green": True, "any_red": False, "failing": []},
         )
         self.assertTrue(green["blocking"])
+        self.assertEqual(green["actionable_failing"], [])
         self.assertFalse(green["needs_fix"])
         self.assertEqual(green["brief"], "No blocking findings.")
 
