@@ -943,6 +943,9 @@ def verify_rewst_issuer_request(
     validated = _validate_rewst_consumed_authorization(path, body, timestamp)
     if validated is None:
         return None, _rewst_auth_error("rewst_authorization_invalid")
+    authorization = validated["authorization"]
+    if not authorization["issued_at"] <= current <= authorization["expires_at"]:
+        return None, _rewst_auth_error("rewst_authorization_invalid")
     authority = {
         "nonce": nonce,
         "timestamp": timestamp,

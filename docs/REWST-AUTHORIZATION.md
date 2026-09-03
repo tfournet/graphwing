@@ -40,7 +40,7 @@ Import `examples/rewst-request-hmac-credential.json` and preserve:
 
 5. Send the lowercase signature plus timestamp and nonce headers.
 
-Signatures are fresh for five minutes and one-time within one daemon. Authorization IDs are also one-time within that daemon, so changing only the nonce cannot reuse a consumed authorization. Every verified authorization, opaque authority, claim, and consume must match the daemon's current challenge. Each retry, resume, and handoff needs a new consumed authorization and nonce; consumed requests stay burned. A claimed authorization is burned if later continuity or queue preparation fails.
+Signatures are fresh for five minutes and one-time within one daemon. Both the signed timestamp and the daemon's current time must be inside the authorization issue/expiry window. Authorization IDs are also one-time within that daemon, so changing only the nonce cannot reuse a consumed authorization. Every verified authorization, opaque authority, claim, and consume must match the daemon's current challenge. Each retry, resume, and handoff needs a new consumed authorization and nonce; consumed requests stay burned. A claimed authorization is burned if later continuity or queue preparation fails.
 
 `agentRun` accepts `max_tokens` and fixed-decimal `max_cost_usd` only with `rewst_authorization`. Descriptor validation rejects a launch above 80 turns, 1,800 wall seconds, one billion tokens, or USD 100,000. The current agent adapter remains stricter at 1,200 execution seconds. These are daemon safety ceilings for one launch, not aggregate product budgets and not a next-state decision.
 
