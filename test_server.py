@@ -13515,12 +13515,14 @@ func main() {
             )
             self.assertNotIn("reasoning_effort", properties)
         evidence_schema = spec["components"]["schemas"]["RouteExecutionProfile"]
-        self.assertFalse(evidence_schema["additionalProperties"])
-        self.assertEqual(set(evidence_schema["required"]), server.ROUTE_EXECUTION_PROFILE_FIELDS)
-        self.assertEqual(
-            evidence_schema["properties"]["role"]["enum"],
-            ["writer", "reviewer1", "reviewer2"],
-        )
+        self.assertEqual(len(evidence_schema["oneOf"]), 2)
+        v1_schema = spec["components"]["schemas"]["RouteExecutionProfileV1"]
+        v2_schema = spec["components"]["schemas"]["RouteExecutionProfileV2"]
+        self.assertFalse(v1_schema["additionalProperties"])
+        self.assertEqual(set(v1_schema["required"]), server.ROUTE_EXECUTION_PROFILE_FIELDS)
+        self.assertFalse(v2_schema["additionalProperties"])
+        self.assertEqual(set(v2_schema["required"]), server.ROUTE_EXECUTION_PROFILE_V2_FIELDS)
+        self.assertEqual(v2_schema["properties"]["role"]["enum"], ["writer", "reviewer1", "reviewer2"])
         route_properties = spec["components"]["schemas"]["SliceRoute"]["properties"]
         self.assertEqual(route_properties["effort"]["enum"], ["high", "default"])
         self.assertEqual(route_properties["reviewer1_effort"]["enum"], ["none", "medium", "high"])
@@ -24460,6 +24462,210 @@ func main() {
         spec = self.load()["spec"]
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
         self.assertIn(("agent", "failure", "rc_failure_join"), edges)
+
+
+class WorkflowRouteProfileV2Tests(unittest.TestCase):
+    """Provider-free issue-186 v2 execution-boundary regressions."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for command in (("init", "-b", "main", "."), ("config", "user.email", "gw@test"),
+                        ("config", "user.name", "gw"), ("config", "commit.gpgsign", "false")):
+            subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
+        (self.repo / "README").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "init"], check=True, capture_output=True)
+        self.jobs = self.root / "jobs"
+        self.codex = _write_fake_codex(self.root / "codex", "codex-v2")
+
+    def profile(self, **changes):
+        profile = {"version": "route-execution-profile-v2", "policy_version": "workflow-normal-v1",
+                   "decision_id": "decision-186", "decision_sha256": "a" * 64,
+                   "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+                   "effective_size": "S", "launcher": "codex", "provider": "openai",
+                   "model": "gpt-5.6-sol", "requested_effort": "medium"}
+        profile.update(changes)
+        return profile
+
+    @contextmanager
+    def boundary(self):
+        with mock.patch.object(server, "JOBS_DIR", self.jobs), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.codex), \
+             mock.patch.object(server, "enqueue_agent", lambda job: None), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}):
+            yield
+
+    def agent_body(self, profile=None, **extra):
+        profile = profile or self.profile()
+        return {"prompt": "make one bounded change", "cwd": "scratch", "launcher": profile["launcher"],
+                "provider": profile["provider"], "model": profile["model"],
+                "route_execution_profile": profile, **extra}
+
+    def test_workflow_route_profile_v2_accepts_each_closed_supported_native_tuple_without_consulting_daemon_route_tables(self):
+        class Poison(dict):
+            def __getitem__(self, key): raise AssertionError("daemon selection consulted")
+        for (launcher, provider, model), efforts in server.EFFORT_PROFILES.items():
+            if model not in server.NATIVE_LAUNCHERS.get(launcher, {}).get("models", ()):
+                continue
+            for effort in efforts:
+                raw = self.profile(launcher=launcher, provider=provider, model=model, requested_effort=effort)
+                with self.subTest(tuple=(launcher, provider, model), effort=effort), \
+                     mock.patch.object(server, "NORMAL_WRITER_ROUTES", Poison()), \
+                     mock.patch.object(server, "NORMAL_REVIEWER_ROUTES", Poison()), \
+                     mock.patch.object(server, "AVAILABILITY_FALLBACK_WRITER_ROUTES", Poison()):
+                    parsed, error = server.parse_route_execution_profile(
+                        raw, expected_role="writer", launcher=launcher, provider=provider, model=model, effort=effort)
+                self.assertIsNone(error)
+                self.assertEqual(parsed, raw)
+
+    def test_workflow_route_profile_v2_rejects_unknown_policy_fields_roles_models_efforts_and_coordinated_identity_drift_before_launcher_resolution(self):
+        bad_profiles = ({"unknown": True}, {"role": "owner"}, {"requested_effort": "ultra"},
+                        {"launcher": "claude", "provider": "anthropic", "model": "claude-opus-5"})
+        for drift in bad_profiles:
+            # Keep the request tuple fixed: coordinated profile tuple drift must
+            # be rejected as evidence mismatch before any launcher is resolved.
+            body = self.agent_body(self.profile(**drift))
+            if "launcher" in drift:
+                body.update({"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"})
+            with self.subTest(drift=drift), mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("launcher resolved")):
+                status, payload = server.agent_run(json.dumps(body).encode(), {"scratch": str(self.repo)})
+            self.assertEqual(status, 400, payload)
+            self.assertIn(payload["code"], {"bad_route_execution_profile", "unsupported_effort", "bad_effort"})
+        identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    "requested_effort": "medium", "effective_effort": "medium", "effort_source": "route",
+                    "launcher_version": "sha256:" + "b" * 64, "repo": "scratch", "branch": "main",
+                    "starting_head": "c" * 40, "native_session_id": "session-186",
+                    "route_execution_profile": self.profile()}
+        for drift in ({"model": "gpt-5.6-terra"}, {"route_execution_profile": self.profile(requested_effort="high")},
+                      {"native_session_id": "other"}):
+            parsed, error = server.parse_session_identity({**identity, **drift})
+            self.assertTrue(error or parsed != identity)
+
+    def test_workflow_route_profile_v2_is_bound_unchanged_through_agent_review_receipt_poll_wait_and_resume(self):
+        profile = self.profile()
+        with self.boundary():
+            status, accepted = server.agent_run(json.dumps(self.agent_body(profile)).encode(), {"scratch": str(self.repo)})
+            self.assertEqual(status, 202, accepted)
+            job = server.read_job(accepted["job_id"]); snapshot = server.agent_execution_snapshot(job)
+            running = server.agent_mark_running(accepted["job_id"], snapshot)
+            self.assertIsNotNone(running)
+            # This is the sole launcher edge: model output/session are the final subprocess fixture.
+            running["session_identity"]["native_session_id"] = "session-186"
+            server.write_job(running)
+            # The structured native session is the only post-launch datum; seal
+            # the terminal receipt against the resulting immutable snapshot.
+            snapshot = server.agent_execution_snapshot(running)
+            receipt = server.normalize_receipt(running, {"status": "ok", "summary": "done"}, 0, False)
+            terminal, installed = server.agent_terminal_transition(accepted["job_id"], snapshot, receipt, None, 0, False)
+            self.assertTrue(installed); self.assertEqual(terminal["session_identity"]["route_execution_profile"], profile)
+            for method, path, body in (("GET", accepted["poll"], b""), ("POST", "/v1/agent/jobs/wait", json.dumps({"job_id": accepted["job_id"], "timeout_seconds": 1}).encode())):
+                code, payload, _ = server.dispatch(method, path, {}, True, body)
+                self.assertEqual(code, 200, payload); self.assertEqual(payload["session_identity"]["route_execution_profile"], profile)
+            parent = server.read_job(accepted["job_id"])
+            resume = self.agent_body(profile, session_identity=parent["session_identity"], resume_job_id=accepted["job_id"])
+            status, resumed = server.agent_run(json.dumps(resume).encode(), {"scratch": str(self.repo)})
+            self.assertEqual(status, 202, resumed); self.assertEqual(resumed["session_identity"], parent["session_identity"])
+
+        # Review has a separate acceptance/receipt/poll/wait authority and must carry the same decision verbatim.
+        review_profile = self.profile(role="reviewer1")
+        with mock.patch.object(server, "JOBS_DIR", self.jobs), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.codex), \
+             mock.patch.object(server, "enqueue_review", lambda job: None):
+            status, review = server.review_run(json.dumps({"repo": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "prompt": "review", "async": True, "route_execution_profile": review_profile}).encode(), {"scratch": str(self.repo)})
+            self.assertEqual(status, 202, review)
+            authority = server.review_authority(review["job_id"]); snap = authority.snapshot()
+            running = server.review_mark_running(review["job_id"], snap, authority)
+            receipt = server.review_receipt(running, {"ok": True, "verdict": "PASS", "no_verdict": False}, identity=review["execution_identity"])
+            _, installed = server.review_terminal_transition(review["job_id"], snap, authority, receipt)
+            self.assertTrue(installed)
+            for method, path, body in (("GET", review["poll"], b""), ("POST", "/v1/review/jobs/wait", json.dumps({"job_id": review["job_id"], "timeout_seconds": 1}).encode())):
+                code, payload, _ = server.dispatch(method, path, {}, True, body)
+                self.assertEqual(code, 200, payload); self.assertEqual(payload["execution_identity"]["route_execution_profile"], review_profile)
+            server.release_review_authority(review["job_id"])
+
+    def test_active_correction_cannot_change_launcher_provider_model_effort_profile_or_native_session_under_v2(self):
+        profile = self.profile()
+        with self.boundary():
+            status, accepted = server.agent_run(json.dumps(self.agent_body(profile)).encode(), {"scratch": str(self.repo)})
+            self.assertEqual(status, 202, accepted)
+            job = server.read_job(accepted["job_id"])
+            identity = {**job["session_identity"], "native_session_id": "session-186"}
+            job["session_identity"] = identity; job["launch_native_session_id"] = "session-186"; job["status"] = "completed"
+            job["receipt"] = {"status": "ok", "job_id": job["job_id"], **{k: job[k] for k in server.AGENT_PROFILE_FIELDS}, "session_identity": identity}
+            server.write_job(job)
+            drifts = (
+                {"launcher": "claude", "provider": "anthropic", "model": "claude-opus-5"},
+                {"model": "gpt-5.6-terra"}, {"effort": "high"},
+                {"route_execution_profile": self.profile(requested_effort="high")},
+                {"session_identity": {**identity, "requested_effort": "high", "effective_effort": "high", "route_execution_profile": self.profile(requested_effort="high")}},
+                {"session_identity": {**identity, "effective_effort": "high"}},
+                {"session_identity": {**identity, "effort_source": "explicit"}},
+                {"session_identity": {**identity, "native_session_id": "other"}},
+            )
+            for change in drifts:
+                body = self.agent_body(profile, session_identity=identity, resume_job_id=job["job_id"]); body.update(change)
+                status, payload = server.agent_run(json.dumps(body).encode(), {"scratch": str(self.repo)})
+                self.assertEqual(status, 400, payload); self.assertIn(payload["code"], {"session_identity_mismatch", "bad_route_execution_profile", "bad_model_identity", "untraceable_resume_session", "bad_session_identity"})
+
+    def test_run_control_settlement_projects_the_pinned_workflow_policy_identity_instead_of_synthesizing_normal_v1(self):
+        profile = self.profile(); identity = {"launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol", "requested_effort": "medium", "effective_effort": "medium", "effort_source": "route", "launcher_version": "sha256:" + "b" * 64, "repo": "scratch", "branch": "main", "starting_head": "c" * 40, "native_session_id": "session-186", "route_execution_profile": profile}
+        continuity = {"run_control_id": "rc1-" + "a" * 64, "attempt_id": "att1-" + "b" * 64, "authorization_id": server.run_control_authorization_id("rc1-" + "a" * 64, "att1-" + "b" * 64), "launch_descriptor_sha256": "d" * 64}
+        receipt = {"job_id": "e" * 32, "status": "ok", "failure_code": "none", **{k: identity[k] for k in server.AGENT_PROFILE_FIELDS}, "session_identity": identity}
+        self.assertEqual(server._run_control_settled_receipt(continuity, receipt, None)["route"], profile)
+        for change in ({"model": "gpt-5.6-terra"}, {"session_identity": {**identity, "route_execution_profile": self.profile(requested_effort="high")}}, {"requested_effort": "high"}):
+            self.assertIsNone(server._run_control_settled_receipt(continuity, {**receipt, **change}, None))
+
+    def test_codeoff_execution_identity_and_effort_pinning_are_unchanged_by_workflow_route_profiles(self):
+        profile = self.profile(launcher="claude", provider="anthropic", model="claude-opus-5", requested_effort="default")
+        self.assertEqual(
+            tuple(profile[key] for key in ("launcher", "provider", "model", "requested_effort")),
+            server.AVAILABILITY_FALLBACK_WRITER_ROUTES["go_coding"],
+        )
+        legacy = server.slice_route_lookup("mechanical", "S", work_kind="go_coding")
+        v2_route = {**legacy, "route_version": server.FALLBACK_ROUTE_VERSION,
+                    "launcher": profile["launcher"], "provider": profile["provider"],
+                    "model": profile["model"], "effort": profile["requested_effort"],
+                    "writer_execution_profile": profile}
+        identity = {"launcher": profile["launcher"], "provider": profile["provider"], "model": profile["model"],
+                    "requested_effort": "default", "effective_effort": "default", "effort_source": "route",
+                    "launcher_version": "sha256:" + "b" * 64, "repo": "scratch", "branch": "main",
+                    "starting_head": "c" * 40, "native_session_id": None, "route_execution_profile": profile}
+        job_id = "f" * 32
+        receipt = {"job_id": job_id, "status": "error", "role": "primary", **{k: identity[k] for k in server.AGENT_PROFILE_FIELDS},
+                   "session_identity": identity, "failure_class": "provider_availability", "failure_code": "missing_binary", "failover_eligible": True}
+        request = {"class": "mechanical", "size": "S", "work_kind": "go_coding", "ac_count": 0, "seams": 0,
+                   "primary_route": v2_route, "primary_receipt": receipt}
+        with mock.patch.object(server, "read_job", side_effect=AssertionError("v2 selection read durable job")), \
+             mock.patch.object(server, "NORMAL_WRITER_ROUTES", side_effect=AssertionError("v2 selection consulted route table")), \
+             mock.patch.object(server, "AVAILABILITY_FALLBACK_WRITER_ROUTES", side_effect=AssertionError("v2 selection consulted fallback table")):
+            status, payload = server.derive_slice_fallback_route(request)
+            self.assertEqual((status, payload["code"]), (400, "v2_route_selection_unsupported"))
+            status, payload = server.derive_slice_recovery_route({**request, "fallback_route": {}, "fallback_receipt": {}})
+            self.assertEqual((status, payload["code"]), (400, "v2_route_selection_unsupported"))
+
+        durable = {"job_id": job_id, "kind": "agent", "status": "failed", "repo": "scratch", "branch": "main",
+                   "starting_head": "c" * 40, "session_identity": identity, "receipt": receipt,
+                   **{k: identity[k] for k in server.AGENT_PROFILE_FIELDS}}
+        with mock.patch.object(server, "read_job", return_value=durable), \
+             mock.patch.object(server, "NORMAL_WRITER_ROUTES", side_effect=AssertionError("evidence selected route")), \
+             mock.patch.object(server, "AVAILABILITY_FALLBACK_WRITER_ROUTES", side_effect=AssertionError("evidence selected route")):
+            recovered, error = server.recovery_job_evidence(receipt, "primary", v2_route, "error", "failed")
+            mismatched, mismatch_error = server.recovery_job_evidence(
+                receipt, "primary", legacy, "error", "failed"
+            )
+        self.assertIsNone(error); self.assertEqual(recovered["session_identity"]["route_execution_profile"], profile)
+        self.assertIsNone(mismatched)
+        self.assertEqual(mismatch_error["code"], "recovery_evidence_mismatch")
+
+        codeoff_identity = {"launcher": "codex", "provider": "openai", "exact_model": "gpt-5.6-sol",
+                            "launcher_version": "sha256:" + "c" * 64, "requested_effort": "default",
+                            "effective_effort": "high", "inference_profile_version": server.CODEOFF_INFERENCE_PROFILE_VERSION}
+        self.assertTrue(server.codeoff_identity_is_pinned("author-1", codeoff_identity))
+        self.assertFalse(server.codeoff_identity_is_pinned("author-1", {**codeoff_identity, "effective_effort": "medium"}))
 
 
 if __name__ == "__main__":

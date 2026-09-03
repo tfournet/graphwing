@@ -1659,7 +1659,7 @@
           "replay": {"type": "boolean"}
         }
       },
-      "RouteExecutionProfile": {
+      "RouteExecutionProfileV1": {
         "type": "object",
         "additionalProperties": false,
         "required": ["version", "route_version", "role", "work_kind", "class", "size", "launcher", "provider", "model", "effort"],
@@ -1676,6 +1676,32 @@
           "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
           "effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] }
         }
+      },
+      "RouteExecutionProfileV2": {
+        "type": "object", "additionalProperties": false,
+        "required": ["version", "policy_version", "decision_id", "decision_sha256", "role", "work_kind", "class", "effective_size", "launcher", "provider", "model", "requested_effort"],
+        "description": "Closed workflow-owned execution decision. Graphwing validates executable capability and immutable binding; it does not select or reconstruct the route.",
+        "properties": {
+          "version": { "type": "string", "const": "route-execution-profile-v2" },
+          "policy_version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "decision_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "decision_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "role": { "type": "string", "enum": ["writer", "reviewer1", "reviewer2"] },
+          "work_kind": { "type": "string", "enum": ["go_coding", "typescript_coding", "research_ops"] },
+          "class": { "type": "string", "enum": ["mechanical", "visual", "sensitive"] },
+          "effective_size": { "type": "string", "enum": ["S", "M", "L"] },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "provider": { "type": "string", "enum": ["openai", "anthropic", "xai"] },
+          "model": { "type": "string", "enum": ["gpt-5.6-sol", "claude-opus-5", "claude-sonnet-5", "grok-4.6"] },
+          "requested_effort": { "type": "string", "enum": ["default", "low", "medium", "high", "max"] }
+        }
+      },
+      "RouteExecutionProfile": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/RouteExecutionProfileV1" },
+          { "$ref": "#/components/schemas/RouteExecutionProfileV2" }
+        ],
+        "description": "Closed v1 compatibility or v2 workflow execution profile."
       },
       "ReviewRunRequest": {
         "type": "object",
@@ -2004,6 +2030,13 @@
           "timeout_seconds": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1800}, {"type": "string", "pattern": "^[0-9]{1,4}$", "description": "Whole-value numeric Graph interpolation."}]}
         }
       },
+      "RunControlRoute": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/RunControlRouteV1" },
+          { "$ref": "#/components/schemas/RouteExecutionProfileV2" }
+        ],
+        "description": "Compatibility route or exact workflow-pinned v2 execution profile."
+      },
       "AgentRunRequest": {
         "type": "object",
         "description": "The root object avoids combinators unsupported by Rewst custom-integration imports. The endpoint enforces prompt/code-off workspace exclusivity and exact mode-specific identity tuples.",
@@ -2175,7 +2208,7 @@
           "blocker_job_id": { "type": "string", "pattern": "^([0-9a-f]{32}|unknown)$" }
         }
       },
-      "RunControlRoute": {
+      "RunControlRouteV1": {
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -2261,7 +2294,7 @@
           "root_workflow_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"},
           "purpose": {"type": "string", "enum": ["implement_slice", "pr_drive", "code_off"]},
           "budgets": {"$ref": "#/components/schemas/RunControlBudgets"},
-          "initial_route": {"$ref": "#/components/schemas/RunControlRoute"}
+          "initial_route": {"$ref": "#/components/schemas/RunControlRouteV1"}
         }
       },
       "RunControlInitializeValidation": {
@@ -2700,7 +2733,7 @@
             "pattern": "^rc1-[0-9a-f]{64}$"
           },
           "route": {
-            "$ref": "#/components/schemas/RunControlRoute"
+            "$ref": "#/components/schemas/RunControlRouteV1"
           },
           "budgets": {
             "$ref": "#/components/schemas/RunControlBudgets"
@@ -2718,7 +2751,7 @@
             "maximum": 11
           },
           "next_route": {
-            "$ref": "#/components/schemas/RunControlRoute"
+            "$ref": "#/components/schemas/RunControlRouteV1"
           },
           "next_envelope": {
             "$ref": "#/components/schemas/RunControlNextEnvelope"

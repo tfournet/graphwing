@@ -553,11 +553,20 @@ FALLBACK_ROUTE_VERSION = "availability-fallback-v1"
 ROUTING_POLICY_V2_VERSION = "routing-policy-v2"
 ROUTING_POLICY_V2_ROUTE_VERSION = "routing-policy-v2-candidate"
 ROUTE_EXECUTION_PROFILE_VERSION = "route-execution-profile-v1"
+ROUTE_EXECUTION_PROFILE_V2_VERSION = "route-execution-profile-v2"
 ROUTE_EXECUTION_ROLES = frozenset({"writer", "reviewer1", "reviewer2"})
 ROUTE_EXECUTION_PROFILE_FIELDS = frozenset({
     "version", "route_version", "role", "work_kind", "class", "size",
     "launcher", "provider", "model", "effort",
 })
+# A workflow-owned decision is provenance.  V2 deliberately contains no daemon
+# route version: validation below checks only executable capability and pins it.
+ROUTE_EXECUTION_PROFILE_V2_FIELDS = frozenset({
+    "version", "policy_version", "decision_id", "decision_sha256", "role",
+    "work_kind", "class", "effective_size", "launcher", "provider", "model",
+    "requested_effort",
+})
+WORKFLOW_POLICY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 RECOVERY_VERSION = "provider-recovery-v1"
 NORMAL_WRITER_ROUTES = {
     "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
@@ -2987,14 +2996,35 @@ def _run_control_settled_receipt(
     Key order is part of the contract: graphwing-run-control-reconcile
     re-serializes the receipt in exactly this order and compares hashes.
     """
-    role = receipt.get("role")
-    route = _run_control_route({
-        "route_version": FALLBACK_ROUTE_VERSION if role == "availability_fallback" else ROUTE_VERSION,
-        "launcher": receipt.get("launcher"), "provider": receipt.get("provider"),
-        "model": receipt.get("model"),
-    })
-    if route is None:
-        return None
+    # V2 is a workflow decision identity, not a daemon-selected route.  Preserve
+    # the complete sealed profile in the settlement rather than deriving a
+    # normal-v1/fallback label from the receipt role.
+    pinned = receipt.get("session_identity")
+    profile = pinned.get("route_execution_profile") if isinstance(pinned, dict) else None
+    if isinstance(profile, dict) and profile.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION:
+        identity, identity_error = parse_session_identity(pinned)
+        if identity_error is not None or identity != pinned:
+            return None
+        role = profile.get("role")
+        route, route_error = parse_route_execution_profile(
+            profile, expected_role=str(role or ""), launcher=identity["launcher"],
+            provider=identity["provider"], model=identity["model"],
+            effort=identity["requested_effort"],
+        )
+        if (
+            route_error is not None or route != profile
+            or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
+        ):
+            return None
+    else:
+        role = receipt.get("role")
+        route = _run_control_route({
+            "route_version": FALLBACK_ROUTE_VERSION if role == "availability_fallback" else ROUTE_VERSION,
+            "launcher": receipt.get("launcher"), "provider": receipt.get("provider"),
+            "model": receipt.get("model"),
+        })
+        if route is None:
+            return None
     succeeded = receipt["status"] == "ok" and receipt["failure_code"] == "none"
     return {
         "receipt_id": f"rec1-{receipt['job_id']}",
@@ -3732,8 +3762,42 @@ def route_execution_profile(route: dict[str, Any], role: str) -> dict[str, str] 
 def parse_route_execution_profile(
     raw: Any, *, expected_role: str, launcher: str, provider: str, model: str,
     effort: Any,
-) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
-    """Corroborate route provenance against the versioned server route catalog."""
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate closed route provenance without selecting a workflow route.
+
+    V1 remains catalog-corroborated compatibility.  V2 is workflow selection
+    provenance: only its closed grammar, native capability tuple and effort
+    support are safety-relevant here.  Do not consult route tables on V2.
+    """
+    if not isinstance(raw, dict):
+        return None, {"error": "route_execution_profile must be one exact closed object", "code": "bad_route_execution_profile"}
+    if raw.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION:
+        if set(raw) != ROUTE_EXECUTION_PROFILE_V2_FIELDS:
+            return None, {"error": "route_execution_profile must be one exact closed object", "code": "bad_route_execution_profile"}
+        if (
+            raw.get("role") != expected_role
+            or raw.get("role") not in ROUTE_EXECUTION_ROLES
+            or raw.get("work_kind") not in SLICE_WORK_KINDS
+            or raw.get("class") not in SLICE_CLASSES
+            or raw.get("effective_size") not in SLICE_SIZES
+            or not isinstance(raw.get("policy_version"), str)
+            or not WORKFLOW_POLICY_ID_RE.fullmatch(raw["policy_version"])
+            or not isinstance(raw.get("decision_id"), str)
+            or not WORKFLOW_POLICY_ID_RE.fullmatch(raw["decision_id"])
+            or not isinstance(raw.get("decision_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", raw["decision_sha256"])
+            or any(not isinstance(raw.get(key), str) for key in ("launcher", "provider", "model", "requested_effort"))
+            or (raw.get("launcher"), raw.get("provider"), raw.get("model")) != (launcher, provider, model)
+            or raw.get("requested_effort") != effort
+        ):
+            return None, {"error": "route_execution_profile is not a supported execution profile", "code": "bad_route_execution_profile"}
+        native = NATIVE_LAUNCHERS.get(launcher)
+        if native is None or provider != native["provider"] or model not in native["models"]:
+            return None, {"error": "route_execution_profile native tuple is unsupported", "code": "bad_route_execution_profile"}
+        profile, profile_error = normalize_effort(launcher, provider, model, effort, "route")
+        if profile_error is not None or profile is None:
+            return None, profile_error or {"error": "route effort is unsupported", "code": "unsupported_effort"}
+        return dict(raw), None
     if not isinstance(raw, dict) or set(raw) != ROUTE_EXECUTION_PROFILE_FIELDS:
         return None, {
             "error": "route_execution_profile must be one exact closed object",
@@ -3903,10 +3967,11 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
     if not isinstance(receipt, dict):
         return 400, {"error": "primary_receipt is required", "code": "missing_primary_receipt"}
 
-    expected_primary_route = slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
-    if primary_route != expected_primary_route:
+    primary_profile = primary_route.get("writer_execution_profile")
+    if isinstance(primary_profile, dict) and primary_profile.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION:
+        return 400, {"error": "v2 workflow routes are not accepted by the v1 fallback selector", "code": "v2_route_selection_unsupported"}
+    if primary_route != slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind):
         return 400, {"error": "primary route does not match normal route", "code": "primary_provider_mismatch"}
-    normal_launcher, normal_provider, normal_model, _ = NORMAL_WRITER_ROUTES[work_kind]
 
     eligible = receipt.get("failover_eligible")
     if not isinstance(eligible, bool):
@@ -3919,9 +3984,14 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
     ):
         return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
     session_identity = receipt.get("session_identity")
+    expected_identity = {
+        "launcher": NORMAL_WRITER_ROUTES[work_kind][0],
+        "provider": NORMAL_WRITER_ROUTES[work_kind][1],
+        "model": NORMAL_WRITER_ROUTES[work_kind][2],
+    }
     if not isinstance(session_identity, dict) or any(
-        session_identity.get(key) != value
-        for key, value in (("launcher", normal_launcher), ("provider", normal_provider), ("model", normal_model))
+        session_identity.get(key) != expected_identity[key]
+        for key in ("launcher", "provider", "model")
     ):
         return 400, {"error": "receipt session_identity does not match normal route", "code": "primary_provider_mismatch"}
     parsed_identity, identity_err = parse_session_identity(session_identity)
@@ -3929,7 +3999,7 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         identity_err
         or parsed_identity != session_identity
         or session_identity.get("route_execution_profile")
-        != primary_route.get("writer_execution_profile")
+        != primary_profile
     ):
         code = "primary_execution_profile_mismatch"
         return 400, {
@@ -3941,11 +4011,11 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
     if failure_code not in PROVIDER_AVAILABILITY_CODES:
         return 400, {"error": "receipt is not availability-fallback eligible", "code": "not_fallback_eligible"}
     expected_efforts = authoritative_route_effort_profiles(
-        normal_launcher, normal_provider, normal_model, primary_route.get("effort")
+        expected_identity["launcher"], expected_identity["provider"], expected_identity["model"], primary_route.get("effort")
     )
     receipt_source = receipt.get("effort_source")
     receipt_effort, receipt_effort_err = normalize_effort(
-        normal_launcher, normal_provider, normal_model,
+        session_identity["launcher"], session_identity["provider"], session_identity["model"],
         receipt.get("requested_effort"),
         receipt_source if isinstance(receipt_source, str) and receipt_source in EFFORT_SOURCES else "route",
     )
@@ -3996,7 +4066,7 @@ def derive_slice_fallback_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         AVAILABILITY_FALLBACK_WRITER_ROUTES[work_kind],
         FALLBACK_ROUTE_VERSION,
         f"availability_fallback:{failure_code}",
-        normal_provider,
+        expected_identity["provider"],
     )
     selected = {
         key: fallback[key]
@@ -4079,7 +4149,7 @@ class NativeReviewExecutionContext:
     requested_effort: str
     effective_effort: str
     effort_source: str
-    route_execution_profile: dict[str, str] | None
+    route_execution_profile: dict[str, Any] | None
     run_budget_seconds: int
     max_turns: int
     permission_profile: str
@@ -4336,28 +4406,57 @@ def recovery_job_evidence(
     parsed_identity, identity_err = parse_session_identity(identity)
     if identity_err or parsed_identity != identity or (receipt_status == "ok" and not identity.get("native_session_id")):
         return None, {"error": "recovery session identity is malformed", "code": "malformed_recovery_evidence"}
-    if (
-        any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
-        or identity.get("route_execution_profile")
-        != route.get("writer_execution_profile")
-    ):
-        return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
     source = receipt.get("effort_source")
-    route_profiles = authoritative_route_effort_profiles(
-        route["launcher"], route["provider"], route["model"], route.get("effort")
+    workflow_v2 = isinstance(identity.get("route_execution_profile"), dict) and (
+        identity["route_execution_profile"].get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION
     )
-    receipt_profile, receipt_profile_err = normalize_effort(
-        route["launcher"], route["provider"], route["model"], receipt.get("requested_effort"),
-        source if isinstance(source, str) and source in EFFORT_SOURCES else "route",
-    )
-    if (
-        not route_profiles or receipt_profile_err or receipt_profile is None
-        or receipt_profile not in route_profiles
-        or any(identity.get(key) != value for key, value in receipt_profile.items())
-        or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
-        or source not in EFFORT_SOURCES
-    ):
-        return None, {"error": "recovery execution profile mismatches", "code": "recovery_evidence_mismatch"}
+    if workflow_v2:
+        # Workflow evidence is valid only for the exact route object that
+        # carries it; a v1 route cannot borrow a separately valid v2 receipt.
+        route_profile = route.get("writer_execution_profile")
+        if (
+            route_profile != identity.get("route_execution_profile")
+            or any(route.get(key) != identity.get(key) for key in ("launcher", "provider", "model"))
+            or route.get("effort") != identity.get("requested_effort")
+        ):
+            return None, {
+                "error": "recovery receipt route identity mismatches",
+                "code": "recovery_evidence_mismatch",
+            }
+        # Evidence validation must not turn a workflow decision back into a
+        # daemon route lookup. Corroborate only tuple, effort, and immutable
+        # receipt equality.
+        receipt_profile, receipt_profile_err = normalize_effort(
+            identity["launcher"], identity["provider"], identity["model"],
+            receipt.get("requested_effort"), "route",
+        )
+        if (
+            receipt_profile_err or receipt_profile is None or source != "route"
+            or any(identity.get(key) != value for key, value in receipt_profile.items())
+            or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
+        ):
+            return None, {"error": "recovery execution profile mismatches", "code": "recovery_evidence_mismatch"}
+    else:
+        if (
+            any(identity.get(key) != route.get(key) for key in ("launcher", "provider", "model"))
+            or identity.get("route_execution_profile") != route.get("writer_execution_profile")
+        ):
+            return None, {"error": "recovery receipt route identity mismatches", "code": "recovery_evidence_mismatch"}
+        route_profiles = authoritative_route_effort_profiles(
+            route["launcher"], route["provider"], route["model"], route.get("effort")
+        )
+        receipt_profile, receipt_profile_err = normalize_effort(
+            route["launcher"], route["provider"], route["model"], receipt.get("requested_effort"),
+            source if isinstance(source, str) and source in EFFORT_SOURCES else "route",
+        )
+        if (
+            not route_profiles or receipt_profile_err or receipt_profile is None
+            or receipt_profile not in route_profiles
+            or any(identity.get(key) != value for key, value in receipt_profile.items())
+            or any(receipt.get(key) != identity.get(key) for key in AGENT_PROFILE_FIELDS)
+            or source not in EFFORT_SOURCES
+        ):
+            return None, {"error": "recovery execution profile mismatches", "code": "recovery_evidence_mismatch"}
     if receipt_status == "ok" and (
         receipt.get("failure_class") != "none" or receipt.get("failure_code") != "none"
         or receipt.get("failover_eligible") is not False
@@ -4413,6 +4512,9 @@ def derive_slice_recovery_route(data: dict[str, Any]) -> tuple[int, dict[str, An
         return 400, {"error": "recovery routes and receipts must be objects", "code": "malformed_recovery_evidence"}
     primary_route, primary_receipt = data["primary_route"], data["primary_receipt"]
     fallback_route, fallback_receipt = data["fallback_route"], data["fallback_receipt"]
+    primary_profile = primary_route.get("writer_execution_profile")
+    if isinstance(primary_profile, dict) and primary_profile.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION:
+        return 400, {"error": "v2 workflow routes are not accepted by the v1 recovery selector", "code": "v2_route_selection_unsupported"}
     expected_primary = slice_route_lookup(class_name, size_floor, ac_count, seams, work_kind)
     if primary_route != expected_primary:
         return 400, {"error": "prior primary route mismatches normal route", "code": "recovery_evidence_mismatch"}
@@ -5560,9 +5662,12 @@ def review_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]
     if provider != native_spec["provider"] or model not in native_spec["models"]:
         return 400, {"error": f"invalid provider/model for {launcher} reviewer", "code": "bad_model_identity"}
     requested_effort = data.get("effort", "default")
-    route_profile: dict[str, str] | None = None
+    route_profile: dict[str, Any] | None = None
     if "route_execution_profile" in data:
         raw_route = data.get("route_execution_profile")
+        if ("effort" not in data and isinstance(raw_route, dict)
+                and raw_route.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION):
+            requested_effort = raw_route.get("requested_effort")
         role = raw_route.get("role") if isinstance(raw_route, dict) else None
         if role not in {"reviewer1", "reviewer2"}:
             return 400, {
@@ -12736,8 +12841,12 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     requested_identity, identity_err = parse_session_identity(data.get("session_identity"))
     if identity_err:
         return 400, identity_err
-    route_profile: dict[str, str] | None = None
+    route_profile: dict[str, Any] | None = None
     requested_effort = data.get("effort", "default")
+    raw_request_route = data.get("route_execution_profile")
+    if (requested_identity is None and "effort" not in data and isinstance(raw_request_route, dict)
+            and raw_request_route.get("version") == ROUTE_EXECUTION_PROFILE_V2_VERSION):
+        requested_effort = raw_request_route.get("requested_effort")
     if requested_identity is not None:
         requested_effort = requested_identity["requested_effort"]
         if "effort" in data and data.get("effort") != requested_effort:

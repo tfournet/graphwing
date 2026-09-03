@@ -76,6 +76,19 @@
       ],
       "timeout_seconds": 15,
       "async": false
+    },
+    {
+      "name": "issue-186-provider-free",
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "test_server.WorkflowRouteProfileV2Tests",
+        "test_run_control_native.NativeRunControlContracts"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 30,
+      "async": false
     }
   ]
 }
