@@ -215,18 +215,29 @@
       },
       {
         "id": "route",
-        "type": "action.graphwing.POST:/v1/slice/route",
-        "label": "sliceRoute",
+        "type": "action.subworkflow",
+        "label": "workflow routing policy",
         "position": {
           "x": 1180,
           "y": 240
         },
         "config": {
-          "integrationInstanceId": "$GRAPHWING_INSTANCE",
-          "timeout": 15,
-          "class": "{{ CTX.run_input.class }}",
-          "work_kind": "{{ CTX.run_input.work_kind | default('go_coding') }}",
-          "size": "{{ CTX.run_input.size }}"
+          "alias": "route",
+          "workflowId": "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID",
+          "workflowVersionId": "$GRAPHWING_ROUTING_POLICY_VERSION_ID",
+          "inputMapping": {
+            "mode": "select",
+            "values": {
+              "class": "{{ CTX.run_input.class }}",
+              "work_kind": "{{ CTX.run_input.work_kind | default('go_coding') }}",
+              "size": "{{ CTX.run_input.size }}"
+            }
+          },
+          "outputMapping": {
+            "mode": "select",
+            "keys": ["ok", "policy_version", "compatibility_behavior", "decision_id", "decision_sha256", "class", "work_kind", "size_floor", "size", "ac_count", "seams", "launcher", "provider", "model", "effort", "reason", "max_turns", "run_budget_seconds", "reviewer_count", "reviewer1", "reviewer1_launcher", "reviewer1_provider", "reviewer1_model", "reviewer1_effort", "reviewer1_reason", "reviewer2", "reviewer2_launcher", "reviewer2_provider", "reviewer2_model", "reviewer2_effort", "reviewer2_reason", "review", "writer_execution_profile", "reviewer1_execution_profile", "reviewer2_execution_profile"]
+          },
+          "timeout": 480
         }
       },
       {
@@ -1784,19 +1795,19 @@
                 "properties": {
                   "route_version": {
                     "kind": "getField",
-                    "path": "TASKS.route.data.route_version"
+                    "path": "TASKS.route.result.compatibility_behavior"
                   },
                   "launcher": {
                     "kind": "getField",
-                    "path": "TASKS.route.data.launcher"
+                    "path": "TASKS.route.result.launcher"
                   },
                   "provider": {
                     "kind": "getField",
-                    "path": "TASKS.route.data.provider"
+                    "path": "TASKS.route.result.provider"
                   },
                   "model": {
                     "kind": "getField",
-                    "path": "TASKS.route.data.model"
+                    "path": "TASKS.route.result.model"
                   }
                 }
               }
@@ -2002,11 +2013,11 @@
           "timeout": 60,
           "cwd": "{{ CTX.run_input.repo }}",
           "prompt": "{{ CTX.iter_writer_task.task | tojson }}",
-          "launcher": "{{ TASKS.route.data.launcher }}",
-          "provider": "{{ TASKS.route.data.provider }}",
-          "model": "{{ TASKS.route.data.model }}",
-          "effort": "{{ TASKS.route.data.effort }}",
-          "route_execution_profile": "{{ TASKS.route.data.writer_execution_profile }}",
+          "launcher": "{{ TASKS.route.result.launcher }}",
+          "provider": "{{ TASKS.route.result.provider }}",
+          "model": "{{ TASKS.route.result.model }}",
+          "effort": "{{ TASKS.route.result.effort }}",
+          "route_execution_profile": "{{ TASKS.route.result.writer_execution_profile }}",
           "_comment": "Without these the writer takes AGENT_RUN_BUDGET=300 and is SIGINTed at 300+60. Three laps ran 260s, 335s and 363s, so a fix round is L-sized work, not M. wait is 960, which clears 600+60 with room.",
           "max_turns": "50",
           "run_budget_seconds": "600",
@@ -2099,7 +2110,7 @@
               "output": "route",
               "expression": {
                 "kind": "getField",
-                "path": "TASKS.route.data"
+                "path": "TASKS.route.result"
               }
             }
           ]

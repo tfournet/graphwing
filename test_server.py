@@ -11405,7 +11405,7 @@ while True:
         # active-session corrections consume the immutable receipt identity.
         self.assertEqual(
             nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
-            "TASKS.route.data",
+            "TASKS.route.result",
         )
         self.assertEqual(nodes["selected_route"]["type"], "transforms.objectBuilder")
         self.assertEqual(
@@ -11452,13 +11452,14 @@ while True:
             if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
         ]
         self.assertEqual([node["id"] for node in model_nodes], ["agent"])
-        self.assertEqual(nodes["agent"]["config"].get("effort"), "{{ TASKS.route.data.effort }}")
+        self.assertEqual(nodes["agent"]["config"].get("effort"), "{{ TASKS.route.result.effort }}")
         self.assertEqual(
             nodes["agent"]["config"].get("route_execution_profile"),
-            "{{ TASKS.route.data.writer_execution_profile }}",
+            "{{ TASKS.route.result.writer_execution_profile }}",
         )
         self.assertEqual(
-            [node["id"] for node in graph["nodes"] if "/v1/slice/route" in node["type"]],
+            [node["id"] for node in graph["nodes"] if node["id"] == "route"
+             and node["type"] == "action.subworkflow"],
             ["route"],
         )
         self.assertNotIn("session_identity", nodes["agent"]["config"])
@@ -13850,8 +13851,8 @@ func main() {
             },
             "pr-drive.json": {
                 "route_nodes": {"route"},
-                "consumers": {"agent": "{{ TASKS.route.data.effort }}"},
-                "profiles": {"agent": "{{ TASKS.route.data.writer_execution_profile }}"},
+                "consumers": {"agent": "{{ TASKS.route.result.effort }}"},
+                "profiles": {"agent": "{{ TASKS.route.result.writer_execution_profile }}"},
             },
         }
         graphs = {
@@ -13861,12 +13862,16 @@ func main() {
         actual_routed_graphs = {
             name for name, graph in graphs.items()
             if any("/v1/slice/route" in node["type"] for node in graph["nodes"])
+            or any(node["id"] == "route" and node["type"] == "action.subworkflow"
+                   for node in graph["nodes"])
         }
         self.assertEqual(actual_routed_graphs, set(expected))
         for graph_name, contract in expected.items():
             nodes = {node["id"]: node for node in graphs[graph_name]["nodes"]}
             self.assertEqual(
-                {node_id for node_id, node in nodes.items() if "/v1/slice/route" in node["type"]},
+                {node_id for node_id, node in nodes.items()
+                 if "/v1/slice/route" in node["type"]
+                 or (node_id == "route" and node["type"] == "action.subworkflow")},
                 contract["route_nodes"],
                 graph_name,
             )
@@ -13989,11 +13994,11 @@ func main() {
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        self.assertIn("route", nodes, "pr-drive must consult sliceRoute")
-        self.assertTrue(nodes["route"]["type"].endswith("/v1/slice/route"))
+        self.assertIn("route", nodes, "pr-drive must consult workflow routing policy")
+        self.assertEqual(nodes["route"]["type"], "action.subworkflow")
         cfg = nodes["agent"]["config"]
-        self.assertIn("TASKS.route.data.model", cfg.get("model", ""))
-        self.assertIn("TASKS.route.data.launcher", cfg.get("launcher", ""))
+        self.assertIn("TASKS.route.result.model", cfg.get("model", ""))
+        self.assertIn("TASKS.route.result.launcher", cfg.get("launcher", ""))
         # route has to run before the writer, not merely exist.
         order = {e["source"]: e["target"] for e in edges}
         self.assertTrue(any(e["target"] == "route" for e in edges), "route is unreachable")
@@ -15037,16 +15042,20 @@ func main() {
             self.assertIn(f"CTX.active_route.value.{slot}_model", config["model"])
             self.assertIn(f"CTX.active_route.value.{slot}_model", config["model"])
         for index in (1, 2):
-            field = f"reviewer{index}_launcher"
+            field = "reviewer_count"
             mapping = nodes[f"map_switch_rev{'' if index == 1 else index}"]["config"]["mappings"]
             self.assertEqual(mapping, [{
                 "id": "m1", "output": field,
-                "expression": {"kind": "getField", "path": f"CTX.active_route.value.{field}"},
+                "expression": {"kind": "getField", "path": "CTX.active_route.value.reviewer_count"},
             }])
             switch = nodes[f"switch_rev{'' if index == 1 else index}"]["config"]
             self.assertEqual(switch["cases"][0]["rules"], [
-                {"path": field, "op": "equals", "value": "none"}
+                {"path": field, "op": "equals", "value": 0}
             ])
+            if index == 2:
+                self.assertEqual(switch["cases"][1]["rules"], [
+                    {"path": field, "op": "equals", "value": 1}
+                ])
         edges = {edge["id"]: edge for edge in graph["spec"]["edges"]}
         for skip, need, wait in (
             ("e_rev_skip", "e_rev_run", "wait_rev1"),
@@ -15095,13 +15104,13 @@ func main() {
         drive = json.loads((root / "pr-drive.json").read_text())
         drive_nodes = {n["id"]: n for n in drive["spec"]["nodes"]}
         self.assertEqual(
-            drive_nodes["route"]["config"]["work_kind"],
+            drive_nodes["route"]["config"]["inputMapping"]["values"]["work_kind"],
             "{{ CTX.run_input.work_kind | default('go_coding') }}",
         )
         self.assertIn("work_kind", drive_nodes["form"]["config"]["inputs"])
         mappings = drive_nodes["receipt"]["config"]["mappings"]
         route = next(m for m in mappings if m["output"] == "route")
-        self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.data"})
+        self.assertEqual(route["expression"], {"kind": "getField", "path": "TASKS.route.result"})
 
     def _queue_closed_review(self, root, *, effort=None, extra=None, active_count=0):
         repo = self._scratch_git(root)
@@ -22144,7 +22153,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "a4bbe173f184745bea547008f7723c3044353d3d1c4208103e385dc7c634ec4b")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "2b181e081935d373787151ef4cf2cc1878925774261377a36d32641ce01a9e0e")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -24058,7 +24067,8 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                 "$GRAPHWING_RUN_CONTROL_RECONCILE_WORKFLOW_ID": "run-control-reconcile.json",
                 "$GRAPHWING_RUN_CONTROL_TRANSITION_WORKFLOW_ID": "run-control-transition.json",
                 "$GRAPHWING_RUN_CONTROL_CONSUME_AUTHORIZATION_WORKFLOW_ID": "run-control-consume-authorization.json",
-                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": "run-control-authorize.json"}
+                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": "run-control-authorize.json",
+                "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID": "routing-policy.json"}
         for name, spec in graphs.items():
             for node in spec["nodes"]:
                 if node["type"] == "action.subworkflow":
@@ -25199,6 +25209,179 @@ func main() {
         spec = self.load()["spec"]
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
         self.assertIn(("agent", "failure", "rc_failure_join"), edges)
+
+
+class WorkflowRoutingConsumerTests(unittest.TestCase):
+    """Issue #186 PR3 consumer cutover fixtures."""
+
+    ROOT = Path(__file__).resolve().parent
+
+    @classmethod
+    def graph(cls, stem):
+        return json.loads((cls.ROOT / "graphs" / f"{stem}.json").read_text())
+
+    @classmethod
+    def policy_output_keys(cls):
+        policy = cls.graph("routing-policy")
+        route_output = next(node for node in policy["spec"]["nodes"] if node["id"] == "route_output")
+        return [mapping["output"] for mapping in route_output["config"]["mappings"]]
+
+    def test_implement_slice_primary_and_reviewer_profiles_come_only_from_routing_policy_subworkflow(self):
+        graph = self.graph("implement-slice")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        route = nodes["route"]
+        self.assertEqual(route["type"], "action.subworkflow")
+        self.assertEqual(route["config"]["workflowId"], "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID")
+        self.assertEqual(route["config"]["workflowVersionId"], "$GRAPHWING_ROUTING_POLICY_VERSION_ID")
+        self.assertEqual(route["config"]["inputMapping"], {
+            "mode": "select",
+            "values": {
+                "class": "{{ CTX.INPUT.class }}", "work_kind": "{{ CTX.INPUT.work_kind }}",
+                "size": "{{ CTX.INPUT.size }}", "ac_count": "{{ CTX.INPUT.ac_count }}",
+                "seams": "{{ CTX.INPUT.seams }}",
+            },
+        })
+        self.assertEqual(route["config"]["outputMapping"], {
+            "mode": "select", "keys": self.policy_output_keys(),
+        })
+        self.assertFalse(any(
+            node["type"] == "action.graphwing.POST:/v1/slice/route"
+            for node in graph["spec"]["nodes"]
+        ))
+        self.assertNotIn("TASKS.route.data", json.dumps(graph))
+        self.assertEqual(nodes["fallback_route"]["config"]["primary_route"], "{{ TASKS.route.result }}")
+        primary = nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]
+        self.assertEqual(primary, {"kind": "getField", "path": "TASKS.route.result"})
+        self.assertEqual(nodes["agent"]["config"]["route_execution_profile"],
+                         "{{ CTX.selected_route.value.writer_execution_profile }}")
+        durable = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["durable_outcome"]["config"]["mappings"]
+        }
+        self.assertIn(
+            "CTX.durable_selected_agent.result.receipt.session_identity.route_execution_profile.policy_version",
+            json.dumps(durable["route_version"]),
+        )
+        self.assertIn(
+            "CTX.durable_selected_agent.result.receipt.session_identity.route_execution_profile.effective_size",
+            json.dumps(durable["effective_size"]),
+        )
+        for node_id, role in (("review1", "reviewer1"), ("review1b", "reviewer1"),
+                              ("review2", "reviewer2"), ("review2b", "reviewer2")):
+            config = nodes[node_id]["config"]
+            self.assertEqual(config["route_execution_profile"],
+                             f"{{{{ CTX.active_route.value.{role}_execution_profile }}}}")
+        self.assertEqual(
+            nodes["map_switch_rev"]["config"]["mappings"][0]["expression"],
+            {"kind": "getField", "path": "CTX.active_route.value.reviewer_count"},
+        )
+        self.assertEqual(
+            nodes["map_switch_rev2"]["config"]["mappings"][0]["expression"],
+            {"kind": "getField", "path": "CTX.active_route.value.reviewer_count"},
+        )
+
+    def test_implement_slice_all_test_red_and_review_nack_corrections_reuse_the_exact_successful_session_profile(self):
+        graph = self.graph("implement-slice")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            config = nodes[node_id]["config"]
+            self.assertIn("session_identity", config)
+            self.assertIn("resume_job_id", config)
+            for field in ("launcher", "provider", "model", "effort", "route_execution_profile"):
+                self.assertIn("session_identity", config[field])
+                self.assertNotIn("TASKS.route", config[field])
+        self.assertEqual(nodes["agent3"]["config"]["route_execution_profile"],
+                         "{{ CTX.receipt2.session_identity.route_execution_profile }}")
+
+    def test_implement_slice_policy_failure_parks_before_agent_or_review_launch(self):
+        graph = self.graph("implement-slice")["spec"]
+        edges = graph["edges"]
+        direct = [(edge.get("sourceHandle"), edge["target"]) for edge in edges if edge["source"] == "route"]
+        self.assertEqual(set(direct), {("success", "normal_primary_candidate"), ("failure", "route_fail")})
+        adjacency = {}
+        for edge in edges:
+            adjacency.setdefault(edge["source"], []).append(edge["target"])
+        seen, pending = set(), ["route_fail"]
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(adjacency.get(current, []))
+        launchers = {
+            node["id"] for node in graph["nodes"]
+            if node["type"] in {
+                "action.graphwing.POST:/v1/agent/run", "action.graphwing.POST:/v1/review/run",
+            }
+        }
+        self.assertTrue(seen.isdisjoint(launchers), seen & launchers)
+
+    def test_pr_drive_primary_profile_and_run_control_route_come_only_from_routing_policy_subworkflow(self):
+        graph = self.graph("pr-drive")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        route = nodes["route"]
+        self.assertEqual(route["type"], "action.subworkflow")
+        self.assertEqual(route["config"]["workflowId"], "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID")
+        self.assertEqual(route["config"]["workflowVersionId"], "$GRAPHWING_ROUTING_POLICY_VERSION_ID")
+        self.assertEqual(route["config"]["outputMapping"]["keys"], self.policy_output_keys())
+        self.assertFalse(any("/v1/slice/route" in node["type"] for node in graph["spec"]["nodes"]))
+        agent = nodes["agent"]["config"]
+        for field in ("launcher", "provider", "model", "effort"):
+            self.assertEqual(agent[field], f"{{{{ TASKS.route.result.{field} }}}}")
+        self.assertEqual(agent["route_execution_profile"],
+                         "{{ TASKS.route.result.writer_execution_profile }}")
+        candidate = next(
+            mapping["expression"] for mapping in nodes["rc_task_material"]["config"]["mappings"]
+            if mapping["output"] == "candidate_route"
+        )["properties"]
+        self.assertEqual(candidate["route_version"], {
+            "kind": "getField", "path": "TASKS.route.result.compatibility_behavior",
+        })
+        for field in ("launcher", "provider", "model"):
+            self.assertEqual(candidate[field], {
+                "kind": "getField", "path": f"TASKS.route.result.{field}",
+            })
+
+    def test_drive_pr_resolves_initial_route_through_rewst_policy_and_never_posts_v1_slice_route(self):
+        spec = importlib.util.spec_from_file_location(
+            "drive_pr_consumer_test", self.ROOT / "scripts" / "drive-pr.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        profile = {
+            "version": "route-execution-profile-v2", "policy_version": "workflow-normal-v1",
+            "decision_id": "routing-normal-v1:" + "a" * 64, "decision_sha256": "a" * 64,
+            "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+            "effective_size": "M", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "requested_effort": "high",
+        }
+        output = {
+            "compatibility_behavior": "normal-v1", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "effort": "high", "writer_execution_profile": profile,
+        }
+        trace = {"data": {"result": {"trace": [
+            {"nodeId": "route_output", "status": "completed", "output": output},
+        ]}}}
+        policy_ref = {
+            "workflow_id": "workflow-exact", "workflow_version_id": "version-exact",
+            "slug": "graphwing-routing-policy",
+        }
+        with mock.patch.object(module.pg, "read_back_exact_published_version", return_value="version-exact") as readback, \
+             mock.patch.object(module.pg, "run_slug", return_value=("completed", "run-1", {}, trace)) as run, \
+             mock.patch.object(module.urllib.request, "urlopen", side_effect=AssertionError("local route called")):
+            route = module.resolve_route("mcp", policy_ref, "mechanical", "M", "go_coding")
+        readback.assert_called_once_with(
+            "mcp", "workflow-exact", "version-exact", "graphwing-routing-policy",
+        )
+        run.assert_called_once_with(
+            "mcp", "graphwing-routing-policy",
+            {"input": {"class": "mechanical", "size": "M", "work_kind": "go_coding"}},
+            wait=90,
+        )
+        self.assertEqual(route, {
+            "route_version": "normal-v1", "launcher": "codex",
+            "provider": "openai", "model": "gpt-5.6-sol",
+        })
 
 
 class RewstNativeRoutingPolicyTests(unittest.TestCase):

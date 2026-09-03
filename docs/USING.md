@@ -59,7 +59,7 @@ Published slug: `graphwing-implement-slice`. Use the manual/form trigger or an a
 
 `ticket` must already be on the frontier, or omit it and Graph takes the next build.
 
-`ac_count` and `seams` feed `sliceRoute`, which may bump the size one step from countable features. Seven ACs took SC-110290 from floor `S` to `M`, which turned Sonnet spec-review on. Omitting them leaves the router blind and the floor unchanged, so send them honestly rather than to dodge a gate.
+`ac_count` and `seams` feed `graphwing-routing-policy`, which may bump the size one step from countable features. Omitting them leaves the workflow policy blind and the floor unchanged, so send them honestly rather than to dodge a gate.
 
 The legacy seat helper still exists:
 
@@ -73,11 +73,11 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
-### Canonical native routing policy (issue #186, slice 2)
+### Canonical native routing policy (issue #186, slice 3)
 
 `graphwing-routing-policy` accepts only `class`, `work_kind`, `size`, `ac_count`, and `seams`. Native AST/object nodes validate and normalize those values, apply at most one size bump, select the current normal-v1 writer and class/effective-size budget, and choose zero, one, or two distinct opposing-provider reviewers. Writer effort remains work-kind-specific; reviewer effort is independently `medium` or `high`. Every present role carries one complete `route-execution-profile-v2` bound to the deterministic decision hash.
 
-The graph's policy version is `workflow-normal-v1`, with `normal-v1` retained as its compatibility behavior label. This does not promote the Python `routing-policy-v2` benchmark candidate, which remains unable to authorize execution. Publisher ordering records the exact policy workflow/version before either future consumer is published. Existing implement-slice, PR-drive, and local route endpoints are intentionally unchanged in this slice; no graph consumes the new policy yet. This source change performs no publication or live use, and either operation requires separate approval.
+The graph's policy version is `workflow-normal-v1`, with `normal-v1` retained as its compatibility behavior label. `implement-slice` and `pr-drive` invoke the exact published workflow/version and feed their initial writers and routed reviewers from its v2 profiles. Same-session corrections reuse the successful receipt identity and never invoke policy again. `scripts/drive-pr.py` runs the same Rewst policy before run-control initialization and projects its compatibility tuple; it no longer calls `/v1/slice/route`. The v1 endpoint/profile and the fallback/recovery branches remain for rollback and later migration. This source change performs no import, publication, provider call, or live canary.
 
 ### Native effort contract (Phases 2–3)
 

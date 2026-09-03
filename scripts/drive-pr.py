@@ -3,9 +3,8 @@
 
 Every attempt is now run-control reservation-backed and the retry loop lives
 inside the graph (graphs/pr-drive.json's capped `attempts` logic.loop), not
-here. This script does the two things only an operator can: initialize the
-run-control record (there is no predecessor run to reserve it), and start the
-graph. One call, one run, up to three in-graph attempts.
+here. This script resolves the exact workflow policy, initializes the run-control
+record, and starts the graph. One call, one run, up to three in-graph attempts.
 
 Why REST and not the webhook: a webhook-triggered run leaves CTX.INPUT empty,
 so every {{ CTX.INPUT.* }} in the graph resolves to nothing and pr-drive dies at
@@ -50,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import publish_graphs as pg  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from server import resolve_executable  # noqa: E402
+from server import parse_route_execution_profile, resolve_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DAEMON_BASE = "http://127.0.0.1:8645"
@@ -256,24 +255,52 @@ def api_key() -> str:
     return path.read_text().strip()
 
 
-def resolve_route(key: str, klass: str, size: str, work_kind: str) -> dict[str, str]:
-    """POST /v1/slice/route on the local daemon, for the initial_route the
-    run-control record is opened with. Each in-graph attempt resolves its own
-    candidate route the same way; this call is only for that opening record."""
-    body = json.dumps({"class": klass, "size": size, "work_kind": work_kind}).encode()
-    req = urllib.request.Request(
-        DAEMON_BASE + "/v1/slice/route", data=body, method="POST",
-        headers={"X-Graphwing-Key": key, "Content-Type": "application/json"},
+def resolve_route(mcp: str, policy_ref: dict[str, Any], klass: str, size: str, work_kind: str,
+                  wait: int = 90) -> dict[str, str]:
+    workflow_id = policy_ref.get("workflow_id")
+    version_id = policy_ref.get("workflow_version_id")
+    slug = policy_ref.get("slug")
+    if not all(isinstance(value, str) and value for value in (workflow_id, version_id, slug)):
+        raise SystemExit("install['routing_policy'] has no exact workflow/version/slug; publish it first")
+    assert isinstance(workflow_id, str) and isinstance(version_id, str) and isinstance(slug, str)
+    if slug != "graphwing-routing-policy":
+        raise SystemExit("install['routing_policy'] names the wrong workflow")
+    pg.read_back_exact_published_version(mcp, workflow_id, version_id, slug)
+    status, _run_id, _run, trace = pg.run_slug(
+        mcp, slug,
+        {"input": {"class": klass, "size": size, "work_kind": work_kind}},
+        wait=wait,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as exc:
-        raise SystemExit(f"slice route failed: HTTP {exc.code} {exc.read().decode()[:400]}")
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"slice route failed: {exc}")
-    return {"route_version": data["route_version"], "launcher": data["launcher"],
-            "provider": data["provider"], "model": data["model"]}
+    if status != "completed":
+        raise SystemExit(f"routing policy run ended {status}")
+    output = next((
+        entry.get("output") for entry in trace_entries(trace)
+        if isinstance(entry, dict)
+        and (entry.get("nodeId") or entry.get("id")) == "route_output"
+    ), None)
+    if not isinstance(output, dict):
+        raise SystemExit("routing policy did not return route_output")
+    profile = output.get("writer_execution_profile")
+    launcher, provider = output.get("launcher"), output.get("provider")
+    model, effort = output.get("model"), output.get("effort")
+    if not all(isinstance(value, str) for value in (launcher, provider, model, effort)):
+        raise SystemExit("routing policy returned a noncanonical writer profile")
+    assert isinstance(launcher, str) and isinstance(provider, str)
+    assert isinstance(model, str) and isinstance(effort, str)
+    parsed, error = parse_route_execution_profile(
+        profile, expected_role="writer", launcher=launcher,
+        provider=provider, model=model, effort=effort,
+    )
+    if (
+        error is not None or parsed != profile or not isinstance(profile, dict)
+        or output.get("compatibility_behavior") != "normal-v1"
+    ):
+        raise SystemExit("routing policy returned a noncanonical writer profile")
+    return {
+        "route_version": output["compatibility_behavior"],
+        "launcher": profile["launcher"], "provider": profile["provider"],
+        "model": profile["model"],
+    }
 
 
 def gh_pr_view(repo_path: Path, pr: str) -> tuple[str, str]:
@@ -449,7 +476,9 @@ def main() -> int:
     print("branch", branch, "head_sha", head_sha)
 
     print("=== resolving the opening route ===")
-    initial_route = resolve_route(api_key(), args.klass, args.size, args.work_kind)
+    initial_route = resolve_route(
+        mcp, install.get("routing_policy") or {}, args.klass, args.size, args.work_kind,
+    )
     print("initial_route", json.dumps(initial_route))
 
     budgets = build_budgets(
