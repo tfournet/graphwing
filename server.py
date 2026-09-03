@@ -3150,7 +3150,7 @@ def _attempt_facts_authorization_available(job: dict[str, Any]) -> tuple[bool, b
 
 
 def _provider_cost_microusd_ceiling(cost: Any) -> int | None:
-    if cost is None:
+    if type(cost) not in {int, float}:
         return None
     exact = Decimal(repr(cost))
     if not exact.is_finite() or exact < 0 or exact > Decimal(str(USAGE_MAX_COST_USD)):

@@ -26024,6 +26024,7 @@ class RunControlAttemptFactsTests(unittest.TestCase):
         self.assertEqual(server._provider_cost_microusd_ceiling(0), 0)
         self.assertEqual(server._provider_cost_microusd_ceiling(0.000001), 1)
         self.assertEqual(server._provider_cost_microusd_ceiling(1.0000001), 1_000_001)
+        self.assertIsNone(server._provider_cost_microusd_ceiling(True))
         self.assertLessEqual(
             server._provider_cost_microusd_ceiling(server.USAGE_MAX_COST_USD),
             2 ** 53 - 1,

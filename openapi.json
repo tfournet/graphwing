@@ -1009,7 +1009,7 @@
             }
           },
           "400": {"$ref": "#/components/responses/BadRequest"},
-          "404": {"$ref": "#/components/responses/NotFound"},
+          "404": {"$ref": "#/components/responses/Error"},
           "409": {"$ref": "#/components/responses/Error"}
         }
       }
