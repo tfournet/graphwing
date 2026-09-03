@@ -188,12 +188,14 @@ trigger with `body: {}` and fails the same silent way.
 that reaches the commit has already spent a full writer session. The graph defaults it
 too, so a caller that forgets loses nothing.
 
-The writer's prompt is not yours to write. Each attempt slot's `iter_findings` node
-reads submitted exact-head `pr-audit-findings v1` reviews first (commit / `pr-audit-sha`
-must match `headRefOid`; only `open` items), else Clean Code `engineering-findings-json`
-issue comments. It prefers the PM audit grade over a separate Clean Code grade, dedupes
-by fingerprint (two reviewers raising one defect is one fix), orders by severity, and
-hands over the remedies without the argument. Stale reviews do not feed the writer.
+The writer's task is not yours to write. Each attempt reads the bounded
+`pr-policy-inputs-v1` fact packet. Native workflow nodes prefer exact-head PR Audit
+records, fall back to Clean Code compatibility facts, keep only open below-bar
+findings, deduplicate and order them, and separate policy, aggregate, transport, and
+root-cause checks. The writer receives a serialized closed `pr-correction-task-v1`
+with one fixed instruction, the exact head, actionable findings, and root checks.
+Legacy daemon `needs_fix` and `brief` fields remain for compatibility but the active
+graph does not read them. Stale reviews do not feed the writer.
 
 Two node-output traps worth knowing before editing this graph. `action.graphwing` results
 are exposed as `TASKS.<node>.data.<field>`, while a `transforms.objectBuilder` publishes
