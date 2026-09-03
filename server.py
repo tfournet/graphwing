@@ -3115,8 +3115,16 @@ def _attempt_facts_terminal_material(job: Any) -> dict[str, Any] | None:
 
 def _attempt_facts_terminal_digest(job: Any) -> str | None:
     material = _attempt_facts_terminal_material(job)
-    canonical = _rewst_canonical_json_bytes(material)
-    return hashlib.sha256(canonical).hexdigest() if canonical is not None else None
+    if material is None or not _provider_json_is_bounded(material):
+        return None
+    try:
+        canonical = json.dumps(
+            material, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (RecursionError, MemoryError, TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def seal_attempt_facts_terminal_authority(job: Any) -> None:

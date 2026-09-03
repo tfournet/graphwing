@@ -25874,8 +25874,33 @@ class WorkflowRouteProfileV2Tests(unittest.TestCase):
         self.assertFalse(server.codeoff_identity_is_pinned("author-1", {**codeoff_identity, "effective_effort": "medium"}))
 
 
-class RunControlAttemptFactsTests(RewstExactAgentAuthorizationTests):
+class RunControlAttemptFactsTests(unittest.TestCase):
     """Provider-free issue-187 PR3 normalized attempt-fact regressions."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        root = Path(self.td.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(self.repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "gw@test"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "graphwing-test"], check=True)
+        (self.repo / "README").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "init"], check=True, capture_output=True)
+        self.jobs = root / "jobs"
+        self.binary = _write_fake_codex(root / "codex")
+        server.reset_rewst_authority_registry_for_test()
+
+    def dispatch_authorized(self, body, headers):
+        with mock.patch.object(server.time, "time", return_value=1_700_000_000), \
+             mock.patch.object(server, "load_rewst_issuer_secret", return_value=b"r" * 32), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}), \
+             mock.patch.object(server, "JOBS_DIR", self.jobs), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.binary), \
+             mock.patch.object(server, "enqueue_agent", lambda job: None):
+            return server.dispatch("POST", "/v1/agent/run", {}, True, body, headers)
 
     def authorized_terminal_job(self, *, usage="default", status="ok", failure_code="none"):
         authorization_id = "attempt-facts-auth"
@@ -25962,6 +25987,10 @@ class RunControlAttemptFactsTests(RewstExactAgentAuthorizationTests):
         self.assertEqual(facts["reasoning_tokens"], 7)
         self.assertEqual(facts["total_tokens"], 170)
         self.assertRegex(facts["receipt_sha256"], r"^[0-9a-f]{64}$")
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            _replace_persisted_job_fixture(job["job_id"], {**job, "status": "running"})
+        status, payload = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual((status, payload["code"]), (409, "attempt_job_not_terminal"))
 
     def test_attempt_facts_preserves_unknown_turns_and_cost_as_null(self):
         usage = {
@@ -26043,16 +26072,25 @@ class RunControlAttemptFactsTests(RewstExactAgentAuthorizationTests):
 
     def test_attempt_facts_after_authority_loss_returns_closed_unavailable_facts_without_invented_usage(self):
         job, authorization_identity = self.authorized_terminal_job()
-        server.clear_terminal_receipt_authority("agent", job["job_id"])
+
+        def assert_unavailable():
+            status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+            self.assertEqual(status, 200, facts)
+            self.assertFalse(facts["authority_available"])
+            self.assertEqual(facts["job_id"], job["job_id"])
+            self.assertEqual(facts["authorization_identity"], authorization_identity)
+            for key, value in facts.items():
+                if key not in {"version", "job_id", "authorization_identity", "authority_available"}:
+                    self.assertIsNone(value, key)
+
+        with server.TERMINAL_RECEIPT_AUTHORITY_LOCK:
+            server.TERMINAL_RECEIPT_AUTHORITY.pop(("agent", job["job_id"]), None)
+        assert_unavailable()
+        server.seal_terminal_receipt_authority("agent", job["receipt"])
+        with server.ATTEMPT_FACTS_TERMINAL_AUTHORITY_LOCK:
+            server.ATTEMPT_FACTS_TERMINAL_AUTHORITY.pop(job["job_id"], None)
+        assert_unavailable()
         server.reset_rewst_authority_registry_for_test()
-        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
-        self.assertEqual(status, 200, facts)
-        self.assertFalse(facts["authority_available"])
-        self.assertEqual(facts["job_id"], job["job_id"])
-        self.assertEqual(facts["authorization_identity"], authorization_identity)
-        for key, value in facts.items():
-            if key not in {"version", "job_id", "authorization_identity", "authority_available"}:
-                self.assertIsNone(value, key)
 
     def test_attempt_facts_runtime_bodies_validate_against_the_closed_openapi_schema(self):
         spec = json.loads(server.openapi_bytes())
