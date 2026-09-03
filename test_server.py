@@ -11823,11 +11823,11 @@ func main() {
             for edge in graph["edges"]
         }
         cases = {
-            "test": ("wait_test", "join_test_accept", "if_test_ok", "join_test_http_fail"),
-            "test2": ("wait_test2", "join_test2_accept", "if_test_ok2", "join_test2_http_fail"),
-            "test3": ("wait_test3", "join_test3_accept", "if_test_ok3", "join_test2_http_fail"),
-            "test_rn1": ("wait_test_rn1", "join_test_rn1_accept", "if_test_rn1", "join_test_http_fail"),
-            "test_rn2": ("wait_test_rn2", "join_test_rn2_accept", "if_test_rn2", "join_test_http_fail"),
+            "test": ("wait_test", "join_test_accept", "test_callback", "if_test_ok", "join_test_http_fail"),
+            "test2": ("wait_test2", "join_test2_accept", "test2_callback", "if_test_ok2", "join_test2_http_fail"),
+            "test3": ("wait_test3", "join_test3_accept", "test3_callback", "if_test_ok3", "join_test2_http_fail"),
+            "test_rn1": ("wait_test_rn1", "join_test_rn1_accept", None, "if_test_rn1", "join_test_http_fail"),
+            "test_rn2": ("wait_test_rn2", "join_test_rn2_accept", None, "if_test_rn2", "join_test_http_fail"),
         }
         def callback_gate_passes(rules, body, accepted_job_id):
             actual = {
@@ -11842,7 +11842,7 @@ func main() {
                     return False
             return True
 
-        for test_id, (wait_id, barrier_id, gate_id, failure_join) in cases.items():
+        for test_id, (wait_id, barrier_id, picker_id, gate_id, failure_join) in cases.items():
             wait = nodes[wait_id]
             barrier = nodes[barrier_id]
             self.assertEqual(wait["type"], "action.wait.webhook")
@@ -11864,7 +11864,12 @@ func main() {
             self.assertIn((wait_id, "pending", test_id), triples)
             self.assertIn((wait_id, "out", barrier_id), triples)
             self.assertIn((test_id, "success", barrier_id), triples)
-            self.assertIn((barrier_id, "out", gate_id), triples)
+            if picker_id is None:
+                self.assertIn((barrier_id, "out", gate_id), triples)
+            else:
+                self.assertNotIn((barrier_id, "out", gate_id), triples)
+                self.assertIn((barrier_id, "out", picker_id), triples)
+                self.assertIn((picker_id, "out", gate_id), triples)
             self.assertNotIn((wait_id, "out", gate_id), triples)
             self.assertIn((wait_id, "timeout", failure_join), triples)
             self.assertIn((wait_id, "failure", failure_join), triples)
@@ -11896,6 +11901,101 @@ func main() {
             set(evidence["then"]["properties"]),
             {"evidence_version", "job_id", "name", "status"},
         )
+
+    def test_implement_slice_async_test_join_selects_pass_from_callback_not_acceptance(self):
+        # Production join.all emits the 202 acceptance object plus the
+        # webhook wrapper. if_test_ok* used to judge that envelope, so a
+        # green recipe (request.body.status=ok) looked like fail and
+        # launched correction writers. Re-emit the wait callback, then
+        # bind job_id to the accepted testRun id.
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        triples = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["edges"]
+        }
+
+        def by_path(value, path):
+            for part in path.split("."):
+                if isinstance(value, dict):
+                    value = value.get(part)
+                else:
+                    return None
+            return value
+
+        def filter_passes(rules, incoming, accepted_job_id):
+            for rule in rules:
+                actual = by_path(incoming, rule["path"])
+                expected = rule["value"]
+                if isinstance(expected, str) and expected.startswith("{{ TASKS."):
+                    expected = accepted_job_id
+                if rule["op"] != "equals" or actual != expected:
+                    return False
+            return True
+
+        def emit_request(builder, context):
+            emitted = {}
+            for mapping in builder["config"]["mappings"]:
+                expression = mapping["expression"]
+                self.assertEqual(expression["kind"], "getField")
+                emitted[mapping["output"]] = by_path(context, expression["path"])
+            return emitted
+
+        cases = (
+            ("test", "wait_test", "join_test_accept", "test_callback", "if_test_ok",
+             "join_switch_rev", "wait2"),
+            ("test2", "wait_test2", "join_test2_accept", "test2_callback", "if_test_ok2",
+             "join_switch_rev", "wait3"),
+            ("test3", "wait_test3", "join_test3_accept", "test3_callback", "if_test_ok3",
+             "join_switch_rev", "join_wait_human"),
+        )
+        for test_id, wait_id, barrier_id, picker_id, gate_id, pass_target, fail_target in cases:
+            accepted = f"accepted-{test_id}"
+            acceptance = {"data": {"status": "queued", "job_id": accepted}}
+            callback = {
+                "request": {
+                    "body": {"status": "ok", "job_id": accepted, "summary": "green"}
+                }
+            }
+            join_envelope = {
+                "mode": "all",
+                "count": 2,
+                "values": [acceptance, callback],
+            }
+            picker = nodes[picker_id]
+            gate = nodes[gate_id]
+            self.assertEqual(picker["type"], "transforms.objectBuilder")
+            self.assertEqual(picker["config"]["alias"], picker_id)
+            self.assertEqual(
+                {mapping["output"] for mapping in picker["config"]["mappings"]},
+                {"request"},
+            )
+            self.assertNotIn((barrier_id, "out", gate_id), triples)
+            self.assertIn((barrier_id, "out", picker_id), triples)
+            self.assertIn((picker_id, "out", gate_id), triples)
+            self.assertIn((gate_id, "pass", pass_target), triples)
+            self.assertIn((gate_id, "fail", fail_target), triples)
+            self.assertNotIn((gate_id, "pass", fail_target), triples)
+            self.assertFalse(
+                filter_passes(gate["config"]["rules"], join_envelope, accepted),
+                f"{gate_id} must not pass the join.all envelope",
+            )
+            projected = emit_request(picker, {"TASKS": {wait_id: callback, test_id: {"data": {"job_id": accepted}}}})
+            self.assertTrue(filter_passes(gate["config"]["rules"], projected, accepted))
+            forged = emit_request(picker, {
+                "TASKS": {
+                    wait_id: {"request": {"body": {"status": "ok", "job_id": f"forged-{test_id}"}}},
+                    test_id: {"data": {"job_id": accepted}},
+                }
+            })
+            self.assertFalse(filter_passes(gate["config"]["rules"], forged, accepted))
+
+        self.assertNotIn(("if_test_ok", "pass", "wait2"), triples)
+        self.assertNotIn(("if_test_ok2", "pass", "wait3"), triples)
+        self.assertIn(("wait2", "pending", "agent2"), triples)
+        self.assertIn(("wait3", "pending", "agent3"), triples)
 
     def test_implement_slice_named_test_evidence_uses_acceptance_identity_not_callback_text(self):
         graph = json.loads(
@@ -14107,6 +14207,9 @@ func main() {
                     "if_test_ok3": "test3",
                     "if_test_rn1": "test_rn1",
                     "if_test_rn2": "test_rn2",
+                    "test_callback": "wait_test",
+                    "test2_callback": "wait_test2",
+                    "test3_callback": "wait_test3",
                 }.get(node_id) == alias
                 if alias not in dominators[node_id] and not (
                     guarded_projection_ref or bound_async_gate_ref
@@ -14183,8 +14286,13 @@ func main() {
                     {"source": target, "handle": "success", "target": barrier},
                     [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges],
                 )
+                picker = "test_callback"
                 self.assertIn(
-                    {"source": barrier, "handle": "out", "target": filt},
+                    {"source": barrier, "handle": "out", "target": picker},
+                    [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges],
+                )
+                self.assertIn(
+                    {"source": picker, "handle": "out", "target": filt},
                     [{"source": e["source"], "handle": e.get("sourceHandle"), "target": e["target"]} for e in edges],
                 )
             # nothing may reach the async node except its wait
@@ -22153,7 +22261,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "2b181e081935d373787151ef4cf2cc1878925774261377a36d32641ce01a9e0e")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "865462e9c3f54d9ad7f047a869ada2f1a043aa76a714800b65ae59936aedb9af")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
