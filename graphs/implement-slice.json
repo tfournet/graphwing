@@ -441,6 +441,7 @@
           "response_webhook_token": "{{ TASKS.wait_test.pending.resumeToken }}"
         }
       },
+      {"id": "test_callback", "type": "transforms.objectBuilder", "label": "Emit accepted test callback", "position": {"x": 1105, "y": 200}, "config": {"alias": "test_callback", "version": 1, "mappings": [{"id": "m1", "output": "request", "expression": {"kind": "getField", "path": "TASKS.wait_test.request"}}]}},
       {"id": "if_test_ok", "type": "logic.filter", "label": "test ok?", "position": {"x": 1120, "y": 200}, "config": {"group": "AND", "rules": [{"path": "request.body.status", "op": "equals", "value": "ok"}, {"path": "request.body.job_id", "op": "equals", "value": "{{ TASKS.test.data.job_id }}"}]}},
       {
         "id": "wait2",
@@ -508,6 +509,7 @@
           "response_webhook_token": "{{ TASKS.wait_test2.pending.resumeToken }}"
         }
       },
+      {"id": "test2_callback", "type": "transforms.objectBuilder", "label": "Emit accepted retry test callback", "position": {"x": 2265, "y": 320}, "config": {"alias": "test2_callback", "version": 1, "mappings": [{"id": "m1", "output": "request", "expression": {"kind": "getField", "path": "TASKS.wait_test2.request"}}]}},
       {"id": "if_test_ok2", "type": "logic.filter", "label": "retry test ok?", "position": {"x": 2280, "y": 320}, "config": {"group": "AND", "rules": [{"path": "request.body.status", "op": "equals", "value": "ok"}, {"path": "request.body.job_id", "op": "equals", "value": "{{ TASKS.test2.data.job_id }}"}]}},
       {
         "id": "wait3",
@@ -543,6 +545,7 @@
           "response_webhook_token": "{{ TASKS.wait_test3.pending.resumeToken }}"
         }
       },
+      {"id": "test3_callback", "type": "transforms.objectBuilder", "label": "Emit accepted second retry test callback", "position": {"x": 2745, "y": 320}, "config": {"alias": "test3_callback", "version": 1, "mappings": [{"id": "m1", "output": "request", "expression": {"kind": "getField", "path": "TASKS.wait_test3.request"}}]}},
       {"id": "if_test_ok3", "type": "logic.filter", "label": "second retry test ok?", "position": {"x": 2760, "y": 320}, "config": {"group": "AND", "rules": [{"path": "request.body.status", "op": "equals", "value": "ok"}, {"path": "request.body.job_id", "op": "equals", "value": "{{ TASKS.test3.data.job_id }}"}]}},
       {
         "id": "wait_human",
@@ -894,7 +897,8 @@
       {"id":"e_writer_success","source":"join_writer_success","sourceHandle":"out","target":"active_route_pick","targetHandle":"in"},
       { "id": "e15", "source": "wait_test", "sourceHandle": "out", "target": "join_test_accept", "targetHandle": "in" },
       { "id": "e_test_accept", "source": "test", "sourceHandle": "success", "target": "join_test_accept", "targetHandle": "in" },
-      { "id": "e_join_test_accept", "source": "join_test_accept", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
+      { "id": "e_join_test_accept", "source": "join_test_accept", "sourceHandle": "out", "target": "test_callback", "targetHandle": "in" },
+      { "id": "e_test_callback", "source": "test_callback", "sourceHandle": "out", "target": "if_test_ok", "targetHandle": "in" },
       { "id": "e16", "source": "test", "sourceHandle": "failure", "target": "join_test_http_fail", "targetHandle": "in" },
       { "id": "e_commit_first", "source": "if_test_ok", "sourceHandle": "pass", "target": "join_switch_rev", "targetHandle": "in" },
       { "id": "e_rev_skip", "source": "switch_rev", "sourceHandle": "case-0", "target": "join_commit", "targetHandle": "in" },
@@ -964,7 +968,8 @@
       { "id": "e27b", "source": "if_receipt_ok2", "sourceHandle": "fail", "target": "join_receipt_fail", "targetHandle": "in" },
       { "id": "e28", "source": "wait_test2", "sourceHandle": "out", "target": "join_test2_accept", "targetHandle": "in" },
       { "id": "e_test2_accept", "source": "test2", "sourceHandle": "success", "target": "join_test2_accept", "targetHandle": "in" },
-      { "id": "e_join_test2_accept", "source": "join_test2_accept", "sourceHandle": "out", "target": "if_test_ok2", "targetHandle": "in" },
+      { "id": "e_join_test2_accept", "source": "join_test2_accept", "sourceHandle": "out", "target": "test2_callback", "targetHandle": "in" },
+      { "id": "e_test2_callback", "source": "test2_callback", "sourceHandle": "out", "target": "if_test_ok2", "targetHandle": "in" },
       { "id": "e_test2_timeout", "source": "wait_test2", "sourceHandle": "timeout", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e_test2_fail", "source": "wait_test2", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e29", "source": "test2", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
@@ -984,7 +989,8 @@
       { "id": "e_agent3_fail", "source": "agent3", "sourceHandle": "failure", "target": "join_correction_action_fail", "targetHandle": "in" },
       { "id": "e31f", "source": "wait_test3", "sourceHandle": "out", "target": "join_test3_accept", "targetHandle": "in" },
       { "id": "e_test3_accept", "source": "test3", "sourceHandle": "success", "target": "join_test3_accept", "targetHandle": "in" },
-      { "id": "e_join_test3_accept", "source": "join_test3_accept", "sourceHandle": "out", "target": "if_test_ok3", "targetHandle": "in" },
+      { "id": "e_join_test3_accept", "source": "join_test3_accept", "sourceHandle": "out", "target": "test3_callback", "targetHandle": "in" },
+      { "id": "e_test3_callback", "source": "test3_callback", "sourceHandle": "out", "target": "if_test_ok3", "targetHandle": "in" },
       { "id": "e_test3_timeout", "source": "wait_test3", "sourceHandle": "timeout", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e_test3_fail", "source": "wait_test3", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
       { "id": "e31g", "source": "test3", "sourceHandle": "failure", "target": "join_test2_http_fail", "targetHandle": "in" },
