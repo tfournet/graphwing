@@ -28,6 +28,17 @@ os.environ["GRAPHWING_HERDR"] = "0"
 import server  # noqa: E402
 
 
+def _write_fake_codex(path: Path, body: str | bytes = "fixture", host: str | bytes = "fixture-host") -> Path:
+    data = body.encode() if isinstance(body, str) else body
+    path.write_bytes(data)
+    path.chmod(0o755)
+    sibling = path.resolve().parent / "codex-code-mode-host"
+    host_data = host.encode() if isinstance(host, str) else host
+    sibling.write_bytes(host_data)
+    sibling.chmod(0o755)
+    return path
+
+
 def _lookup_view(node):
     """Read an objectBuilder conditional chain as the lookup table it replaced.
 
@@ -60,6 +71,11 @@ def _fixture_execution_profile(
             "effective_effort": "high" if launcher in {"codex", "grok"} else "default",
             "effort_source": source,
         }
+    if binary is not None and launcher == "codex":
+        path = Path(binary)
+        host = path.resolve().parent / "codex-code-mode-host"
+        if host.is_file():
+            return {**profile, "launcher_version": _codex_host_fixture_version(path.read_bytes(), host.read_bytes())}
     version_bytes = (
         Path(binary).read_bytes()
         if binary is not None
@@ -81,6 +97,13 @@ def _grok_node_fixture_version(script: bytes, node: bytes) -> str:
     return "sha256:" + hashlib.sha256(
         b"graphwing/grok-node-launcher/v1\0"
         + hashlib.sha256(script).digest() + hashlib.sha256(node).digest()
+    ).hexdigest()
+
+
+def _codex_host_fixture_version(codex: bytes, host: bytes) -> str:
+    return "sha256:" + hashlib.sha256(
+        b"graphwing/codex-code-mode-host/v1\0"
+        + hashlib.sha256(codex).digest() + hashlib.sha256(host).digest()
     ).hexdigest()
 
 
@@ -183,7 +206,7 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(effort_err)
         self.assertIsNotNone(profile)
         assert profile is not None and branch is not None and head is not None
-        pinned = server.pin_launcher(binary)
+        pinned = server.pin_native_launcher(binary, launcher)
         identity = {
             "version": server.REVIEW_EXECUTION_VERSION,
             "kind": "review",
@@ -464,7 +487,7 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             binary = Path(td) / "codex"
-            binary.write_text("codex fixture")
+            _write_fake_codex(binary, "codex fixture")
             body = json.dumps({
                 "prompt": "bounded fixture", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol", "effort": "high",
@@ -516,7 +539,10 @@ class DispatchTests(unittest.TestCase):
             with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as td:
                 jobs = Path(td) / "jobs"
                 binary = Path(td) / launcher
-                binary.write_text(f"{launcher} fixture")
+                if launcher == "codex":
+                    _write_fake_codex(binary, f"{launcher} fixture")
+                else:
+                    binary.write_text(f"{launcher} fixture")
                 body = json.dumps({
                     "prompt": "bounded fixture", "cwd": "scratch", "launcher": launcher,
                     "provider": provider, "model": model,
@@ -542,8 +568,8 @@ class DispatchTests(unittest.TestCase):
     def test_resume_rejects_effort_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
             binary = Path(td) / "codex"
-            binary.write_text("codex fixture")
-            version = "sha256:" + hashlib.sha256(binary.read_bytes()).hexdigest()
+            _write_fake_codex(binary, "codex fixture")
+            version = server.launcher_version_fingerprint(binary, "codex")
             branch = subprocess.run(
                 ["git", "-C", str(self.scratch), "rev-parse", "--abbrev-ref", "HEAD"],
                 check=True, capture_output=True, text=True,
@@ -583,8 +609,8 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             binary = Path(td) / "codex"
-            binary.write_bytes(b"phase-1 launcher fixture")
-            expected = "sha256:" + hashlib.sha256(binary.read_bytes()).hexdigest()
+            _write_fake_codex(binary, b"phase-1 launcher fixture")
+            expected = server.launcher_version_fingerprint(binary, "codex")
             body = json.dumps({
                 "prompt": "bounded fixture", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
@@ -612,17 +638,19 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(payload["code"], "bad_cwd")
 
     def test_agent_run_omitted_cwd_uses_server_default_repo_policy(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(server, "JOBS_DIR", Path(td)), \
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "codex"
+            _write_fake_codex(binary)
+            with mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"), \
              mock.patch.object(server, "load_repos", return_value={"other": str(self.scratch), "scratch": str(self.scratch)}), \
              mock.patch.dict(os.environ, {"GRAPHWING_DEFAULT_REPO": "scratch"}), \
-             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
              mock.patch.object(server, "enqueue_agent"):
-            status, payload, _ = server.dispatch(
-                "POST", "/v1/agent/run", {}, True,
-                b'{"prompt":"x","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
-            )
-            job = server.read_job(payload["job_id"])
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/agent/run", {}, True,
+                    b'{"prompt":"x","launcher":"codex","provider":"openai","model":"gpt-5.6-sol"}',
+                )
+                job = server.read_job(payload["job_id"])
         self.assertEqual(status, 202, payload)
         self.assertEqual((job["repo"], job["cwd"]), ("scratch", str(self.scratch)))
 
@@ -653,7 +681,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(Path(td))
             jobs = Path(td) / "jobs"
             codex = Path(td) / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}):
                 with mock.patch.object(server, "JOBS_DIR", jobs):
                     with mock.patch.object(server, "enqueue_agent", lambda job: None):
@@ -689,7 +717,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             current = root / "current-codex"
-            current.write_text("fixture")
+            _write_fake_codex(current)
             body = json.dumps({
                 "prompt": "ping", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
@@ -711,7 +739,7 @@ class DispatchTests(unittest.TestCase):
             root = Path(td)
             jobs = root / "jobs"
             current = root / "current-codex"
-            current.write_text("fixture")
+            _write_fake_codex(current)
             job_id = "ab" * 16
             job = {
                 "job_id": job_id,
@@ -817,11 +845,16 @@ class DispatchTests(unittest.TestCase):
             root = Path(td)
             jobs = root / "jobs"
             codex = root / "current-codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             captured = []
 
             def fake_run(command, **kwargs):
                 captured.append((command, kwargs))
+                argv0 = Path(command[0])
+                captured.append({
+                    "argv0_bytes": argv0.read_bytes(),
+                    "host_bytes": (argv0.parent / "codex-code-mode-host").read_bytes(),
+                })
                 output_index = command.index("--output-last-message") + 1
                 Path(command[output_index]).write_text(
                     '{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}'
@@ -837,8 +870,12 @@ class DispatchTests(unittest.TestCase):
                     result = server.native_review_result(context)
         self.assertTrue(result["ok"], result)
         command, kwargs = captured[0]
-        self.assertEqual(Path(command[0]).parent, Path("/proc/self/fd"))
-        self.assertEqual(kwargs["pass_fds"], (int(Path(command[0]).name),))
+        argv0 = Path(command[0])
+        self.assertEqual(argv0.name, "codex")
+        self.assertFalse(str(argv0).startswith("/proc/self/fd/"))
+        self.assertEqual(captured[1]["host_bytes"], b"fixture-host")
+        self.assertEqual(captured[1]["argv0_bytes"], b"fixture")
+        self.assertEqual(kwargs["pass_fds"], ())
 
     def test_codex_agent_run_records_git_bound_session_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -846,7 +883,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({
                 "prompt": "ping", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
@@ -1061,7 +1098,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             branch = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", codex)
@@ -1182,7 +1219,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             branch = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             old_head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", codex)
@@ -1524,7 +1561,7 @@ class DispatchTests(unittest.TestCase):
             jobs = Path(td) / "jobs"
             job_id = "ab" * 16
             binary = Path(td) / "codex"
-            binary.write_text("changed launcher fixture")
+            _write_fake_codex(binary, "changed launcher fixture")
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "requested_effort": "high", "effective_effort": "high", "effort_source": "explicit",
@@ -1605,7 +1642,7 @@ class DispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             binary = Path(td) / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             hostile = "spawn failed /home/private/codex TOKEN_SECRET https://private.example provider text"
             job_id = "ac" * 16
             profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", binary)
@@ -2110,7 +2147,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             profile = _fixture_execution_profile("codex", "openai", "gpt-5.6-sol", binary)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "branch", "--show-current"], check=True,
@@ -2366,7 +2403,7 @@ class DispatchTests(unittest.TestCase):
             jdir.mkdir(parents=True)
             head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             job = {
                 "job_id": job_id, "status": "queued", "repo": "scratch", "cwd": str(repo),
                 "prompt": "x", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
@@ -2454,7 +2491,7 @@ class DispatchTests(unittest.TestCase):
                     )
                     return 0
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             _stamp_fixture_execution_profile(job, binary)
             (jdir / "job.json").write_text(json.dumps(job))
             with mock.patch.object(server, "JOBS_DIR", jobs), \
@@ -2491,7 +2528,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
@@ -2510,7 +2547,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             barrier = threading.Barrier(3)
             results = []
@@ -2543,7 +2580,7 @@ class DispatchTests(unittest.TestCase):
                 "job_id": blocker_id, "kind": "script", "status": "running", "cwd": str(repo),
             }))
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
@@ -2579,7 +2616,7 @@ class DispatchTests(unittest.TestCase):
                       "log_ref": str(queued_dir / "stdout.log")}
             (queued_dir / "job.json").write_text(json.dumps(queued))
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "post_receipt", return_value={"ok": True, "status": 200}) as posted:
@@ -2695,7 +2732,7 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(codeoff_saved["status"], "failed")
             self.assertEqual(codeoff_saved["receipt"]["failure_code"], "cancelled")
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "scratch", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
@@ -2731,7 +2768,7 @@ class DispatchTests(unittest.TestCase):
             nested = repo / "nested"
             nested.mkdir()
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps({"prompt": "x", "cwd": "nested", "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol"}).encode()
             with mock.patch.object(server, "load_repos", return_value={"nested": str(nested)}), \
                  mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}):
@@ -2856,7 +2893,7 @@ class DispatchTests(unittest.TestCase):
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             attempt = 0
             class FakeProc:
                 pid = 42
@@ -2878,7 +2915,7 @@ class DispatchTests(unittest.TestCase):
                         + json.dumps({"type": "item.completed", "item": {"id": "i", "type": "agent_message", "text": '{"status":"ok","sha":null,"pr_url":null,"summary":"done"}'}})
                     )
                     return 0
-            def spawn(job, binary):
+            def spawn(job, binary, **kwargs):
                 nonlocal attempt
                 attempt += 1
                 return FakeProc(job, attempt), None
@@ -2990,7 +3027,7 @@ class DispatchTests(unittest.TestCase):
             jdir.mkdir(parents=True)
             (jdir / "prompt.txt").write_text("fixture prompt")
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             job = {
                 "job_id": job_id, "cwd": td, "model": "gpt-5.6-sol",
                 "launcher": "codex", "provider": "openai",
@@ -3063,13 +3100,15 @@ class DispatchTests(unittest.TestCase):
             output = b'{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}\n'
             return subprocess.CompletedProcess(cmd, 0, output, b"")
 
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
-            with self._native_review_context(
-                "codex", "openai", "gpt-5.6-sol", Path(__file__),
-                diff_text="fixture", requested_effort="medium", effort_source="explicit",
-            ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
-                result = server.native_review_result(context)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_fake_codex(root / "codex")
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"):
+                with self._native_review_context(
+                    "codex", "openai", "gpt-5.6-sol", root / "codex",
+                    diff_text="fixture", requested_effort="medium", effort_source="explicit",
+                ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                    result = server.native_review_result(context)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["requested_effort"], "medium")
         self.assertEqual(result["effective_effort"], "medium")
@@ -3080,12 +3119,6 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(captured["cmd"][captured["cmd"].index("--sandbox") + 1], "read-only")
 
     def test_codex_writer_and_review_commands_are_exact(self):
-        """Codex 0.151.0 resolves its code-mode host as a sibling of argv[0].
-
-        Graphwing execs the sealed memfd at /proc/self/fd/N, so the sibling
-        resolves to /codex-code-mode-host and the run dies before it reviews.
-        Every Codex invocation therefore pins features.code_mode_host=false.
-        """
         job = self._adapter_contract_job(
             "codex", "openai", "gpt-5.6-sol", "high", "high"
         )
@@ -3097,7 +3130,6 @@ class DispatchTests(unittest.TestCase):
             [
                 "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
                 "-c", "model_reasoning_effort=high",
-                "-c", "features.code_mode_host=false",
                 "-C", "/fixture/repo", "--sandbox", "workspace-write",
                 "--output-last-message", "/fixture/job/last-message.txt",
                 "-",
@@ -3111,7 +3143,6 @@ class DispatchTests(unittest.TestCase):
             [
                 "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
                 "-c", "model_reasoning_effort=high",
-                "-c", "features.code_mode_host=false",
                 "-C", "/fixture/repo", "--sandbox", "read-only",
                 "--output-last-message", "/fixture/job/last-message.txt",
                 "-",
@@ -3126,15 +3157,13 @@ class DispatchTests(unittest.TestCase):
             [
                 "/fixture/codex", "exec", "--json", "--model", "gpt-5.6-sol",
                 "-c", "model_reasoning_effort=high",
-                "-c", "features.code_mode_host=false",
                 "-C", "/fixture/repo", "--sandbox", "workspace-write",
                 "--output-last-message", "/fixture/job/last-message.txt",
                 "resume", "0f" * 16, "-",
             ],
         )
 
-    def test_codex_command_never_requests_the_missing_code_mode_host(self):
-        """Regression: the pre-fix argv, which omitted the setting, is gone."""
+    def test_codex_command_does_not_disable_code_mode_host(self):
         for model in ("gpt-5.6-sol", "gpt-5.6-terra"):
             for effort in ("low", "medium", "high", "max"):
                 for sandbox in ("workspace-write", "read-only"):
@@ -3151,56 +3180,84 @@ class DispatchTests(unittest.TestCase):
                                 job, Path("/fixture/job/prompt.txt"), "/fixture/repo",
                                 Path("/fixture/codex"), sandbox=sandbox,
                             )
-                            settings = [
-                                cmd[index + 1]
-                                for index, value in enumerate(cmd[:-1])
-                                if value == "-c"
-                                and cmd[index + 1].startswith("features.code_mode_host=")
-                            ]
-                            self.assertEqual(
-                                settings, ["features.code_mode_host=false"]
+                            self.assertFalse(
+                                any("code_mode_host" in value for value in cmd)
                             )
-                            position = cmd.index("features.code_mode_host=false")
-                            self.assertEqual(cmd[position - 1], "-c")
-                            self.assertLess(position, cmd.index("-C"))
-                            self.assertNotIn("--config", cmd)
                             self.assertEqual(
                                 [v for v in cmd if v.startswith("features.")],
-                                ["features.code_mode_host=false"],
+                                [],
                             )
                             self.assertEqual(cmd[-1], "-")
                             self.assertEqual(
                                 cmd[cmd.index("--sandbox") + 1], sandbox
                             )
 
-    def test_codex_review_invocation_disables_the_code_mode_host(self):
+    def test_codex_review_invocation_keeps_code_mode_host(self):
         captured = {}
 
         def fake_run(cmd, **kwargs):
             captured["cmd"] = list(cmd)
+            captured["pass_fds"] = kwargs.get("pass_fds")
+            argv0 = Path(cmd[0])
+            captured["argv0_bytes"] = argv0.read_bytes()
+            captured["host_bytes"] = (argv0.parent / "codex-code-mode-host").read_bytes()
             output = b'{"status":"ok","sha":null,"pr_url":null,"summary":"VERDICT: PASS"}\n'
             return subprocess.CompletedProcess(cmd, 0, output, b"")
 
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(server, "JOBS_DIR", Path(td) / "jobs"):
-            with self._native_review_context(
-                "codex", "openai", "gpt-5.6-sol", Path(__file__),
-                diff_text="fixture", requested_effort="high", effort_source="explicit",
-            ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
-                result = server.native_review_result(context)
-        self.assertTrue(result["ok"], result)
-        cmd = captured["cmd"]
-        self.assertEqual(
-            [
-                cmd[index + 1]
-                for index, value in enumerate(cmd[:-1])
-                if value == "-c" and cmd[index + 1].startswith("features.")
-            ],
-            ["features.code_mode_host=false"],
-        )
-        self.assertLess(cmd.index("features.code_mode_host=false"), cmd.index("-C"))
-        self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
-        self.assertEqual(cmd[-1], "-")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_fake_codex(root / "codex", b"review-codex", b"review-host")
+            with mock.patch.object(server, "JOBS_DIR", root / "jobs"):
+                with self._native_review_context(
+                    "codex", "openai", "gpt-5.6-sol", root / "codex",
+                    diff_text="fixture", requested_effort="high", effort_source="explicit",
+                ) as context, mock.patch.object(server.subprocess, "run", side_effect=fake_run):
+                    result = server.native_review_result(context)
+            self.assertTrue(result["ok"], result)
+            cmd = captured["cmd"]
+            self.assertFalse(any("code_mode_host" in value for value in cmd))
+            self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+            self.assertEqual(cmd[-1], "-")
+            argv0 = Path(cmd[0])
+            self.assertEqual(argv0.name, "codex")
+            self.assertFalse(str(argv0).startswith("/proc/self/fd/"))
+            self.assertEqual(captured["host_bytes"], b"review-host")
+            self.assertEqual(captured["argv0_bytes"], b"review-codex")
+            self.assertEqual(captured["pass_fds"], ())
+
+    def test_codex_spawn_materializes_sibling_host_and_skips_memfd_argv0(self):
+        job = self._adapter_contract_job("codex", "openai", "gpt-5.6-sol", "high", "high")
+        captured = {}
+
+        def stop(command, **kwargs):
+            captured["cmd"] = list(command)
+            captured["pass_fds"] = kwargs.get("pass_fds")
+            raise AssertionError("stop")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs"
+            job_dir = jobs / job["job_id"]
+            job_dir.mkdir(parents=True)
+            (job_dir / "prompt.txt").write_text("fixture prompt")
+            install = root / "bin"
+            install.mkdir()
+            _write_fake_codex(install / "codex", b"pinned-codex\n", b"pinned-host\n")
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 server.pinned_native_launcher(install / "codex", "codex") as pinned, \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=stop):
+                (install / "codex").write_bytes(b"disk-codex-changed")
+                (install / "codex-code-mode-host").write_bytes(b"disk-host-changed")
+                with self.assertRaises(AssertionError):
+                    server.spawn_codex(job, pinned.path, pinned_launcher=pinned)
+            cmd = captured["cmd"]
+            argv0 = Path(cmd[0])
+            self.assertEqual(argv0.name, "codex")
+            self.assertFalse(str(argv0).startswith("/proc/self/fd/"))
+            self.assertEqual(argv0.read_bytes(), b"pinned-codex\n")
+            self.assertEqual((argv0.parent / "codex-code-mode-host").read_bytes(), b"pinned-host\n")
+            self.assertEqual(captured["pass_fds"], ())
+            self.assertNotIn("features.code_mode_host=false", cmd)
 
     def test_claude_command_uses_effective_effort(self):
         for effort in ("low", "medium", "high", "max"):
@@ -3328,11 +3385,13 @@ class DispatchTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"GRAPHWING_NODE_BIN": str(node)}), \
                  server.pinned_native_launcher(grok, "grok") as changed:
                 self.assertNotEqual(changed.fingerprint, expected)
-            for launcher in ("codex", "claude"):
-                with server.pinned_native_launcher(grok, launcher) as unchanged:
-                    self.assertEqual(unchanged.fingerprint,
-                                     "sha256:" + hashlib.sha256(script).hexdigest())
-                    self.assertIsNone(unchanged.companion)
+            with server.pinned_native_launcher(grok, "claude") as unchanged:
+                self.assertEqual(unchanged.fingerprint,
+                                 "sha256:" + hashlib.sha256(script).hexdigest())
+                self.assertIsNone(unchanged.companion)
+            with self.assertRaises(server.CodexHostUnavailable):
+                with server.pinned_native_launcher(grok, "codex"):
+                    pass
 
     @staticmethod
     def _fd_is_closed(fd):
@@ -3381,6 +3440,81 @@ class DispatchTests(unittest.TestCase):
                     status, payload, _ = server.dispatch("POST", "/v1/review/run", {}, True, body)
                 self.assertEqual(status, expected_status); spawn.assert_not_called()
                 self.assertNotIn("TOKEN", json.dumps(payload))
+
+    def test_codex_code_mode_host_composite_pin_and_cleanup(self):
+        domain = b"graphwing/codex-code-mode-host/v1\0"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            install = root / "bin"
+            install.mkdir()
+            codex, host = install / "codex", install / "codex-code-mode-host"
+            codex_bytes, host_bytes = b"exact-codex-bytes\n", b"exact-host-bytes\n"
+            codex.write_bytes(codex_bytes)
+            host.write_bytes(host_bytes)
+            codex.chmod(0o755)
+            host.chmod(0o755)
+            expected = "sha256:" + hashlib.sha256(
+                domain + hashlib.sha256(codex_bytes).digest() + hashlib.sha256(host_bytes).digest()
+            ).hexdigest()
+            with server.pinned_native_launcher(codex, "codex") as accepted:
+                accepted_fds = (accepted.fd, accepted.companion.fd)
+                self.assertIsNotNone(accepted.companion)
+                self.assertEqual(accepted.fingerprint, expected)
+                self.assertEqual(
+                    accepted.companion.fingerprint,
+                    "sha256:" + hashlib.sha256(host_bytes).hexdigest(),
+                )
+                with server.repin_native_launcher(accepted, "codex") as execution:
+                    execution_fds = (execution.fd, execution.companion.fd)
+                    self.assertEqual(execution.fingerprint, expected)
+                    self.assertNotEqual(execution_fds, accepted_fds)
+                    host.write_bytes(b"disk-host-after-pin")
+                    self.assertEqual(
+                        Path(f"/proc/self/fd/{execution.companion.fd}").read_bytes(),
+                        host_bytes,
+                    )
+                self.assertTrue(all(self._fd_is_closed(fd) for fd in execution_fds))
+            self.assertTrue(all(self._fd_is_closed(fd) for fd in accepted_fds))
+            self.assertEqual(
+                server.launcher_version_fingerprint(codex, "codex"),
+                "sha256:" + hashlib.sha256(
+                    domain
+                    + hashlib.sha256(codex_bytes).digest()
+                    + hashlib.sha256(b"disk-host-after-pin").digest()
+                ).hexdigest(),
+            )
+            host.unlink()
+            self.assertEqual(server.launcher_version_fingerprint(codex, "codex"), "missing_companion")
+            host.write_bytes(host_bytes)
+            host.chmod(0o755)
+            for launcher in ("claude", "grok"):
+                with server.pinned_native_launcher(codex, launcher) as unchanged:
+                    self.assertEqual(
+                        unchanged.fingerprint,
+                        "sha256:" + hashlib.sha256(codex_bytes).hexdigest(),
+                    )
+                    self.assertIsNone(unchanged.companion)
+
+    def test_codex_missing_code_mode_host_fails_closed_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._scratch_git(Path(td))
+            jobs = Path(td) / "jobs"
+            codex = Path(td) / "codex"
+            codex.write_bytes(b"fixture")
+            codex.chmod(0o755)
+            body = json.dumps({
+                "prompt": "ping", "cwd": "scratch", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
+            }).encode()
+            with mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
+                 mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
+                 mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "enqueue_agent") as enqueue:
+                status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
+            self.assertEqual(status, 501, payload)
+            self.assertEqual(payload["code"], "missing_binary")
+            self.assertEqual(payload["error"], "launcher companion is unavailable")
+            enqueue.assert_not_called()
 
     def test_all_native_adapters_bind_execution_profile(self):
         # Independent contract: do not derive expected rows from implementation tables.
@@ -4448,7 +4582,7 @@ while True:
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             codex = Path(td) / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             job_id = "ab" * 16
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
@@ -4496,7 +4630,7 @@ while True:
             (jdir / "job.json").write_text(json.dumps(job))
             (jdir / "prompt.txt").write_text("x")
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             _stamp_fixture_execution_profile(job, codex)
             (jdir / "job.json").write_text(json.dumps(job))
             class FakeProc:
@@ -4537,7 +4671,7 @@ while True:
                 jdir = jobs / job_id
                 jdir.mkdir(parents=True)
                 binary = root / "codex"
-                binary.write_text("fixture")
+                _write_fake_codex(binary)
                 identity = {
                     "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                     "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
@@ -4596,7 +4730,7 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
@@ -4650,7 +4784,7 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
@@ -4717,7 +4851,7 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             branch = subprocess.run(
                 ["git", "-C", str(repo), "branch", "--show-current"],
                 check=True, capture_output=True, text=True,
@@ -4788,7 +4922,7 @@ while True:
             jdir = jobs / job_id
             jdir.mkdir(parents=True)
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             identity = {
                 "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
                 "repo": "scratch", "branch": "main", "starting_head": "0" * 40,
@@ -4870,7 +5004,7 @@ while True:
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             codex = root / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
 
             class FakeProc:
                 pid = 42
@@ -4899,7 +5033,7 @@ while True:
                  mock.patch.object(server, "load_repos", return_value={"scratch": str(repo)}), \
                  mock.patch.dict(os.environ, {"GRAPHWING_CODEX_BIN": str(codex)}), \
                  mock.patch.object(server, "enqueue_agent", lambda job: server.run_agent_job(job["job_id"])), \
-                 mock.patch.object(server, "spawn_writer", side_effect=lambda job, binary: (FakeProc(job), None)):
+                 mock.patch.object(server, "spawn_writer", side_effect=lambda job, binary, **kwargs: (FakeProc(job), None)):
                 status, payload, _ = server.dispatch("POST", "/v1/agent/run", {}, True, body)
                 saved = server.read_job(payload["job_id"])
             self.assertEqual(status, 202, payload)
@@ -4965,7 +5099,7 @@ while True:
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs"
             codex = Path(td) / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             body = json.dumps(
                 {
                     "prompt": "ping",
@@ -7853,7 +7987,7 @@ while True:
             with self.subTest(path=path), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 binary = root / "fixture-launcher"
-                binary.write_text("provider-free fixture")
+                _write_fake_codex(binary, "provider-free fixture")
                 with mock.patch.object(server, "JOBS_DIR", root / "jobs"), \
                      mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
                      mock.patch.object(server, "enqueue_agent") as agent_spawn, \
@@ -7965,7 +8099,7 @@ while True:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             binary = root / "fixture-launcher"
-            binary.write_text("provider-free fixture")
+            _write_fake_codex(binary, "provider-free fixture")
             base = {
                 "repo": "scratch", "prompt": "reviewer drift fixture",
                 "response_webhook_url": "https://callback.invalid/fixture",
@@ -8622,7 +8756,10 @@ while True:
                     self.assertEqual(fallback_route["writer_execution_profile"], fallback_evidence)
 
                     fallback_binary = root / f"fixture-{fallback_route['launcher']}"
-                    fallback_binary.write_text("provider-free fixture")
+                    if fallback_route["launcher"] == "codex":
+                        _write_fake_codex(fallback_binary, "provider-free fixture")
+                    else:
+                        fallback_binary.write_text("provider-free fixture")
                     fallback_request = {
                         "prompt": "fallback fixture", "cwd": "scratch",
                         "launcher": fallback_route["launcher"],
@@ -8734,8 +8871,7 @@ while True:
             root = Path(td)
             jobs = root / "jobs"
             launcher = root / "codex-review-wrapper"
-            launcher.write_text("#!/bin/sh\nexit 0\n")
-            launcher.chmod(0o755)
+            _write_fake_codex(launcher, "#!/bin/sh\nexit 0\n")
             with mock.patch.object(server, "JOBS_DIR", jobs), \
                  mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
                  mock.patch.object(
@@ -15522,7 +15658,7 @@ func main() {
             )
             codex_bin = root / "codex"
             claude_bin = root / "claude"
-            codex_bin.write_text("fixture")
+            _write_fake_codex(codex_bin)
             claude_bin.write_text("fixture")
             with self._native_review_context(
                 "codex", "openai", "gpt-5.6-sol", codex_bin, diff_text=diff
@@ -15894,7 +16030,7 @@ func main() {
         with tempfile.TemporaryDirectory() as td:
             codex_bin = Path(td) / "codex"
             claude_bin = Path(td) / "claude"
-            codex_bin.write_text("fixture")
+            _write_fake_codex(codex_bin)
             claude_bin.write_text("fixture")
             with self._native_review_context(
                 "codex", "openai", "gpt-5.6-sol", codex_bin
@@ -15987,7 +16123,7 @@ func main() {
         )
         with tempfile.TemporaryDirectory() as td:
             codex = Path(td) / "codex"
-            codex.write_text("fixture")
+            _write_fake_codex(codex)
             for outcome, code in cases:
                 effect = outcome if isinstance(outcome, BaseException) else None
                 with self.subTest(outcome=type(outcome).__name__, code=code), \
@@ -17341,7 +17477,7 @@ func main() {
             repo = self._scratch_git(root)
             jobs = root / "jobs"
             binary = root / "codex"
-            binary.write_text("fixture")
+            _write_fake_codex(binary)
             body = json.dumps({
                 "prompt": "bounded", "cwd": "scratch", "launcher": "codex",
                 "provider": "openai", "model": "gpt-5.6-sol",
@@ -17650,6 +17786,7 @@ class CodeOffTests(unittest.TestCase):
         self.records = root / "codeoffs"
         self.workspaces = root / "codeoff-workspaces"
         self.jobs = root / "jobs"
+        self.launcher_bin = _write_fake_codex(root / "launcher", Path(__file__).read_bytes())
         self.tests_path = root / "tests.json"
         self.tests_path.write_text(json.dumps({"tests": [
             {"name": "fixture-pass", "argv": [sys.executable, "-c", "import subprocess; from pathlib import Path; assert subprocess.check_output(['git','rev-parse','--is-inside-work-tree'], text=True).strip() == 'true'; assert Path('README.md').is_file()"], "cwd": "scratch", "timeout_seconds": 10, "async": False},
@@ -17674,15 +17811,12 @@ class CodeOffTests(unittest.TestCase):
             mock.patch.object(server, "CODEOFF_MODEL_MANIFEST", proven),
             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
             mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")),
-            # One launcher artifact for prepare and launch: the immutable slot
-            # identity pins the exact wrapper fingerprint, so both boundaries
-            # must observe the same file for any fixture that launches a slot.
-            mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)),
+            mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin),
         )
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.launcher_version = server.launcher_version_fingerprint(Path(__file__))
+        self.launcher_version = server.launcher_version_fingerprint(self.launcher_bin)
 
     def _git(self, *args):
         return subprocess.run(
@@ -17732,7 +17866,7 @@ class CodeOffTests(unittest.TestCase):
         manifest = json.loads((self.records / experiment_id / "manifest.json").read_text())
         identity = manifest["identities"][slot]
         body = self._agent_body(experiment_id, slot)
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent") as enqueue:
             status, payload = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, payload)
@@ -17835,7 +17969,7 @@ class CodeOffTests(unittest.TestCase):
         expect_native_session=True,
     ):
         body = self._agent_body(experiment_id, slot)
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent"):
             status, launched = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, launched)
@@ -17848,7 +17982,7 @@ class CodeOffTests(unittest.TestCase):
         process = mock.Mock(pid=76, returncode=0)
         process.wait.return_value = 0
 
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "spawn_writer", return_value=(process, None)), \
              mock.patch.object(server, "herdr_job_done"):
             server.run_agent_job(job_id)
@@ -18068,7 +18202,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(manifest["budgets"], native["budgets"])
         agent_body = self._agent_body("graph-values-0001", "author-1")
         agent_body.update({key: str(agent_body[key]) for key in ("max_turns", "run_budget_seconds")})
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent") as enqueue:
             status, receipt = self._post("/v1/agent/run", agent_body)
         self.assertEqual(status, 202, receipt)
@@ -18612,14 +18746,14 @@ class CodeOffTests(unittest.TestCase):
         self._prepare(experiment_id, seed=(1).to_bytes(32, "big").hex())
         body = self._agent_body(experiment_id, "author-2")
         self.assertEqual(body["model"], "grok-4.6")
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent"):
             status, launched = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, launched)
         job_id = launched["job_id"]
         (self.jobs / job_id / "last-message.txt").write_text(
             json.dumps({"status": "ok", "sha": None, "pr_url": None, "summary": "done"}))
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "run_grok_acp", return_value=(0, False, "grok-codeoff-76", None)), \
              mock.patch.object(server, "herdr_job_done"):
             server.run_agent_job(job_id)
@@ -18632,7 +18766,7 @@ class CodeOffTests(unittest.TestCase):
         experiment_id = "grok-adapter-evidence"
         self._prepare(experiment_id, seed=(1).to_bytes(32, "big").hex())
         body = self._agent_body(experiment_id, "author-2")
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent"):
             status, launched = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, launched)
@@ -18644,7 +18778,7 @@ class CodeOffTests(unittest.TestCase):
             job["_adapter_failure_code"] = "adapter_contract_invalid"
             return 0, False, "grok-adapter-evidence-76", None
 
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "run_grok_acp", side_effect=adapter_success_with_failure_evidence), \
              mock.patch.object(server, "herdr_job_done"):
             server.run_agent_job(job_id)
@@ -18693,7 +18827,7 @@ class CodeOffTests(unittest.TestCase):
             "provider": "openai", "model": "gpt-5.6-sol", "max_turns": 1, "run_budget_seconds": 30,
         }
         with mock.patch.object(server, "CODEOFF_LOCK", ForbiddenLock()), \
-             mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent") as enqueue:
             status, payload = self._post("/v1/agent/run", body)
         self.assertEqual(status, 202, payload)
@@ -18722,7 +18856,7 @@ class CodeOffTests(unittest.TestCase):
             body = self._agent_body(experiment_id, slot)
             mismatched = {**body, "provider": "anthropic" if body["provider"] == "openai" else "openai"}
             with self.subTest(model=expected), \
-                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+                 mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
                  mock.patch.object(server, "enqueue_agent") as enqueue:
                 mismatch_status, mismatch = self._post("/v1/agent/run", mismatched)
                 status, payload = self._post("/v1/agent/run", body)
@@ -18760,7 +18894,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual((status, payload["code"]), (400, "codeoff_budget_mismatch"))
 
         job_id = self._launch_done("experiment-0001", "author-1")
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent"):
             status, payload = self._post("/v1/agent/run", self._agent_body("experiment-0001", "author-1"))
         self.assertEqual((status, payload["code"]), (409, "slot_already_launched"))
@@ -18793,7 +18927,7 @@ class CodeOffTests(unittest.TestCase):
                         "session_identity": resume_identity},
         })
         resume_body.update({"resume_job_id": resume_id, "session_identity": resume_identity})
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)):
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin):
             status, payload = self._post("/v1/agent/run", resume_body)
         self.assertEqual((status, payload["code"]), (400, "codeoff_resume_mismatch"), payload)
 
@@ -19037,7 +19171,7 @@ class CodeOffTests(unittest.TestCase):
 
     def test_nonterminal_agent_receipt_remains_retryable(self):
         self._prepare()
-        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=Path(__file__)), \
+        with mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin), \
              mock.patch.object(server, "enqueue_agent"):
             status, launched = self._post("/v1/agent/run", self._agent_body("experiment-0001", "author-1"))
         self.assertEqual(status, 202, launched)
@@ -19744,7 +19878,10 @@ class CodeOffTests(unittest.TestCase):
                 self.assertIsNone(effort_err)
                 self.assertEqual(identity["requested_effort"], requested)
                 self.assertEqual(identity["effective_effort"], profile["effective_effort"])
-                self.assertEqual(identity["launcher_version"], self.launcher_version)
+                self.assertEqual(
+                    identity["launcher_version"],
+                    server.launcher_version_fingerprint(self.launcher_bin, identity["launcher"]),
+                )
                 self.assertEqual(
                     identity["inference_profile_version"], server.CODEOFF_INFERENCE_PROFILE_VERSION,
                 )
@@ -21122,7 +21259,7 @@ class RunControlSettlementTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True, capture_output=True)
             self.repo = repo
             binary = self.ledger / "codex"
-            binary.write_text("codex fixture")
+            _write_fake_codex(binary, "codex fixture")
             self.binary = binary
         body = {"prompt": "fix it", "cwd": "scratch", "launcher": "codex", "provider": "openai",
                 "model": "gpt-5.6-sol", **({"run_control": trio or self.trio()} if trio is not False else {}),

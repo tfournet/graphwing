@@ -553,8 +553,8 @@ PR, since each was found and fixed after #171 had already merged.
 
 ## Next bounded task
 
-Launcher identity work (#151, spike verdict: codex infeasible under the
-pinned memfd launcher; `NORMAL_WRITER_ROUTES` still sends `go_coding` to
-codex by default — `--work-kind typescript_coding` is an operator
-workaround, not a policy change) and the MCP build-and-export loop for the
-catalog.
+Codex writers now execute a job-private sibling copy of sealed launcher
+bytes (`codex` + `codex-code-mode-host`) so `current_exe()` is a real path.
+`go_coding` remains Codex. Live canary of a real file-editing `go_coding`
+run is still required. The MCP build-and-export loop for the catalog remains
+open.
