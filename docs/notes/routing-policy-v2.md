@@ -3,7 +3,7 @@
 ## Status and authority
 
 - `normal-v1` remains the active writer policy exposed by `POST /v1/slice/route`.
-- `routing-policy-v2-candidate` is benchmark-only and non-production. It is available only through the centralized Python candidate table/function and is not an OpenAPI route. Nothing in this catalog may select it for real work.
+- `routing-policy-v2-candidate` is benchmark-only, unpromoted, and non-production. It is available only through the centralized Python candidate table/function and is not an OpenAPI route. Nothing in this catalog may select it for real work, and it cannot authorize execution.
 - Candidate route profiles deliberately fail the existing `route-execution-profile-v1` parser because their route version is not executable. Promotion requires the Phase 8 benchmark and a separately reviewed activation change.
 - No graph, tenant integration, published workflow, launcher, or provider is changed or invoked by this candidate.
 

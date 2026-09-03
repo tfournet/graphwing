@@ -4,5 +4,10 @@
   "custom_integration_id": "",
   "instance_id": "",
   "pr_status_repo": "",
-  "smoke_repo": ""
+  "smoke_repo": "",
+  "routing_policy": {
+    "workflow_id": "",
+    "workflow_version_id": "",
+    "slug": "graphwing-routing-policy"
+  }
 }

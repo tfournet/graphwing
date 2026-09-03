@@ -1,0 +1,2553 @@
+{
+  "slug": "graphwing-routing-policy",
+  "name": "graphwing-routing-policy",
+  "description": "Deterministic Rewst-native routing policy. Payload: class, work_kind, size, ac_count, seams. Preserves normal-v1 compatibility behavior and emits closed route-execution-profile-v2 decisions; malformed inputs fail closed.",
+  "spec": {
+    "meta": {
+      "useSearchAttributes": true,
+      "contractVersion": "workflow-normal-v1"
+    },
+    "nodes": [
+      {
+        "id": "trigger",
+        "type": "trigger.manual",
+        "label": "Routing policy input",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {}
+      },
+      {
+        "id": "policy_input",
+        "type": "transforms.objectBuilder",
+        "label": "Project closed policy input",
+        "position": {
+          "x": 160,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_policy_input",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "class",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "mechanical"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.class"
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "work_kind",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.work_kind"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "size",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.INPUT.size"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "M"
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.size"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "ac_count",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.ac_count"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "seams",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.seams"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "policy_input_shape",
+        "type": "transforms.objectBuilder",
+        "label": "Validate and normalize policy input",
+        "position": {
+          "x": 320,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_policy_input_shape",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "valid",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "in",
+                  "left": {
+                    "kind": "filter",
+                    "filter": "join",
+                    "input": {
+                      "kind": "filter",
+                      "filter": "sort",
+                      "input": {
+                        "kind": "filter",
+                        "filter": "keys",
+                        "input": {
+                          "kind": "getField",
+                          "path": "CTX.INPUT"
+                        },
+                        "filterArgs": []
+                      },
+                      "filterArgs": []
+                    },
+                    "filterArgs": [
+                      {
+                        "kind": "literal",
+                        "value": "|"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": [
+                      "work_kind",
+                      "seams|work_kind",
+                      "ac_count|work_kind",
+                      "ac_count|seams|work_kind",
+                      "size|work_kind",
+                      "seams|size|work_kind",
+                      "ac_count|size|work_kind",
+                      "ac_count|seams|size|work_kind",
+                      "class|work_kind",
+                      "class|seams|work_kind",
+                      "ac_count|class|work_kind",
+                      "ac_count|class|seams|work_kind",
+                      "class|size|work_kind",
+                      "class|seams|size|work_kind",
+                      "ac_count|class|size|work_kind",
+                      "ac_count|class|seams|size|work_kind"
+                    ]
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "and",
+                        "left": {
+                          "kind": "binary",
+                          "operator": "in",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.class"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": [
+                              "mechanical",
+                              "visual",
+                              "sensitive"
+                            ]
+                          }
+                        },
+                        "right": {
+                          "kind": "binary",
+                          "operator": "in",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.work_kind"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": [
+                              "go_coding",
+                              "typescript_coding",
+                              "research_ops"
+                            ]
+                          }
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "in",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input.size"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": [
+                            "S",
+                            "M",
+                            "L"
+                          ]
+                        }
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "in",
+                      "left": {
+                        "kind": "filter",
+                        "filter": "tojson",
+                        "input": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input.ac_count"
+                        },
+                        "filterArgs": []
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": [
+                          "null",
+                          "0",
+                          "1",
+                          "2",
+                          "3",
+                          "4",
+                          "5",
+                          "6",
+                          "7",
+                          "8",
+                          "9",
+                          "10",
+                          "11",
+                          "12",
+                          "13",
+                          "14",
+                          "15",
+                          "16",
+                          "17",
+                          "18",
+                          "19",
+                          "20",
+                          "21",
+                          "22",
+                          "23",
+                          "24",
+                          "25",
+                          "26",
+                          "27",
+                          "28",
+                          "29",
+                          "30",
+                          "31",
+                          "32",
+                          "33",
+                          "34",
+                          "35",
+                          "36",
+                          "37",
+                          "38",
+                          "39",
+                          "40",
+                          "41",
+                          "42",
+                          "43",
+                          "44",
+                          "45",
+                          "46",
+                          "47",
+                          "48",
+                          "49",
+                          "50",
+                          "51",
+                          "52",
+                          "53",
+                          "54",
+                          "55",
+                          "56",
+                          "57",
+                          "58",
+                          "59",
+                          "60",
+                          "61",
+                          "62",
+                          "63",
+                          "64",
+                          "65",
+                          "66",
+                          "67",
+                          "68",
+                          "69",
+                          "70",
+                          "71",
+                          "72",
+                          "73",
+                          "74",
+                          "75",
+                          "76",
+                          "77",
+                          "78",
+                          "79",
+                          "80",
+                          "81",
+                          "82",
+                          "83",
+                          "84",
+                          "85",
+                          "86",
+                          "87",
+                          "88",
+                          "89",
+                          "90",
+                          "91",
+                          "92",
+                          "93",
+                          "94",
+                          "95",
+                          "96",
+                          "97",
+                          "98",
+                          "99",
+                          "\"0\"",
+                          "\"1\"",
+                          "\"2\"",
+                          "\"3\"",
+                          "\"4\"",
+                          "\"5\"",
+                          "\"6\"",
+                          "\"7\"",
+                          "\"8\"",
+                          "\"9\"",
+                          "\"10\"",
+                          "\"11\"",
+                          "\"12\"",
+                          "\"13\"",
+                          "\"14\"",
+                          "\"15\"",
+                          "\"16\"",
+                          "\"17\"",
+                          "\"18\"",
+                          "\"19\"",
+                          "\"20\"",
+                          "\"21\"",
+                          "\"22\"",
+                          "\"23\"",
+                          "\"24\"",
+                          "\"25\"",
+                          "\"26\"",
+                          "\"27\"",
+                          "\"28\"",
+                          "\"29\"",
+                          "\"30\"",
+                          "\"31\"",
+                          "\"32\"",
+                          "\"33\"",
+                          "\"34\"",
+                          "\"35\"",
+                          "\"36\"",
+                          "\"37\"",
+                          "\"38\"",
+                          "\"39\"",
+                          "\"40\"",
+                          "\"41\"",
+                          "\"42\"",
+                          "\"43\"",
+                          "\"44\"",
+                          "\"45\"",
+                          "\"46\"",
+                          "\"47\"",
+                          "\"48\"",
+                          "\"49\"",
+                          "\"50\"",
+                          "\"51\"",
+                          "\"52\"",
+                          "\"53\"",
+                          "\"54\"",
+                          "\"55\"",
+                          "\"56\"",
+                          "\"57\"",
+                          "\"58\"",
+                          "\"59\"",
+                          "\"60\"",
+                          "\"61\"",
+                          "\"62\"",
+                          "\"63\"",
+                          "\"64\"",
+                          "\"65\"",
+                          "\"66\"",
+                          "\"67\"",
+                          "\"68\"",
+                          "\"69\"",
+                          "\"70\"",
+                          "\"71\"",
+                          "\"72\"",
+                          "\"73\"",
+                          "\"74\"",
+                          "\"75\"",
+                          "\"76\"",
+                          "\"77\"",
+                          "\"78\"",
+                          "\"79\"",
+                          "\"80\"",
+                          "\"81\"",
+                          "\"82\"",
+                          "\"83\"",
+                          "\"84\"",
+                          "\"85\"",
+                          "\"86\"",
+                          "\"87\"",
+                          "\"88\"",
+                          "\"89\"",
+                          "\"90\"",
+                          "\"91\"",
+                          "\"92\"",
+                          "\"93\"",
+                          "\"94\"",
+                          "\"95\"",
+                          "\"96\"",
+                          "\"97\"",
+                          "\"98\"",
+                          "\"99\""
+                        ]
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "in",
+                    "left": {
+                      "kind": "filter",
+                      "filter": "tojson",
+                      "input": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.seams"
+                      },
+                      "filterArgs": []
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": [
+                        "null",
+                        "0",
+                        "1",
+                        "2",
+                        "3",
+                        "4",
+                        "5",
+                        "6",
+                        "7",
+                        "8",
+                        "9",
+                        "10",
+                        "11",
+                        "12",
+                        "13",
+                        "14",
+                        "15",
+                        "16",
+                        "17",
+                        "18",
+                        "19",
+                        "20",
+                        "\"0\"",
+                        "\"1\"",
+                        "\"2\"",
+                        "\"3\"",
+                        "\"4\"",
+                        "\"5\"",
+                        "\"6\"",
+                        "\"7\"",
+                        "\"8\"",
+                        "\"9\"",
+                        "\"10\"",
+                        "\"11\"",
+                        "\"12\"",
+                        "\"13\"",
+                        "\"14\"",
+                        "\"15\"",
+                        "\"16\"",
+                        "\"17\"",
+                        "\"18\"",
+                        "\"19\"",
+                        "\"20\""
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "policy_input_valid",
+        "type": "logic.filter",
+        "label": "Policy input valid?",
+        "position": {
+          "x": 480,
+          "y": 0
+        },
+        "config": {
+          "group": "AND",
+          "rules": [
+            {
+              "path": "valid",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
+      },
+      {
+        "id": "policy_input_normalized",
+        "type": "transforms.objectBuilder",
+        "label": "Normalize validated policy counts",
+        "position": {
+          "x": 560,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_policy_input_normalized",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "ac_count",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.ac_count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": null
+                },
+                "else": {
+                  "kind": "filter",
+                  "filter": "int",
+                  "input": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.ac_count"
+                  },
+                  "filterArgs": []
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "seams",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.seams"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": null
+                },
+                "else": {
+                  "kind": "filter",
+                  "filter": "int",
+                  "input": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.seams"
+                  },
+                  "filterArgs": []
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "policy_rejected",
+        "type": "transforms.regexReplace",
+        "label": "Reject malformed policy input",
+        "position": {
+          "x": 640,
+          "y": 160
+        },
+        "config": {
+          "input": "graphwing_routing_policy_input_rejected",
+          "pattern": "(?=graphwing)",
+          "replacement": ""
+        }
+      },
+      {
+        "id": "effective_size",
+        "type": "transforms.objectBuilder",
+        "label": "Apply one-step effective-size rule",
+        "position": {
+          "x": 640,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_effective_size",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "value",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "or",
+                  "left": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input_normalized.ac_count"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": null
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": false
+                    },
+                    "else": {
+                      "kind": "binary",
+                      "operator": ">=",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input_normalized.ac_count"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": 6
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.class"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "visual"
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "or",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input_normalized.seams"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": null
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input_normalized.seams"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": 1
+                        }
+                      }
+                    }
+                  }
+                },
+                "then": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.size"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "S"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "M"
+                  },
+                  "else": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.size"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "M"
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "L"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": "L"
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.size"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "writer_profile",
+        "type": "transforms.objectBuilder",
+        "label": "Select normal-v1 writer profile",
+        "position": {
+          "x": 800,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_writer_profile",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "codex"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "claude"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "grok"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "openai"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "anthropic"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "xai"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "gpt-5.6-sol"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "claude-opus-5"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "grok-4.6"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "high"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "default"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "default"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "execution_budget",
+        "type": "transforms.objectBuilder",
+        "label": "Select class and effective-size budget",
+        "position": {
+          "x": 960,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_execution_budget",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "max_turns",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_effective_size.value"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "S"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": 10
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "M"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": 30
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": 50
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "run_budget_seconds",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "mechanical"
+                  }
+                },
+                "then": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "S"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": 120
+                  },
+                  "else": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_effective_size.value"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "M"
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": 300
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": 600
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "S"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": 180
+                  },
+                  "else": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_effective_size.value"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "M"
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": 600
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": 900
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "reviewer_policy",
+        "type": "transforms.objectBuilder",
+        "label": "Select opposing reviewer policy",
+        "position": {
+          "x": 1120,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_reviewer_policy",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "count",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "sensitive"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": 2
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.class"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "mechanical"
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_effective_size.value"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "S"
+                      }
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": 0
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "sensitive"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "high"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "medium"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reviewer1_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "codex"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "codex"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "reviewer1_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "anthropic"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "openai"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "reviewer1_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude-sonnet-5"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "gpt-5.6-sol"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "gpt-5.6-sol"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "reviewer2_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "grok"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "grok"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "reviewer2_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "xai"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "xai"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "anthropic"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "reviewer2_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "grok-4.6"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "grok-4.6"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude-opus-5"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "decision_material",
+        "type": "transforms.objectBuilder",
+        "label": "Build canonical routing decision",
+        "position": {
+          "x": 1280,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_decision_material",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "value",
+              "expression": {
+                "kind": "object",
+                "properties": {
+                  "policy_version": {
+                    "kind": "literal",
+                    "value": "workflow-normal-v1"
+                  },
+                  "compatibility_behavior": {
+                    "kind": "literal",
+                    "value": "normal-v1"
+                  },
+                  "class": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "work_kind": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "size_floor": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.size"
+                  },
+                  "effective_size": {
+                    "kind": "getField",
+                    "path": "CTX.routing_effective_size.value"
+                  },
+                  "ac_count": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input_normalized.ac_count"
+                  },
+                  "seams": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input_normalized.seams"
+                  },
+                  "writer": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile"
+                  },
+                  "budget": {
+                    "kind": "getField",
+                    "path": "CTX.routing_execution_budget"
+                  },
+                  "reviewers": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "decision_hash",
+        "type": "transforms.hash",
+        "label": "Hash canonical routing decision",
+        "position": {
+          "x": 1440,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_decision_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ CTX.routing_decision_material.value }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "route_output",
+        "type": "transforms.objectBuilder",
+        "label": "Emit route execution profiles v2",
+        "position": {
+          "x": 1600,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_policy_output",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "ok",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            },
+            {
+              "id": "m2",
+              "output": "policy_version",
+              "expression": {
+                "kind": "literal",
+                "value": "workflow-normal-v1"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "compatibility_behavior",
+              "expression": {
+                "kind": "literal",
+                "value": "normal-v1"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "decision_id",
+              "expression": {
+                "kind": "binary",
+                "operator": "+",
+                "left": {
+                  "kind": "literal",
+                  "value": "routing-normal-v1:"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.routing_decision_hash.value"
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "decision_sha256",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_decision_hash.value"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "class",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.class"
+              }
+            },
+            {
+              "id": "m7",
+              "output": "work_kind",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.work_kind"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "size_floor",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.size"
+              }
+            },
+            {
+              "id": "m9",
+              "output": "size",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_effective_size.value"
+              }
+            },
+            {
+              "id": "m10",
+              "output": "ac_count",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input_normalized.ac_count"
+              }
+            },
+            {
+              "id": "m11",
+              "output": "seams",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input_normalized.seams"
+              }
+            },
+            {
+              "id": "m12",
+              "output": "launcher",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_writer_profile.launcher"
+              }
+            },
+            {
+              "id": "m13",
+              "output": "provider",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_writer_profile.provider"
+              }
+            },
+            {
+              "id": "m14",
+              "output": "model",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_writer_profile.model"
+              }
+            },
+            {
+              "id": "m15",
+              "output": "effort",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_writer_profile.effort"
+              }
+            },
+            {
+              "id": "m16",
+              "output": "reason",
+              "expression": {
+                "kind": "binary",
+                "operator": "+",
+                "left": {
+                  "kind": "literal",
+                  "value": "workflow-normal-v1:work_kind="
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.work_kind"
+                }
+              }
+            },
+            {
+              "id": "m17",
+              "output": "max_turns",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_execution_budget.max_turns"
+              }
+            },
+            {
+              "id": "m18",
+              "output": "run_budget_seconds",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_execution_budget.run_budget_seconds"
+              }
+            },
+            {
+              "id": "m19",
+              "output": "reviewer_count",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_reviewer_policy.count"
+              }
+            },
+            {
+              "id": "m20",
+              "output": "reviewer1",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer1_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m21",
+              "output": "reviewer1_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer1_launcher"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m22",
+              "output": "reviewer1_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer1_provider"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m23",
+              "output": "reviewer1_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer1_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m24",
+              "output": "reviewer1_effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.effort"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m25",
+              "output": "reviewer1_reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "different_provider_from_writer"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "not_required_by_review_policy"
+                }
+              }
+            },
+            {
+              "id": "m26",
+              "output": "reviewer2",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer2_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m27",
+              "output": "reviewer2_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer2_launcher"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m28",
+              "output": "reviewer2_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer2_provider"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m29",
+              "output": "reviewer2_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.reviewer2_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m30",
+              "output": "reviewer2_effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_reviewer_policy.effort"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m31",
+              "output": "reviewer2_reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "different_provider_from_writer_and_reviewer1"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "not_required_by_review_policy"
+                }
+              }
+            },
+            {
+              "id": "m32",
+              "output": "review",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "none"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.count"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": 1
+                    }
+                  },
+                  "then": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": ">=",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_reviewer_policy.count"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": 1
+                      }
+                    },
+                    "then": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer1_model"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": "none"
+                    }
+                  },
+                  "else": {
+                    "kind": "binary",
+                    "operator": "+",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "conditional",
+                        "condition": {
+                          "kind": "binary",
+                          "operator": ">=",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_reviewer_policy.count"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": 1
+                          }
+                        },
+                        "then": {
+                          "kind": "getField",
+                          "path": "CTX.routing_reviewer_policy.reviewer1_model"
+                        },
+                        "else": {
+                          "kind": "literal",
+                          "value": "none"
+                        }
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "_"
+                      }
+                    },
+                    "right": {
+                      "kind": "conditional",
+                      "condition": {
+                        "kind": "binary",
+                        "operator": ">=",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_reviewer_policy.count"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": 2
+                        }
+                      },
+                      "then": {
+                        "kind": "getField",
+                        "path": "CTX.routing_reviewer_policy.reviewer2_model"
+                      },
+                      "else": {
+                        "kind": "literal",
+                        "value": "none"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m33",
+              "output": "writer_execution_profile",
+              "expression": {
+                "kind": "object",
+                "properties": {
+                  "version": {
+                    "kind": "literal",
+                    "value": "route-execution-profile-v2"
+                  },
+                  "policy_version": {
+                    "kind": "literal",
+                    "value": "workflow-normal-v1"
+                  },
+                  "decision_id": {
+                    "kind": "binary",
+                    "operator": "+",
+                    "left": {
+                      "kind": "literal",
+                      "value": "routing-normal-v1:"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "CTX.routing_decision_hash.value"
+                    }
+                  },
+                  "decision_sha256": {
+                    "kind": "getField",
+                    "path": "CTX.routing_decision_hash.value"
+                  },
+                  "role": {
+                    "kind": "literal",
+                    "value": "writer"
+                  },
+                  "work_kind": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "class": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "effective_size": {
+                    "kind": "getField",
+                    "path": "CTX.routing_effective_size.value"
+                  },
+                  "launcher": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.launcher"
+                  },
+                  "provider": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.provider"
+                  },
+                  "model": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.model"
+                  },
+                  "requested_effort": {
+                    "kind": "getField",
+                    "path": "CTX.routing_writer_profile.effort"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m34",
+              "output": "reviewer1_execution_profile",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "object",
+                  "properties": {
+                    "version": {
+                      "kind": "literal",
+                      "value": "route-execution-profile-v2"
+                    },
+                    "policy_version": {
+                      "kind": "literal",
+                      "value": "workflow-normal-v1"
+                    },
+                    "decision_id": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "literal",
+                        "value": "routing-normal-v1:"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_decision_hash.value"
+                      }
+                    },
+                    "decision_sha256": {
+                      "kind": "getField",
+                      "path": "CTX.routing_decision_hash.value"
+                    },
+                    "role": {
+                      "kind": "literal",
+                      "value": "reviewer1"
+                    },
+                    "work_kind": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "class": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.class"
+                    },
+                    "effective_size": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "launcher": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer1_launcher"
+                    },
+                    "provider": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer1_provider"
+                    },
+                    "model": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer1_model"
+                    },
+                    "requested_effort": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.effort"
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            },
+            {
+              "id": "m35",
+              "output": "reviewer2_execution_profile",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "object",
+                  "properties": {
+                    "version": {
+                      "kind": "literal",
+                      "value": "route-execution-profile-v2"
+                    },
+                    "policy_version": {
+                      "kind": "literal",
+                      "value": "workflow-normal-v1"
+                    },
+                    "decision_id": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "literal",
+                        "value": "routing-normal-v1:"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_decision_hash.value"
+                      }
+                    },
+                    "decision_sha256": {
+                      "kind": "getField",
+                      "path": "CTX.routing_decision_hash.value"
+                    },
+                    "role": {
+                      "kind": "literal",
+                      "value": "reviewer2"
+                    },
+                    "work_kind": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "class": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.class"
+                    },
+                    "effective_size": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "launcher": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer2_launcher"
+                    },
+                    "provider": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer2_provider"
+                    },
+                    "model": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.reviewer2_model"
+                    },
+                    "requested_effort": {
+                      "kind": "getField",
+                      "path": "CTX.routing_reviewer_policy.effort"
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "trigger",
+        "sourceHandle": "out",
+        "target": "policy_input"
+      },
+      {
+        "id": "e2",
+        "source": "policy_input",
+        "sourceHandle": "out",
+        "target": "policy_input_shape"
+      },
+      {
+        "id": "e3",
+        "source": "policy_input_shape",
+        "sourceHandle": "out",
+        "target": "policy_input_valid"
+      },
+      {
+        "id": "e4",
+        "source": "policy_input_valid",
+        "sourceHandle": "pass",
+        "target": "policy_input_normalized"
+      },
+      {
+        "id": "e5",
+        "source": "effective_size",
+        "sourceHandle": "out",
+        "target": "writer_profile"
+      },
+      {
+        "id": "e6",
+        "source": "writer_profile",
+        "sourceHandle": "out",
+        "target": "execution_budget"
+      },
+      {
+        "id": "e7",
+        "source": "execution_budget",
+        "sourceHandle": "out",
+        "target": "reviewer_policy"
+      },
+      {
+        "id": "e8",
+        "source": "reviewer_policy",
+        "sourceHandle": "out",
+        "target": "decision_material"
+      },
+      {
+        "id": "e9",
+        "source": "decision_material",
+        "sourceHandle": "out",
+        "target": "decision_hash"
+      },
+      {
+        "id": "e10",
+        "source": "decision_hash",
+        "sourceHandle": "out",
+        "target": "route_output"
+      },
+      {
+        "id": "e-reject",
+        "source": "policy_input_valid",
+        "sourceHandle": "fail",
+        "target": "policy_rejected"
+      },
+      {
+        "id": "e-normalized",
+        "source": "policy_input_normalized",
+        "sourceHandle": "out",
+        "target": "effective_size"
+      }
+    ]
+  }
+}

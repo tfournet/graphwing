@@ -73,6 +73,12 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
+### Canonical native routing policy (issue #186, slice 2)
+
+`graphwing-routing-policy` accepts only `class`, `work_kind`, `size`, `ac_count`, and `seams`. Native AST/object nodes validate and normalize those values, apply at most one size bump, select the current normal-v1 writer and class/effective-size budget, and choose zero, one, or two distinct opposing-provider reviewers. Writer effort remains work-kind-specific; reviewer effort is independently `medium` or `high`. Every present role carries one complete `route-execution-profile-v2` bound to the deterministic decision hash.
+
+The graph's policy version is `workflow-normal-v1`, with `normal-v1` retained as its compatibility behavior label. This does not promote the Python `routing-policy-v2` benchmark candidate, which remains unable to authorize execution. Publisher ordering records the exact policy workflow/version before either future consumer is published. Existing implement-slice, PR-drive, and local route endpoints are intentionally unchanged in this slice; no graph consumes the new policy yet. This source change performs no publication or live use, and either operation requires separate approval.
+
 ### Native effort contract (Phases 2–3)
 
 Direct `POST /v1/agent/run` and `POST /v1/review/run` accept optional `effort` with the closed values `default`, `low`, `medium`, `high`, and `max`. A supplied direct-call value records `effort_source: explicit`; omission records `requested_effort: default` and `effort_source: launcher_default`. Source `route` is available only when the request also supplies the exact closed `route_execution_profile` emitted by the selected route. That `route-execution-profile-v1` object binds route version, role, work kind, class/effective size, launcher/provider/model, and requested effort; runtime reconstructs it from the versioned route catalog and rejects unknown, missing, extra, or mismatched evidence before launch. Unknown effort text returns `400 bad_effort`; a known value outside the selected native profile returns `400 unsupported_effort` before process launch.

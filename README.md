@@ -56,6 +56,7 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 
 | Workflow | You pass | It does |
 |---|---|---|
+| `graphwing-routing-policy` | `class`, `work_kind`, `size`, `ac_count`, `seams` | Build one deterministic native `workflow-normal-v1` routing decision and complete `route-execution-profile-v2` objects. Invalid closed inputs hard-fail. It is cataloged ahead of future consumers for exact-version publication, but no graph consumes it yet and this source change performs no publication. |
 | `graphwing-run-control-authorize` | `record_key`, `server_instance_challenge` | Compatibility-only foundation helper. It remains cataloged but no source `action.subworkflow` or `pr-drive` publication chain references it. |
 | `graphwing-run-control-transition` | `expected_pointer_version`, `from_logical_revision`, `operation_id`, `operation_type`, `owner_workflow_run_id`, `run_control_id`, `target_logical_revision`, `target_state`, `target_state_record_key`, `target_state_sha256`, `transition_delta`, `transition_request_sha256` | Active v1 content-addressed Records plus KV CAS journal transition/recovery helper; pending is fail-closed and cannot launch. |
 | `graphwing-run-control-initialize` | `budgets`, `evaluator_contract_sha256`, `initial_route`, `root_identity` | Active v1 initializer called by `scripts/drive-pr.py` before `pr-drive`; it writes the closed root identity and immutable budgets through `transition`. |
