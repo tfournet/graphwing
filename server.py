@@ -2883,6 +2883,11 @@ RUN_CONTROL_AUTHORITY_LOSS_REASONS = (
     "continuation_kick_failed", "kicked_run_never_settled", "launched_run_never_settled",
 )
 RUN_CONTROL_SETTLE_FIELDS = frozenset({"run_control", "receipt"})
+ATTEMPT_FACTS_VERSION = "normalized-attempt-facts-v2"
+REWST_AUTHORIZATION_IDENTITY_VERSION = "graphwing-rewst-authorization-identity-v1"
+REWST_AUTHORIZATION_IDENTITY_FIELDS = frozenset({
+    "version", "authorization_id", "descriptor_sha256",
+})
 # The closed AgentReceipt failure_code vocabulary: none on success, every
 # classified launcher code, and the structured provider availability codes.
 # Built from PROVIDER_AVAILABILITY_CODES (not just the PROVIDER_FAILURE_GROUPS
@@ -3063,6 +3068,197 @@ def _run_control_usage_projection(usage: dict[str, Any] | None) -> dict[str, Any
 def _run_control_receipt_sha256(receipt: dict[str, Any]) -> str:
     payload = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def rewst_authorization_identity(
+    authority: Any, descriptor: Any,
+) -> dict[str, str] | None:
+    """Project the exact consumed launch authorization without its signed body."""
+    authorization = authority.get("authorization") if isinstance(authority, dict) else None
+    canonical = _rewst_canonical_json_bytes(descriptor)
+    authorization_id = authorization.get("authorization_id") if isinstance(authorization, dict) else None
+    if canonical is None or not _valid_rewst_id(authorization_id):
+        return None
+    return {
+        "version": REWST_AUTHORIZATION_IDENTITY_VERSION,
+        "authorization_id": authorization_id,
+        "descriptor_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def _parse_rewst_authorization_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != REWST_AUTHORIZATION_IDENTITY_FIELDS:
+        return None
+    if (
+        value.get("version") != REWST_AUTHORIZATION_IDENTITY_VERSION
+        or not _valid_rewst_id(value.get("authorization_id"))
+        or not _valid_sha256(value.get("descriptor_sha256"))
+    ):
+        return None
+    return {key: value[key] for key in sorted(REWST_AUTHORIZATION_IDENTITY_FIELDS)}
+
+
+def _attempt_facts_terminal_material(job: Any) -> dict[str, Any] | None:
+    if not isinstance(job, dict):
+        return None
+    material = {
+        key: job.get(key)
+        for key in (
+            "job_id", "kind", "status", "repo", "branch", "starting_head",
+            *AGENT_PROFILE_FIELDS, "session_identity", "rewst_authorization_identity", "receipt",
+        )
+    }
+    return material if _parse_rewst_authorization_identity(
+        material.get("rewst_authorization_identity")
+    ) is not None else None
+
+
+def _attempt_facts_terminal_digest(job: Any) -> str | None:
+    material = _attempt_facts_terminal_material(job)
+    canonical = _rewst_canonical_json_bytes(material)
+    return hashlib.sha256(canonical).hexdigest() if canonical is not None else None
+
+
+def seal_attempt_facts_terminal_authority(job: Any) -> None:
+    digest = _attempt_facts_terminal_digest(job)
+    job_id = job.get("job_id") if isinstance(job, dict) else None
+    if digest is None or not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
+        return
+    with ATTEMPT_FACTS_TERMINAL_AUTHORITY_LOCK:
+        ATTEMPT_FACTS_TERMINAL_AUTHORITY[job_id] = digest
+
+
+def _attempt_facts_authorization_available(job: dict[str, Any]) -> tuple[bool, bool]:
+    """Return (available, contradictory) for the sealed terminal record."""
+    job_id = job["job_id"]
+    with ATTEMPT_FACTS_TERMINAL_AUTHORITY_LOCK:
+        expected = ATTEMPT_FACTS_TERMINAL_AUTHORITY.get(job_id)
+    if expected is None:
+        return False, False
+    actual = _attempt_facts_terminal_digest(job)
+    if actual is None or not hmac.compare_digest(expected, actual):
+        return False, True
+    return True, False
+
+
+def _provider_cost_microusd_ceiling(cost: Any) -> int | None:
+    if cost is None:
+        return None
+    exact = Decimal(repr(cost))
+    if not exact.is_finite() or exact < 0 or exact > Decimal(str(USAGE_MAX_COST_USD)):
+        return None
+    return int((exact * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
+
+
+def _unavailable_attempt_facts(
+    job_id: str, authorization_identity: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "version": ATTEMPT_FACTS_VERSION,
+        "job_id": job_id,
+        "authorization_identity": authorization_identity,
+        "authority_available": False,
+        "session_identity": None,
+        "route_execution_profile": None,
+        "terminal_status": None,
+        "failure_class": None,
+        "failure_code": None,
+        "failover_eligible": None,
+        "turns_observed": None,
+        "provider_cost_usd": None,
+        "provider_cost_microusd_ceiling": None,
+        "wall_seconds": None,
+        "fresh_input_tokens": None,
+        "cached_input_tokens": None,
+        "cache_write_tokens": None,
+        "output_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+        "receipt_sha256": None,
+    }
+
+
+def run_control_attempt_facts(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Return only sealed terminal execution facts for one exact authorization."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != {"job_id", "authorization_identity"}:
+        return _run_control_error(
+            "unexpected_fields", "attempt facts requires exactly job_id and authorization_identity",
+        )
+    job_id = data.get("job_id")
+    if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
+        return _run_control_error("bad_job_id", "job_id is invalid")
+    requested_identity = _parse_rewst_authorization_identity(data.get("authorization_identity"))
+    if requested_identity is None:
+        return _run_control_error(
+            "bad_authorization_identity", "authorization_identity is outside the closed contract",
+        )
+    job = read_job(job_id)
+    if job is None:
+        return 404, {"error": "job not found", "code": "not_found"}
+    if not is_agent_job_record(job) or job.get("status") not in {"completed", "failed"}:
+        return 409, {"error": "job is not a canonical terminal agent record", "code": "attempt_job_not_terminal"}
+    stored_identity = _parse_rewst_authorization_identity(job.get("rewst_authorization_identity"))
+    if stored_identity is None or stored_identity != requested_identity:
+        return 409, {
+            "error": "job authorization identity does not match", "code": "attempt_authorization_mismatch",
+        }
+    receipt = job.get("receipt")
+    if not isinstance(receipt, dict):
+        return 409, {"error": "terminal receipt is unavailable", "code": "attempt_receipt_mismatch"}
+    authority_available, contradictory = _attempt_facts_authorization_available(job)
+    usage, usage_diagnostic = authorized_receipt_usage("agent", receipt)
+    if contradictory or usage_diagnostic == "usage_authority_mismatch":
+        return 409, {"error": "sealed attempt evidence does not match", "code": "attempt_receipt_mismatch"}
+    if not authority_available or usage_diagnostic == "usage_authority_unavailable":
+        return 200, _unavailable_attempt_facts(job_id, stored_identity)
+    if not receipt_profile_matches_job(job, receipt):
+        return 409, {"error": "sealed attempt profile does not match", "code": "attempt_receipt_mismatch"}
+    normalized_receipt = sanitized_agent_receipt(job)
+    if normalized_receipt is None:
+        return 409, {"error": "sealed attempt receipt is not canonical", "code": "attempt_receipt_mismatch"}
+    session_identity = job["session_identity"]
+    route_profile = session_identity.get("route_execution_profile")
+    if not isinstance(route_profile, dict):
+        return 409, {"error": "sealed attempt has no exact route profile", "code": "attempt_route_missing"}
+    receipt_status = normalized_receipt.get("status")
+    failure_code = normalized_receipt.get("failure_code")
+    expected_job_status = "completed" if receipt_status == "ok" else "failed"
+    if (
+        receipt_status not in {"ok", "error", "timeout"}
+        or (receipt_status == "ok") != (failure_code == "none")
+        or job.get("status") != expected_job_status
+    ):
+        return 409, {"error": "terminal status does not match the sealed receipt", "code": "attempt_receipt_mismatch"}
+    terminal_status = {"ok": "succeeded", "error": "failed", "timeout": "timed_out"}[receipt_status]
+    usage_values = usage or {}
+    token_fields = (
+        "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+        "output_tokens", "reasoning_tokens",
+    )
+    cost = usage_values.get("provider_cost_usd")
+    return 200, {
+        "version": ATTEMPT_FACTS_VERSION,
+        "job_id": job_id,
+        "authorization_identity": stored_identity,
+        "authority_available": True,
+        "session_identity": session_identity,
+        "route_execution_profile": route_profile,
+        "terminal_status": terminal_status,
+        "failure_class": normalized_receipt.get("failure_class"),
+        "failure_code": failure_code,
+        "failover_eligible": normalized_receipt.get("failover_eligible"),
+        "turns_observed": usage_values.get("turns_observed"),
+        "provider_cost_usd": cost,
+        "provider_cost_microusd_ceiling": _provider_cost_microusd_ceiling(cost),
+        "wall_seconds": usage_values.get("wall_seconds"),
+        **{key: usage_values.get(key) for key in token_fields},
+        "total_tokens": sum(usage_values[key] for key in token_fields) if usage is not None else None,
+        "receipt_sha256": _run_control_receipt_sha256(receipt),
+    }
 
 
 def _run_control_settled_receipt(
@@ -7492,7 +7688,7 @@ def agent_execution_snapshot(job: Any) -> dict[str, Any] | None:
             "branch", "starting_head", "launch_native_session_id",
             "max_turns", "run_budget_seconds", "codeoff_workspace", "prompt_hash",
             "git_baseline", "resume_job_id", "response_webhook_url",
-            "response_webhook_token", "resume_url",
+            "response_webhook_token", "resume_url", "rewst_authorization_identity",
         )
     }
     immutable["session_identity"] = dict(job["session_identity"])
@@ -7656,6 +7852,7 @@ def agent_terminal_transition(
                     return reject_or_sanitize(persisted)
                 _write_job_unlocked(current)
                 seal_terminal_receipt_authority("agent", terminal_receipt)
+                seal_attempt_facts_terminal_authority(current)
                 return current, True
             finally:
                 transition_keys.discard(key)
@@ -8253,6 +8450,8 @@ USAGE_DIAGNOSTICS = frozenset({
 })
 TERMINAL_RECEIPT_AUTHORITY_LOCK = threading.Lock()
 TERMINAL_RECEIPT_AUTHORITY: dict[tuple[str, str], str] = {}
+ATTEMPT_FACTS_TERMINAL_AUTHORITY_LOCK = threading.Lock()
+ATTEMPT_FACTS_TERMINAL_AUTHORITY: dict[str, str] = {}
 
 
 def valid_normalized_usage(usage: Any) -> bool:
@@ -8311,6 +8510,9 @@ def seal_terminal_receipt_authority(kind: str, receipt: dict[str, Any]) -> None:
 def clear_terminal_receipt_authority(kind: str, job_id: str) -> None:
     with TERMINAL_RECEIPT_AUTHORITY_LOCK:
         TERMINAL_RECEIPT_AUTHORITY.pop((kind, job_id), None)
+    if kind == "agent":
+        with ATTEMPT_FACTS_TERMINAL_AUTHORITY_LOCK:
+            ATTEMPT_FACTS_TERMINAL_AUTHORITY.pop(job_id, None)
 
 
 def authorized_receipt_usage(
@@ -13114,6 +13316,7 @@ def agent_run(
     elif data.get("resume_job_id") not in (None, ""):
         return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
     expected_rewst_descriptor: dict[str, Any] | None = None
+    authorization_identity: dict[str, str] | None = None
     if rewst_authority is not None:
         request_without_authorization = dict(data)
         request_without_authorization.pop("rewst_authorization", None)
@@ -13145,6 +13348,11 @@ def agent_run(
             expected_rewst_descriptor is None
             or not rewst_descriptor_matches(rewst_authority, expected_rewst_descriptor)
         ):
+            return _rewst_auth_error("rewst_authorization_mismatch")
+        authorization_identity = rewst_authorization_identity(
+            rewst_authority, expected_rewst_descriptor,
+        )
+        if authorization_identity is None:
             return _rewst_auth_error("rewst_authorization_mismatch")
     writer_parent_paths: list[str] = []
     if resume_parent is not None:
@@ -13227,6 +13435,8 @@ def agent_run(
         }
         if continuity is not None:
             job["run_control"] = continuity
+        if authorization_identity is not None:
+            job["rewst_authorization_identity"] = authorization_identity
         if git_baseline is not None:
             job["git_baseline"] = git_baseline
             job["writer_parent_paths"] = writer_parent_paths
@@ -13420,6 +13630,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/evaluate":
         status, payload = run_control_evaluate(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/run/control/attempt-facts":
+        status, payload = run_control_attempt_facts(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/validate-initialize":
         status, payload = run_control_validate_initialize(body)

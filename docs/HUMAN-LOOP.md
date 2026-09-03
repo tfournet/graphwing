@@ -23,6 +23,14 @@ Source implementation and high-confidence Graphwing PR merges are authorized. Li
 
 The current run-control path and temporary daemon owners are frozen in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). Do not remove a v1 compatibility surface or infer a v2 record from v1 state before the separately approved cutover proof.
 
+The additive `POST /v1/run/control/attempt-facts` boundary reports one exact-authorized,
+authority-sealed terminal agent attempt as closed `normalized-attempt-facts-v2`. It
+reports identity, route profile, terminal/failure state, nullable observed usage, exact
+ceiling microdollars, and a receipt hash only. It does not aggregate history, fill
+unknowns from reservations, interpret progress, choose a route, or make a lifecycle
+decision. Replacement-daemon authority loss produces closed null facts with
+`authority_available: false`; v1 settle and authority-loss remain compatibility-only.
+
 ## Flow
 
 1. Grill the idea and record the accepted behavior on its GitHub issue.
