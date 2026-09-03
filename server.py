@@ -11454,6 +11454,24 @@ def _codeoff_v2_replay(
         or manifest.get("initialize_request_hash") != request_hash
     ):
         return _codeoff_v2_park(root, state, "codeoff_v2_policy_mismatch")
+    expected_slots = {
+        slot: {"slot": slot, **identity}
+        for slot, identity in (manifest.get("identities") or {}).items()
+        if isinstance(slot, str) and isinstance(identity, dict)
+    }
+    events = _codeoff_events(root, state)
+    initialization_events = [event for event in events if event.get("kind") == "v2_initialized"]
+    initialized_data = initialization_events[0].get("data") if len(initialization_events) == 1 else None
+    if (
+        codeoff_manifest_identity_error(manifest) is not None
+        or manifest.get("slots") != expected_slots
+        or not isinstance(initialized_data, dict)
+        or initialized_data.get("policy_hash") != manifest.get("policy_hash")
+        or initialized_data.get("seed_commitment") != manifest.get("selection", {}).get("seed_commitment")
+        or initialized_data.get("identities_hash") != manifest.get("identities_hash")
+        or initialized_data.get("prompt_hash") != manifest.get("prompt_hash")
+    ):
+        return _codeoff_v2_park(root, state, "codeoff_v2_authority_unavailable")
     if not _codeoff_v2_policy_current(policy):
         return _codeoff_v2_park(root, state, "codeoff_v2_policy_expired")
     seed_path = root / "private" / "seed"
@@ -12612,6 +12630,11 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     if err:
         return None, err
     assert root and manifest and state
+    if manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION:
+        return None, {
+            "error": "code-off v2 stops after initialization until workflow cutover",
+            "code": "codeoff_v2_not_activated",
+        }
     identity_err = codeoff_manifest_identity_error(manifest)
     if identity_err:
         return None, identity_err
@@ -12663,7 +12686,10 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             return 400, {"error": "code-off jobs resolve prompt and cwd from the opaque reference", "code": "bad_codeoff_workspace"}
         codeoff, codeoff_err = _resolve_codeoff_agent(data.get("codeoff_workspace"))
         if codeoff_err:
-            return 409 if codeoff_err.get("code") in ("experiment_finalized", "bad_experiment_stage", "codeoff_identity_unpinned") else 400, codeoff_err
+            return 409 if codeoff_err.get("code") in (
+                "experiment_finalized", "bad_experiment_stage", "codeoff_identity_unpinned",
+                "codeoff_v2_not_activated",
+            ) else 400, codeoff_err
         assert codeoff is not None
         prompt_bytes = codeoff["prompt"]
         prompt = prompt_bytes.decode("utf-8")

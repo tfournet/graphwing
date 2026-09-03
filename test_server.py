@@ -21926,6 +21926,19 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         initialize = next(node for node in graph["spec"]["nodes"] if node["id"] == "initialize_v2")
         self.assertNotIn("seed", initialize["config"])
 
+        author = payload["slots"]["author-1"]
+        with mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("v2 author launched")):
+            launch_status, launch = server.dispatch(
+                "POST", "/v1/agent/run", {}, True, json.dumps({
+                    "codeoff_workspace": {"experiment_id": "policy-v2-experiment", "slot": "author-1"},
+                    "launcher": author["launcher"], "provider": author["provider"],
+                    "model": author["exact_model"], "effort": author["requested_effort"],
+                    "max_turns": self._policy()["budgets"]["max_turns"],
+                    "run_budget_seconds": self._policy()["budgets"]["author_seconds"],
+                }).encode(),
+            )[:2]
+        self.assertEqual((launch_status, launch["code"]), (409, "codeoff_v2_not_activated"))
+
     def test_v2_replay_returns_the_same_commitment_and_slots_but_changed_policy_local_loss_or_expiry_cannot_redraw_or_launch(self):
         body = self._body("policy-v2-replay")
         first_status, first = self._post(body)
@@ -21958,6 +21971,27 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
              mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("expired replay resolved launcher")):
             status, rejected = self._post(expiry_body)
         self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_policy_expired", "parked"))
+
+        drift_body = self._body("policy-v2-identity-drift")
+        self.assertEqual(self._post(drift_body)[0], 200)
+        drift_root = self.records / "policy-v2-identity-drift"
+        manifest = json.loads((drift_root / "manifest.json").read_text())
+        manifest["identities"]["author-1"]["launcher_version"] = "sha256:" + "0" * 64
+        manifest["slots"]["author-1"]["launcher_version"] = "sha256:" + "0" * 64
+        manifest["identity_snapshot_hashes"]["author-1"] = server.codeoff_identity_snapshot_hash(
+            manifest["identities"]["author-1"]
+        )
+        manifest["identities_hash"] = hashlib.sha256(
+            server.codeoff_canonical_json(manifest["identities"])
+        ).hexdigest()
+        manifest_bytes = server.codeoff_canonical_json(manifest) + b"\n"
+        (drift_root / "manifest.json").write_bytes(manifest_bytes)
+        state = json.loads((drift_root / "state.json").read_text())
+        state["manifest_file_hash"] = hashlib.sha256(manifest_bytes).hexdigest()
+        (drift_root / "state.json").write_text(json.dumps(state))
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("drift replay resolved launcher")):
+            status, rejected = self._post(drift_body)
+        self.assertEqual((status, rejected["code"]), (409, "codeoff_v2_authority_unavailable"))
 
         interrupted_body = self._body("policy-v2-interrupted")
         with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=OSError("fixture interruption")):
