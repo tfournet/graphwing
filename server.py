@@ -11500,7 +11500,10 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         return 400, policy_err
     assert policy is not None
     policy_hash = data.get("policy_hash")
-    expected_policy_hash = hashlib.sha256(_codeoff_v2_policy_json(policy)).hexdigest()
+    try:
+        expected_policy_hash = hashlib.sha256(_codeoff_v2_policy_json(policy)).hexdigest()
+    except UnicodeEncodeError:
+        return 400, {"error": "policy strings must be valid Unicode", "code": "bad_policy"}
     if not isinstance(policy_hash, str) or policy_hash != expected_policy_hash:
         return 400, {"error": "policy_hash must bind the complete canonical policy", "code": "bad_policy_hash"}
     experiment_id, eid_err = _codeoff_id(data.get("experiment_id"))
@@ -11565,6 +11568,10 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         if workspace_root.exists():
             return 409, {"ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION, "policy_version": CODEOFF_V2_POLICY_VERSION, "experiment_id": experiment_id, "status": "parked", "code": "codeoff_v2_authority_unavailable", "error": "opaque workspace exists without local initialization authority"}
 
+        # Reserve the opaque namespace before minting private draw authority.
+        # A crash after this point leaves a fail-closed marker, never permission
+        # to mint another seed for the same experiment identifier.
+        workspace_root.mkdir(parents=True, mode=0o700)
         seed_hex = secrets.token_hex(32)
         selection = _codeoff_v2_draw(seed_hex, policy)
         participants = {p["logical_model"]: p for p in policy["participants"]}
@@ -11641,7 +11648,9 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         record_build = Path(tempfile.mkdtemp(prefix=f".initialize-v2-{experiment_id}-", dir=CODEOFFS_DIR))
         created: list[Path] = []
         try:
-            _codeoff_atomic_bytes(record_build / "private" / "seed", seed_hex.encode(), immutable=True)
+            private_root = record_build / "private"
+            private_root.mkdir(mode=0o700)
+            _codeoff_atomic_bytes(private_root / "seed", seed_hex.encode(), immutable=True)
             prompt_hash = _codeoff_artifact(record_build, canonical_prompt)
             manifest = {**locked, "created_at": utcnow()}
             _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
@@ -11659,7 +11668,6 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
                 "policy_hash": policy_hash, "seed_commitment": selection["seed_commitment"],
                 "identities_hash": identities_hash, "prompt_hash": prompt_hash,
             })
-            workspace_root.mkdir(parents=True, mode=0o700)
             for slot in ("author-1", "author-2"):
                 path = codeoff_workspace_path(experiment_id, slot)
                 created.append(path)
@@ -11675,7 +11683,6 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
         except BaseException:
             for path in reversed(created):
                 _codeoff_remove_worktree(repo, path)
-            shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(record_build, ignore_errors=True)
             raise
     return 200, _codeoff_v2_result(manifest, state)

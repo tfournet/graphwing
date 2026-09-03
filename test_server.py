@@ -21912,6 +21912,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         private_seed = self.records / "policy-v2-experiment" / "private" / "seed"
         self.assertRegex(private_seed.read_text(), r"^[0-9a-f]{64}$")
         self.assertEqual(stat.S_IMODE(private_seed.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(private_seed.parent.stat().st_mode), 0o700)
         manifest = json.loads((self.records / "policy-v2-experiment" / "manifest.json").read_text())
         self.assertEqual(self._secret_keys(manifest), set())
         self.assertFalse((private_seed.parent / "blinding.json").exists())
@@ -21958,6 +21959,15 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             status, rejected = self._post(expiry_body)
         self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_policy_expired", "parked"))
 
+        interrupted_body = self._body("policy-v2-interrupted")
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=OSError("fixture interruption")):
+            status, interrupted = self._post(interrupted_body)
+        self.assertEqual((status, interrupted["code"]), (500, "codeoff_runtime_failure"))
+        self.assertTrue((self.workspaces / "policy-v2-interrupted").is_dir())
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("interrupted retry redrew")):
+            status, rejected = self._post(interrupted_body)
+        self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_authority_unavailable", "parked"))
+
     def test_v2_collision_with_v1_is_read_only_and_policy_hash_matches_go_json(self):
         v1_id = "policy-v1-collision"
         v1_body = {
@@ -21993,6 +22003,12 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         status, payload = self._post(body)
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["policy_hash"], body["policy_hash"])
+
+        invalid_unicode = self._body("policy-v2-invalid-unicode")
+        invalid_unicode["policy"]["classification"]["category"] = "bad-\ud800"
+        invalid_unicode["policy_hash"] = "0" * 64
+        status, payload = self._post(invalid_unicode)
+        self.assertEqual((status, payload["code"]), (400, "bad_policy"))
 
     def test_v2_workflow_expiry_and_participant_eligibility_park_before_launcher_resolution_while_daemon_only_enforces_hard_supported_identity_bounds(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())["spec"]
