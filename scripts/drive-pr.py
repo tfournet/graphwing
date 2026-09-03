@@ -37,6 +37,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -47,6 +48,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import publish_graphs as pg  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from server import resolve_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DAEMON_BASE = "http://127.0.0.1:8645"
@@ -273,14 +277,21 @@ def resolve_route(key: str, klass: str, size: str, work_kind: str) -> dict[str, 
 
 
 def gh_pr_view(repo_path: Path, pr: str) -> tuple[str, str]:
-    import subprocess
+    gh_bin = resolve_executable(
+        "gh", "GRAPHWING_GH_BIN", Path.home() / ".local" / "bin" / "gh",
+    )
+    if not gh_bin.is_file() or not os.access(gh_bin, os.X_OK):
+        raise SystemExit(f"resolved gh executable is unavailable: {gh_bin}")
     proc = subprocess.run(
-        ["gh", "pr", "view", str(pr), "--json", "headRefName,headRefOid"],
+        [str(gh_bin), "pr", "view", str(pr), "--json", "headRefName,headRefOid"],
         cwd=str(repo_path), capture_output=True, text=True, timeout=30,
     )
     if proc.returncode != 0:
         raise SystemExit(f"gh pr view {pr} failed: {proc.stderr.strip()[:400]}")
-    data = json.loads(proc.stdout)
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise SystemExit(f"gh pr view {pr} returned non-JSON output") from None
     return data["headRefName"], data["headRefOid"]
 
 
@@ -431,6 +442,12 @@ def main() -> int:
         if not wait_for_fresh_review(args.repo, args.pr, opening):
             return 1
 
+    print("=== reading the PR head ===")
+    repos = load_repos()
+    repo_path = resolve_repo_path(args.repo, repos)
+    branch, head_sha = gh_pr_view(repo_path, args.pr)
+    print("branch", branch, "head_sha", head_sha)
+
     print("=== resolving the opening route ===")
     initial_route = resolve_route(api_key(), args.klass, args.size, args.work_kind)
     print("initial_route", json.dumps(initial_route))
@@ -468,11 +485,6 @@ def main() -> int:
         return 1
     run_control_id = identity_output["run_control_id"]
     print("run_control_id", run_control_id)
-
-    repos = load_repos()
-    repo_path = resolve_repo_path(args.repo, repos)
-    branch, head_sha = gh_pr_view(repo_path, args.pr)
-    print("branch", branch, "head_sha", head_sha)
 
     payload = build_pr_drive_input(
         args.repo, args.pr, args.test, args.auto_merge, args.klass, args.size,

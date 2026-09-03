@@ -16,7 +16,7 @@ import threading
 import time
 import unittest
 from copy import deepcopy
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22692,6 +22692,42 @@ class DrivePrScriptTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     m.resolve_repo_path("unknown", repos)
 
+    def test_gh_pr_view_uses_graphwings_resolved_native_binary(self):
+        m = self.module
+        with tempfile.TemporaryDirectory() as tmp:
+            native = Path(tmp) / "native-gh"
+            native.write_text("fixture")
+            native.chmod(0o755)
+            completed = subprocess.CompletedProcess(
+                [str(native), "pr", "view"], 0,
+                stdout='{"headRefName":"fix/pr","headRefOid":"' + "a" * 40 + '"}\n',
+                stderr="",
+            )
+            with mock.patch.object(m, "resolve_executable", return_value=native) as resolver, \
+                 mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(m.gh_pr_view(Path(tmp), "3914"), ("fix/pr", "a" * 40))
+        resolver.assert_called_once_with(
+            "gh", "GRAPHWING_GH_BIN", Path.home() / ".local" / "bin" / "gh",
+        )
+        self.assertEqual(run.call_args.args[0][0], str(native))
+        self.assertNotEqual(run.call_args.args[0][0], "gh")
+
+    def test_gh_pr_view_rejects_non_json_stdout_without_decoder_traceback(self):
+        m = self.module
+        with tempfile.TemporaryDirectory() as tmp:
+            native = Path(tmp) / "native-gh"
+            native.write_text("fixture")
+            native.chmod(0o755)
+            completed = subprocess.CompletedProcess(
+                [str(native), "pr", "view"], 0,
+                stdout='mise config tools: gh@2.99.0\n{"headRefName":"fix/pr","headRefOid":"' + "a" * 40 + '"}\n',
+                stderr="",
+            )
+            with mock.patch.object(m, "resolve_executable", return_value=native), \
+                 mock.patch.object(m.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(SystemExit, "gh pr view 3914 returned non-JSON output"):
+                    m.gh_pr_view(Path(tmp), "3914")
+
     def test_workflow_run_title_matches_servers_pr_and_repo_fallback(self):
         m = self.module
         self.assertEqual(m.workflow_run_title("pr-drive", {"pr_number": "3526"}), "pr-drive PR 3526")
@@ -22764,6 +22800,53 @@ class DrivePrScriptTests(unittest.TestCase):
                 rc = m.main()
         mock_findings.assert_not_called()
         self.assertEqual(rc, 1)
+
+    def test_main_reads_pr_head_before_durable_run_control_initialize(self):
+        m = self.module
+        events = []
+
+        def fake_run_slug(_mcp, workflow, _payload, wait):
+            events.append(workflow)
+            if workflow == "graphwing-run-control-initialize":
+                return "completed", "init-run", {}, {
+                    "trace": [{"id": "identity", "output": {"run_control_id": "rc1-abc"}}],
+                }
+            return "completed", "drive-run", {}, {"trace": []}
+
+        def fake_pr_view(_repo_path, _pr):
+            events.append("gh-pr-view")
+            return "fix/pr", "a" * 40
+
+        install = {"pr_drive": {"workflow_id": "wf-1", "workflow_version_id": "wfv-1"}}
+        patches = (
+            mock.patch.object(sys, "argv", ["drive-pr.py", "3914"]),
+            mock.patch.object(m, "worst_case_run_seconds", return_value=10),
+            mock.patch.object(m.pg, "load_install", return_value=install),
+            mock.patch.object(m.pg, "tenant_id", return_value="tenant"),
+            mock.patch.object(m.pg, "rewst_mcp", return_value="mcp"),
+            mock.patch.object(m.pg, "run_slug", side_effect=fake_run_slug),
+            mock.patch.object(m, "findings", side_effect=[{"holds": [], "grade": "A"}, None]),
+            mock.patch.object(m, "resolve_route", return_value={
+                "route_version": "normal-v1", "launcher": "codex",
+                "provider": "openai", "model": "gpt-5.6-sol",
+            }),
+            mock.patch.object(m, "api_key", return_value="key"),
+            mock.patch.object(m, "load_repos", return_value={"riftwing": "/repo"}),
+            mock.patch.object(m, "resolve_repo_path", return_value=Path("/repo")),
+            mock.patch.object(m, "gh_pr_view", side_effect=fake_pr_view),
+            mock.patch.object(m, "evaluator_contract_sha256", return_value="b" * 64),
+            mock.patch.object(m, "utc_compact_timestamp", return_value="20260903T000000Z"),
+            mock.patch.object(m, "record_workflow_run"),
+            mock.patch("builtins.print"),
+        )
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            self.assertEqual(m.main(), 0)
+
+        self.assertEqual(events, [
+            "gh-pr-view", "graphwing-run-control-initialize", "graphwing-pr-drive",
+        ])
 
     def test_settled_grade_plus_sticky_hold_is_not_an_in_flight_audit(self):
         # GRAPHWING_REVIEW_WAIT used to treat any holds as "audit still
