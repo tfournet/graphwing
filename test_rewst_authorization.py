@@ -197,7 +197,11 @@ class RewstAuthorizationFoundationTests(unittest.TestCase):
             self.assertEqual(verify(candidate, headers)[1][1]["code"], code)
         self.assertEqual(verify(body)[1][1]["code"], "rewst_authorization_replayed")
         with mock.patch.object(server, "REWST_REPLAY_REGISTRY_MAX", 1):
-            saturated = verify(body, signed_headers(body, nonce="b" * 64))[1]
+            second = authorized_body(
+                auth_overrides={"authorization_id": "auth-2"},
+                descriptor_overrides={"authorization_id": "auth-2"},
+            )
+            saturated = verify(second, signed_headers(second, nonce="b" * 64))[1]
         self.assertEqual(saturated[1]["code"], "rewst_authorization_registry_saturated")
 
     def test_signed_lone_surrogates_and_canonicalization_failures_are_sanitized(self):

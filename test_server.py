@@ -3,6 +3,7 @@ import ast
 import errno
 import fcntl
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -162,6 +163,377 @@ def _stamp_complete_writer_evidence(job):
         "failure_class": "none", "failure_code": "none", "failover_eligible": False,
     })
     return job
+
+
+def _exact_rewst_headers(
+    body: bytes, *, nonce: str = "a" * 64, timestamp: int = 1_700_000_000,
+    secret: bytes = b"r" * 32,
+):
+    signed = (
+        b"graphwing-rewst-request-v2\n"
+        + server.REWST_SERVER_INSTANCE_CHALLENGE.encode() + b"\n"
+        + str(timestamp).encode() + b"\n" + nonce.encode() + b"\n" + body
+    )
+    return {
+        "X-Graphwing-Rewst-Timestamp": str(timestamp),
+        "X-Graphwing-Rewst-Nonce": nonce,
+        "X-Graphwing-Rewst-Signature": hmac.new(secret, signed, hashlib.sha256).hexdigest(),
+    }
+
+
+def _exact_authorized_agent_request(
+    repo: Path,
+    binary: Path,
+    *,
+    authorization_id: str = "auth-1",
+    launcher: str = "codex",
+    provider: str = "openai",
+    model: str = "gpt-5.6-sol",
+    effort: str = "high",
+    route_version: str = "normal-v1",
+    nonce: str = "a" * 64,
+    timestamp: int = 1_700_000_000,
+    request_overrides: dict[str, Any] | None = None,
+    descriptor_overrides: dict[str, Any] | None = None,
+    secret: bytes = b"r" * 32,
+):
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    route = {
+        "version": "route-execution-profile-v1", "route_version": route_version,
+        "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+        "size": "S", "launcher": launcher, "provider": provider,
+        "model": model, "effort": effort,
+    }
+    request = {
+        "prompt": "authorized fixture", "cwd": "scratch", "launcher": launcher,
+        "provider": provider, "model": model, "effort": effort,
+        "route_execution_profile": route, "max_turns": 10,
+        "run_budget_seconds": 120, "max_tokens": 200_000,
+        "max_cost_usd": "2", "response_webhook_url": "https://example.invalid/resume",
+        "response_webhook_token": "callback-fixture",
+    }
+    request.update(request_overrides or {})
+    canonical_request = json.dumps(
+        request, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    callback = json.dumps(
+        {"response_webhook_token": request.get("response_webhook_token"),
+         "response_webhook_url": request.get("response_webhook_url") or request.get("resume_url")},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    descriptor = {
+        "descriptor_version": "graphwing-launch-descriptor-v1", "operation": "agent_run",
+        "route_version": route["route_version"], "role": "writer",
+        "work_kind": route["work_kind"], "work_class": route["class"],
+        "effective_size": route["size"], "profile_version": route["version"],
+        "launcher": request["launcher"], "provider": request["provider"],
+        "model": request["model"], "requested_effort": request["effort"],
+        "effective_effort": request["effort"], "effort_source": "route",
+        "launcher_version": server.launcher_version_fingerprint(binary, launcher),
+        "repo": "scratch", "branch": branch, "starting_head": head,
+        "prompt_sha256": hashlib.sha256(request["prompt"].strip().encode()).hexdigest(),
+        "diff_sha256": None, "resume_parent_job_id": request.get("resume_job_id"),
+        "max_turns": request["max_turns"], "wall_seconds": request["run_budget_seconds"],
+        "max_tokens": request["max_tokens"], "max_cost_usd": request["max_cost_usd"],
+        "callback_sha256": hashlib.sha256(b"graphwing/callback/v1\0" + callback).hexdigest(),
+        "permission_profile": "workspace-write-v1", "authorization_id": authorization_id,
+        "consumed_version": 2, "record_key": "run-1", "record_version": 7,
+        "payload_sha256": "5" * 64,
+        "request_sha256": hashlib.sha256(canonical_request).hexdigest(),
+        "server_instance_challenge": server.REWST_SERVER_INSTANCE_CHALLENGE,
+    }
+    descriptor.update(descriptor_overrides or {})
+    authorization = {
+        "authorization_version": "graphwing-rewst-authorization-v1",
+        "authorization_id": authorization_id, "state": "consumed", "ok": True,
+        "swapped": True, "expected_version": 1, "consumed_version": 2,
+        "issued_at": timestamp - 10, "expires_at": timestamp + 100,
+        "collection": "graphwing_run_control_v1", "record_key": "run-1",
+        "record_found": True, "record_version": 7, "payload_sha256": "5" * 64,
+        "descriptor": descriptor,
+        "server_instance_challenge": server.REWST_SERVER_INSTANCE_CHALLENGE,
+    }
+    body = json.dumps(
+        {**request, "rewst_authorization": authorization},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    headers = _exact_rewst_headers(body, nonce=nonce, timestamp=timestamp, secret=secret)
+    return body, headers, descriptor
+
+
+class RewstExactAgentAuthorizationTests(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        root = Path(self.td.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(self.repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "gw@test"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "graphwing-test"], check=True)
+        (self.repo / "README").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "init"], check=True, capture_output=True)
+        self.jobs = root / "jobs"
+        self.binary = _write_fake_codex(root / "codex")
+        server.reset_rewst_authority_registry_for_test()
+
+    def dispatch_authorized(self, body, headers, *, enqueue=None, binary=None):
+        binary = binary or self.binary
+        enqueue = enqueue or (lambda job: None)
+        with mock.patch.object(server.time, "time", return_value=1_700_000_000), \
+             mock.patch.object(server, "load_rewst_issuer_secret", return_value=b"r" * 32), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}), \
+             mock.patch.object(server, "JOBS_DIR", self.jobs), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=binary), \
+             mock.patch.object(server, "enqueue_agent", side_effect=enqueue):
+            return server.dispatch("POST", "/v1/agent/run", {}, True, body, headers)
+
+    def test_agent_run_with_rewst_authorization_calls_verify_match_claim_and_consume_in_order(self):
+        body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
+        events = []
+        real_verify = server.verify_rewst_issuer_request
+        real_match = server.rewst_descriptor_matches
+        real_claim = server.claim_rewst_launch_authority
+        real_consume = server.consume_rewst_launch_authority
+
+        def record(name, function):
+            def wrapped(*args, **kwargs):
+                events.append(name)
+                return function(*args, **kwargs)
+            return wrapped
+
+        with mock.patch.object(server.time, "time", return_value=1_700_000_000), \
+             mock.patch.object(server, "load_rewst_issuer_secret", return_value=b"r" * 32), \
+             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}), \
+             mock.patch.object(server, "JOBS_DIR", self.jobs), \
+             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.binary), \
+             mock.patch.object(server, "enqueue_agent", lambda job: events.append("enqueue")), \
+             mock.patch.object(server, "verify_rewst_issuer_request", side_effect=record("verify", real_verify)), \
+             mock.patch.object(server, "rewst_descriptor_matches", side_effect=record("match", real_match)), \
+             mock.patch.object(server, "claim_rewst_launch_authority", side_effect=record("claim", real_claim)), \
+             mock.patch.object(server, "consume_rewst_launch_authority", side_effect=record("consume", real_consume)):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/agent/run", {}, True, body, headers,
+            )
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(events, ["verify", "match", "claim", "consume", "enqueue"])
+
+    def test_exact_authorization_rejects_request_body_repo_head_route_effort_budget_callback_and_resume_drift_before_spawn(self):
+        drift = {
+            "repo": {"repo": "other"},
+            "head": {"starting_head": "f" * 40},
+            "route": {"route_version": "availability-fallback-v1"},
+            "effort": {"requested_effort": "low"},
+            "budget": {"max_turns": 11},
+            "callback": {"callback_sha256": "f" * 64},
+            "resume": {"resume_parent_job_id": "b" * 32},
+        }
+        for index, (name, descriptor_overrides) in enumerate(drift.items(), 1):
+            with self.subTest(name=name):
+                server.reset_rewst_authority_registry_for_test()
+                body, headers, _ = _exact_authorized_agent_request(
+                    self.repo, self.binary, nonce=f"{index:064x}",
+                    authorization_id=f"auth-{index}",
+                    descriptor_overrides=descriptor_overrides,
+                )
+                queued = []
+                status, payload, _ = self.dispatch_authorized(
+                    body, headers, enqueue=lambda job: queued.append(job)
+                )
+                self.assertEqual(status, 401, (name, payload))
+                self.assertEqual(payload["code"], "rewst_authorization_mismatch")
+                self.assertEqual(queued, [])
+
+        body, _, _ = _exact_authorized_agent_request(
+            self.repo, self.binary, nonce="8" * 64, authorization_id="auth-body"
+        )
+        changed = json.loads(body)
+        changed["prompt"] = "same signature contract, different exact body"
+        changed_body = json.dumps(changed, sort_keys=True, separators=(",", ":")).encode()
+        status, payload, _ = self.dispatch_authorized(
+            changed_body, _exact_rewst_headers(changed_body, nonce="8" * 64)
+        )
+        self.assertEqual(status, 401, payload)
+        self.assertEqual(payload["code"], "rewst_authorization_invalid")
+
+    def test_replayed_nonce_and_reused_consumed_authorization_cannot_create_a_second_job(self):
+        body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
+        first_status, first, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(first_status, 202, first)
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            job = server.read_job(first["job_id"])
+            job["status"] = "completed"
+            server.write_job(job)
+
+        replay_status, replay, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(replay_status, 401, replay)
+        self.assertEqual(replay["code"], "rewst_authorization_replayed")
+        reused_headers = _exact_rewst_headers(body, nonce="b" * 64)
+        reused_status, reused, _ = self.dispatch_authorized(body, reused_headers)
+        self.assertEqual(reused_status, 401, reused)
+        self.assertEqual(reused["code"], "rewst_authorization_replayed")
+
+    def test_daemon_restart_challenge_rejects_an_old_consumed_authorization(self):
+        body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
+        status, payload, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(status, 202, payload)
+        server.reset_rewst_authority_registry_for_test()
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", "f" * 64):
+            restarted_status, restarted, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(restarted_status, 401, restarted)
+        self.assertEqual(restarted["code"], "rewst_authorization_invalid")
+
+    def test_claimed_authority_is_not_left_launchable_after_claim_queue_or_continuity_failure(self):
+        body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
+        with mock.patch.object(server, "claim_rewst_launch_authority", return_value=False), \
+             mock.patch.object(server, "consume_rewst_launch_authority") as consume:
+            status, payload, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(status, 401, payload)
+        self.assertEqual(payload["code"], "rewst_authorization_claim_failed")
+        consume.assert_not_called()
+
+        server.reset_rewst_authority_registry_for_test()
+        body, headers, _ = _exact_authorized_agent_request(
+            self.repo, self.binary, nonce="b" * 64, authorization_id="auth-queue"
+        )
+        status, payload, _ = self.dispatch_authorized(
+            body, headers, enqueue=lambda job: (_ for _ in ()).throw(RuntimeError("queue"))
+        )
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["code"], "queue_failed")
+        self.assertEqual({item["state"] for item in server._REWST_AUTHORITIES.values()}, {"consumed"})
+        self.assertFalse(self.jobs.exists() and any(self.jobs.iterdir()))
+
+        server.reset_rewst_authority_registry_for_test()
+        body, headers, _ = _exact_authorized_agent_request(
+            self.repo, self.binary, nonce="d" * 64, authorization_id="auth-write"
+        )
+        queued = []
+        with mock.patch.object(server, "write_job", return_value=False):
+            status, payload, _ = self.dispatch_authorized(
+                body, headers, enqueue=lambda job: queued.append(job)
+            )
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["code"], "queue_failed")
+        self.assertEqual(queued, [])
+        self.assertEqual({item["state"] for item in server._REWST_AUTHORITIES.values()}, {"consumed"})
+
+        server.reset_rewst_authority_registry_for_test()
+        continuity = {
+            "run_control_id": "rc1-" + "1" * 64,
+            "attempt_id": "att1-" + "2" * 64,
+            "launch_descriptor_sha256": "5" * 64,
+        }
+        continuity["authorization_id"] = server.run_control_authorization_id(
+            continuity["run_control_id"], continuity["attempt_id"]
+        )
+        body, headers, _ = _exact_authorized_agent_request(
+            self.repo, self.binary, nonce="c" * 64, authorization_id="auth-continuity",
+            request_overrides={"run_control": continuity},
+        )
+        with mock.patch.object(
+            server, "run_control_claim_launch",
+            return_value=(409, {"error": "claimed elsewhere", "code": "reservation_already_launched"}),
+        ):
+            status, payload, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(status, 409, payload)
+        self.assertEqual({item["state"] for item in server._REWST_AUTHORITIES.values()}, {"consumed"})
+
+    def test_run_control_resume_and_cross_model_handoff_require_fresh_exact_authorization(self):
+        body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
+        status, first, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(status, 202, first)
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            parent = server.read_job(first["job_id"])
+            identity = dict(parent["session_identity"], native_session_id="native-parent")
+            parent.update({
+                "status": "completed", "session_identity": identity,
+                "receipt": {
+                    "status": "ok", "job_id": parent["job_id"],
+                    "session_identity": identity,
+                    **{key: parent[key] for key in server.AGENT_PROFILE_FIELDS},
+                },
+            })
+            server.write_job(parent)
+        resume_body, resume_headers, _ = _exact_authorized_agent_request(
+            self.repo, self.binary, nonce="b" * 64, authorization_id="auth-resume",
+            request_overrides={
+                "prompt": "fresh authorized resume", "session_identity": identity,
+                "resume_job_id": first["job_id"],
+            },
+        )
+        status, resumed, _ = self.dispatch_authorized(resume_body, resume_headers)
+        self.assertEqual(status, 202, resumed)
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            resumed_job = server.read_job(resumed["job_id"])
+            resumed_job["status"] = "completed"
+            server.write_job(resumed_job)
+
+        claude = Path(self.td.name) / "claude"
+        claude.write_text("claude fixture")
+        handoff_body, handoff_headers, _ = _exact_authorized_agent_request(
+            self.repo, claude, nonce="c" * 64, authorization_id="auth-handoff",
+            launcher="claude", provider="anthropic", model="claude-opus-5",
+            effort="default", route_version="availability-fallback-v1",
+            request_overrides={"prompt": "fresh authorized cross-model handoff"},
+        )
+        status, handed_off, _ = self.dispatch_authorized(
+            handoff_body, handoff_headers, binary=claude
+        )
+        self.assertEqual(status, 202, handed_off)
+        self.assertEqual(handed_off["launcher"], "claude")
+        self.assertEqual(len(server._REWST_AUTHORITIES), 3)
+        self.assertEqual({item["state"] for item in server._REWST_AUTHORITIES.values()}, {"consumed"})
+
+    def test_per_launch_turn_wall_token_and_cost_safety_ceilings_remain_fail_closed(self):
+        cases = (
+            ("turns", {"max_turns": 81}, {"max_turns": 81}),
+            ("wall", {"run_budget_seconds": 1801}, {"wall_seconds": 1801}),
+            ("tokens", {"max_tokens": 1_000_000_001}, {"max_tokens": 1_000_000_001}),
+            ("cost", {"max_cost_usd": "100000.000000000001"},
+             {"max_cost_usd": "100000.000000000001"}),
+        )
+        for index, (name, request_overrides, descriptor_overrides) in enumerate(cases, 1):
+            with self.subTest(name=name):
+                server.reset_rewst_authority_registry_for_test()
+                body, headers, _ = _exact_authorized_agent_request(
+                    self.repo, self.binary, nonce=f"{index:064x}",
+                    authorization_id=f"auth-ceiling-{index}",
+                    request_overrides=request_overrides,
+                    descriptor_overrides=descriptor_overrides,
+                )
+                status, payload, _ = self.dispatch_authorized(body, headers)
+                self.assertIn(status, {400, 401}, payload)
+                self.assertFalse(self.jobs.exists() and any(self.jobs.iterdir()))
+
+    def test_agent_run_openapi_exposes_the_closed_opt_in_authorization_and_envelopes(self):
+        spec = json.loads((Path(__file__).parent / "openapi.json").read_text())
+        schemas = spec["components"]["schemas"]
+        request = schemas["AgentRunRequest"]
+        self.assertFalse(request["additionalProperties"])
+        self.assertEqual(
+            request["properties"]["rewst_authorization"],
+            {"$ref": "#/components/schemas/RewstConsumedAuthorization"},
+        )
+        self.assertEqual(request["properties"]["max_tokens"]["oneOf"][0], {
+            "type": "integer", "minimum": 0, "maximum": 1_000_000_000,
+        })
+        self.assertEqual(request["properties"]["max_cost_usd"], {
+            "type": "string",
+            "pattern": r"^(?:(?:0|[1-9][0-9]{0,4})(?:\.[0-9]{1,12})?|100000(?:\.0{1,12})?)$",
+        })
+        self.assertEqual(
+            schemas["RewstLaunchDescriptor"]["properties"]["max_cost_usd"],
+            request["properties"]["max_cost_usd"],
+        )
 
 
 class DispatchTests(unittest.TestCase):
@@ -23581,11 +23953,15 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
             "compatibility-only",
         )
 
-    def test_rewst_authorization_primitives_are_reported_dormant_until_dispatch_calls_them(self):
+    def test_rewst_authorization_primitives_are_hard_safety_reached_by_agent_dispatch(self):
         inventory = self.catalog.RUN_CONTROL_DAEMON_CLASSIFICATION
         self.assertTrue(self.catalog.REWST_AUTHORIZATION_PRIMITIVES)
-        for symbol in self.catalog.REWST_AUTHORIZATION_PRIMITIVES:
-            self.assertEqual(inventory[symbol], "dormant", symbol)
+        active = set(self.catalog.REWST_AUTHORIZATION_PRIMITIVES) - {
+            "consume_rewst_authority_for_job"
+        }
+        for symbol in active:
+            self.assertEqual(inventory[symbol], "hard-safety", symbol)
+        self.assertEqual(inventory["consume_rewst_authority_for_job"], "dormant")
         self.assertEqual(inventory["_new_rewst_server_instance_challenge"], "hard-safety")
 
         tree = ast.parse((self.ROOT / "server.py").read_text())
@@ -23602,7 +23978,8 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
             for node in ast.walk(functions[name]):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                     pending.append(node.func.id)
-        self.assertTrue(set(self.catalog.REWST_AUTHORIZATION_PRIMITIVES).isdisjoint(reached))
+        self.assertTrue(active <= reached)
+        self.assertNotIn("consume_rewst_authority_for_job", reached)
 
     def test_run_control_migration_docs_preserve_issue_184_ownership_and_approval_gates(self):
         note = (self.ROOT / "docs" / "notes" / "run-control-activation-recovery.md").read_text()
