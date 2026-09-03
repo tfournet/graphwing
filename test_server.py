@@ -7912,6 +7912,209 @@ while True:
         self.assertIn("headRefOid", ",".join(calls[0]))
         self.assertIn("comments", ",".join(calls[0]))
 
+    def test_gh_pr_findings_adds_closed_pr_policy_inputs_v1_without_changing_legacy_projection(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        view = {
+            "ok": True,
+            "data": {
+                "headRefOid": head,
+                "labels": [{"name": "hold:pm-review"}, {"name": "grade-A-"}],
+                "comments": [{"body": self._clean_code_comment()}],
+                "reviews": [],
+            },
+        }
+        checks = {"ok": True, "data": [{"name": "pm-review", "bucket": "fail"}]}
+        expected_legacy = server.fold_pr_findings_checks(
+            server.pr_findings_from(
+                labels=["hold:pm-review", "grade-A-"],
+                comment_bodies=[self._clean_code_comment()],
+                reviews=[], head_sha=head,
+            ),
+            server.annotate_pr_checks(deepcopy(checks)),
+        )
+        expected_legacy["status"] = 200
+        expected_legacy["findings"] = expected_legacy["findings"][:20]
+        expected_legacy["repo"] = "scratch"
+
+        def fake_json(_repo, argv):
+            return deepcopy(view if argv[:2] == ["pr", "view"] else checks)
+
+        with mock.patch.object(server, "gh_json", fake_json):
+            status, payload, _ = server.dispatch(
+                "GET", "/v1/gh/pr/findings",
+                {"repo": ["scratch"], "number": ["3913"]}, True, b"",
+            )
+        self.assertEqual(status, 200, payload)
+        facts = payload.pop("pr_policy_inputs_v1")
+        self.assertEqual(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            json.dumps(expected_legacy, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertEqual(facts["version"], "pr-policy-inputs-v1")
+        self.assertTrue(facts["complete"])
+        self.assertEqual(facts["observed_head_sha"], head)
+        self.assertEqual(facts["confirming_head_sha"], head)
+        self.assertEqual(facts["labels"], {
+            "items": ["grade-A-", "hold:pm-review"], "total": 2, "truncated": False,
+        })
+        self.assertEqual(set(facts), {
+            "version", "complete", "observed_head_sha", "confirming_head_sha",
+            "labels", "review_sources", "checks", "incomplete_reasons",
+        })
+
+    def test_pr_policy_inputs_keep_exact_head_audit_and_clean_code_sources_separate(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        facts = server.pr_policy_inputs_from(
+            head_sha=head,
+            confirming_head_sha=head,
+            labels=["grade-B", "hold:pm-review"],
+            comment_bodies=[self._clean_code_comment(grade="B", fingerprint="same")],
+            reviews=[{
+                "state": "COMMENTED", "commit": {"oid": head},
+                "body": self._pr_audit_body(
+                    head, "C", [self._pr_audit_finding("same", severity="MUST")],
+                ),
+            }],
+            checks={"ok": True, "data": []},
+        )
+        audits = facts["review_sources"]["pr_audit"]["items"]
+        clean = facts["review_sources"]["clean_code"]["items"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(len(clean), 1)
+        self.assertEqual(audits[0]["source"], "pr_audit")
+        self.assertEqual(audits[0]["commit_sha"], head)
+        self.assertEqual(audits[0]["marker_sha"], head)
+        self.assertEqual(audits[0]["block_sha"], head)
+        self.assertTrue(audits[0]["exact_head"])
+        self.assertEqual(audits[0]["grade"], "C")
+        self.assertEqual(audits[0]["findings"]["items"][0]["source"], "pr_audit")
+        self.assertEqual(clean[0]["findings"]["items"][0]["source"], "clean_code")
+        self.assertEqual(
+            [item["id"] for source in (audits[0], clean[0])
+             for item in source["findings"]["items"]],
+            ["same", "same"],
+        )
+
+    def test_pr_policy_inputs_preserve_resolved_and_duplicate_finding_facts(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        duplicate = self._pr_audit_finding("F1")
+        resolved = self._pr_audit_finding("F1", status="resolved", summary="old")
+        facts = server.pr_policy_inputs_from(
+            head_sha=head, confirming_head_sha=head, labels=[], comment_bodies=[],
+            reviews=[{
+                "state": "COMMENTED", "commit_id": head,
+                "body": self._pr_audit_body(head, "C", [duplicate, duplicate, resolved]),
+            }],
+            checks={"ok": True, "data": []},
+        )
+        findings = facts["review_sources"]["pr_audit"]["items"][0]["findings"]
+        self.assertEqual(findings["total"], 3)
+        self.assertFalse(findings["truncated"])
+        self.assertEqual([item["id"] for item in findings["items"]], ["F1", "F1", "F1"])
+        self.assertEqual([item["status"] for item in findings["items"]],
+                         ["open", "open", "resolved"])
+
+        over_limit = [self._pr_audit_finding(f"F{i}") for i in range(21)]
+        bounded = server.pr_policy_inputs_from(
+            head_sha=head, confirming_head_sha=head, labels=[], comment_bodies=[],
+            reviews=[{
+                "state": "COMMENTED", "commit_id": head,
+                "body": self._pr_audit_body(head, "C", over_limit),
+            }],
+            checks={"ok": True, "data": []},
+        )
+        bounded_findings = bounded["review_sources"]["pr_audit"]["items"][0]["findings"]
+        self.assertEqual(bounded_findings["total"], 21)
+        self.assertEqual(len(bounded_findings["items"]), 20)
+        self.assertTrue(bounded_findings["truncated"])
+        self.assertFalse(bounded["complete"])
+        self.assertIn("pr_audit_findings_truncated", bounded["incomplete_reasons"])
+
+    def test_pr_policy_inputs_preserve_policy_aggregate_transport_and_root_check_facts_without_classification(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        rows = [
+            {"name": "pm-review", "bucket": "fail"},
+            {"name": "ci-status", "state": "pending"},
+            {"name": "Forward event to pr-audit daemon", "bucket": "cancel"},
+            {"name": "Go Unit Tests / 1/2", "bucket": "pass"},
+            {"name": "unknown-check", "state": "surprise"},
+            {"name": "conflicting-check", "bucket": "pass", "state": "failure"},
+        ]
+        facts = server.pr_policy_inputs_from(
+            head_sha=head, confirming_head_sha=head, labels=[], comment_bodies=[], reviews=[],
+            checks={"ok": True, "data": rows},
+        )
+        self.assertEqual(facts["checks"], {
+            "items": [
+                {"name": "pm-review", "observed_state": "fail"},
+                {"name": "ci-status", "observed_state": "pending"},
+                {"name": "Forward event to pr-audit daemon", "observed_state": "fail"},
+                {"name": "Go Unit Tests / 1/2", "observed_state": "pass"},
+                {"name": "unknown-check", "observed_state": "unknown"},
+                {"name": "conflicting-check", "observed_state": "inconsistent"},
+            ],
+            "total": 6, "truncated": False,
+        })
+        forbidden = {"blocking", "needs_fix", "actionable", "actionable_failing", "brief"}
+        self.assertFalse(forbidden & set(json.dumps(facts).replace('"', " ").split()))
+
+    def test_gh_pr_findings_rejects_a_head_change_across_fact_collection(self):
+        first = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        calls = 0
+
+        def fake_json(_repo, argv):
+            nonlocal calls
+            if argv[:2] == ["pr", "checks"]:
+                return {"ok": True, "data": [{"name": "tests", "bucket": "pass"}]}
+            calls += 1
+            if calls == 1:
+                return {"ok": True, "data": {
+                    "headRefOid": first, "labels": [], "comments": [], "reviews": [],
+                }}
+            return {"ok": True, "data": {"headRefOid": second}}
+
+        with mock.patch.object(server, "gh_json", fake_json):
+            status, payload, _ = server.dispatch(
+                "GET", "/v1/gh/pr/findings",
+                {"repo": ["scratch"], "number": ["3913"]}, True, b"",
+            )
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["code"], "head_moved")
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("pr_policy_inputs_v1", payload)
+        self.assertNotIn("findings", payload)
+
+    def test_openapi_defines_exact_closed_pr_policy_inputs_v1(self):
+        spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
+        schemas = spec["components"]["schemas"]
+        schema = schemas["PrPolicyInputsV1"]
+        expected = {
+            "version", "complete", "observed_head_sha", "confirming_head_sha",
+            "labels", "review_sources", "checks", "incomplete_reasons",
+        }
+        self.assertEqual(schema["type"], "object")
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), expected)
+        self.assertEqual(set(schema["properties"]), expected)
+        self.assertEqual(schema["properties"]["version"]["const"], "pr-policy-inputs-v1")
+        self.assertEqual(
+            schemas["PrPolicyFindingFact"]["required"],
+            ["source", "id", "status", "severity", "location", "remedy"],
+        )
+        for name in ("PrPolicyStringFacts", "PrPolicyFindingFacts",
+                     "PrPolicyAuditSources", "PrPolicyCleanCodeSources", "PrPolicyCheckFacts"):
+            collection = schemas[name]
+            self.assertFalse(collection["additionalProperties"], name)
+            self.assertEqual(set(collection["required"]), {"items", "total", "truncated"})
+            self.assertGreater(collection["properties"]["items"]["maxItems"], 0)
+            self.assertEqual(collection["properties"]["total"]["minimum"], 0)
+        dump = json.dumps(schema)
+        for forbidden in ("blocking", "needs_fix", "actionable_failing", "brief"):
+            self.assertNotIn(forbidden, dump)
+        gh_data = schemas["GhData"]["properties"]
+        self.assertEqual(gh_data["pr_policy_inputs_v1"], {"$ref": "#/components/schemas/PrPolicyInputsV1"})
+
     def test_review_no_verdict_is_flagged_not_an_opinion(self):
         # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran
         # counted as a reviewer that said no. Both SC-110290 review passes died

@@ -648,7 +648,9 @@
         ],
         "responses": {
           "200": { "description": "findings", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
-          "400": { "$ref": "#/components/responses/BadRequest" }
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "409": { "description": "PR head moved while facts were collected", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GhData" } } } },
+          "502": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -1807,6 +1809,142 @@
           "kicked": { "type": "boolean" }
         }
       },
+      "PrPolicyLocationFact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line"],
+        "properties": {
+          "path": { "type": ["string", "null"], "maxLength": 4096 },
+          "line": { "oneOf": [{ "type": "integer" }, { "type": "string", "maxLength": 64 }, { "type": "null" }] }
+        }
+      },
+      "PrPolicyFindingFact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "id", "status", "severity", "location", "remedy"],
+        "properties": {
+          "source": { "type": "string", "enum": ["pr_audit", "clean_code"] },
+          "id": { "type": ["string", "null"], "maxLength": 512 },
+          "status": { "type": ["string", "null"], "maxLength": 64 },
+          "severity": { "type": ["string", "null"], "maxLength": 64 },
+          "location": { "$ref": "#/components/schemas/PrPolicyLocationFact" },
+          "remedy": { "type": "string", "maxLength": 8192 }
+        }
+      },
+      "PrPolicyStringFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "total", "truncated"],
+        "properties": {
+          "items": { "type": "array", "maxItems": 100, "items": { "type": "string", "maxLength": 512 } },
+          "total": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "PrPolicyFindingFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "total", "truncated"],
+        "properties": {
+          "items": { "type": "array", "maxItems": 20, "items": { "$ref": "#/components/schemas/PrPolicyFindingFact" } },
+          "total": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "PrPolicyAuditSource": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "submitted_state", "commit_sha", "marker_sha", "block_sha", "exact_head", "grade", "findings"],
+        "properties": {
+          "source": { "type": "string", "const": "pr_audit" },
+          "submitted_state": { "type": "string", "maxLength": 64 },
+          "commit_sha": { "type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          "marker_sha": { "type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          "block_sha": { "type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          "exact_head": { "type": "boolean" },
+          "grade": { "type": ["string", "null"], "maxLength": 64 },
+          "findings": { "$ref": "#/components/schemas/PrPolicyFindingFacts" }
+        }
+      },
+      "PrPolicyCleanCodeSource": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "findings"],
+        "properties": {
+          "source": { "type": "string", "const": "clean_code" },
+          "findings": { "$ref": "#/components/schemas/PrPolicyFindingFacts" }
+        }
+      },
+      "PrPolicyAuditSources": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "total", "truncated"],
+        "properties": {
+          "items": { "type": "array", "maxItems": 20, "items": { "$ref": "#/components/schemas/PrPolicyAuditSource" } },
+          "total": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "PrPolicyCleanCodeSources": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "total", "truncated"],
+        "properties": {
+          "items": { "type": "array", "maxItems": 20, "items": { "$ref": "#/components/schemas/PrPolicyCleanCodeSource" } },
+          "total": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "PrPolicyReviewSources": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pr_audit", "clean_code"],
+        "properties": {
+          "pr_audit": { "$ref": "#/components/schemas/PrPolicyAuditSources" },
+          "clean_code": { "$ref": "#/components/schemas/PrPolicyCleanCodeSources" }
+        }
+      },
+      "PrPolicyCheckFact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "observed_state"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "observed_state": { "type": "string", "enum": ["pass", "fail", "pending", "unknown", "inconsistent"] }
+        }
+      },
+      "PrPolicyCheckFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "total", "truncated"],
+        "properties": {
+          "items": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/PrPolicyCheckFact" } },
+          "total": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "PrPolicyInputsV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "complete", "observed_head_sha", "confirming_head_sha", "labels", "review_sources", "checks", "incomplete_reasons"],
+        "properties": {
+          "version": { "type": "string", "const": "pr-policy-inputs-v1" },
+          "complete": { "type": "boolean", "description": "False when any source is unavailable, malformed, truncated, or spans different heads; workflow policy must park rather than act." },
+          "observed_head_sha": { "type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          "confirming_head_sha": { "type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          "labels": { "$ref": "#/components/schemas/PrPolicyStringFacts" },
+          "review_sources": { "$ref": "#/components/schemas/PrPolicyReviewSources" },
+          "checks": { "$ref": "#/components/schemas/PrPolicyCheckFacts" },
+          "incomplete_reasons": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "enum": ["invalid_head", "head_moved", "labels_malformed", "labels_truncated", "pr_audit_malformed", "pr_audit_truncated", "pr_audit_findings_malformed", "pr_audit_findings_truncated", "clean_code_malformed", "clean_code_truncated", "clean_code_findings_malformed", "clean_code_findings_truncated", "checks_unavailable", "checks_malformed", "checks_truncated"]
+            }
+          }
+        }
+      },
       "GhData": {
         "type": "object",
         "properties": {
@@ -1823,7 +1961,8 @@
           "failing": { "type": "array", "items": { "type": "string" } },
           "actionable_failing": { "type": "array", "items": { "type": "string" }, "description": "Root-cause failing checks included in the writer brief; excludes closed policy/aggregate and review-transport checks" },
           "needs_fix": { "type": "boolean", "description": "Writer dispatch: nonempty sub-A findings or folded root-cause red checks; not hold:* or policy/aggregate/review-transport checks alone" },
-          "pending": { "type": "array", "items": { "type": "string" } }
+          "pending": { "type": "array", "items": { "type": "string" } },
+          "pr_policy_inputs_v1": { "$ref": "#/components/schemas/PrPolicyInputsV1" }
         }
       },
       "UnitsStatus": {
