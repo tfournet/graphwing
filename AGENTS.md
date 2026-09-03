@@ -7,7 +7,18 @@ This git repo is the **node catalog** source of truth. It is not a mega-agent an
 - Prefer a new deterministic op over an agent loop. New workflow JSON only when **edges** change; loop iterations are run `input`.
 - This host only: git, local `gh`, file head, units, Herdr, allowlisted scripts/tests, and preinstalled native model launchers. Cloud integrations stay on Rewst Graph.
 - Clean machine: `./start.sh`. It can optionally install herdr and cloudflared, but model launchers must already be installed. `rr` is a drop-in `rr.json` plugin; tests stay local (`testRun` / `test_server.py`).
-- Do not install this on Rewst Internal. Do not ship as a platform package.
+- Do not install this on Rewst Internal. Do not ship it as a platform package.
+
+## Hard architecture rules
+
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the governing responsibility boundary.
+
+- Rewst workflows own business policy and durable workflow state: routing, retries, review actionability, lifecycle transitions, winner selection, merge eligibility, and terminal outcomes.
+- Graphwing is limited to bounded local execution, normalized facts, authentication, allowlists, identity and receipt verification, atomic local effects, and non-bypassable safety enforcement. A workflow cannot weaken daemon safety; the daemon does not choose product policy.
+- The product north star is one resumable, live-proven pre- and post-PR lifecycle.
+- Workflow decides merge eligibility and intent. The daemon freshly revalidates exact head, named-test evidence, checks, holds, authorization, and the exact merge operation.
+- Migrate policy incrementally and live-prove each replacement before deleting its daemon path.
+- Source implementation and high-confidence Graphwing PR merges are authorized. Live deployment, OpenAPI re-import, workflow publication, live canaries, and destructive historical cleanup require separate direct approval.
 
 ## Where to edit
 
