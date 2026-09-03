@@ -129,9 +129,10 @@ RUN_CONTROL_DAEMON_CLASSIFICATION = {
     "run_control_settle": "compatibility-only",
     "run_control_authority_loss": "compatibility-only",
 
-    # Unreferenced helper and exact HMAC/descriptor/one-time authority foundation.
+    # Unreferenced helper and exact HMAC/descriptor/one-time launch authority.
     "_run_control_id": "dormant",
-    **{symbol: "dormant" for symbol in REWST_AUTHORIZATION_PRIMITIVES},
+    **{symbol: "hard-safety" for symbol in REWST_AUTHORIZATION_PRIMITIVES},
+    "consume_rewst_authority_for_job": "dormant",
 }
 
 

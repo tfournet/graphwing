@@ -76,10 +76,16 @@ def _new_rewst_server_instance_challenge() -> str:
 
 REWST_SERVER_INSTANCE_CHALLENGE = _new_rewst_server_instance_challenge()
 
-# Dormant Rewst launch-authorization primitives. Existing request dispatch does
-# not call these until the workflow-enforcement phase lands.
+# Rewst launch-authorization primitives. Agent dispatch uses them only when the
+# additive rewst_authorization field is present; published v1 callers remain
+# temporarily compatible until the workflow cutover is live-proven.
 REWST_SIGNATURE_MAX_SKEW_SECONDS = 300
 REWST_REPLAY_REGISTRY_MAX = 4096
+REWST_LAUNCH_MAX_TURNS = 80
+REWST_LAUNCH_MAX_WALL_SECONDS = 1800
+REWST_LAUNCH_MAX_TOKENS = 1_000_000_000
+REWST_LAUNCH_MAX_COST_USD = Decimal("100000")
+AGENT_PERMISSION_PROFILE = "workspace-write-v1"
 REWST_TIMESTAMP_RE = re.compile(r"[1-9][0-9]{9}")
 REWST_NONCE_RE = re.compile(r"[0-9a-f]{64}")
 REWST_SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
@@ -897,7 +903,8 @@ def _validate_rewst_consumed_authorization(
             or re.fullmatch(
                 r"(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,12})?",
                 descriptor["max_cost_usd"],
-            ) is None):
+            ) is None
+            or Decimal(descriptor["max_cost_usd"]) > REWST_LAUNCH_MAX_COST_USD):
         return None
     return {"authorization": auth, "descriptor": descriptor}
 
@@ -949,11 +956,16 @@ def verify_rewst_issuer_request(
     with _REWST_AUTHORITY_LOCK:
         expired = [
             key for key, item in _REWST_AUTHORITIES.items()
-            if abs(current - int(item["timestamp"])) > REWST_SIGNATURE_MAX_SKEW_SECONDS
+            if current > int(item["expires_at"])
         ]
         for key in expired:
             _REWST_AUTHORITIES.pop(key, None)
-        if nonce in _REWST_AUTHORITIES:
+        authorization_id = validated["authorization"]["authorization_id"]
+        if (
+            nonce in _REWST_AUTHORITIES
+            or any(item.get("authorization_id") == authorization_id
+                   for item in _REWST_AUTHORITIES.values())
+        ):
             return None, _rewst_auth_error("rewst_authorization_replayed")
         if len(_REWST_AUTHORITIES) >= REWST_REPLAY_REGISTRY_MAX:
             return None, _rewst_auth_error("rewst_authorization_registry_saturated")
@@ -962,7 +974,9 @@ def verify_rewst_issuer_request(
             return None, _rewst_auth_error("rewst_authorization_invalid")
         _REWST_AUTHORITIES[nonce] = {
             "timestamp": timestamp,
+            "expires_at": validated["authorization"]["expires_at"],
             "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
+            "authorization_id": authorization_id,
             "authority_sha256": authority_digest,
             "state": "verified",
             "job_id": None,
@@ -985,6 +999,66 @@ def rewst_descriptor_matches(authority: Any, expected: Any) -> bool:
     actual_hash = hashlib.sha256(actual).digest()
     expected_hash = hashlib.sha256(wanted).digest()
     return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def _rewst_callback_sha256(url: str | None, token: str | None) -> str:
+    canonical = _rewst_canonical_json_bytes({
+        "response_webhook_token": token,
+        "response_webhook_url": url,
+    })
+    if canonical is None:
+        raise ValueError("callback is not canonical")
+    return hashlib.sha256(b"graphwing/callback/v1\0" + canonical).hexdigest()
+
+
+def _rewst_agent_launch_descriptor(
+    authority: dict[str, Any], *, route_profile: dict[str, str], launcher: str,
+    provider: str, model: str, effort: dict[str, str], launcher_version: str,
+    repo: str, branch: str, starting_head: str, prompt: str,
+    resume_parent_job_id: str | None, max_turns: int, wall_seconds: int,
+    max_tokens: int, max_cost_usd: str, webhook_url: str | None,
+    webhook_token: str | None, request_sha256: str,
+) -> dict[str, Any] | None:
+    authorization = authority.get("authorization")
+    if not isinstance(authorization, dict):
+        return None
+    expected = {
+        "descriptor_version": "graphwing-launch-descriptor-v1",
+        "operation": "agent_run",
+        "route_version": route_profile["route_version"],
+        "role": "writer",
+        "work_kind": route_profile["work_kind"],
+        "work_class": route_profile["class"],
+        "effective_size": route_profile["size"],
+        "profile_version": route_profile["version"],
+        "launcher": launcher,
+        "provider": provider,
+        "model": model,
+        "requested_effort": effort["requested_effort"],
+        "effective_effort": effort["effective_effort"],
+        "effort_source": effort["effort_source"],
+        "launcher_version": launcher_version,
+        "repo": repo,
+        "branch": branch,
+        "starting_head": starting_head,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "diff_sha256": None,
+        "resume_parent_job_id": resume_parent_job_id,
+        "max_turns": max_turns,
+        "wall_seconds": wall_seconds,
+        "max_tokens": max_tokens,
+        "max_cost_usd": max_cost_usd,
+        "callback_sha256": _rewst_callback_sha256(webhook_url, webhook_token),
+        "permission_profile": AGENT_PERMISSION_PROFILE,
+        "authorization_id": authorization.get("authorization_id"),
+        "consumed_version": authorization.get("consumed_version"),
+        "record_key": authorization.get("record_key"),
+        "record_version": authorization.get("record_version"),
+        "payload_sha256": authorization.get("payload_sha256"),
+        "request_sha256": request_sha256,
+        "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
+    }
+    return expected if set(expected) == REWST_DESCRIPTOR_FIELDS else None
 
 
 def _rewst_authority_digest(authority: Any) -> bytes | None:
@@ -12786,7 +12860,9 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     return {"root": root, "manifest": manifest, "state": state, "slot": slot, "cwd": workspace, "repo_name": f"codeoff:{manifest['experiment_id']}:{slot}", "prompt": prompt, "prompt_hash": prompt_hash, "identity": manifest["identities"][slot], "budget": budget, "max_turns": manifest["budgets"]["max_turns"]}, None
 
 
-def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+def agent_run(
+    body: bytes, repos: dict[str, str], *, rewst_authority: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
     data, err = parse_json_object(body)
     if err:
         return 400, err
@@ -12795,11 +12871,25 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
         "session_identity", "resume_job_id", "cwd", "response_webhook_url",
         "response_webhook_token", "resume_url", "codeoff_workspace", "effort",
-        "route_execution_profile", "run_control",
+        "route_execution_profile", "run_control", "rewst_authorization", "max_tokens",
+        "max_cost_usd",
     }
     unexpected = sorted(set(data) - allowed)
     if unexpected:
         return 400, {"error": "request contains unsupported fields", "code": "unexpected_fields", "fields": unexpected}
+    has_rewst_authorization = "rewst_authorization" in data
+    if has_rewst_authorization != (rewst_authority is not None):
+        return _rewst_auth_error("rewst_authorization_invalid")
+    if not has_rewst_authorization and ({"max_tokens", "max_cost_usd"} & set(data)):
+        return 400, {
+            "error": "launch token and cost envelopes require exact Rewst authorization",
+            "code": "rewst_authorization_required",
+        }
+    if has_rewst_authorization and data.get("codeoff_workspace") is not None:
+        return 400, {
+            "error": "run-control authorization cannot select a code-off workspace",
+            "code": "bad_rewst_authorization_scope",
+        }
     continuity: dict[str, str] | None = None
     if "run_control" in data:
         continuity = run_control_continuity(data["run_control"])
@@ -12938,6 +13028,21 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         return 400, budget_err
     if codeoff is not None and (turns != codeoff["max_turns"] or budget != codeoff["budget"]):
         return 400, {"error": "code-off job must use the immutable turn and time budgets", "code": "codeoff_budget_mismatch"}
+    max_tokens: int | None = None
+    max_cost_usd: str | None = None
+    if has_rewst_authorization:
+        if route_profile is None:
+            return _rewst_auth_error("rewst_authorization_mismatch")
+        max_tokens, tokens_err = parse_optional_int(
+            data, "max_tokens", 0, REWST_LAUNCH_MAX_TOKENS
+        )
+        max_cost_usd = data.get("max_cost_usd")
+        parsed_cost = _run_control_cost(max_cost_usd)
+        if (
+            tokens_err is not None or max_tokens is None
+            or parsed_cost is None or parsed_cost > REWST_LAUNCH_MAX_COST_USD
+        ):
+            return _rewst_auth_error("rewst_authorization_invalid")
     binary = resolve_launcher_binary_now(launcher)
     launcher_version = launcher_version_fingerprint(binary, launcher)
     if launcher_version in (None, "missing_companion"):
@@ -12967,6 +13072,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     branch, head, git_err = current_branch_head(resolved)
     if git_err:
         return 400, git_err
+    assert branch is not None and head is not None
     session_identity = {
         "launcher": launcher, "provider": provider, "model": model,
         "requested_effort": effort["requested_effort"],
@@ -13004,6 +13110,39 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         session_identity = requested_identity
     elif data.get("resume_job_id") not in (None, ""):
         return 400, {"error": f"{launcher} resume_job_id requires session_identity", "code": "launcher_state_mismatch"}
+    expected_rewst_descriptor: dict[str, Any] | None = None
+    if rewst_authority is not None:
+        request_without_authorization = dict(data)
+        request_without_authorization.pop("rewst_authorization", None)
+        canonical_request = _rewst_canonical_json_bytes(request_without_authorization)
+        if canonical_request is None or route_profile is None or max_tokens is None or max_cost_usd is None:
+            return _rewst_auth_error("rewst_authorization_mismatch")
+        expected_rewst_descriptor = _rewst_agent_launch_descriptor(
+            rewst_authority,
+            route_profile=route_profile,
+            launcher=launcher,
+            provider=provider,
+            model=model,
+            effort=effort,
+            launcher_version=launcher_version,
+            repo=repo_name,
+            branch=branch,
+            starting_head=head,
+            prompt=prompt,
+            resume_parent_job_id=data.get("resume_job_id") or None,
+            max_turns=turns or AGENT_MAX_TURNS,
+            wall_seconds=budget or AGENT_RUN_BUDGET,
+            max_tokens=max_tokens,
+            max_cost_usd=max_cost_usd,
+            webhook_url=webhook_url,
+            webhook_token=webhook_token,
+            request_sha256=hashlib.sha256(canonical_request).hexdigest(),
+        )
+        if (
+            expected_rewst_descriptor is None
+            or not rewst_descriptor_matches(rewst_authority, expected_rewst_descriptor)
+        ):
+            return _rewst_auth_error("rewst_authorization_mismatch")
     writer_parent_paths: list[str] = []
     if resume_parent is not None:
         parent_paths = resume_parent.get("writer_paths")
@@ -13042,9 +13181,16 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         if active_job_count() >= AGENT_MAX_CONCURRENT:
             return 429, {"error": "too many in-flight agent jobs", "code": "busy"}
         job_id = uuid.uuid4().hex
+        rewst_claimed = False
+        if rewst_authority is not None:
+            rewst_claimed = claim_rewst_launch_authority(rewst_authority, job_id)
+            if not rewst_claimed:
+                return _rewst_auth_error("rewst_authorization_claim_failed")
         if continuity is not None:
             launch_err = run_control_claim_launch(continuity, job_id)
             if launch_err is not None:
+                if rewst_claimed:
+                    consume_rewst_launch_authority(rewst_authority, job_id)
                 return launch_err
         log_ref = str(job_dir(job_id) / "stdout.log")
         job = {
@@ -13085,15 +13231,32 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         if codeoff is not None:
             job["codeoff_workspace"] = {"experiment_id": codeoff["manifest"]["experiment_id"], "slot": codeoff["slot"]}
             job["prompt_hash"] = codeoff["prompt_hash"]
-        job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        prompt_path = job_dir(job_id) / "prompt.txt"
-        if codeoff is not None and codeoff["slot"].startswith("author-"):
-            prompt_path.symlink_to(codeoff["root"] / "artifacts" / codeoff["prompt_hash"])
-        elif codeoff is not None:
-            prompt_path.write_bytes(prompt_bytes)
-        else:
-            prompt_path.write_text(wrap_prompt(job_id, prompt, str(resolved)))
-        write_job(job)
+        try:
+            job_dir(job_id).mkdir(parents=True, exist_ok=True)
+            prompt_path = job_dir(job_id) / "prompt.txt"
+            if codeoff is not None and codeoff["slot"].startswith("author-"):
+                prompt_path.symlink_to(codeoff["root"] / "artifacts" / codeoff["prompt_hash"])
+            elif codeoff is not None:
+                prompt_path.write_bytes(prompt_bytes)
+            else:
+                prompt_path.write_text(wrap_prompt(job_id, prompt, str(resolved)))
+        except OSError:
+            if rewst_claimed:
+                consume_rewst_launch_authority(rewst_authority, job_id)
+            shutil.rmtree(job_dir(job_id), ignore_errors=True)
+            return 500, {
+                "error": "agent launch preparation failed", "code": "launch_preparation_failed"
+            }
+        if rewst_claimed and not consume_rewst_launch_authority(rewst_authority, job_id):
+            shutil.rmtree(job_dir(job_id), ignore_errors=True)
+            return _rewst_auth_error("rewst_authorization_consume_failed")
+        try:
+            persisted = write_job(job)
+        except OSError:
+            persisted = False
+        if not persisted:
+            shutil.rmtree(job_dir(job_id), ignore_errors=True)
+            return 500, {"error": "agent queue persistence failed", "code": "queue_failed"}
         if codeoff is not None:
             try:
                 state = codeoff["state"]
@@ -13113,7 +13276,11 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
             except (OSError, RuntimeError):
                 shutil.rmtree(job_dir(job_id), ignore_errors=True)
                 return 500, {"ok": False, "error": "code-off launch persistence was interrupted; retry the same slot", "code": "codeoff_runtime_failure", "retryable": True}
-    enqueue_agent(job)
+    try:
+        enqueue_agent(job)
+    except Exception:
+        shutil.rmtree(job_dir(job_id), ignore_errors=True)
+        return 500, {"error": "agent queue failed", "code": "queue_failed"}
     return 202, {
         "ok": True,
         "kind": "agent",
@@ -13422,7 +13589,15 @@ def dispatch_inner(
         status, payload = gh_pr_merge(body, repos)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/agent/run":
-        status, payload = agent_run(body, repos)
+        rewst_authority = None
+        parsed_agent_request, _ = parse_json_object(body)
+        if isinstance(parsed_agent_request, dict) and "rewst_authorization" in parsed_agent_request:
+            rewst_authority, authorization_error = verify_rewst_issuer_request(
+                method, path, body, headers
+            )
+            if authorization_error is not None:
+                return json_out(*authorization_error)
+        status, payload = agent_run(body, repos, rewst_authority=rewst_authority)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/agent/jobs/wait":
         status, payload = agent_job_wait(body)
