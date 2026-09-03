@@ -221,6 +221,16 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 
 ## Run a deterministic code-off
 
+### Additive workflow-owned initialization (policy v2)
+
+The catalog contains a parallel initialization-only v2 branch selected explicitly with `policy_version: code-off-policy-v2`. Omitting that field keeps the complete v1 workflow unchanged. The v2 branch builds and hashes one closed policy with native object-builder, hash, time, and filter nodes. That policy owns the ordered participant roster, fixed/random judge census, exact launcher identities, role effort, rubric and aggregation versions, classification, budgets, and its 2026-09-03 through 2026-10-03 approval window. An expired policy or an ineligible participant parks in the workflow before Graphwing resolves launcher bytes.
+
+`codeOffV2Initialize` receives the policy and canonical hash plus the normal repository/task/test inputs. It does not accept a seed or blind map. Graphwing privately creates the seed, performs the cryptographic draw, pins exact launcher fingerprints and slot identities, creates only the two opaque author worktrees, and returns the commitment, public slot descriptors, hashes, and path-free workspace receipts. An exact untouched replay returns the same result. Policy drift, expiry after initialization, missing private seed authority, or missing/mutated worktrees parks without redraw, substitution, fallback, or a new launch.
+
+This is PR 1 compatibility scaffolding only. V2 stops after initialization; v1 still owns the published full experiment lifecycle. Local Graphwing records remain disposable execution authority. V2 durable transitions, activation, OpenAPI re-import, publication/readback, and live canaries require later approved phases.
+
+### Existing v1 workflow
+
 `graphwing-code-off` is one bounded DAG. Supply an unused lowercase `experiment_id`, an allowlisted repo at the exact clean `base_sha`, a 64-character lowercase hex seed, locked category/tags/source, the task, named tests, toolchain, budgets, and a commit message. Whole-value Graph interpolation may serialize tags, tests, toolchain, and budgets as bounded JSON strings; the server parses them before strict native validation. Callers never supply workspace paths; `agentRun` resolves only `{experiment_id, slot}`.
 
 `code-off-draw-v1` uses the seed as an HMAC-SHA-256 key to rank the canonical pool and each judge's `[author-1, author-2]` order without modulo bias. The public commitment is `SHA-256("graphwing/code-off/seed-commitment/v1\\0" + seed)`; audit never returns the seed or a blind ordering before completion. There is no redraw, fallback, or cherry-picking.
