@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: one bounded run reserves and settles each attempt through a capped in-run retry loop (up to three slots; a slot re-reads the PR and does nothing once green), then a fresh remote-state gate terminates policy-held or otherwise non-ready PRs before any callback wait; ready PRs run one final head-bound named test and persisted evidence gate before optional merge. Every attempt is run-control reservation-backed; start after graphwing-run-control-initialize with run_control_id. The webhook/doorbell start is a known-disabled operator path because current webhook runs do not create CTX.INPUT.",
+  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: one bounded run reserves and settles each attempt through a capped in-run retry loop (up to three slots; a slot re-reads the PR, holds failed PR Audit transport as review infrastructure, and after a correction waits for exact-head audit evidence before another writer), then a fresh remote-state gate terminates policy-held or otherwise non-ready PRs before any callback wait; ready PRs run one final head-bound named test and persisted evidence gate before optional merge. Every attempt is run-control reservation-backed; start after graphwing-run-control-initialize with run_control_id. The webhook/doorbell start is a known-disabled operator path because current webhook runs do not create CTX.INPUT.",
   "spec": {
     "meta": {
       "useSearchAttributes": true
@@ -296,6 +296,41 @@
         }
       },
       {
+        "id": "iter_review_transport_failures",
+        "type": "transforms.transformArray",
+        "label": "Identify review transport failures",
+        "position": {
+          "x": 1240,
+          "y": 380
+        },
+        "config": {
+          "alias": "iter_review_transport_failures",
+          "operation": "filter",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "TASKS.iter_findings.data.failing"
+            }
+          },
+          "filterCondition": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "binary",
+              "operator": "==",
+              "left": {
+                "kind": "getField",
+                "path": "ITEM"
+              },
+              "right": {
+                "kind": "literal",
+                "value": "Forward event to pr-audit daemon"
+              }
+            }
+          }
+        }
+      },
+      {
         "id": "iter_snap",
         "type": "transforms.objectBuilder",
         "config": {
@@ -317,6 +352,170 @@
                 "kind": "getField",
                 "path": "ITEM"
               }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head_audit",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.iter_findings.data.exact_head_audit"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "review_infrastructure_failed",
+              "expression": {
+                "kind": "binary",
+                "operator": ">",
+                "left": {
+                  "kind": "function",
+                  "name": "count",
+                  "args": [
+                    {
+                      "kind": "getField",
+                      "path": "CTX.iter_review_transport_failures"
+                    }
+                  ]
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": 0
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "exact_head_audit_pending",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.correction_push_receipt.ok"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "or",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "!=",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.iter_findings.data.exact_head_audit"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "!=",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.iter_findings.data.head_sha"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "CTX.correction_push_receipt.head_sha"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "review_infrastructure_hold",
+        "type": "transforms.objectBuilder",
+        "label": "Review infrastructure hold",
+        "position": {
+          "x": 1360,
+          "y": 500
+        },
+        "config": {
+          "alias": "review_infrastructure_hold",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "review_infrastructure_failed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.iter_findings.data.head_sha"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "failing",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_review_transport_failures"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "exact_head_audit_hold",
+        "type": "transforms.objectBuilder",
+        "label": "Exact-head audit still pending",
+        "position": {
+          "x": 1420,
+          "y": 440
+        },
+        "config": {
+          "alias": "exact_head_audit_hold",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "exact_head_audit_pending"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "expected_head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.correction_push_receipt.head_sha"
+              }
             }
           ]
         }
@@ -327,6 +526,26 @@
         "config": {
           "mode": "rules",
           "cases": [
+            {
+              "label": "review_infrastructure_hold",
+              "rules": [
+                {
+                  "path": "review_infrastructure_failed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "exact_head_audit_pending",
+              "rules": [
+                {
+                  "path": "exact_head_audit_pending",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
             {
               "label": "red",
               "rules": [
@@ -475,6 +694,14 @@
                   }
                 }
               }
+            },
+            {
+              "id": "m6",
+              "output": "checkout_ok",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.iter_checkout.data.ok"
+              }
             }
           ]
         }
@@ -523,7 +750,7 @@
               "exact_request_body_sha256": "{{ CTX.rc_task_hash.value }}",
               "repository": "{{ CTX.run_input.repo }}",
               "branch": "{{ TASKS.view.data.data.headRefName }}",
-              "head_sha": "{{ TASKS.view.data.data.headRefOid }}",
+              "head_sha": "{{ TASKS.iter_findings.data.head_sha }}",
               "task_sha256": "{{ CTX.rc_task_hash.value }}",
               "permission_profile": "pr-drive-writer-v1",
               "callback_binding_sha256": "{{ CTX.rc_callback_hash.value }}",
@@ -845,6 +1072,123 @@
         }
       },
       {
+        "id": "correction_head",
+        "type": "action.graphwing.GET:/v1/git/rev-parse",
+        "label": "Read local correction head",
+        "position": {
+          "x": 3140,
+          "y": 160
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "rev": "HEAD"
+        }
+      },
+      {
+        "id": "correction_view",
+        "type": "action.graphwing.GET:/v1/gh/pr/view",
+        "label": "Read pushed correction head",
+        "position": {
+          "x": 3140,
+          "y": 160
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "correction_push_receipt",
+        "type": "transforms.objectBuilder",
+        "label": "Correction pushed",
+        "position": {
+          "x": 3200,
+          "y": 160
+        },
+        "config": {
+          "alias": "correction_push_receipt",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "ok",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.fix_commit.data.ok"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.fix_push.data.ok"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.correction_view.data.ok"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.correction_head.data.sha"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "TASKS.correction_view.data.data.headRefOid"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.correction_head.data.sha"
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "herdr_pr_checkout",
         "type": "action.noop",
         "label": "Herdr: PR checkout failed",
@@ -890,6 +1234,18 @@
         "id": "herdr_push",
         "type": "action.noop",
         "label": "Herdr: push failed",
+        "config": {}
+      },
+      {
+        "id": "herdr_correction_head",
+        "type": "action.noop",
+        "label": "Herdr: local correction head read failed",
+        "config": {}
+      },
+      {
+        "id": "herdr_correction_view",
+        "type": "action.noop",
+        "label": "Herdr: pushed head read failed",
         "config": {}
       },
       {
@@ -1365,6 +1721,13 @@
         "id": "e11",
         "source": "iter_findings",
         "sourceHandle": "success",
+        "target": "iter_review_transport_failures",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e11a",
+        "source": "iter_review_transport_failures",
+        "sourceHandle": "out",
         "target": "iter_snap",
         "targetHandle": "in"
       },
@@ -1383,6 +1746,20 @@
         "targetHandle": "in"
       },
       {
+        "id": "e13a",
+        "source": "switch_needs_fix",
+        "sourceHandle": "case-0",
+        "target": "review_infrastructure_hold",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e13b",
+        "source": "switch_needs_fix",
+        "sourceHandle": "case-1",
+        "target": "exact_head_audit_hold",
+        "targetHandle": "in"
+      },
+      {
         "id": "e14",
         "source": "switch_needs_fix",
         "sourceHandle": "default",
@@ -1392,7 +1769,7 @@
       {
         "id": "e15",
         "source": "switch_needs_fix",
-        "sourceHandle": "case-0",
+        "sourceHandle": "case-2",
         "target": "iter_checkout",
         "targetHandle": "in"
       },
@@ -1625,6 +2002,41 @@
         "source": "fix_push",
         "sourceHandle": "failure",
         "target": "herdr_push",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e47a",
+        "source": "fix_push",
+        "sourceHandle": "success",
+        "target": "correction_head",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e47h",
+        "source": "correction_head",
+        "sourceHandle": "success",
+        "target": "correction_view",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e47i",
+        "source": "correction_head",
+        "sourceHandle": "failure",
+        "target": "herdr_correction_head",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e47b",
+        "source": "correction_view",
+        "sourceHandle": "success",
+        "target": "correction_push_receipt",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e47c",
+        "source": "correction_view",
+        "sourceHandle": "failure",
+        "target": "herdr_correction_view",
         "targetHandle": "in"
       },
       {

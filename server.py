@@ -4788,7 +4788,8 @@ def pr_findings_from(
     audit = _pr_audit_from_reviews(reviews or [], head_sha)
     if audit is not None and audit.get("error"):
         return {"ok": False, "blocking": True, "code": "unparsable_findings",
-                "error": audit["error"], "grade": grade, "holds": holds}
+                "error": audit["error"], "grade": grade, "holds": holds,
+                "exact_head_audit": False, "head_sha": head_sha}
     if audit is not None:
         findings = dict(audit["findings"])
         if audit.get("grade"):
@@ -4835,6 +4836,8 @@ def pr_findings_from(
         "ok": True,
         "grade": grade,
         "holds": holds,
+        "exact_head_audit": audit is not None,
+        "head_sha": head_sha,
         "blocking": blocking,
         "needs_fix": needs_fix,
         "findings": ordered,

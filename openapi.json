@@ -641,7 +641,7 @@
       "get": {
         "operationId": "ghPrFindings",
         "tags": ["gh"],
-        "summary": "Machine verdict for a PR: exact-head PR Audit reviews, else Clean Code comments; grade, holds, deduped findings, rendered brief",
+        "summary": "Normalized PR facts: exact-head PR Audit presence, reviews or Clean Code fallback, checks, grade, holds, findings, and legacy brief",
         "parameters": [
           { "$ref": "#/components/parameters/repo" },
           { "name": "number", "in": "query", "required": true, "schema": { "type": "string" } }

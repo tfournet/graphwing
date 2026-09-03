@@ -7510,6 +7510,123 @@ while True:
         self.assertFalse(green["needs_fix"])
         self.assertEqual(green["brief"], "No blocking findings.")
 
+    def test_pr_drive_holds_review_transport_failures_in_the_workflow(self):
+        # Live #194: after a successful correction push, the next loop slot
+        # treated this failed audit delivery job as a repository defect and
+        # launched a writer. Review actionability belongs to the workflow, so
+        # keep the daemon's legacy classification unchanged and stop before
+        # writer dispatch with an explicit infrastructure hold.
+        self.assertNotIn("Forward event to pr-audit daemon", server.NON_ACTIONABLE_PR_CHECKS)
+        legacy = server.fold_pr_findings_checks(
+            server.pr_findings_from(labels=["grade-A-"], comment_bodies=[]),
+            {"ok": True, "all_green": False, "any_red": True,
+             "failing": ["Forward event to pr-audit daemon"]},
+        )
+        self.assertTrue(legacy["needs_fix"], "daemon policy remains unchanged")
+        self.assertEqual(legacy["failing"], ["Forward event to pr-audit daemon"])
+        self.assertTrue(all(isinstance(name, str) for name in legacy["failing"]))
+
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        triples = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["spec"]["edges"]
+        }
+
+        transport = nodes["iter_review_transport_failures"]
+        self.assertEqual(transport["type"], "transforms.transformArray")
+        self.assertEqual(transport["config"]["operation"], "filter")
+        self.assertEqual(
+            transport["config"]["array"]["ast"],
+            {"kind": "getField", "path": "TASKS.iter_findings.data.failing"},
+        )
+        self.assertEqual(transport["config"]["filterCondition"]["ast"], {
+            "kind": "binary", "operator": "==",
+            "left": {"kind": "getField", "path": "ITEM"},
+            "right": {"kind": "literal", "value": "Forward event to pr-audit daemon"},
+        })
+
+        self.assertIn(("iter_findings", "success", "iter_review_transport_failures"), triples)
+        self.assertIn(("iter_review_transport_failures", "out", "iter_snap"), triples)
+        self.assertIn(("iter_snap", "out", "switch_needs_fix"), triples)
+        self.assertIn(("switch_needs_fix", "case-0", "review_infrastructure_hold"), triples)
+        self.assertIn(("switch_needs_fix", "case-1", "exact_head_audit_hold"), triples)
+        self.assertIn(("switch_needs_fix", "case-2", "iter_checkout"), triples)
+        self.assertIn(("switch_needs_fix", "default", "iter_skip"), triples)
+        self.assertIn(("fix_push", "success", "correction_head"), triples)
+        self.assertIn(("correction_head", "success", "correction_view"), triples)
+        self.assertIn(("correction_view", "success", "correction_push_receipt"), triples)
+        self.assertFalse(any(edge[0] == "correction_push_receipt" for edge in triples))
+        self.assertFalse(any(edge[0] == "review_infrastructure_hold" for edge in triples))
+        self.assertFalse(any(edge[0] == "exact_head_audit_hold" for edge in triples))
+        for node_id in ("review_infrastructure_hold", "exact_head_audit_hold",
+                        "correction_head", "correction_view",
+                        "correction_push_receipt"):
+            self.assertIn("position", nodes[node_id], node_id)
+
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["iter_snap"]["config"]["mappings"]
+        }
+        self.assertEqual(mappings["exact_head_audit"], {
+            "kind": "getField", "path": "TASKS.iter_findings.data.exact_head_audit",
+        })
+        hold_dump = json.dumps(mappings["review_infrastructure_failed"])
+        self.assertIn("CTX.iter_review_transport_failures", hold_dump)
+        pending_dump = json.dumps(mappings["exact_head_audit_pending"])
+        self.assertIn("CTX.correction_push_receipt.ok", pending_dump)
+        self.assertIn("CTX.correction_push_receipt.head_sha", pending_dump)
+        self.assertIn("TASKS.iter_findings.data.head_sha", pending_dump)
+        self.assertIn("exact_head_audit", pending_dump)
+        self.assertEqual(
+            nodes["review_infrastructure_hold"]["config"]["alias"],
+            "review_infrastructure_hold",
+        )
+        push_mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["correction_push_receipt"]["config"]["mappings"]
+        }
+        push_ok_dump = json.dumps(push_mappings["ok"])
+        for path in ("TASKS.fix_commit.data.ok", "TASKS.fix_push.data.ok",
+                     "TASKS.correction_view.data.ok", "TASKS.correction_head.data.sha",
+                     "TASKS.correction_view.data.data.headRefOid"):
+            self.assertIn(path, push_ok_dump)
+        self.assertEqual(push_mappings["head_sha"], {
+            "kind": "getField", "path": "TASKS.correction_head.data.sha",
+        })
+        self.assertEqual(nodes["correction_head"]["config"]["rev"], "HEAD")
+        self.assertEqual(
+            nodes["rc_state"]["config"]["inputMapping"]["values"]["head_sha"],
+            "{{ TASKS.iter_findings.data.head_sha }}",
+        )
+
+    def test_pr_findings_reports_exact_head_audit_presence_as_a_fact(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        stale = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        fallback = server.pr_findings_from(
+            labels=["grade-B"],
+            comment_bodies=[self._clean_code_comment(grade="B")],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit": {"oid": stale},
+                "body": self._pr_audit_body(stale, "C", [self._pr_audit_finding("old")]),
+            }],
+            head_sha=head,
+        )
+        self.assertFalse(fallback["exact_head_audit"])
+
+        exact = server.pr_findings_from(
+            labels=["grade-B"],
+            comment_bodies=[],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit": {"oid": head},
+                "body": self._pr_audit_body(head, "C", [self._pr_audit_finding("current")]),
+            }],
+            head_sha=head,
+        )
+        self.assertTrue(exact["exact_head_audit"])
+
     @staticmethod
     def _pr_audit_finding(fid, *, file="a.go", line=10, severity="MUST", status="open",
                           summary="bare filter", fix="align discovery"):
@@ -7660,6 +7777,7 @@ while True:
         self.assertFalse(out["ok"])
         self.assertTrue(out["blocking"])
         self.assertEqual(out["code"], "unparsable_findings")
+        self.assertFalse(out["exact_head_audit"])
 
     def test_gh_pr_findings_fetches_submitted_reviews_not_only_comments(self):
         # The GET handler asked gh for labels,comments only, so even a correct
@@ -23164,9 +23282,19 @@ class PrDriveGraphTests(unittest.TestCase):
         # (actionable review findings or folded red checks) is the field that
         # means "this needs a writer"; merge blocking stays on holds/grade.
         self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
-        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "needs_fix", "op": "equals", "value": True}]}])
+        self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [
+            {"label": "review_infrastructure_hold", "rules": [
+                {"path": "review_infrastructure_failed", "op": "equals", "value": True},
+            ]},
+            {"label": "exact_head_audit_pending", "rules": [
+                {"path": "exact_head_audit_pending", "op": "equals", "value": True},
+            ]},
+            {"label": "red", "rules": [
+                {"path": "needs_fix", "op": "equals", "value": True},
+            ]},
+        ])
         self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
-        self.assertIn(("switch_needs_fix", "case-0", "iter_checkout"), edges)
+        self.assertIn(("switch_needs_fix", "case-2", "iter_checkout"), edges)
         self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))
         snap = {m["output"]: m["expression"] for m in nodes["iter_snap"]["config"]["mappings"]}
         self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
