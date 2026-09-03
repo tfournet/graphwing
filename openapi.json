@@ -986,6 +986,34 @@
         }
       }
     },
+    "/v1/run/control/attempt-facts": {
+      "post": {
+        "operationId": "runControlAttemptFacts",
+        "tags": ["agent"],
+        "summary": "Read one exact-authorized terminal agent job and return sealed normalized facts without lifecycle policy",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/RunControlAttemptFactsRequest"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Closed normalized attempt facts; authority loss preserves identity while all observed facts remain null",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/NormalizedAttemptFactsV2"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/v1/run/control/evaluate": {
       "post": {
         "operationId": "runControlEvaluate",
@@ -1611,6 +1639,109 @@
           "authorization_id": {"type": "string", "pattern": "^rca1-[0-9a-f]{64}-[0-9a-f]{64}$"},
           "launch_descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
         }
+      },
+      "RewstAuthorizationIdentity": {
+        "type": "object", "additionalProperties": false,
+        "required": ["version", "authorization_id", "descriptor_sha256"],
+        "properties": {
+          "version": {"type": "string", "const": "graphwing-rewst-authorization-identity-v1"},
+          "authorization_id": {
+            "type": "string", "minLength": 1, "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+          },
+          "descriptor_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      },
+      "RunControlAttemptFactsRequest": {
+        "type": "object", "additionalProperties": false,
+        "required": ["job_id", "authorization_identity"],
+        "properties": {
+          "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "authorization_identity": {"$ref": "#/components/schemas/RewstAuthorizationIdentity"}
+        }
+      },
+      "NormalizedAttemptFactsV2": {
+        "type": "object", "additionalProperties": false,
+        "required": [
+          "version", "job_id", "authorization_identity", "authority_available",
+          "session_identity", "route_execution_profile", "terminal_status",
+          "failure_class", "failure_code", "failover_eligible", "turns_observed",
+          "provider_cost_usd", "provider_cost_microusd_ceiling", "wall_seconds",
+          "fresh_input_tokens", "cached_input_tokens", "cache_write_tokens",
+          "output_tokens", "reasoning_tokens", "total_tokens", "receipt_sha256"
+        ],
+        "properties": {
+          "version": {"type": "string", "const": "normalized-attempt-facts-v2"},
+          "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+          "authorization_identity": {"$ref": "#/components/schemas/RewstAuthorizationIdentity"},
+          "authority_available": {"type": "boolean"},
+          "session_identity": {
+            "oneOf": [{"$ref": "#/components/schemas/SessionIdentity"}, {"type": "null"}]
+          },
+          "route_execution_profile": {
+            "oneOf": [{"$ref": "#/components/schemas/RouteExecutionProfile"}, {"type": "null"}]
+          },
+          "terminal_status": {
+            "type": ["string", "null"], "enum": ["succeeded", "failed", "timed_out", null]
+          },
+          "failure_class": {
+            "oneOf": [{"$ref": "#/components/schemas/AgentReceipt/properties/failure_class"}, {"type": "null"}]
+          },
+          "failure_code": {
+            "oneOf": [{"$ref": "#/components/schemas/AgentReceipt/properties/failure_code"}, {"type": "null"}]
+          },
+          "failover_eligible": {"type": ["boolean", "null"]},
+          "turns_observed": {"type": ["integer", "null"], "minimum": 0, "maximum": 80},
+          "provider_cost_usd": {"type": ["number", "null"], "minimum": 0, "maximum": 100000},
+          "provider_cost_microusd_ceiling": {
+            "type": ["integer", "null"], "minimum": 0, "maximum": 100000000000,
+            "description": "Exact conservative integer microdollars; every positive sub-microdollar provider value rounds to one."
+          },
+          "wall_seconds": {"type": ["number", "null"], "minimum": 0, "maximum": 1800},
+          "fresh_input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000},
+          "cached_input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000},
+          "cache_write_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000},
+          "output_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000},
+          "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000},
+          "total_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 5000000000},
+          "receipt_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "authority_available": {"const": true},
+              "session_identity": {"$ref": "#/components/schemas/SessionIdentity"},
+              "route_execution_profile": {"$ref": "#/components/schemas/RouteExecutionProfile"},
+              "terminal_status": {"enum": ["succeeded", "failed", "timed_out"]},
+              "failure_class": {"$ref": "#/components/schemas/AgentReceipt/properties/failure_class"},
+              "failure_code": {"$ref": "#/components/schemas/AgentReceipt/properties/failure_code"},
+              "failover_eligible": {"type": "boolean"},
+              "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          },
+          {
+            "properties": {
+              "authority_available": {"const": false},
+              "session_identity": {"type": "null"},
+              "route_execution_profile": {"type": "null"},
+              "terminal_status": {"type": "null"},
+              "failure_class": {"type": "null"},
+              "failure_code": {"type": "null"},
+              "failover_eligible": {"type": "null"},
+              "turns_observed": {"type": "null"},
+              "provider_cost_usd": {"type": "null"},
+              "provider_cost_microusd_ceiling": {"type": "null"},
+              "wall_seconds": {"type": "null"},
+              "fresh_input_tokens": {"type": "null"},
+              "cached_input_tokens": {"type": "null"},
+              "cache_write_tokens": {"type": "null"},
+              "output_tokens": {"type": "null"},
+              "reasoning_tokens": {"type": "null"},
+              "total_tokens": {"type": "null"},
+              "receipt_sha256": {"type": "null"}
+            }
+          }
+        ]
       },
       "RunControlSettleRequest": {
         "type": "object", "additionalProperties": false,

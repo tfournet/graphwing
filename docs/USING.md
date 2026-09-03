@@ -153,6 +153,31 @@ the alias convention recorded in issue-52 git history, but they do not prove how
 tenant version will evaluate those expressions. Publish/canary verification remains a
 separate runtime step.
 
+### Sealed normalized attempt facts
+
+`POST /v1/run/control/attempt-facts` is the additive v2 fact boundary. Its closed
+request names one terminal agent `job_id` and the exact consumed Rewst authorization
+identity persisted at launch: authorization ID plus the canonical launch-descriptor
+hash. The daemon rereads the terminal job and accepts facts only when the complete
+job/session/route/authorization/receipt projection still matches the process-local
+terminal seal. After daemon replacement that seal is unavailable, so the endpoint
+returns `authority_available: false` and null observed facts rather than trusting disk
+or filling usage from the authorization envelope.
+
+An available `normalized-attempt-facts-v2` response carries the authoritative session
+identity and exact route execution profile, normalized terminal and failure facts,
+nullable observed turns and provider cost, observed wall time and token counts, total
+tokens, and the terminal receipt hash. `provider_cost_microusd_ceiling` is an exact
+integer ceiling of provider-reported USD cost: every positive value below one
+microdollar becomes one, while unknown cost remains null. The largest allowed value is
+100,000,000,000, below JavaScript/Rewst exact-integer limits.
+
+This operation does not read attempt history, aggregate budgets, substitute reservation
+values, interpret progress, select routes, or return continue, handoff, restructure, or
+terminal policy. The v1 validate-receipt, settle, authority-loss, and settled-receipt
+surfaces remain compatibility-only until the approved v2 workflow cutover and live
+zero-caller proof.
+
 ## Drive a PR to green
 
 The active v1 call path is source-derived and pinned in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). It remains compatibility behavior during the workflow-owned v2 migration; do not treat local run-control state as permanent authority.

@@ -97,6 +97,7 @@ RUN_CONTROL_DAEMON_CLASSIFICATION = {
     "_run_control_route": "normalized-fact",
     "run_control_validate_initialize": "normalized-fact",
     "run_control_validate_receipt": "normalized-fact",
+    "run_control_attempt_facts": "normalized-fact",
 
     # Active non-bypassable request/continuity fences.
     "RUN_CONTROL_CONTINUITY_FIELDS": "hard-safety",

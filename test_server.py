@@ -23919,7 +23919,7 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
             },
             "normalized-fact": {
                 "run_control_validate_initialize", "run_control_validate_receipt",
-                "_run_control_usage_projection",
+                "run_control_attempt_facts", "_run_control_usage_projection",
             },
             "hard-safety": {
                 "_new_rewst_server_instance_challenge", "run_control_continuity",
@@ -25872,6 +25872,222 @@ class WorkflowRouteProfileV2Tests(unittest.TestCase):
                             "effective_effort": "high", "inference_profile_version": server.CODEOFF_INFERENCE_PROFILE_VERSION}
         self.assertTrue(server.codeoff_identity_is_pinned("author-1", codeoff_identity))
         self.assertFalse(server.codeoff_identity_is_pinned("author-1", {**codeoff_identity, "effective_effort": "medium"}))
+
+
+class RunControlAttemptFactsTests(RewstExactAgentAuthorizationTests):
+    """Provider-free issue-187 PR3 normalized attempt-fact regressions."""
+
+    def authorized_terminal_job(self, *, usage="default", status="ok", failure_code="none"):
+        authorization_id = "attempt-facts-auth"
+        body, headers, descriptor = _exact_authorized_agent_request(
+            self.repo, self.binary, authorization_id=authorization_id,
+        )
+        code, accepted, _ = self.dispatch_authorized(body, headers)
+        self.assertEqual(code, 202, accepted)
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            job = server.read_job(accepted["job_id"])
+            snapshot = server.agent_execution_snapshot(job)
+            running = server.agent_mark_running(accepted["job_id"], snapshot)
+            self.assertIsNotNone(running)
+            running["session_identity"]["native_session_id"] = "attempt-facts-session"
+            self.assertTrue(server.write_job(running))
+            snapshot = server.agent_execution_snapshot(running)
+            receipt = server.normalize_receipt(
+                running, {"status": status, "summary": "fixture"},
+                0 if status == "ok" else 1, status == "timeout",
+            )
+            receipt.update(server.classify_agent_failure(
+                "success" if failure_code == "none" else failure_code
+            ))
+            receipt["status"] = status
+            receipt["summary"] = receipt["diagnostic"]["summary"]
+            if usage == "default":
+                usage = {
+                    "usage_version": "normalized-usage-v1",
+                    "fresh_input_tokens": 100, "cached_input_tokens": 20,
+                    "cache_write_tokens": 3, "output_tokens": 40,
+                    "reasoning_tokens": 7, "provider_cost_usd": 0.0125,
+                    "wall_seconds": 12.9, "turns_observed": 4,
+                }
+            receipt["usage"] = usage
+            receipt["usage_diagnostic"] = None if usage is not None else "usage_not_reported"
+            terminal, installed = server.agent_terminal_transition(
+                accepted["job_id"], snapshot, receipt, None,
+                0 if status == "ok" else 1, status == "timeout",
+            )
+            self.assertTrue(installed, terminal)
+            job = server.read_job(accepted["job_id"])
+        authorization_identity = {
+            "version": "graphwing-rewst-authorization-identity-v1",
+            "authorization_id": authorization_id,
+            "descriptor_sha256": hashlib.sha256(json.dumps(
+                descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest(),
+        }
+        return job, authorization_identity
+
+    def attempt_facts(self, job_id, authorization_identity, **extra):
+        body = {"job_id": job_id, "authorization_identity": authorization_identity, **extra}
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/run/control/attempt-facts", {}, True,
+                json.dumps(body).encode(),
+            )
+        return status, payload
+
+    def test_attempt_facts_accepts_only_the_authority_sealed_terminal_job(self):
+        job, authorization_identity = self.authorized_terminal_job()
+        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, facts)
+        self.assertEqual(facts["version"], "normalized-attempt-facts-v2")
+        self.assertTrue(facts["authority_available"])
+        self.assertEqual(facts["job_id"], job["job_id"])
+        self.assertEqual(facts["authorization_identity"], authorization_identity)
+        self.assertEqual(facts["session_identity"], job["session_identity"])
+        self.assertEqual(
+            facts["route_execution_profile"],
+            job["session_identity"]["route_execution_profile"],
+        )
+        self.assertEqual(facts["terminal_status"], "succeeded")
+        self.assertEqual((facts["failure_class"], facts["failure_code"]), ("none", "none"))
+        self.assertFalse(facts["failover_eligible"])
+        self.assertEqual(facts["turns_observed"], 4)
+        self.assertEqual(facts["provider_cost_usd"], 0.0125)
+        self.assertEqual(facts["provider_cost_microusd_ceiling"], 12_500)
+        self.assertEqual(facts["wall_seconds"], 12.9)
+        self.assertEqual(facts["fresh_input_tokens"], 100)
+        self.assertEqual(facts["cached_input_tokens"], 20)
+        self.assertEqual(facts["cache_write_tokens"], 3)
+        self.assertEqual(facts["output_tokens"], 40)
+        self.assertEqual(facts["reasoning_tokens"], 7)
+        self.assertEqual(facts["total_tokens"], 170)
+        self.assertRegex(facts["receipt_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_attempt_facts_preserves_unknown_turns_and_cost_as_null(self):
+        usage = {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 1, "cached_input_tokens": 2,
+            "cache_write_tokens": 3, "output_tokens": 4,
+            "reasoning_tokens": 5, "provider_cost_usd": None,
+            "wall_seconds": 6.25, "turns_observed": None,
+        }
+        job, authorization_identity = self.authorized_terminal_job(usage=usage)
+        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, facts)
+        self.assertIsNone(facts["turns_observed"])
+        self.assertIsNone(facts["provider_cost_usd"])
+        self.assertIsNone(facts["provider_cost_microusd_ceiling"])
+        self.assertEqual(facts["total_tokens"], 15)
+
+    def test_attempt_facts_rounds_positive_provider_cost_up_to_exact_microusd_without_underflow(self):
+        usage = {
+            "usage_version": "normalized-usage-v1",
+            "fresh_input_tokens": 0, "cached_input_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 0,
+            "reasoning_tokens": 0, "provider_cost_usd": 0.000000000001,
+            "wall_seconds": 0, "turns_observed": 0,
+        }
+        job, authorization_identity = self.authorized_terminal_job(usage=usage)
+        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, facts)
+        self.assertEqual(facts["provider_cost_usd"], 0.000000000001)
+        self.assertEqual(facts["provider_cost_microusd_ceiling"], 1)
+        self.assertEqual(server._provider_cost_microusd_ceiling(0), 0)
+        self.assertEqual(server._provider_cost_microusd_ceiling(0.000001), 1)
+        self.assertEqual(server._provider_cost_microusd_ceiling(1.0000001), 1_000_001)
+        self.assertLessEqual(
+            server._provider_cost_microusd_ceiling(server.USAGE_MAX_COST_USD),
+            2 ** 53 - 1,
+        )
+
+    def test_attempt_facts_rejects_tampered_receipt_route_session_and_authorization_identity(self):
+        job, authorization_identity = self.authorized_terminal_job()
+        original = deepcopy(job)
+        cases = {
+            "receipt": {**job, "receipt": {**job["receipt"], "summary": "tampered"}},
+            "session": {**job, "session_identity": {**job["session_identity"], "native_session_id": "other"}},
+            "route": {**job, "session_identity": {
+                **job["session_identity"],
+                "route_execution_profile": {
+                    **job["session_identity"]["route_execution_profile"], "decision_id": "other",
+                },
+            }},
+            "authorization": {**job, "rewst_authorization_identity": {
+                **job["rewst_authorization_identity"], "descriptor_sha256": "0" * 64,
+            }},
+        }
+        for label, changed in cases.items():
+            with self.subTest(label=label), mock.patch.object(server, "JOBS_DIR", self.jobs):
+                _replace_persisted_job_fixture(job["job_id"], changed)
+            status, payload = self.attempt_facts(job["job_id"], authorization_identity)
+            self.assertEqual(status, 409, (label, payload))
+        with mock.patch.object(server, "JOBS_DIR", self.jobs):
+            _replace_persisted_job_fixture(job["job_id"], original)
+        wrong_identity = {**authorization_identity, "authorization_id": "other-auth"}
+        status, payload = self.attempt_facts(job["job_id"], wrong_identity)
+        self.assertEqual((status, payload["code"]), (409, "attempt_authorization_mismatch"))
+
+    def test_attempt_facts_contains_no_budget_checkpoint_no_progress_or_next_decision(self):
+        job, authorization_identity = self.authorized_terminal_job()
+        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, facts)
+        forbidden = {
+            "budget", "budgets", "reservation", "envelope", "history", "attempts",
+            "checkpoint", "progress", "constraint_signals", "verified_outcome",
+            "decision", "next_decision", "continue_same_model", "handoff_cross_model",
+            "restructure", "terminate", "route_choice",
+        }
+        self.assertTrue(forbidden.isdisjoint(facts))
+        self.assertNotIn("max_tokens", json.dumps(facts, sort_keys=True))
+        self.assertNotIn("max_cost_usd", json.dumps(facts, sort_keys=True))
+
+    def test_attempt_facts_after_authority_loss_returns_closed_unavailable_facts_without_invented_usage(self):
+        job, authorization_identity = self.authorized_terminal_job()
+        server.clear_terminal_receipt_authority("agent", job["job_id"])
+        server.reset_rewst_authority_registry_for_test()
+        status, facts = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, facts)
+        self.assertFalse(facts["authority_available"])
+        self.assertEqual(facts["job_id"], job["job_id"])
+        self.assertEqual(facts["authorization_identity"], authorization_identity)
+        for key, value in facts.items():
+            if key not in {"version", "job_id", "authorization_identity", "authority_available"}:
+                self.assertIsNone(value, key)
+
+    def test_attempt_facts_runtime_bodies_validate_against_the_closed_openapi_schema(self):
+        spec = json.loads(server.openapi_bytes())
+        operation = spec["paths"]["/v1/run/control/attempt-facts"]["post"]
+        request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+        request_schema = spec["components"]["schemas"][request_schema["$ref"].rsplit("/", 1)[-1]]
+        response_schema = spec["components"]["schemas"][response_schema["$ref"].rsplit("/", 1)[-1]]
+        job, authorization_identity = self.authorized_terminal_job()
+        request = {"job_id": job["job_id"], "authorization_identity": authorization_identity}
+        status, available = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, available)
+        server.clear_terminal_receipt_authority("agent", job["job_id"])
+        server.reset_rewst_authority_registry_for_test()
+        status, unavailable = self.attempt_facts(job["job_id"], authorization_identity)
+        self.assertEqual(status, 200, unavailable)
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            self.assertFalse(request_schema.get("additionalProperties", True))
+            self.assertFalse(response_schema.get("additionalProperties", True))
+            self.assertEqual(set(request_schema["required"]), set(request))
+            self.assertEqual(set(response_schema["required"]), set(available))
+        else:
+            validator = Draft202012Validator(spec)
+            for schema, instance in (
+                (request_schema, request), (response_schema, available),
+                (response_schema, unavailable),
+            ):
+                errors = list(validator.evolve(schema=schema).iter_errors(instance))
+                self.assertEqual(errors, [], [error.message for error in errors])
+        status, payload = self.attempt_facts(
+            job["job_id"], authorization_identity, next_decision="continue_same_model",
+        )
+        self.assertEqual((status, payload["code"]), (400, "unexpected_fields"))
 
 
 if __name__ == "__main__":
