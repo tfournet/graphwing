@@ -15828,7 +15828,10 @@ func main() {
                 self.assertNotIn("223,401", text)
                 self.assertNotIn("241,008", text)
 
-    def test_landed_phase6_and_followup_candidates_fit_the_review_maximum(self):
+    def test_landed_phase6_and_foundation_candidates_fit_the_review_maximum(self):
+        # Historical candidates are fixed ranges. Do not measure from an old
+        # boundary to the current checkout: that charges already accepted main
+        # history to every future PR and must eventually fail unrelated work.
         phase6 = self._candidate_diff_bytes(
             self._PHASE6_BASE_COMMIT, self._PHASE6_LANDED_COMMIT
         )
@@ -15836,13 +15839,11 @@ func main() {
             self._DURABLE_FOUNDATION_BASE_COMMIT,
             self._DURABLE_FOUNDATION_LANDED_COMMIT,
         )
-        followup = self._candidate_diff_bytes(self._DURABLE_FOUNDATION_LANDED_COMMIT)
-        if phase6 is None or foundation is None or followup is None:
+        if phase6 is None or foundation is None:
             self.skipTest("review boundaries are not reachable from this checkout")
         self.assertGreater(phase6, self._SUPERSEDED_REVIEW_MAX_DIFF_BYTES)
         self.assertLessEqual(phase6, server.REVIEW_MAX_DIFF_BYTES)
         self.assertLessEqual(foundation, server.REVIEW_MAX_DIFF_BYTES)
-        self.assertLessEqual(followup, server.REVIEW_MAX_DIFF_BYTES)
 
     def test_large_review_diff_launches_with_the_prompt_off_argv(self):
         # A 224-KiB diff: far past the superseded maximum and past the single
