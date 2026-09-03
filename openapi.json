@@ -1821,7 +1821,8 @@
           "remote_state": { "type": "string", "description": "ghPrView remote-only readiness; ready still lacks named-test evidence" },
           "remote_ready": { "type": "boolean", "description": "Remote state only, never a merge-safety attestation" },
           "failing": { "type": "array", "items": { "type": "string" } },
-          "needs_fix": { "type": "boolean", "description": "Writer dispatch: nonempty sub-A findings or folded red checks; not hold:* alone" },
+          "actionable_failing": { "type": "array", "items": { "type": "string" }, "description": "Root-cause failing checks included in the writer brief; excludes closed policy/aggregate checks" },
+          "needs_fix": { "type": "boolean", "description": "Writer dispatch: nonempty sub-A findings or folded root-cause red checks; not hold:* or policy/aggregate checks alone" },
           "pending": { "type": "array", "items": { "type": "string" } }
         }
       },

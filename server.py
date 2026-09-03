@@ -4729,17 +4729,23 @@ def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, 
     }
 
 
+NON_ACTIONABLE_PR_CHECKS = frozenset({"pm-review", "ci-status"})
+
+
 def fold_pr_findings_checks(out: dict[str, Any], ck: dict[str, Any]) -> dict[str, Any]:
-    """Fold GitHub check reds into writer dispatch without touching merge blocking."""
-    failing = [name for name in (ck.get("failing") or [])[:20] if isinstance(name, str) and name.strip()]
+    """Fold root-cause GitHub check reds into writer dispatch."""
+    failing = [name.strip() for name in (ck.get("failing") or [])[:20]
+               if isinstance(name, str) and name.strip()]
+    actionable = [name for name in failing if name not in NON_ACTIONABLE_PR_CHECKS]
     out["all_green"] = bool(ck.get("all_green"))
     out["any_red"] = bool(ck.get("any_red"))
     out["failing"] = failing
+    out["actionable_failing"] = actionable
     if not out.get("ok"):
         return out
     review_fix = bool(out.get("needs_fix"))
-    out["needs_fix"] = review_fix or bool(failing)
-    out["brief"] = render_pr_drive_brief(out.get("findings") or [] if review_fix else [], failing)
+    out["needs_fix"] = review_fix or bool(actionable)
+    out["brief"] = render_pr_drive_brief(out.get("findings") or [] if review_fix else [], actionable)
     return out
 
 
