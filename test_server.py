@@ -7510,6 +7510,201 @@ while True:
         self.assertFalse(green["needs_fix"])
         self.assertEqual(green["brief"], "No blocking findings.")
 
+    @staticmethod
+    def _pr_audit_finding(fid, *, file="a.go", line=10, severity="MUST", status="open",
+                          summary="bare filter", fix="align discovery"):
+        return {
+            "id": fid, "file": file, "line": line, "severity": severity,
+            "summary": summary, "fix_guidance": fix, "accept": "worker matches lint",
+            "status": status, "domain": "behavior",
+        }
+
+    @staticmethod
+    def _pr_audit_body(sha, grade, findings, *, closed=True):
+        block = json.dumps({
+            "sha": sha, "tier": "full", "grade": grade, "round": 1,
+            "findings": findings,
+        })
+        body = (
+            f"# PR Audit — Grade: {grade} (HOLD)\n"
+            f"<!-- pr-audit-sha: {sha} -->\n"
+            f"<!-- pr-audit-findings v1\n{block}\n"
+        )
+        return body + ("-->\n" if closed else "")
+
+    @staticmethod
+    def _clean_code_comment(grade="A-", fingerprint="nit"):
+        block = json.dumps({
+            "findings": [{"severity": "minor", "fingerprint": fingerprint, "remedy": "tidy"}],
+        })
+        return f"## Claude's Review\n> **Grade: {grade}**\n<!-- engineering-findings-json\n{block}\n-->"
+
+    def test_pr_findings_reads_exact_head_pr_audit_reviews(self):
+        # Live #191: /v1/gh/pr/findings read only issue comments for
+        # engineering-findings-json. The PM audit is a submitted review whose
+        # machine block is pr-audit-findings v1. Clean Code still labels A-
+        # and comments a nit, so pr-drive skipped writers on 3913/3914.
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        findings = [
+            self._pr_audit_finding("F1", line=104, severity="MUST"),
+            self._pr_audit_finding("F2", line=91, severity="SHOULD",
+                                   summary="inputKind gate", fix="mirror unwrap"),
+            self._pr_audit_finding("F3", line=104, severity="SHOULD",
+                                   summary="bare AST", fix="restrict bare-AST"),
+        ]
+        out = server.pr_findings_from(
+            labels=["grade-A-", "hold:pm-review"],
+            comment_bodies=[self._clean_code_comment()],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit": {"oid": head},
+                "body": self._pr_audit_body(head, "C", findings),
+            }],
+            head_sha=head,
+        )
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["grade"], "C")
+        self.assertEqual(out["holds"], ["hold:pm-review"])
+        self.assertTrue(out["blocking"])
+        self.assertTrue(out["needs_fix"], out)
+        prints = [f["fingerprint"] for f in out["findings"]]
+        self.assertEqual(prints, ["F1", "F2", "F3"])
+        self.assertEqual(out["blocker"], 1)
+        self.assertEqual(out["major"], 2)
+        self.assertIn("F1", out["brief"])
+        self.assertIn("align discovery", out["brief"])
+        self.assertNotIn("nit", out["brief"])
+        self.assertNotEqual(out["brief"], "No blocking findings.")
+
+        plus = server.pr_findings_from(
+            labels=["grade-A-", "hold:pm-review"],
+            comment_bodies=[self._clean_code_comment()],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit_id": "22a55f00024fbaa3d4e9f4b9e8f8f71664d0d71d",
+                "body": self._pr_audit_body(
+                    "22a55f00024fbaa3d4e9f4b9e8f8f71664d0d71d", "B+", findings[:2],
+                ),
+            }],
+            head_sha="22a55f00024fbaa3d4e9f4b9e8f8f71664d0d71d",
+        )
+        self.assertEqual(plus["grade"], "B+")
+        self.assertTrue(plus["needs_fix"], plus)
+        self.assertEqual([f["fingerprint"] for f in plus["findings"]], ["F1", "F2"])
+
+    def test_pr_findings_ignores_stale_pending_and_resolved_pr_audits(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        stale = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        open_f = self._pr_audit_finding("F1")
+        resolved = self._pr_audit_finding("F9", status="resolved", summary="old")
+        out = server.pr_findings_from(
+            labels=["grade-A-", "hold:pm-review"],
+            comment_bodies=[self._clean_code_comment()],
+            reviews=[
+                {
+                    "state": "COMMENTED",
+                    "commit": {"oid": stale},
+                    "body": self._pr_audit_body(stale, "C", [open_f, open_f]),
+                },
+                {
+                    "state": "PENDING",
+                    "commit": {"oid": head},
+                    "body": self._pr_audit_body(head, "C", [open_f]),
+                },
+                {
+                    "state": "COMMENTED",
+                    "commit": {"oid": head},
+                    "body": self._pr_audit_body(head, "A-", [resolved]),
+                },
+            ],
+            head_sha=head,
+        )
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["grade"], "A-")
+        self.assertEqual(out["findings"], [])
+        self.assertFalse(out["needs_fix"])
+        self.assertEqual(out["brief"], "No blocking findings.")
+
+        dup = server.pr_findings_from(
+            labels=["grade-B"],
+            comment_bodies=[],
+            reviews=[
+                {
+                    "state": "COMMENTED",
+                    "commit": {"oid": head},
+                    "body": self._pr_audit_body(head, "B", [open_f]),
+                },
+                {
+                    "state": "COMMENTED",
+                    "commit_id": head,
+                    "body": self._pr_audit_body(head, "B", [open_f]),
+                },
+            ],
+            head_sha=head,
+        )
+        self.assertEqual([f["fingerprint"] for f in dup["findings"]], ["F1"])
+        self.assertTrue(dup["needs_fix"])
+
+    def test_pr_findings_unclosed_exact_head_pr_audit_is_unparsable(self):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        out = server.pr_findings_from(
+            labels=["grade-A-"],
+            comment_bodies=[self._clean_code_comment()],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit": {"oid": head},
+                "body": self._pr_audit_body(head, "C", [self._pr_audit_finding("F1")], closed=False),
+            }],
+            head_sha=head,
+        )
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["blocking"])
+        self.assertEqual(out["code"], "unparsable_findings")
+
+    def test_gh_pr_findings_fetches_submitted_reviews_not_only_comments(self):
+        # The GET handler asked gh for labels,comments only, so even a correct
+        # parser never saw the audit. Fetch reviews + head and fold checks.
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        calls = []
+        view = {
+            "ok": True,
+            "data": {
+                "headRefOid": head,
+                "labels": [{"name": "grade-A-"}, {"name": "hold:pm-review"}],
+                "comments": [{"body": self._clean_code_comment()}],
+                "reviews": [{
+                    "state": "COMMENTED",
+                    "commit": {"oid": head},
+                    "body": self._pr_audit_body(head, "C", [
+                        self._pr_audit_finding("F1"),
+                        self._pr_audit_finding("F2", severity="SHOULD"),
+                        self._pr_audit_finding("F3", severity="SHOULD"),
+                    ]),
+                }],
+            },
+        }
+        checks = {"ok": True, "data": [{"name": "pm-review", "bucket": "fail"}]}
+
+        def fake_json(_repo, argv):
+            calls.append(list(argv))
+            if argv[:2] == ["pr", "view"]:
+                return deepcopy(view)
+            return deepcopy(checks)
+
+        with mock.patch.object(server, "gh_json", fake_json):
+            status, payload, _ = server.dispatch(
+                "GET", "/v1/gh/pr/findings",
+                {"repo": ["scratch"], "number": ["3913"]}, True, b"",
+            )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["grade"], "C")
+        self.assertTrue(payload["needs_fix"], payload)
+        self.assertEqual([f["fingerprint"] for f in payload["findings"]], ["F1", "F2", "F3"])
+        self.assertIn("reviews", ",".join(calls[0]))
+        self.assertIn("headRefOid", ",".join(calls[0]))
+        self.assertIn("comments", ",".join(calls[0]))
+
     def test_review_no_verdict_is_flagged_not_an_opinion(self):
         # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran
         # counted as a reviewer that said no. Both SC-110290 review passes died
