@@ -43,6 +43,17 @@ class NativeRunControlContracts(unittest.TestCase):
    body=json.loads(json.dumps(base)); body['route']=route
    self.assertTrue(validator.is_valid(body),list(validator.iter_errors(body)))
    self.assertEqual(server.run_control_evaluate(json.dumps(body).encode())[0],200)
+  v2={'version':'route-execution-profile-v2','policy_version':'workflow-normal-v1','decision_id':'decision-186','decision_sha256':'a'*64,'role':'writer','work_kind':'go_coding','class':'mechanical','effective_size':'S','launcher':'codex','provider':'openai','model':'gpt-5.6-sol','requested_effort':'medium'}
+  body=json.loads(json.dumps(base)); body['route']=v2
+  self.assertFalse(validator.is_valid(body),list(validator.iter_errors(body)))
+  self.assertEqual(server.run_control_evaluate(json.dumps(body).encode())[0],400)
+  initialize={'root_workflow_id':'workflow','root_workflow_version_id':'version','root_workflow_run_id':'run','purpose':'implement_slice','budgets':base['budgets'],'initial_route':v2}
+  init_schema={'$schema':'https://json-schema.org/draft/2020-12/schema','components':{'schemas':schemas},'$ref':'#/components/schemas/RunControlInitializeRequest'}
+  self.assertFalse(Draft202012Validator(init_schema).is_valid(initialize))
+  self.assertEqual(server.run_control_validate_initialize(json.dumps(initialize).encode())[0],400)
+  settled={'receipt_id':'rec1-'+'e'*32,'attempt_id':'att1-'+'a'*64,'run_control_id':'rc1-'+'b'*64,'authorization_id':'rca1-'+'b'*64+'-'+'a'*64,'launch_descriptor_sha256':'d'*64,'job_id':'e'*32,'terminal_status':'succeeded','route':v2,'usage':{'turns':0,'wall_seconds':0,'tokens':0,'provider_cost_usd':'0'},'progress':{'checkpoint':0,'failing_regression_present':True,'production_diff_bytes':0,'focused_tests_green':False,'diff_fingerprint':'f'*64},'constraint_signals':[],'verified_outcome':False}
+  settled_schema={'$schema':'https://json-schema.org/draft/2020-12/schema','components':{'schemas':schemas},'$ref':'#/components/schemas/RunControlSettledReceipt'}
+  self.assertTrue(Draft202012Validator(settled_schema).is_valid(settled),list(Draft202012Validator(settled_schema).iter_errors(settled)))
  def test_recorded_260_turn_537_incident_stops_before_reservation(self):
   attempts=[]
   for sequence,cost in ((1,'2.680000000000'),(2,'2.690000000000')):
