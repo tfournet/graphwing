@@ -55,6 +55,10 @@ RUN_CONTROL_WORKFLOW_PIN_SOURCES = {
     "$GRAPHWING_RUN_CONTROL_STATE": "run-control-state",
     "$GRAPHWING_RUN_CONTROL_TRANSITION": "run-control-transition",
 }
+ROUTING_POLICY_WORKFLOW_PIN_SOURCES = {
+    "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID": "routing-policy",
+    "$GRAPHWING_ROUTING_POLICY_VERSION_ID": "routing-policy",
+}
 RUN_CONTROL_PIN_ERROR_MESSAGES = {
     "run-control-consume-authorization": "run-control authorization publication returned no exact IDs",
     "run-control-transition": "run-control transition publication returned no exact IDs",
@@ -336,6 +340,26 @@ def upsert_workflow(mcp: str, name: str, slug: str, description: str, spec: dict
     return wid, vid, created.get("slug") or slug
 
 
+def read_back_exact_published_version(
+    mcp: str, workflow_id: str, version_id: str, slug: str,
+) -> str:
+    """Require a fresh provider readback to name the exact published version."""
+    st, workflow = api(mcp, "GET", f"/workflows/{workflow_id}?include=spec")
+    must(st, workflow, label=f"read back {slug}")
+    if not isinstance(workflow, dict):
+        raise SystemExit(f"{slug} readback was not an object")
+    current = workflow.get("currentVersion") or workflow.get("current_version") or {}
+    if (
+        workflow.get("id") != workflow_id
+        or current.get("id") != version_id
+        or current.get("status") != "published"
+    ):
+        raise SystemExit(
+            f"{slug} readback did not match exact published version {version_id}"
+        )
+    return version_id
+
+
 def run_slug(mcp: str, slug: str, payload: dict, wait: int = 90):
     print(f"=== run {slug} ===")
     st, body = api(mcp, "POST", f"/workflows/{slug}/run", payload)
@@ -364,7 +388,7 @@ def save_install(install: dict) -> None:
 
 
 CATALOG = [
-    "run-control-transition", "run-control-consume-authorization",
+    "routing-policy", "run-control-transition", "run-control-consume-authorization",
     "run-control-initialize", "run-control-state", "run-control-reconcile",
     "run-control-consume", "run-control-authorize", "verify-stack",
     "implement-slice", "pr-drive", "pr-status", "code-off",
@@ -382,7 +406,9 @@ def publish_stems(only: str) -> list[str]:
     if only == "all":
         return list(CATALOG)
     if only == "pr-drive":
-        return DURABLE_CHAIN + ["pr-drive"]
+        return ["routing-policy"] + DURABLE_CHAIN + ["pr-drive"]
+    if only == "implement-slice":
+        return ["routing-policy", "implement-slice"]
     return [only]
 
 
@@ -400,6 +426,21 @@ def register_run_control_workflow_pins(
     for placeholder in placeholders:
         pins[f"{placeholder}_WORKFLOW_ID"] = workflow_id
         pins[f"{placeholder}_VERSION_ID"] = version_id
+
+
+def register_routing_policy_workflow_pins(
+    stem: str, workflow_id, version_id, pins: dict[str, str],
+) -> None:
+    placeholders = [
+        placeholder for placeholder, source in ROUTING_POLICY_WORKFLOW_PIN_SOURCES.items()
+        if source == stem
+    ]
+    if not placeholders:
+        return
+    if not isinstance(workflow_id, str) or not isinstance(version_id, str) or not workflow_id or not version_id:
+        raise SystemExit("routing policy publication returned no exact IDs")
+    for placeholder in placeholders:
+        pins[placeholder] = workflow_id if placeholder.endswith("WORKFLOW_ID") else version_id
 
 
 def main():
@@ -435,6 +476,11 @@ def main():
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
         register_run_control_workflow_pins(stem, wid, vid, workflow_pins)
+        register_routing_policy_workflow_pins(stem, wid, vid, workflow_pins)
+        if stem == "routing-policy":
+            if not isinstance(wid, str) or not isinstance(vid, str):
+                raise SystemExit("routing policy publication returned no exact IDs")
+            read_back_exact_published_version(mcp, wid, vid, slug)
     if not args.no_run and "pr-drive" in published:
         repo = (os.environ.get("GRAPHWING_SMOKE_REPO") or install.get("smoke_repo") or "").strip()
         if not repo:
@@ -450,6 +496,8 @@ def main():
             published["pr-drive"]["status"] = rs
             published["pr-drive"]["smoke"] = "missing_pr"
     install["custom_integration_id"] = integration
+    if "routing-policy" in published:
+        install["routing_policy"] = published["routing-policy"]
     install["pr_drive"] = published.get("pr-drive") or install.get("pr_drive")
     if "pr-status" in published:
         install["pr_status"] = published["pr-status"]

@@ -17705,6 +17705,7 @@ func main() {
             mock.patch.object(pg, "rewst_mcp", return_value="fixture-token"),
             mock.patch.object(pg, "public_openapi_url", return_value="https://fixture.invalid/openapi.json"),
             mock.patch.object(pg, "upsert_workflow", side_effect=upsert),
+            mock.patch.object(pg, "read_back_exact_published_version", return_value="version-graphwing-routing-policy"),
             mock.patch.object(pg, "save_install", side_effect=lambda value: saved.append(deepcopy(value))),
             mock.patch("builtins.print"),
         ):
@@ -24813,6 +24814,475 @@ func main() {
         spec = self.load()["spec"]
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
         self.assertIn(("agent", "failure", "rc_failure_join"), edges)
+
+
+class RewstNativeRoutingPolicyTests(unittest.TestCase):
+    """Provider-free fixtures for issue #186's canonical native policy."""
+
+    ROOT = Path(__file__).resolve().parent
+    PROFILE_FIELDS = {
+        "version", "policy_version", "decision_id", "decision_sha256", "role",
+        "work_kind", "class", "effective_size", "launcher", "provider", "model",
+        "requested_effort",
+    }
+    WRITERS = {
+        "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
+        "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
+        "research_ops": ("grok", "xai", "grok-4.6", "default"),
+    }
+    REVIEWERS = {
+        "openai": (
+            ("claude", "anthropic", "claude-sonnet-5"),
+            ("grok", "xai", "grok-4.6"),
+        ),
+        "anthropic": (
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("grok", "xai", "grok-4.6"),
+        ),
+        "xai": (
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("claude", "anthropic", "claude-opus-5"),
+        ),
+    }
+    BUDGETS = {
+        ("mechanical", "S"): (10, 120),
+        ("mechanical", "M"): (30, 300),
+        ("mechanical", "L"): (50, 600),
+        ("visual", "S"): (10, 180),
+        ("visual", "M"): (30, 600),
+        ("visual", "L"): (50, 900),
+        ("sensitive", "S"): (10, 180),
+        ("sensitive", "M"): (30, 600),
+        ("sensitive", "L"): (50, 900),
+    }
+
+    @classmethod
+    def load(cls):
+        graph = json.loads((cls.ROOT / "graphs" / "routing-policy.json").read_text())
+        return graph, {node["id"]: node for node in graph["spec"]["nodes"]}
+
+    @staticmethod
+    def _path(context, path):
+        value = context
+        for part in path.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    @classmethod
+    def _eval(cls, expression, context):
+        kind = expression["kind"]
+        if kind == "literal":
+            return deepcopy(expression.get("value"))
+        if kind == "getField":
+            return cls._path(context, expression["path"])
+        if kind == "object":
+            return {key: cls._eval(value, context) for key, value in expression["properties"].items()}
+        if kind == "array":
+            return [cls._eval(value, context) for value in expression["elements"]]
+        if kind == "conditional":
+            branch = "then" if cls._eval(expression["condition"], context) else "else"
+            return cls._eval(expression[branch], context)
+        if kind == "coalesce":
+            primary = cls._eval(expression["primary"], context)
+            return primary if primary is not None else cls._eval(expression["fallback"], context)
+        if kind == "filter":
+            value = cls._eval(expression["input"], context)
+            if expression["filter"] == "int":
+                return int(value)
+            if expression["filter"] == "tojson":
+                return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if expression["filter"] == "keys":
+                return list(value)
+            if expression["filter"] == "sort":
+                return sorted(value)
+            if expression["filter"] == "join":
+                separator = expression["filterArgs"][0]["value"]
+                return separator.join(value)
+            raise AssertionError(expression["filter"])
+        if kind == "binary":
+            left, right = cls._eval(expression["left"], context), cls._eval(expression["right"], context)
+            return {
+                "==": lambda: type(left) is type(right) and left == right,
+                "!=": lambda: not (type(left) is type(right) and left == right),
+                ">=": lambda: left >= right,
+                ">": lambda: left > right,
+                "<=": lambda: left <= right,
+                "<": lambda: left < right,
+                "and": lambda: left and right,
+                "or": lambda: left or right,
+                "in": lambda: left in right,
+                "+": lambda: left + right,
+            }[expression["operator"]]()
+        raise AssertionError(kind)
+
+    @classmethod
+    def _object_builder(cls, node, context):
+        return {
+            mapping["output"]: cls._eval(mapping["expression"], context)
+            for mapping in node["config"]["mappings"]
+        }
+
+    @classmethod
+    def route(cls, payload):
+        _, nodes = cls.load()
+        context = {"CTX": {"INPUT": deepcopy(payload)}}
+        for node_id in ("policy_input", "policy_input_shape"):
+            node = nodes[node_id]
+            value = cls._object_builder(node, context)
+            context["CTX"][node["config"]["alias"]] = value
+        if context["CTX"]["routing_policy_input_shape"]["valid"] is not True:
+            return None
+        for node_id in (
+            "policy_input_normalized", "effective_size", "writer_profile",
+            "execution_budget", "reviewer_policy", "decision_material",
+        ):
+            node = nodes[node_id]
+            value = cls._object_builder(node, context)
+            context["CTX"][node["config"]["alias"]] = value
+        material = context["CTX"]["routing_decision_material"]["value"]
+        digest = hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        context["CTX"]["routing_decision_hash"] = {"value": digest}
+        output = cls._object_builder(nodes["route_output"], context)
+        return output
+
+    def test_routing_policy_graph_uses_only_native_policy_nodes_and_has_no_graphwing_route_action(self):
+        graph, nodes = self.load()
+        self.assertEqual(graph["slug"], "graphwing-routing-policy")
+        expected = {
+            "policy_input": "transforms.objectBuilder",
+            "policy_input_shape": "transforms.objectBuilder",
+            "policy_input_valid": "logic.filter",
+            "policy_input_normalized": "transforms.objectBuilder",
+            "policy_rejected": "transforms.regexReplace",
+            "effective_size": "transforms.objectBuilder",
+            "writer_profile": "transforms.objectBuilder",
+            "execution_budget": "transforms.objectBuilder",
+            "reviewer_policy": "transforms.objectBuilder",
+            "decision_material": "transforms.objectBuilder",
+            "decision_hash": "transforms.hash",
+            "route_output": "transforms.objectBuilder",
+        }
+        for node_id, node_type in expected.items():
+            self.assertEqual(nodes[node_id]["type"], node_type)
+        self.assertEqual(
+            {mapping["output"] for mapping in nodes["policy_input"]["config"]["mappings"]},
+            {"class", "work_kind", "size", "ac_count", "seams"},
+        )
+        node_types = {node["type"] for node in graph["spec"]["nodes"]}
+        self.assertNotIn("transforms.codeExpression", node_types)
+        self.assertFalse(any(node_type.startswith("action.graphwing") for node_type in node_types))
+        dumped = json.dumps(graph)
+        self.assertNotRegex(dumped, r"{%-?\\s*(?:set|for|if)\\b")
+        edges = {(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["spec"]["edges"]}
+        self.assertIn(("policy_input_valid", "fail", "policy_rejected"), edges)
+        self.assertIn(("policy_input_valid", "pass", "policy_input_normalized"), edges)
+        self.assertIn(("policy_input_normalized", "out", "effective_size"), edges)
+        self.assertEqual(nodes["policy_rejected"]["config"], {
+            "input": "graphwing_routing_policy_input_rejected",
+            "pattern": "(?=graphwing)",
+            "replacement": "",
+        })
+        self.assertNotIn("policy_rejected", {edge["source"] for edge in graph["spec"]["edges"]})
+        valid_expression = nodes["policy_input_shape"]["config"]["mappings"][0]["expression"]
+        key_membership = valid_expression["left"]
+        self.assertEqual(key_membership["operator"], "in")
+        self.assertEqual(key_membership["left"]["filter"], "join")
+        self.assertTrue(all(isinstance(value, str) for value in key_membership["right"]["value"]))
+
+    def test_routing_policy_graph_matches_the_hard_coded_normal_v1_matrix_for_all_27_class_kind_size_combinations(self):
+        seen = set()
+        for work_kind, writer in self.WRITERS.items():
+            for class_name in ("mechanical", "visual", "sensitive"):
+                for size in ("S", "M", "L"):
+                    route = self.route({
+                        "class": class_name, "work_kind": work_kind, "size": size,
+                        "ac_count": 0, "seams": 0,
+                    })
+                    with self.subTest(work_kind=work_kind, class_name=class_name, size=size):
+                        self.assertIsNotNone(route)
+                        seen.add((work_kind, class_name, size))
+                        self.assertEqual(route["compatibility_behavior"], "normal-v1")
+                        self.assertEqual(route["policy_version"], "workflow-normal-v1")
+                        self.assertEqual(route["size"], size)
+                        self.assertEqual(
+                            tuple(route[key] for key in ("launcher", "provider", "model", "effort")),
+                            writer,
+                        )
+                        self.assertEqual(
+                            (route["max_turns"], route["run_budget_seconds"]),
+                            self.BUDGETS[(class_name, size)],
+                        )
+        self.assertEqual(len(seen), 27)
+
+    def test_routing_policy_graph_preserves_ac_count_seam_effective_size_and_budget_boundaries(self):
+        cases = (
+            ("mechanical", "S", None, None, "S"),
+            ("mechanical", "S", 5, 0, "S"),
+            ("mechanical", "S", 6, 0, "M"),
+            ("mechanical", "M", 6, 0, "L"),
+            ("mechanical", "L", 6, 0, "L"),
+            ("visual", "S", 5, None, "M"),
+            ("visual", "S", 5, 1, "M"),
+            ("visual", "S", 5, 0, "S"),
+            ("visual", "S", 5, 2, "S"),
+            ("visual", "S", 6, 1, "M"),
+            ("visual", "M", 6, 1, "L"),
+        )
+        for class_name, size, ac_count, seams, effective in cases:
+            payload = {"class": class_name, "work_kind": "go_coding", "size": size}
+            if ac_count is not None: payload["ac_count"] = ac_count
+            if seams is not None: payload["seams"] = seams
+            route = self.route(payload)
+            with self.subTest(payload=payload):
+                self.assertEqual(route["size"], effective)
+                self.assertEqual(
+                    (route["max_turns"], route["run_budget_seconds"]),
+                    self.BUDGETS[(class_name, effective)],
+                )
+
+    def test_routing_policy_graph_emits_independent_writer_and_reviewer_efforts_and_distinct_opposing_reviewers(self):
+        for work_kind, writer in self.WRITERS.items():
+            for class_name, size, count, review_effort in (
+                ("mechanical", "S", 0, "medium"),
+                ("mechanical", "M", 1, "medium"),
+                ("visual", "M", 1, "medium"),
+                ("sensitive", "M", 2, "high"),
+            ):
+                route = self.route({
+                    "class": class_name, "work_kind": work_kind, "size": size,
+                    "ac_count": 0, "seams": 0,
+                })
+                with self.subTest(work_kind=work_kind, class_name=class_name, size=size):
+                    self.assertEqual(route["reviewer_count"], count)
+                    profiles = [route[f"reviewer{i}_execution_profile"] for i in (1, 2)]
+                    present = [profile for profile in profiles if profile is not None]
+                    self.assertEqual(len(present), count)
+                    expected_reviewers = self.REVIEWERS[writer[1]][:count]
+                    for index, profile in enumerate(present):
+                        self.assertNotEqual(profile["provider"], writer[1])
+                        self.assertEqual(profile["requested_effort"], review_effort)
+                        self.assertEqual(
+                            (profile["launcher"], profile["provider"], profile["model"]),
+                            expected_reviewers[index],
+                        )
+                        role = f"reviewer{index + 1}"
+                        self.assertEqual(
+                            tuple(route[f"{role}_{key}"] for key in ("launcher", "provider", "model")),
+                            expected_reviewers[index],
+                        )
+                    if count == 2:
+                        self.assertNotEqual(present[0]["provider"], present[1]["provider"])
+                    self.assertEqual(route["effort"], writer[3])
+
+    def test_routing_policy_graph_emits_closed_route_execution_profile_v2_for_every_present_role(self):
+        for work_kind in self.WRITERS:
+            for class_name, size in (("mechanical", "S"), ("visual", "M"), ("sensitive", "L")):
+                route = self.route({
+                    "class": class_name, "work_kind": work_kind, "size": size,
+                    "ac_count": "0", "seams": "0",
+                })
+                profiles = [route["writer_execution_profile"]] + [
+                    route[f"reviewer{i}_execution_profile"] for i in (1, 2)
+                    if route[f"reviewer{i}_execution_profile"] is not None
+                ]
+                for profile in profiles:
+                    with self.subTest(work_kind=work_kind, class_name=class_name, role=profile["role"]):
+                        self.assertEqual(set(profile), self.PROFILE_FIELDS)
+                        self.assertEqual(profile["version"], "route-execution-profile-v2")
+                        self.assertEqual(profile["policy_version"], "workflow-normal-v1")
+                        self.assertEqual(profile["decision_id"], route["decision_id"])
+                        self.assertEqual(profile["decision_sha256"], route["decision_sha256"])
+                        self.assertRegex(profile["decision_sha256"], r"^[0-9a-f]{64}$")
+                        parsed, error = server.parse_route_execution_profile(
+                            profile, expected_role=profile["role"], launcher=profile["launcher"],
+                            provider=profile["provider"], model=profile["model"],
+                            effort=profile["requested_effort"],
+                        )
+                        self.assertIsNone(error)
+                        self.assertEqual(parsed, profile)
+
+    def test_routing_policy_graph_preserves_normal_v1_omitted_class_and_size_defaults(self):
+        base = {"work_kind": "go_coding", "ac_count": 0, "seams": 0}
+        route = self.route(base)
+        self.assertEqual(route["class"], "mechanical")
+        self.assertEqual(route["size_floor"], "M")
+        self.assertEqual(route["size"], "M")
+        self.assertEqual(route["reviewer_count"], 1)
+        self.assertEqual((route["max_turns"], route["run_budget_seconds"]), (30, 300))
+        explicit = self.route({**base, "class": "mechanical", "size": "M"})
+        self.assertEqual(route, explicit)
+
+    def test_routing_policy_graph_rejects_boolean_float_signed_padded_non_ascii_and_out_of_range_counts(self):
+        malformed = (
+            {"ac_count": True}, {"ac_count": 6.5}, {"ac_count": -1},
+            {"ac_count": 100}, {"ac_count": "+6"}, {"ac_count": "06"},
+            {"ac_count": "٦"}, {"ac_count": "6_0"}, {"ac_count": "abc"},
+            {"seams": False}, {"seams": 1.5}, {"seams": -1}, {"seams": 21},
+            {"seams": "+1"}, {"seams": "01"}, {"seams": "１"},
+            {"class": ""}, {"class": "Mechanical"}, {"size": " M "},
+            {"work_kind": " go_coding"}, {"unexpected": "not-closed"},
+        )
+        base = {"class": "mechanical", "work_kind": "go_coding", "size": "S"}
+        for bad in malformed:
+            with self.subTest(bad=bad):
+                self.assertIsNone(self.route({**base, **bad}))
+        for ac_count in (0, 99, "0", "99"):
+            for seams in (0, 20, "0", "20"):
+                self.assertIsNotNone(self.route({**base, "ac_count": ac_count, "seams": seams}))
+
+    def test_routing_policy_v2_candidate_is_documented_as_unpromoted_and_cannot_be_selected_by_the_canonical_graph(self):
+        graph, _ = self.load()
+        dumped = json.dumps(graph)
+        self.assertNotIn("routing-policy-v2-candidate", dumped)
+        self.assertNotIn("benchmark_candidate", dumped)
+        route = self.route({
+            "class": "mechanical", "work_kind": "go_coding", "size": "S",
+            "ac_count": 0, "seams": 0,
+        })
+        self.assertEqual(route["model"], "gpt-5.6-sol")
+        note = (self.ROOT / "docs" / "notes" / "routing-policy-v2.md").read_text()
+        baseline = (self.ROOT / "docs" / "notes" / "routing-v1-baseline.md").read_text()
+        for text in (note, baseline):
+            self.assertIn("unpromoted", text)
+            self.assertIn("cannot authorize execution", text)
+
+    def test_publish_graphs_publishes_routing_policy_before_every_consumer_and_reads_back_its_exact_version(self):
+        from scripts import publish_graphs as pg
+
+        self.assertEqual(pg.CATALOG[0], "routing-policy")
+        for consumer in ("implement-slice", "pr-drive"):
+            stems = pg.publish_stems(consumer)
+            self.assertLess(stems.index("routing-policy"), stems.index(consumer))
+        self.assertEqual(
+            pg.ROUTING_POLICY_WORKFLOW_PIN_SOURCES,
+            {
+                "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID": "routing-policy",
+                "$GRAPHWING_ROUTING_POLICY_VERSION_ID": "routing-policy",
+            },
+        )
+        pins = {}
+        pg.register_routing_policy_workflow_pins(
+            "routing-policy", "workflow-exact", "version-exact", pins,
+        )
+        self.assertEqual(pins, {
+            "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID": "workflow-exact",
+            "$GRAPHWING_ROUTING_POLICY_VERSION_ID": "version-exact",
+        })
+        graph = {"spec": {"nodes": [{
+            "id": "route", "type": "action.subworkflow", "config": {
+                "workflowId": "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID",
+                "workflowVersionId": "$GRAPHWING_ROUTING_POLICY_VERSION_ID",
+            },
+        }]}}
+        substituted = pg.subst_instance(graph, "instance", workflow_pins=pins)
+        pg.assert_pinned_subworkflows(substituted)
+        self.assertEqual(substituted["spec"]["nodes"][0]["config"], {
+            "workflowId": "workflow-exact", "workflowVersionId": "version-exact",
+        })
+        with mock.patch.object(pg, "api", return_value=(200, {
+            "id": "workflow-exact",
+            "currentVersion": {"id": "version-exact", "status": "published"},
+        })):
+            readback = pg.read_back_exact_published_version(
+                "token", "workflow-exact", "version-exact", "graphwing-routing-policy",
+            )
+        self.assertEqual(readback, "version-exact")
+
+    def test_routing_policy_graph_actual_riftwing_ast_when_available(self):
+        riftwing = Path(os.environ.get(
+            "RIFTWING_CHECKOUT", "/home/tim/work/riftwing/sc-109005",
+        )) / "rewst-go"
+        if not (riftwing / "go.mod").is_file():
+            self.skipTest("authoritative Riftwing checkout unavailable")
+        go_source = r'''package asteval
+import (
+    "encoding/json"
+    "os"
+    "testing"
+)
+func TestGraphwingRoutingPolicyClosedInput(t *testing.T) {
+    raw, err := os.ReadFile(os.Getenv("GRAPHWING_ROUTING_POLICY_GRAPH")); if err != nil { t.Fatal(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { t.Fatal(err) }
+    spec := envelope["spec"].(map[string]any)
+    var expression any
+    for _, rawNode := range spec["nodes"].([]any) {
+        node := rawNode.(map[string]any)
+        if node["id"] == "policy_input_shape" {
+            expression = node["config"].(map[string]any)["mappings"].([]any)[0].(map[string]any)["expression"]
+        }
+    }
+    if expression == nil { t.Fatal("missing policy_input_shape expression") }
+    cases := []struct{name string; input, projected map[string]any; want bool}{
+        {"full", map[string]any{"class":"mechanical","work_kind":"go_coding","size":"S","ac_count":float64(6),"seams":"1"}, map[string]any{"class":"mechanical","work_kind":"go_coding","size":"S","ac_count":float64(6),"seams":"1"}, true},
+        {"defaults", map[string]any{"work_kind":"go_coding"}, map[string]any{"class":"mechanical","work_kind":"go_coding","size":"M","ac_count":nil,"seams":nil}, true},
+        {"extra", map[string]any{"work_kind":"go_coding","unexpected":true}, map[string]any{"class":"mechanical","work_kind":"go_coding","size":"M","ac_count":nil,"seams":nil}, false},
+        {"bad-count", map[string]any{"work_kind":"go_coding","ac_count":"abc"}, map[string]any{"class":"mechanical","work_kind":"go_coding","size":"M","ac_count":"abc","seams":nil}, false},
+    }
+    for _, tc := range cases {
+        t.Run(tc.name, func(t *testing.T) {
+            got, err := Evaluate(expression, map[string]any{"CTX":map[string]any{"INPUT":tc.input,"routing_policy_input":tc.projected}})
+            if err != nil { t.Fatal(err) }
+            valid, ok := got.(bool); if !ok || valid != tc.want { t.Fatalf("got %#v, want %v", got, tc.want) }
+        })
+    }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "routing_policy_ast_test.go"
+            source.write_text(go_source)
+            virtual = riftwing / "internal" / "asteval" / "graphwing_routing_policy_test.go"
+            overlay = tmp_path / "overlay.json"
+            overlay.write_text(json.dumps({"Replace": {str(virtual): str(source)}}))
+            result = subprocess.run(
+                ["go", "test", "-overlay", str(overlay), "./internal/asteval",
+                 "-run", "TestGraphwingRoutingPolicyClosedInput", "-count=1"],
+                cwd=riftwing, env={**os.environ, "GRAPHWING_ROUTING_POLICY_GRAPH": str(self.ROOT / "graphs" / "routing-policy.json")},
+                text=True, capture_output=True, timeout=120, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_routing_policy_graph_actual_riftwing_workflow_lint_when_available(self):
+        graph_path = self.ROOT / "graphs" / "routing-policy.json"
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            self.assertNotIn(
+                "transforms.codeExpression",
+                {node["type"] for node in self.load()[0]["spec"]["nodes"]},
+            )
+            return
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    raw, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+    result := linter.Lint(envelope["spec"].(map[string]any))
+    for _, issue := range result.Issues { encoded, _ := json.Marshal(issue); fmt.Println(string(encoded)) }
+    fmt.Printf("issues=%d\n", len(result.Issues))
+    if len(result.Issues) != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "routing_policy_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(
+                ["go", "run", str(checker), str(graph_path)],
+                cwd=Path(riftwing) / "rewst-go", text=True, capture_output=True,
+                timeout=120, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("issues=0", result.stdout)
 
 
 class WorkflowRouteProfileV2Tests(unittest.TestCase):

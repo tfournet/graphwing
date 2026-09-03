@@ -4,6 +4,9 @@
 
 - Catalog base: `9f7a178c8491f1ea7ac7dab14f5e6856254c45a8` (`origin/main` at characterization time).
 - Route contract: `normal-v1`.
+- Omitted or null `class` preserves the public selector default `mechanical`; omitted or null `size` preserves its `M` floor. `work_kind` remains required. These compatibility defaults are explicit in the workflow graph and their complete output is fixture-locked. Unlike the compatibility endpoint's historical string trimming, the canonical workflow accepts enum values only in exact closed form; empty, padded, or case-shifted enum text fails closed rather than being normalized.
+- Workflow-owned source parity: `graphs/routing-policy.json` now records `workflow-normal-v1`, with `normal-v1` as its compatibility behavior label. It preserves this frozen matrix while existing consumers and endpoints remain on the daemon selector until the later migration slice.
+- The separate Python `routing-policy-v2` benchmark proposal remains unpromoted and cannot authorize execution.
 - Evidence level: local source, provider-free fixtures, and one immutable committed snapshot of sanitized categorical/numeric observations. This is not provider, Rewst publication, tenant-import, or live-canary proof.
 - No launcher or provider was invoked to produce this note or its fixtures.
 - Paths use `$WORKTREE` for the isolated catalog checkout and `$GRAPHWING_HOME` for the replaceable local Graphwing seat. They are placeholders, not host paths.

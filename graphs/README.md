@@ -21,6 +21,7 @@ Copy `examples/rewst-install.example.json` to `$GRAPHWING_HOME/rewst-install.jso
 
 | Slug | Input | Shape |
 |---|---|---|
+| `graphwing-routing-policy` | `class`, `work_kind`, `size`, `ac_count`, `seams` | deterministic native validation, one-step effective size, normal-v1-compatible writer/budget/opposing-review policy, and complete workflow-owned `route-execution-profile-v2` output; source-catalog only until separately authorized publication |
 | `graphwing-run-control-authorize` | `record_key`, `server_instance_challenge` | compatibility-only foundation helper; cataloged but absent from the source subworkflow graph and the `pr-drive` publication chain |
 | `graphwing-run-control-transition` | `expected_pointer_version`, `from_logical_revision`, `operation_id`, `operation_type`, `owner_workflow_run_id`, `run_control_id`, `target_logical_revision`, `target_state`, `target_state_record_key`, `target_state_sha256`, `transition_delta`, `transition_request_sha256` | active v1 stable → pending → content-addressed Record materialize/readback/hash → stable transition with deterministic recovery and fail-closed pending state |
 | `graphwing-run-control-initialize` | `budgets`, `evaluator_contract_sha256`, `initial_route`, `root_identity` | active v1 root called by `scripts/drive-pr.py`; closed-root-identity and immutable-budget initialization through `transition` |
