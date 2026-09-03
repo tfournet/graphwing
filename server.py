@@ -4588,7 +4588,7 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         return int(view.get("status", 400)), view
     vd = view.get("data") or {}
     checks = annotate_pr_checks(gh_json(repo, ["pr", "checks", number, "--json",
-        "name,state,bucket,link"]))
+        GH_PR_CHECKS_JSON]))
     if not checks.get("ok"):
         return int(checks.get("status", 502)), checks
     confirmed = fresh_pr_view(repo, number)
@@ -4846,7 +4846,9 @@ def pr_findings_from(
     }
 
 
-NON_ACTIONABLE_PR_CHECKS = frozenset({"pm-review", "ci-status"})
+NON_ACTIONABLE_PR_CHECKS = frozenset({
+    "pm-review", "ci-status", "Forward event to pr-audit daemon",
+})
 
 
 def fold_pr_findings_checks(out: dict[str, Any], ck: dict[str, Any]) -> dict[str, Any]:
@@ -5545,6 +5547,12 @@ def fresh_pr_view(path: Path, number: str) -> dict[str, Any]:
 GH_CHECK_PASS = frozenset({"pass", "passing", "skipping", "skipped", "skip", "success", "neutral"})
 GH_CHECK_FAIL = frozenset({"fail", "failure", "cancel", "cancelled", "cancelling", "error", "timed_out", "action_required", "startup_failure", "stale"})
 GH_CHECK_PENDING = frozenset({"pending", "queued", "in_progress", "expected", "waiting", "requested"})
+GH_CHECK_KIND = {
+    **{x: "pass" for x in GH_CHECK_PASS},
+    **{x: "fail" for x in GH_CHECK_FAIL},
+    **{x: "pending" for x in GH_CHECK_PENDING},
+}
+GH_PR_CHECKS_JSON = "name,state,bucket,link,startedAt,completedAt"
 
 
 def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
@@ -5587,6 +5595,24 @@ def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _gh_check_when(row: dict[str, Any]) -> datetime | None:
+    for key in ("completedAt", "startedAt"):
+        raw = row.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            stamp = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp
+    return None
+
+
 def annotate_pr_checks(out: dict[str, Any]) -> dict[str, Any]:
     """Classify a nonempty, structurally known GitHub check set."""
     if not out.get("ok"):
@@ -5598,16 +5624,38 @@ def annotate_pr_checks(out: dict[str, Any]) -> dict[str, Any]:
     valid_rows = rows if isinstance(rows, list) else []
     malformed = not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip() for row in valid_rows)
     inconsistent = False
+    # #197. Do not classify a stale same-name run as the current check.
+    by_name: dict[str, list[tuple[datetime | None, str]]] = {}
+    order: list[str] = []
     for row in valid_rows:
         if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip(): continue
         name = str(row["name"]).strip()
         values = [str(row[key]).strip().lower().replace("-", "_") for key in ("bucket", "state") if row.get(key) not in (None, "")]
-        kinds = [{**{x: "pass" for x in GH_CHECK_PASS}, **{x: "fail" for x in GH_CHECK_FAIL}, **{x: "pending" for x in GH_CHECK_PENDING}}.get(value) for value in values]
+        kinds = [GH_CHECK_KIND.get(value) for value in values]
         if not values: malformed = True
         elif None in kinds: unknown.append(name)
         elif len(set(kinds)) != 1: inconsistent = True
-        elif kinds[0] == "fail": failing.append(name)
-        elif kinds[0] == "pending": pending.append(name)
+        else:
+            if name not in by_name:
+                order.append(name)
+                by_name[name] = []
+            kind = kinds[0]
+            if kind is None:
+                unknown.append(name)
+                continue
+            by_name[name].append((_gh_check_when(row), kind))
+    for name in order:
+        runs = by_name[name]
+        kinds = {kind for _when, kind in runs}
+        if len(kinds) == 1:
+            kind = next(iter(kinds))
+        elif any(when is None for when, _kind in runs):
+            inconsistent = True
+            continue
+        else:
+            kind = max(runs, key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc))[1]
+        if kind == "fail": failing.append(name)
+        elif kind == "pending": pending.append(name)
     if malformed: state = "malformed"
     elif not rows: state = "no_checks"
     elif inconsistent: state = "inconsistent"
@@ -12359,7 +12407,7 @@ def dispatch_inner(
                 # the checks node: that output is ~21KB and Rewst replaces it
                 # with an artifact stub, so TASKS.checks.all_green is null.
                 ck = annotate_pr_checks(
-                    gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
+                    gh_json(repo_path, ["pr", "checks", number, "--json", GH_PR_CHECKS_JSON])
                 )
                 out = fold_pr_findings_checks(out, ck)
                 # Flat, not nested under "data": the connector already exposes
@@ -12374,7 +12422,7 @@ def dispatch_inner(
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
             out = annotate_pr_checks(
-                gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
+                gh_json(repo_path, ["pr", "checks", number, "--json", GH_PR_CHECKS_JSON])
             )
         else:
             out = None

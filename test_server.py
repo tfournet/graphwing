@@ -6184,6 +6184,43 @@ while True:
         self.assertFalse(out["any_red"])
         self.assertEqual(out["pending"], ["ci"])
 
+    def test_annotate_pr_checks_uses_latest_same_name_run(self):
+        out = server.annotate_pr_checks({"ok": True, "data": [
+            {"name": "Forward event to pr-audit daemon", "bucket": "fail",
+             "completedAt": "2026-09-03T16:00:00Z"},
+            {"name": "Forward event to pr-audit daemon", "bucket": "pass",
+             "completedAt": "2026-09-03T16:05:00Z"},
+            {"name": "Go Unit Tests / 1/2", "bucket": "pass",
+             "completedAt": "2026-09-03T16:06:00Z"},
+        ]})
+        self.assertTrue(out["all_green"], out)
+        self.assertFalse(out["any_red"])
+        self.assertEqual(out["failing"], [])
+        self.assertEqual(out["checks_state"], "green")
+
+        later_fail = server.annotate_pr_checks({"ok": True, "data": [
+            {"name": "ci", "bucket": "pass", "completedAt": "2026-09-03T16:00:00Z"},
+            {"name": "ci", "bucket": "fail", "completedAt": "2026-09-03T16:05:00Z"},
+        ]})
+        self.assertEqual(later_fail["failing"], ["ci"])
+        self.assertEqual(later_fail["checks_state"], "red")
+
+        later_pending = server.annotate_pr_checks({"ok": True, "data": [
+            {"name": "ci", "bucket": "fail", "completedAt": "2026-09-03T16:00:00Z"},
+            {"name": "ci", "bucket": "pending", "startedAt": "2026-09-03T16:05:00Z"},
+        ]})
+        self.assertEqual(later_pending["failing"], [])
+        self.assertEqual(later_pending["pending"], ["ci"])
+        self.assertEqual(later_pending["checks_state"], "pending")
+
+    def test_annotate_pr_checks_same_name_conflict_without_times_is_inconsistent(self):
+        out = server.annotate_pr_checks({"ok": True, "data": [
+            {"name": "ci", "bucket": "fail"},
+            {"name": "ci", "bucket": "pass"},
+        ]})
+        self.assertEqual(out["checks_state"], "inconsistent")
+        self.assertFalse(out["all_green"])
+
     def test_gh_pr_checks_requires_number(self):
         status, payload, _ = server.dispatch("GET", "/v1/gh/pr/checks", {}, True, b"")
         self.assertEqual(status, 400)
@@ -7511,20 +7548,71 @@ while True:
         self.assertFalse(green["needs_fix"])
         self.assertEqual(green["brief"], "No blocking findings.")
 
+    def test_pr_findings_review_transport_never_enters_writer_brief(self):
+        held = server.pr_findings_from(labels=["grade-A"], comment_bodies=[])
+        transport_only = server.fold_pr_findings_checks(
+            held,
+            {"ok": True, "all_green": False, "any_red": True,
+             "failing": ["Forward event to pr-audit daemon"]},
+        )
+        self.assertIn("Forward event to pr-audit daemon", server.NON_ACTIONABLE_PR_CHECKS)
+        self.assertEqual(transport_only["failing"], ["Forward event to pr-audit daemon"])
+        self.assertEqual(transport_only["actionable_failing"], [])
+        self.assertFalse(transport_only["needs_fix"])
+        self.assertNotIn("Forward event to pr-audit daemon", transport_only["brief"])
+        self.assertEqual(transport_only["brief"], "No blocking findings.")
+
+        mixed = server.fold_pr_findings_checks(
+            held,
+            {"ok": True, "all_green": False, "any_red": True,
+             "failing": ["Forward event to pr-audit daemon", "Go Unit Tests / 1/2"]},
+        )
+        self.assertEqual(mixed["actionable_failing"], ["Go Unit Tests / 1/2"])
+        self.assertTrue(mixed["needs_fix"])
+        self.assertIn("Go Unit Tests / 1/2", mixed["brief"])
+        self.assertNotIn("Forward event to pr-audit daemon", mixed["brief"])
+
+    def test_pr_findings_superseded_audit_dispatch_is_not_a_code_task(self):
+        head = "6977ccecf1a15080b5948915584eda61bb7cda47"
+        findings = server.pr_findings_from(
+            labels=["grade-A"],
+            comment_bodies=[],
+            reviews=[{
+                "state": "COMMENTED",
+                "commit": {"oid": head},
+                "body": self._pr_audit_body(head, "A", []),
+            }],
+            head_sha=head,
+        )
+        ck = server.annotate_pr_checks({"ok": True, "data": [
+            {"name": "Forward event to pr-audit daemon", "bucket": "fail",
+             "completedAt": "2026-09-03T16:00:00Z"},
+            {"name": "Forward event to pr-audit daemon", "bucket": "pass",
+             "completedAt": "2026-09-03T16:01:00Z"},
+            {"name": "pm-review", "bucket": "pass",
+             "completedAt": "2026-09-03T16:01:00Z"},
+        ]})
+        out = server.fold_pr_findings_checks(findings, ck)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["exact_head_audit"])
+        self.assertEqual(out["grade"], "A")
+        self.assertEqual(ck["failing"], [])
+        self.assertFalse(out["needs_fix"], out)
+        self.assertEqual(out["actionable_failing"], [])
+        self.assertEqual(out["brief"], "No blocking findings.")
+
     def test_pr_drive_holds_review_transport_failures_in_the_workflow(self):
-        # Live #194: after a successful correction push, the next loop slot
-        # treated this failed audit delivery job as a repository defect and
-        # launched a writer. Review actionability belongs to the workflow, so
-        # keep the daemon's legacy classification unchanged and stop before
-        # writer dispatch with an explicit infrastructure hold.
-        self.assertNotIn("Forward event to pr-audit daemon", server.NON_ACTIONABLE_PR_CHECKS)
+        # Live #194/#197: a current audit-dispatch failure stays in failing
+        # for the workflow hold and never becomes a writer task.
+        self.assertIn("Forward event to pr-audit daemon", server.NON_ACTIONABLE_PR_CHECKS)
         legacy = server.fold_pr_findings_checks(
             server.pr_findings_from(labels=["grade-A-"], comment_bodies=[]),
             {"ok": True, "all_green": False, "any_red": True,
              "failing": ["Forward event to pr-audit daemon"]},
         )
-        self.assertTrue(legacy["needs_fix"], "daemon policy remains unchanged")
+        self.assertFalse(legacy["needs_fix"])
         self.assertEqual(legacy["failing"], ["Forward event to pr-audit daemon"])
+        self.assertEqual(legacy["actionable_failing"], [])
         self.assertTrue(all(isinstance(name, str) for name in legacy["failing"]))
 
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
