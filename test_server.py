@@ -7244,8 +7244,7 @@ while True:
         # Every in-run attempt ends in the loop; the final evidence leg only
         # runs once, after the loop's `done` handle, regardless of how many
         # slots ran or whether any of them did anything.
-        self.assertIn(("attempts", "done", "join_final"), triples)
-        self.assertIn(("join_final", "out", "final_view"), triples)
+        self.assertIn(("attempts", "done", "final_view"), triples)
         self.assertIn(("final_view", "success", "final_state_snap"), triples)
         self.assertIn(("final_state_snap", "out", "switch_final_state"), triples)
         self.assertIn(("switch_final_state", "case-0", "final_checkout"), triples)
@@ -7296,7 +7295,7 @@ while True:
         paths = merge_paths("join_start")
         self.assertTrue(paths)
         for path in paths:
-            self.assertTrue({"join_final", "final_view", "final_checkout", "final_wait", "switch_final_test"} <= set(path), path)
+            self.assertTrue({"final_view", "final_checkout", "final_wait", "switch_final_test"} <= set(path), path)
         for source, handle in (("final_wait", "timeout"), ("final_wait", "failure"), ("switch_final_test", "default"), ("final_test", "failure")):
             targets = [e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle]
             self.assertTrue(targets, (source, handle))
@@ -7622,25 +7621,24 @@ while True:
             for edge in graph["spec"]["edges"]
         }
 
-        transport = nodes["iter_review_transport_failures"]
+        transport = nodes["iter_review_transport_checks"]
         self.assertEqual(transport["type"], "transforms.transformArray")
         self.assertEqual(transport["config"]["operation"], "filter")
         self.assertEqual(
             transport["config"]["array"]["ast"],
-            {"kind": "getField", "path": "TASKS.iter_findings.data.failing"},
+            {"kind": "getField", "path": "TASKS.iter_findings.data.pr_policy_inputs_v1.checks.items"},
         )
-        self.assertEqual(transport["config"]["filterCondition"]["ast"], {
-            "kind": "binary", "operator": "==",
-            "left": {"kind": "getField", "path": "ITEM"},
-            "right": {"kind": "literal", "value": "Forward event to pr-audit daemon"},
-        })
+        transport_condition = json.dumps(transport["config"]["filterCondition"]["ast"])
+        self.assertIn("ITEM.observed_state", transport_condition)
+        self.assertIn("Forward event to pr-audit daemon", transport_condition)
 
-        self.assertIn(("iter_findings", "success", "iter_review_transport_failures"), triples)
-        self.assertIn(("iter_review_transport_failures", "out", "iter_snap"), triples)
-        self.assertIn(("iter_snap", "out", "switch_needs_fix"), triples)
-        self.assertIn(("switch_needs_fix", "case-0", "review_infrastructure_hold"), triples)
-        self.assertIn(("switch_needs_fix", "case-1", "exact_head_audit_hold"), triples)
-        self.assertIn(("switch_needs_fix", "case-2", "iter_checkout"), triples)
+        self.assertIn(("iter_findings", "success", "iter_exact_audits"), triples)
+        self.assertIn(("iter_policy_checks", "out", "iter_review_transport_checks"), triples)
+        self.assertIn(("iter_review_transport_checks", "out", "iter_root_cause_checks"), triples)
+        self.assertIn(("iter_policy_snap", "out", "switch_needs_fix"), triples)
+        self.assertIn(("switch_needs_fix", "case-1", "review_infrastructure_hold"), triples)
+        self.assertIn(("switch_needs_fix", "case-2", "exact_head_audit_hold"), triples)
+        self.assertIn(("switch_needs_fix", "case-3", "iter_checkout"), triples)
         self.assertIn(("switch_needs_fix", "default", "iter_skip"), triples)
         self.assertIn(("fix_push", "success", "correction_head"), triples)
         self.assertIn(("correction_head", "success", "correction_view"), triples)
@@ -7655,17 +7653,17 @@ while True:
 
         mappings = {
             mapping["output"]: mapping["expression"]
-            for mapping in nodes["iter_snap"]["config"]["mappings"]
+            for mapping in nodes["iter_policy_snap"]["config"]["mappings"]
         }
         self.assertEqual(mappings["exact_head_audit"], {
-            "kind": "getField", "path": "TASKS.iter_findings.data.exact_head_audit",
+            "kind": "getField", "path": "CTX.iter_selected_review_facts.exact_head_audit",
         })
         hold_dump = json.dumps(mappings["review_infrastructure_failed"])
-        self.assertIn("CTX.iter_review_transport_failures", hold_dump)
+        self.assertIn("CTX.iter_review_transport_checks", hold_dump)
         pending_dump = json.dumps(mappings["exact_head_audit_pending"])
         self.assertIn("CTX.correction_push_receipt.ok", pending_dump)
         self.assertIn("CTX.correction_push_receipt.head_sha", pending_dump)
-        self.assertIn("TASKS.iter_findings.data.head_sha", pending_dump)
+        self.assertIn("CTX.iter_selected_review_facts.exact_head_sha", pending_dump)
         self.assertIn("exact_head_audit", pending_dump)
         self.assertEqual(
             nodes["review_infrastructure_hold"]["config"]["alias"],
@@ -7686,7 +7684,7 @@ while True:
         self.assertEqual(nodes["correction_head"]["config"]["rev"], "HEAD")
         self.assertEqual(
             nodes["rc_state"]["config"]["inputMapping"]["values"]["head_sha"],
-            "{{ TASKS.iter_findings.data.head_sha }}",
+            "{{ CTX.iter_selected_review_facts.exact_head_sha }}",
         )
 
     def test_pr_findings_reports_exact_head_audit_presence_as_a_fact(self):
@@ -13566,7 +13564,12 @@ func main() {
         self.assertTrue(nodes["iter_findings"]["type"].endswith("/v1/gh/pr/findings"))
         self.assertTrue(any(e["source"] == "attempts" and e.get("sourceHandle") == "each"
                             and e["target"] == "iter_findings" for e in edges))
-        self.assertIn("iter_findings", nodes["agent"]["config"]["prompt"])
+        self.assertEqual(nodes["agent"]["config"]["prompt"],
+                         "{{ CTX.iter_writer_task.task | tojson }}")
+        task_dump = json.dumps(nodes["iter_writer_task"])
+        self.assertIn("pr-correction-task-v1", task_dump)
+        self.assertIn("CTX.iter_actionable_review_findings", task_dump)
+        self.assertIn("CTX.iter_ordered_root_cause_check_names", task_dump)
 
     def test_pr_drive_agent_budget_fits_inside_its_wait(self):
         # The agent node passed no budget, so the writer took
@@ -13661,13 +13664,17 @@ func main() {
                 self.assertIn(rule["path"], produced,
                               f"case {case['label']} reads {rule['path']}, which "
                               f"{feeders[0]} never produces")
-        # Writer dispatch is findings.needs_fix (actionable review items or
-        # folded red checks), not merge blocking: hold:pm-review alone is a
-        # merge hold, and all_green is check status only. Gating on
+        # Writer dispatch is the native policy packet's actionable decision,
+        # not a legacy daemon projection: hold:pm-review alone is a merge
+        # hold, and all_green is check status only. Gating on
         # all_green skipped a genuine review blocker (live bdc72f98 / #172);
         # gating on blocking spent a writer on an empty brief (live #177).
         by_output = {m["output"]: m["expression"] for m in feeder["config"]["mappings"]}
-        self.assertEqual(by_output["needs_fix"], {"kind": "getField", "path": "TASKS.iter_findings.data.needs_fix"})
+        self.assertIn("actionable", by_output)
+        actionable_dump = json.dumps(by_output["actionable"])
+        self.assertIn("CTX.iter_actionable_review_findings", actionable_dump)
+        self.assertIn("CTX.iter_ordered_root_cause_check_names", actionable_dump)
+        self.assertNotIn("TASKS.iter_findings.data.needs_fix", json.dumps(graph["spec"]))
 
     def test_implement_slice_rewst_templates_are_path_valid_and_jinja_lite_safe(self):
         graph = json.loads(
@@ -23726,7 +23733,7 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertEqual(next(m for m in nodes["attempt_slots"]["config"]["mappings"] if m["output"] == "slots")["expression"], {"kind": "literal", "value": [1, 2, 3]})
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
         self.assertIn(("attempts", "each", "iter_findings"), edges)
-        self.assertIn(("attempts", "done", "join_final"), edges)
+        self.assertIn(("attempts", "done", "final_view"), edges)
         # body reachability from each; nothing in it targets the loop node
         adjacency = {}
         for s, h, t in edges:
@@ -23737,7 +23744,7 @@ class PrDriveGraphTests(unittest.TestCase):
             if cur in seen: continue
             seen.add(cur); stack.extend(adjacency.get(cur, []))
         self.assertNotIn("attempts", seen)
-        self.assertNotIn("join_final", seen)
+        self.assertNotIn("final_view", seen)
         self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume", "rc_settle", "rc_reconcile", "fix_push"} <= seen)
         self.assertEqual(sum(1 for s, h, t in edges if t == "attempts"), 1)
 
@@ -23761,6 +23768,9 @@ class PrDriveGraphTests(unittest.TestCase):
         # means "this needs a writer"; merge blocking stays on holds/grade.
         self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
         self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [
+            {"label": "policy_inputs_incomplete", "rules": [
+                {"path": "policy_inputs_incomplete", "op": "equals", "value": True},
+            ]},
             {"label": "review_infrastructure_hold", "rules": [
                 {"path": "review_infrastructure_failed", "op": "equals", "value": True},
             ]},
@@ -23768,13 +23778,13 @@ class PrDriveGraphTests(unittest.TestCase):
                 {"path": "exact_head_audit_pending", "op": "equals", "value": True},
             ]},
             {"label": "red", "rules": [
-                {"path": "needs_fix", "op": "equals", "value": True},
+                {"path": "actionable", "op": "equals", "value": True},
             ]},
         ])
         self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
-        self.assertIn(("switch_needs_fix", "case-2", "iter_checkout"), edges)
+        self.assertIn(("switch_needs_fix", "case-3", "iter_checkout"), edges)
         self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))
-        snap = {m["output"]: m["expression"] for m in nodes["iter_snap"]["config"]["mappings"]}
+        snap = {m["output"]: m["expression"] for m in nodes["iter_policy_snap"]["config"]["mappings"]}
         self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
         task = next(m for m in nodes["rc_task_material"]["config"]["mappings"] if m["output"] == "task")["expression"]["properties"]
         self.assertEqual(task["attempt"], {"kind": "getField", "path": "ITEM"})
@@ -23782,7 +23792,7 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertEqual(state["endpoint"], "/v1/agent/run")
         self.assertEqual(state["exact_request_body_sha256"], "{{ CTX.rc_task_hash.value }}")
         self.assertEqual(nodes["agent"]["config"]["run_control"], "{{ CTX.rc_continuity.run_control }}")
-        self.assertEqual(nodes["agent"]["config"]["prompt"], "{{ TASKS.iter_findings.data.brief | default(CTX.run_input.prompt) }}")
+        self.assertEqual(nodes["agent"]["config"]["prompt"], "{{ CTX.iter_writer_task.task | tojson }}")
         continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
         self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
             "run_control_id": "CTX.run_input.run_control_id",
@@ -23797,6 +23807,303 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertNotIn("CTX.INPUT.run_control.", dump)
         self.assertNotIn('"CTX.INPUT.run_control"', dump)
         self.assertIn("CTX.INPUT.run_control_id", dump)
+
+    @staticmethod
+    def _policy_fixture(*, grade="A-", audit_findings=None, clean_findings=None, checks=None,
+                        exact_audit=True, complete=True):
+        head = "a0b5afa87dafe7625b8e2cd7ec85f0b3ee43ea00"
+        audit_findings = audit_findings or []
+        clean_findings = clean_findings or []
+        checks = checks or []
+        return {
+            "version": "pr-policy-inputs-v1", "complete": complete,
+            "observed_head_sha": head, "confirming_head_sha": head,
+            "labels": {"items": [f"grade-{grade}", "hold:pm-review"],
+                       "total": 2, "truncated": False},
+            "review_sources": {
+                "pr_audit": {"items": [{
+                    "source": "pr_audit", "commit_sha": head, "marker_sha": head,
+                    "block_sha": head, "exact_head": exact_audit, "grade": grade,
+                    "findings": {"items": audit_findings,
+                                 "total": len(audit_findings), "truncated": False},
+                }], "total": 1, "truncated": False},
+                "clean_code": {"items": [{
+                    "source": "clean_code",
+                    "findings": {"items": clean_findings,
+                                 "total": len(clean_findings), "truncated": False},
+                }], "total": 1, "truncated": False},
+            },
+            "checks": {"items": checks, "total": len(checks), "truncated": False},
+            "incomplete_reasons": [] if complete else ["checks_truncated"],
+        }
+
+    @staticmethod
+    def _run_native_pr_policy(spec, facts):
+        """Execute the closed PR2 native transform subset used by pr-drive."""
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        ctx = {}
+        tasks = {"iter_findings": {"data": {"pr_policy_inputs_v1": facts}}}
+
+        def get_path(path, item=None):
+            root = {"CTX": ctx, "TASKS": tasks, "ITEM": item}
+            parts = path.split(".")
+            value = root.get(parts[0])
+            for part in parts[1:]:
+                if not isinstance(value, dict):
+                    return None
+                value = value.get(part)
+            return value
+
+        def evaluate(expr, item=None):
+            kind = expr["kind"]
+            if kind == "literal":
+                return deepcopy(expr.get("value"))
+            if kind == "getField":
+                return get_path(expr["path"], item)
+            if kind == "binary":
+                left, right = evaluate(expr["left"], item), evaluate(expr["right"], item)
+                operator = expr["operator"]
+                if operator == "==": return left == right
+                if operator == "!=": return left != right
+                if operator == ">": return left > right
+                if operator == ">=": return left >= right
+                if operator == "<": return left < right
+                if operator == "<=": return left <= right
+                if operator == "in": return left in right
+                if operator == "not in": return left not in right
+                if operator == "and": return bool(left) and bool(right)
+                if operator == "or": return bool(left) or bool(right)
+                raise AssertionError(f"unsupported binary operator {operator}")
+            if kind == "conditional":
+                return evaluate(expr["then"] if evaluate(expr["condition"], item) else expr["else"], item)
+            if kind == "function":
+                args = [evaluate(arg, item) for arg in expr.get("args", [])]
+                if expr["name"] == "count":
+                    return len(args[0] or [])
+                raise AssertionError(f"unsupported function {expr['name']}")
+            if kind == "object":
+                return {key: evaluate(value, item) for key, value in expr["properties"].items()}
+            if kind == "array":
+                return [evaluate(value, item) for value in expr["elements"]]
+            raise AssertionError(f"unsupported AST kind {kind}")
+
+        order = [
+            "iter_exact_audits", "iter_clean_code_sources", "iter_selected_audit",
+            "iter_advisory_grade_labels", "iter_selected_review_facts",
+            "iter_selected_finding_lists", "iter_selected_findings",
+            "iter_open_review_findings", "iter_ranked_review_findings",
+            "iter_findings_by_id", "iter_findings_by_severity", "iter_unique_review_findings",
+            "iter_below_bar_review_findings", "iter_actionable_review_findings", "iter_policy_checks",
+            "iter_review_transport_checks", "iter_root_cause_checks",
+            "iter_root_cause_check_names", "iter_unique_root_cause_check_names",
+            "iter_ordered_root_cause_check_names", "iter_writer_task", "iter_policy_snap",
+        ]
+        for node_id in order:
+            node = nodes[node_id]
+            cfg = node["config"]
+            alias = cfg["alias"]
+            if node["type"] == "transforms.objectBuilder":
+                ctx[alias] = {m["output"]: evaluate(m["expression"])
+                              for m in cfg["mappings"]}
+            elif node["type"] == "transforms.aggregate":
+                values = evaluate(cfg["array"]["ast"]) or []
+                ctx[alias] = (values[-1] if cfg["operation"] == "last" and values else
+                              values[0] if cfg["operation"] == "first" and values else None)
+            else:
+                values = evaluate(cfg["array"]["ast"]) or []
+                operation = cfg["operation"]
+                if operation == "filter":
+                    values = [value for value in values
+                              if evaluate(cfg["filterCondition"]["ast"], value)]
+                elif operation == "map":
+                    map_cfg = cfg["mapConfig"]
+                    if map_cfg["mode"] == "field":
+                        values = [get_path("ITEM." + map_cfg["fieldPath"], value) for value in values]
+                    else:
+                        values = [{m["output"]: evaluate(m["expression"], value)
+                                   for m in map_cfg["mappings"]} for value in values]
+                elif operation == "flatten":
+                    values = [nested for value in values for nested in (value or [])]
+                elif operation == "sort":
+                    field = cfg.get("sortBy", "").removeprefix("item.")
+                    key = ((lambda value: get_path("ITEM." + field, value))
+                           if field else (lambda value: value))
+                    values = sorted(values, key=key,
+                                    reverse=cfg.get("sortOrder") == "desc")
+                elif operation == "unique":
+                    field = cfg.get("uniqueBy", "").removeprefix("item.")
+                    key = ((lambda value: get_path("ITEM." + field, value))
+                           if field else (lambda value: value))
+                    seen = set()
+                    values = [value for value in values
+                              if not (key(value) in seen or seen.add(key(value)))]
+                else:
+                    raise AssertionError(f"unsupported operation {operation}")
+                ctx[alias] = values
+        snap = ctx["iter_policy_snap"]
+        if snap["policy_inputs_incomplete"]:
+            route = "policy_inputs_incomplete"
+        elif snap["review_infrastructure_failed"]:
+            route = "review_infrastructure_hold"
+        elif snap["exact_head_audit_pending"]:
+            route = "exact_head_audit_pending"
+        elif snap["actionable"]:
+            route = "red"
+        else:
+            route = "not_red"
+        return ctx, route
+
+    def test_pr_drive_actionability_reads_only_pr_policy_inputs_v1(self):
+        graph = self.load()
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        active = [nodes[node_id] for node_id in (
+            "iter_exact_audits", "iter_clean_code_sources", "iter_selected_review_facts",
+            "iter_open_review_findings", "iter_policy_checks", "iter_review_transport_checks",
+            "iter_root_cause_checks", "iter_writer_task", "iter_policy_snap", "agent",
+        )]
+        dumped = json.dumps(active)
+        self.assertIn("TASKS.iter_findings.data.pr_policy_inputs_v1", dumped)
+        for forbidden in ("TASKS.iter_findings.data.blocking", "TASKS.iter_findings.data.needs_fix",
+                          "TASKS.iter_findings.data.actionable_failing", "TASKS.iter_findings.data.brief"):
+            self.assertNotIn(forbidden, json.dumps(graph["spec"]))
+        self.assertEqual(nodes["agent"]["config"]["prompt"],
+                         "{{ CTX.iter_writer_task.task | tojson }}")
+
+    def test_pr_drive_hold_only_grade_a_minus_never_reaches_writer(self):
+        spec = self.load()["spec"]
+        ctx, route = self._run_native_pr_policy(spec, self._policy_fixture())
+        self.assertEqual(route, "not_red")
+        self.assertFalse(ctx["iter_policy_snap"]["actionable"])
+        self.assertEqual(ctx["iter_writer_task"]["task"]["actionable_findings"], [])
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
+
+    def test_pr_drive_policy_and_aggregate_checks_never_enter_writer_task(self):
+        spec = self.load()["spec"]
+        policy = [{"name": "pm-review", "observed_state": "fail"},
+                  {"name": "ci-status", "observed_state": "fail"}]
+        ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(checks=policy))
+        self.assertEqual(route, "not_red")
+        self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"], [])
+        mixed = policy + [{"name": "Go Unit Tests / 1/2", "observed_state": "fail"}]
+        ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(checks=mixed))
+        self.assertEqual(route, "red")
+        self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"],
+                         ["Go Unit Tests / 1/2"])
+
+    def test_pr_drive_root_cause_ci_failure_enters_structured_writer_task(self):
+        spec = self.load()["spec"]
+        ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(
+            checks=[{"name": "Python tests", "observed_state": "fail"}],
+        ))
+        self.assertEqual(route, "red")
+        task = ctx["iter_writer_task"]["task"]
+        self.assertEqual(set(task), {"version", "instruction", "exact_head_sha",
+                                     "actionable_findings", "root_cause_checks"})
+        self.assertEqual(task["version"], "pr-correction-task-v1")
+        self.assertEqual(task["root_cause_checks"], ["Python tests"])
+        self.assertEqual(task["actionable_findings"], [])
+
+    def test_pr_drive_exact_head_review_red_selects_open_findings_and_deduplicates_in_workflow(self):
+        spec = self.load()["spec"]
+        def finding(fid, severity, status="open", source="pr_audit"):
+            return {"source": source, "id": fid, "status": status, "severity": severity,
+                    "location": {"path": "x.py", "line": 1}, "remedy": f"fix {fid}"}
+        audit = [finding("Z", "minor"), finding("A", "major"), finding("A", "critical"),
+                 finding("R", "blocker", "resolved")]
+        clean = [finding("CLEAN", "blocker", source="clean_code")]
+        ctx, route = self._run_native_pr_policy(
+            spec, self._policy_fixture(grade="B", audit_findings=audit, clean_findings=clean),
+        )
+        self.assertEqual(route, "red")
+        selected = ctx["iter_writer_task"]["task"]["actionable_findings"]
+        self.assertEqual([(item["id"], item["severity"]) for item in selected],
+                         [("A", "critical"), ("Z", "minor")])
+        self.assertTrue(all(set(item) == {"source", "id", "status", "severity",
+                                          "location", "remedy"} for item in selected))
+        self.assertNotIn("CLEAN", [item["id"] for item in selected])
+        self.assertNotIn("R", [item["id"] for item in selected])
+
+    def test_pr_drive_clean_code_compatibility_finding_without_status_is_open(self):
+        spec = self.load()["spec"]
+        finding = {"source": "clean_code", "id": "legacy", "status": None,
+                   "severity": "major", "location": {"path": "x.py", "line": 1},
+                   "remedy": "fix legacy finding"}
+        facts = self._policy_fixture(grade="B", audit_findings=[], clean_findings=[finding],
+                                     exact_audit=False)
+        ctx, route = self._run_native_pr_policy(spec, facts)
+        self.assertEqual(route, "red")
+        self.assertEqual([item["id"] for item in
+                          ctx["iter_writer_task"]["task"]["actionable_findings"]],
+                         ["legacy"])
+
+    def test_pr_drive_review_transport_failure_is_an_infrastructure_hold_not_writer_work(self):
+        spec = self.load()["spec"]
+        ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(checks=[{
+            "name": "Forward event to pr-audit daemon", "observed_state": "fail",
+        }]))
+        self.assertEqual(route, "review_infrastructure_hold")
+        self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"], [])
+        self.assertFalse(ctx["iter_policy_snap"]["actionable"])
+
+    def test_pr_drive_writer_task_has_no_code_expression_or_procedural_nunjucks(self):
+        spec = self.load()["spec"]
+        native_ids = {node["id"] for node in spec["nodes"] if node["id"].startswith("iter_")}
+        policy_ids = {
+            "iter_exact_audits", "iter_clean_code_sources", "iter_selected_audit",
+            "iter_advisory_grade_labels", "iter_selected_review_facts",
+            "iter_selected_finding_lists", "iter_selected_findings",
+            "iter_open_review_findings", "iter_ranked_review_findings",
+            "iter_findings_by_id", "iter_findings_by_severity", "iter_unique_review_findings",
+            "iter_below_bar_review_findings", "iter_actionable_review_findings", "iter_policy_checks",
+            "iter_review_transport_checks", "iter_root_cause_checks",
+            "iter_root_cause_check_names", "iter_unique_root_cause_check_names",
+            "iter_ordered_root_cause_check_names", "iter_writer_task", "iter_policy_snap",
+        }
+        self.assertTrue(policy_ids <= native_ids)
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        allowed = {"transforms.transformArray", "transforms.objectBuilder", "transforms.aggregate"}
+        self.assertTrue(all(nodes[node_id]["type"] in allowed for node_id in policy_ids))
+        dumped = json.dumps([nodes[node_id] for node_id in policy_ids] + [nodes["agent"]])
+        self.assertNotIn("codeExpression", dumped)
+        self.assertNotRegex(dumped, r"{%-?\s*(?:for|set|if|while)\b")
+        self.assertNotIn("namespace(", dumped)
+        self.assertNotIn("logic.loop", dumped)
+
+    def test_pr_drive_actual_riftwing_workflow_lint_when_available(self):
+        graph_path = Path(server.__file__).parent / "graphs" / "pr-drive.json"
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            self.assertNotIn("transforms.codeExpression", {
+                node["type"] for node in self.load()["spec"]["nodes"]
+                if node["id"].startswith("iter_")
+            })
+            return
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    raw, err := os.ReadFile(os.Args[1]); if err != nil { panic(err) }
+    var envelope map[string]any
+    if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+    result := linter.Lint(envelope["spec"].(map[string]any))
+    for _, issue := range result.Issues { encoded, _ := json.Marshal(issue); fmt.Println(string(encoded)) }
+    fmt.Printf("issues=%d\n", len(result.Issues))
+    if len(result.Issues) != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "graphwing_pr_drive_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(["go", "run", str(checker), str(graph_path)],
+                                    cwd=Path(riftwing) / "rewst-go", text=True,
+                                    capture_output=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "issues=0")
 
     def test_agent_launch_failure_reaches_the_run_control_failure_fence(self):
         # Live proof run ba65af2a: an HTTP 502 launching the writer (a
