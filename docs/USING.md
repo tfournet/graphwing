@@ -149,6 +149,8 @@ separate runtime step.
 
 ## Drive a PR to green
 
+The active v1 call path is source-derived and pinned in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). It remains compatibility behavior during the workflow-owned v2 migration; do not treat local run-control state as permanent authority.
+
 ```bash
 python3 scripts/drive-pr.py 3526 --message "fix: address review findings [SC-110507]"
 ```

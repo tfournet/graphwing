@@ -24,6 +24,112 @@ HOME = Path(os.environ.get("GRAPHWING_HOME", Path.home() / ".graphwing"))
 BASE = os.environ.get("GRAPHWING_REWST_API", "https://app.rewst.ai/api").rstrip("/")
 TENANT = ""
 
+# docs/ARCHITECTURE.md + issue #184. Keep this inventory complete until the
+# separately gated v2 cutover removes the compatibility owners.
+RUN_CONTROL_BASELINE_SHA = "631e10f9fa5ae4aa7a0ae511161e1a7faab99016"
+RUN_CONTROL_GRAPH_CLASSIFICATION = {
+    "run-control-authorize": "compatibility-only",
+    "run-control-consume": "active",
+    "run-control-consume-authorization": "active",
+    "run-control-initialize": "active",
+    "run-control-reconcile": "active",
+    "run-control-state": "active",
+    "run-control-transition": "active",
+}
+REWST_AUTHORIZATION_PRIMITIVES = (
+    "_validate_rewst_consumed_authorization",
+    "claim_rewst_launch_authority",
+    "consume_rewst_authority_for_job",
+    "consume_rewst_launch_authority",
+    "rewst_descriptor_matches",
+    "verify_rewst_issuer_request",
+)
+REWST_AUTHORIZATION_FOUNDATION = (
+    "_new_rewst_server_instance_challenge",
+    *REWST_AUTHORIZATION_PRIMITIVES,
+)
+RUN_CONTROL_WORKFLOW_PIN_SOURCES = {
+    "$GRAPHWING_RUN_CONTROL_AUTHORIZE": "run-control-consume-authorization",
+    "$GRAPHWING_RUN_CONTROL_CONSUME": "run-control-consume",
+    "$GRAPHWING_RUN_CONTROL_RECONCILE": "run-control-reconcile",
+    "$GRAPHWING_RUN_CONTROL_STATE": "run-control-state",
+    "$GRAPHWING_RUN_CONTROL_TRANSITION": "run-control-transition",
+}
+RUN_CONTROL_PIN_ERROR_MESSAGES = {
+    "run-control-consume-authorization": "run-control authorization publication returned no exact IDs",
+    "run-control-transition": "run-control transition publication returned no exact IDs",
+}
+RUN_CONTROL_DAEMON_CLASSIFICATION = {
+    # Daemon-owned aggregate budgets, history interpretation, and next state.
+    "RUN_CONTROL_VERSION": "business-policy",
+    "RUN_CONTROL_MAX_ATTEMPTS": "business-policy",
+    "RUN_CONTROL_CONSTRAINT_SIGNALS": "business-policy",
+    "RUN_CONTROL_GAMING_SIGNALS": "business-policy",
+    "RUN_CONTROL_BUDGET_FIELDS": "business-policy",
+    "RUN_CONTROL_ATTEMPT_FIELDS": "business-policy",
+    "RUN_CONTROL_PROGRESS_FIELDS": "business-policy",
+    "RUN_CONTROL_REQUEST_FIELDS": "business-policy",
+    "RUN_CONTROL_NEXT_ENVELOPE_FIELDS": "business-policy",
+    "_run_control_checkpoint": "business-policy",
+    "run_control_evaluate": "business-policy",
+
+    # Closed parsing and projections that do not choose the next state.
+    "RUN_CONTROL_ROUTE_FIELDS": "normalized-fact",
+    "RUN_CONTROL_USAGE_FIELDS": "normalized-fact",
+    "RUN_CONTROL_ID_RE": "normalized-fact",
+    "RUN_CONTROL_REWST_ID_RE": "normalized-fact",
+    "RUN_CONTROL_RUN_ID_RE": "normalized-fact",
+    "RUN_CONTROL_ATTEMPT_ID_RE": "normalized-fact",
+    "RUN_CONTROL_COST_RE": "normalized-fact",
+    "_run_control_usage_projection": "normalized-fact",
+    "_run_control_receipt_sha256": "normalized-fact",
+    "_run_control_error": "normalized-fact",
+    "_run_control_closed": "normalized-fact",
+    "_run_control_text": "normalized-fact",
+    "_run_control_uint": "normalized-fact",
+    "_run_control_cost": "normalized-fact",
+    "_run_control_cost_text": "normalized-fact",
+    "_run_control_ratio_text": "normalized-fact",
+    "_run_control_route": "normalized-fact",
+    "run_control_validate_initialize": "normalized-fact",
+    "run_control_validate_receipt": "normalized-fact",
+
+    # Active non-bypassable request/continuity fences.
+    "RUN_CONTROL_CONTINUITY_FIELDS": "hard-safety",
+    "_new_rewst_server_instance_challenge": "hard-safety",
+    "run_control_authorization_id": "hard-safety",
+    "run_control_continuity": "hard-safety",
+    "run_control_kick_request_sha256": "hard-safety",
+    "run_control_claim_kick": "hard-safety",
+    "run_control_claim_launch": "hard-safety",
+    "run_control_record_kick_result": "hard-safety",
+
+    # v1 local coordination and settlement retained for in-flight records.
+    "RUN_CONTROL_DIR": "compatibility-only",
+    "RUN_CONTROL_SETTLEMENT_VERSION": "compatibility-only",
+    "RUN_CONTROL_LEDGER_VERSION": "compatibility-only",
+    "RUN_CONTROL_KICK_LOSS_GRACE_SECONDS": "compatibility-only",
+    "RUN_CONTROL_AUTHORITY_LOSS_REASONS": "compatibility-only",
+    "RUN_CONTROL_SETTLE_FIELDS": "compatibility-only",
+    "RUN_CONTROL_TERMINAL_FAILURE_CODES": "compatibility-only",
+    "RUN_CONTROL_LEDGER_LOCK": "compatibility-only",
+    "_run_control_now": "compatibility-only",
+    "_run_control_ledger_path": "compatibility-only",
+    "_run_control_job_path": "compatibility-only",
+    "_run_control_ledger_read": "compatibility-only",
+    "_run_control_ledger_write": "compatibility-only",
+    "_run_control_ledger_record": "compatibility-only",
+    "_run_control_record_continuity": "compatibility-only",
+    "_run_control_settled_receipt": "compatibility-only",
+    "_run_control_settlement_result": "compatibility-only",
+    "run_control_settle": "compatibility-only",
+    "run_control_authority_loss": "compatibility-only",
+
+    # Unreferenced helper and exact HMAC/descriptor/one-time authority foundation.
+    "_run_control_id": "dormant",
+    **{symbol: "dormant" for symbol in REWST_AUTHORIZATION_PRIMITIVES},
+}
+
 
 def load_install() -> dict:
     path = HOME / "rewst-install.json"
@@ -280,6 +386,22 @@ def publish_stems(only: str) -> list[str]:
     return [only]
 
 
+def register_run_control_workflow_pins(
+    stem: str, workflow_id, version_id, pins: dict[str, str],
+) -> None:
+    placeholders = [
+        placeholder for placeholder, source in RUN_CONTROL_WORKFLOW_PIN_SOURCES.items()
+        if source == stem
+    ]
+    if not placeholders:
+        return
+    if not isinstance(workflow_id, str) or not isinstance(version_id, str) or not workflow_id or not version_id:
+        raise SystemExit(RUN_CONTROL_PIN_ERROR_MESSAGES.get(stem, f"{stem} publication returned no exact IDs"))
+    for placeholder in placeholders:
+        pins[f"{placeholder}_WORKFLOW_ID"] = workflow_id
+        pins[f"{placeholder}_VERSION_ID"] = version_id
+
+
 def main():
     global TENANT
     ap = argparse.ArgumentParser()
@@ -312,28 +434,7 @@ def main():
         g = load_graph(stem, instance, hook_secret, status_repo, workflow_pins)
         wid, vid, slug = upsert_workflow(mcp, g["name"], g["slug"], g["description"], g["spec"])
         published[stem] = {"workflow_id": wid, "workflow_version_id": vid, "slug": slug}
-        if stem == "run-control-transition":
-            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
-                raise SystemExit("run-control transition publication returned no exact IDs")
-            workflow_pins.update({
-                "$GRAPHWING_RUN_CONTROL_TRANSITION_WORKFLOW_ID": wid,
-                "$GRAPHWING_RUN_CONTROL_TRANSITION_VERSION_ID": vid,
-            })
-        if stem == "run-control-consume-authorization":
-            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
-                raise SystemExit("run-control authorization publication returned no exact IDs")
-            workflow_pins.update({
-                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_WORKFLOW_ID": wid,
-                "$GRAPHWING_RUN_CONTROL_AUTHORIZE_VERSION_ID": vid,
-            })
-        if stem in {"run-control-state", "run-control-consume", "run-control-reconcile"}:
-            if not isinstance(wid, str) or not isinstance(vid, str) or not wid or not vid:
-                raise SystemExit(f"{stem} publication returned no exact IDs")
-            prefix = stem.removeprefix("run-control-").replace("-", "_").upper()
-            workflow_pins.update({
-                f"$GRAPHWING_RUN_CONTROL_{prefix}_WORKFLOW_ID": wid,
-                f"$GRAPHWING_RUN_CONTROL_{prefix}_VERSION_ID": vid,
-            })
+        register_run_control_workflow_pins(stem, wid, vid, workflow_pins)
     if not args.no_run and "pr-drive" in published:
         repo = (os.environ.get("GRAPHWING_SMOKE_REPO") or install.get("smoke_repo") or "").strip()
         if not repo:

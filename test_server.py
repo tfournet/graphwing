@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import errno
 import fcntl
 import hashlib
@@ -22439,6 +22440,192 @@ class RunControlAdversarialTests(unittest.TestCase):
             self.now[0] += 1
             status, out = self.authority_loss(trio)
         self.assertEqual((status, out["authority_loss_reason"]), (200, "launched_run_never_settled"))
+
+
+class RunControlOwnershipBaselineTests(unittest.TestCase):
+    """Issue #187 slice 1: source-derived ownership and reachability."""
+
+    ROOT = Path(server.__file__).parent
+
+    @classmethod
+    def setUpClass(cls):
+        from scripts import publish_graphs
+
+        cls.catalog = publish_graphs
+        cls.graphs = {
+            path.stem: json.loads(path.read_text())
+            for path in sorted((cls.ROOT / "graphs").glob("*.json"))
+        }
+
+    def _placeholder_target(self, workflow_id):
+        match = re.fullmatch(r"\$GRAPHWING_(RUN_CONTROL_[A-Z_]+)_WORKFLOW_ID", workflow_id)
+        if match is None:
+            return None
+        placeholder = workflow_id.removesuffix("_WORKFLOW_ID")
+        self.assertIn(placeholder, self.catalog.RUN_CONTROL_WORKFLOW_PIN_SOURCES)
+        return self.catalog.RUN_CONTROL_WORKFLOW_PIN_SOURCES[placeholder]
+
+    def _run_control_calls(self):
+        calls = {stem: set() for stem in self.graphs}
+        for stem, graph in self.graphs.items():
+            for node in graph["spec"]["nodes"]:
+                if node["type"] != "action.subworkflow":
+                    continue
+                workflow_id = node["config"]["workflowId"]
+                target = self._placeholder_target(workflow_id)
+                if target is not None:
+                    version_id = node["config"]["workflowVersionId"]
+                    self.assertEqual(
+                        version_id,
+                        workflow_id.removesuffix("_WORKFLOW_ID") + "_VERSION_ID",
+                        (stem, node["id"]),
+                    )
+                    self.assertIn(target, self.graphs, (stem, node["id"], target))
+                    calls[stem].add(target)
+        return calls
+
+    def _active_run_control_graphs(self):
+        script_tree = ast.parse((self.ROOT / "scripts" / "drive-pr.py").read_text())
+        roots = set()
+        for call in (node for node in ast.walk(script_tree) if isinstance(node, ast.Call)):
+            if not (isinstance(call.func, ast.Attribute) and call.func.attr == "run_slug"):
+                continue
+            for argument in call.args:
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    if argument.value.startswith("graphwing-run-control-"):
+                        roots.add(argument.value.removeprefix("graphwing-"))
+                    elif argument.value == "graphwing-pr-drive":
+                        roots.add("pr-drive")
+        calls = self._run_control_calls()
+        reached, pending = set(), list(roots)
+        while pending:
+            stem = pending.pop()
+            if stem in reached:
+                continue
+            reached.add(stem)
+            pending.extend(calls.get(stem, ()))
+        return {stem for stem in reached if stem.startswith("run-control-")}
+
+    def test_run_control_catalog_metadata_matches_the_mechanical_subworkflow_call_graph(self):
+        graph_stems = {path.stem for path in (self.ROOT / "graphs").glob("run-control-*.json")}
+        inventory = self.catalog.RUN_CONTROL_GRAPH_CLASSIFICATION
+        self.assertEqual(set(inventory), graph_stems)
+        active = self._active_run_control_graphs()
+        self.assertEqual({stem for stem, state in inventory.items() if state == "active"}, active)
+        self.assertEqual(
+            {stem for stem, state in inventory.items() if state == "compatibility-only"},
+            graph_stems - active,
+        )
+        published_chain = set(self.catalog.publish_stems("pr-drive"))
+        self.assertTrue((active - {"run-control-initialize"}) <= published_chain)
+        self.assertTrue((graph_stems - active).isdisjoint(published_chain))
+
+        tree = ast.parse((self.ROOT / "server.py").read_text())
+        symbols = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith(("run_control", "_run_control")):
+                    symbols.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                symbols.update(
+                    target.id for target in targets
+                    if isinstance(target, ast.Name) and target.id.startswith("RUN_CONTROL_")
+                )
+        symbols.update(self.catalog.REWST_AUTHORIZATION_FOUNDATION)
+        self.assertEqual(set(self.catalog.RUN_CONTROL_DAEMON_CLASSIFICATION), symbols)
+        self.assertLessEqual(
+            set(self.catalog.RUN_CONTROL_DAEMON_CLASSIFICATION.values()),
+            {"compatibility-only", "dormant", "normalized-fact", "hard-safety", "business-policy"},
+        )
+        expected_owners = {
+            "business-policy": {
+                "run_control_evaluate", "_run_control_checkpoint", "RUN_CONTROL_MAX_ATTEMPTS",
+                "RUN_CONTROL_CONSTRAINT_SIGNALS", "RUN_CONTROL_GAMING_SIGNALS",
+            },
+            "normalized-fact": {
+                "run_control_validate_initialize", "run_control_validate_receipt",
+                "_run_control_usage_projection",
+            },
+            "hard-safety": {
+                "_new_rewst_server_instance_challenge", "run_control_continuity",
+                "run_control_claim_launch",
+            },
+            "compatibility-only": {
+                "_run_control_settled_receipt", "run_control_settle", "run_control_authority_loss",
+                "_run_control_ledger_read", "_run_control_ledger_write", "_run_control_ledger_record",
+                "RUN_CONTROL_LEDGER_LOCK",
+            },
+        }
+        for classification, names in expected_owners.items():
+            self.assertEqual(
+                {name: self.catalog.RUN_CONTROL_DAEMON_CLASSIFICATION[name] for name in names},
+                {name: classification for name in names},
+            )
+
+    def test_pr_drive_active_run_control_chain_names_state_consume_authorize_reconcile_and_transition(self):
+        self.assertEqual(
+            self._active_run_control_graphs(),
+            {
+                "run-control-initialize", "run-control-state", "run-control-consume",
+                "run-control-consume-authorization", "run-control-reconcile", "run-control-transition",
+            },
+        )
+        consume_nodes = {
+            node["id"] for node in self.graphs["run-control-consume"]["spec"]["nodes"]
+        }
+        self.assertIn("authorize", consume_nodes)
+
+    def test_run_control_authorize_is_unreferenced_and_marked_compatibility_only(self):
+        callers = {
+            source for source, targets in self._run_control_calls().items()
+            if "run-control-authorize" in targets
+        }
+        self.assertEqual(callers, set())
+        self.assertEqual(
+            self.catalog.RUN_CONTROL_GRAPH_CLASSIFICATION["run-control-authorize"],
+            "compatibility-only",
+        )
+
+    def test_rewst_authorization_primitives_are_reported_dormant_until_dispatch_calls_them(self):
+        inventory = self.catalog.RUN_CONTROL_DAEMON_CLASSIFICATION
+        self.assertTrue(self.catalog.REWST_AUTHORIZATION_PRIMITIVES)
+        for symbol in self.catalog.REWST_AUTHORIZATION_PRIMITIVES:
+            self.assertEqual(inventory[symbol], "dormant", symbol)
+        self.assertEqual(inventory["_new_rewst_server_instance_challenge"], "hard-safety")
+
+        tree = ast.parse((self.ROOT / "server.py").read_text())
+        functions = {
+            node.name: node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        reached, pending = set(), ["dispatch", "dispatch_inner"]
+        while pending:
+            name = pending.pop()
+            if name in reached or name not in functions:
+                continue
+            reached.add(name)
+            for node in ast.walk(functions[name]):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    pending.append(node.func.id)
+        self.assertTrue(set(self.catalog.REWST_AUTHORIZATION_PRIMITIVES).isdisjoint(reached))
+
+    def test_run_control_migration_docs_preserve_issue_184_ownership_and_approval_gates(self):
+        note = (self.ROOT / "docs" / "notes" / "run-control-activation-recovery.md").read_text()
+        self.assertEqual(self.catalog.RUN_CONTROL_BASELINE_SHA, "631e10f9fa5ae4aa7a0ae511161e1a7faab99016")
+        self.assertIn(self.catalog.RUN_CONTROL_BASELINE_SHA, note)
+        self.assertIn("issue #184", note)
+        self.assertIn("v1 in-flight records remain readable", note)
+        self.assertIn("never inferred or guessed into v2", note)
+        self.assertIn("Source implementation and high-confidence Graphwing PR merges are authorized", note)
+        note_lower = note.lower()
+        for gate in ("deployment", "openapi re-import", "workflow publication", "live canaries",
+                     "historical cleanup"):
+            self.assertIn(gate, note_lower)
+        for rel in ("README.md", "graphs/README.md", "docs/HUMAN-LOOP.md", "docs/USING.md",
+                    "docs/REWST-AUTHORIZATION.md"):
+            text = (self.ROOT / rel).read_text()
+            self.assertIn("run-control-activation-recovery.md", text, rel)
 
 
 class GraphEdgeHandleVocabularyTests(unittest.TestCase):

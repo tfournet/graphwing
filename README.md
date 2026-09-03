@@ -56,13 +56,13 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 
 | Workflow | You pass | It does |
 |---|---|---|
-| `graphwing-run-control-authorize` | `record_key`, `server_instance_challenge` | Inert foundation helper: native exact durable-record readback/hash binding, exact descriptor/challenge input gate, and challenge-bound one-time issued-to-consumed KV CAS. Existing launch graphs do not call it yet. |
-| `graphwing-run-control-transition` | `expected_pointer_version`, `from_logical_revision`, `operation_id`, `operation_type`, `owner_workflow_run_id`, `run_control_id`, `target_logical_revision`, `target_state`, `target_state_record_key`, `target_state_sha256`, `transition_delta`, `transition_request_sha256` | Dormant content-addressed Records plus KV CAS journal transition/recovery helper; pending is fail-closed and cannot launch. |
-| `graphwing-run-control-initialize` | `budgets`, `evaluator_contract_sha256`, `initial_route`, `root_identity` | Dormant immutable-budget initializer with an explicit closed root identity, non-path hashed run/state identities, and an exactly pinned transition child. |
-| `graphwing-run-control-state` | `branch`, `callback_binding_sha256`, `candidate_route`, `endpoint`, `exact_request_body_sha256`, `handoff`, `head_sha`, `launcher_fingerprint`, `next_envelope`, `permission_profile`, `repository`, `run_control_id`, `task_sha256` | Dormant verified-state evaluator/challenge controller that consumes the propagated run-control ID and persists at most one reservation or a terminal result; it has no launch edge. |
-| `graphwing-run-control-reconcile` | `authority_loss_reason`, `kind`, `receipt`, `run_control_id` | Dormant exact terminal-receipt or conservative full-envelope authority-loss reconciliation. |
-| `graphwing-run-control-consume-authorization` | `attempt_id`, `authorization_id`, `launch_descriptor_sha256`, `server_instance_challenge`, `state_record_key`, `state_sha256` | Dormant exact issued-to-consumed authorization CAS helper. |
-| `graphwing-run-control-consume` | `run_control_id` | Dormant controller that verifies one outstanding reservation, consumes authority, and persists consumed state without launching. |
+| `graphwing-run-control-authorize` | `record_key`, `server_instance_challenge` | Compatibility-only foundation helper. It remains cataloged but no source `action.subworkflow` or `pr-drive` publication chain references it. |
+| `graphwing-run-control-transition` | `expected_pointer_version`, `from_logical_revision`, `operation_id`, `operation_type`, `owner_workflow_run_id`, `run_control_id`, `target_logical_revision`, `target_state`, `target_state_record_key`, `target_state_sha256`, `transition_delta`, `transition_request_sha256` | Active v1 content-addressed Records plus KV CAS journal transition/recovery helper; pending is fail-closed and cannot launch. |
+| `graphwing-run-control-initialize` | `budgets`, `evaluator_contract_sha256`, `initial_route`, `root_identity` | Active v1 initializer called by `scripts/drive-pr.py` before `pr-drive`; it writes the closed root identity and immutable budgets through `transition`. |
+| `graphwing-run-control-state` | `branch`, `callback_binding_sha256`, `candidate_route`, `endpoint`, `exact_request_body_sha256`, `handoff`, `head_sha`, `launcher_fingerprint`, `next_envelope`, `permission_profile`, `repository`, `run_control_id`, `task_sha256` | Active v1 evaluator/challenge controller called by each `pr-drive` attempt; it persists at most one reservation or a terminal result. |
+| `graphwing-run-control-reconcile` | `authority_loss_reason`, `kind`, `receipt`, `run_control_id` | Active v1 exact terminal-receipt or conservative full-envelope authority-loss reconciliation. |
+| `graphwing-run-control-consume-authorization` | `attempt_id`, `authorization_id`, `launch_descriptor_sha256`, `server_instance_challenge`, `state_record_key`, `state_sha256` | Active v1 authorization child. The publisher resolves `consume`'s `AUTHORIZE` pin to this exact six-input graph. |
+| `graphwing-run-control-consume` | `run_control_id` | Active v1 controller whose `authorize` node calls `consume-authorization`, verifies one outstanding reservation, and persists consumed state without launching. |
 | `graphwing-implement-slice` | `repo`, `branch`, `index`, `ticket`, `commit_message`, `test`, `iters_left`, `class`, `work_kind`, `size`, `ac_count`, `seams`, `kick_url`, `kick_token`, `e2e`, `recovery_version`, `prior_primary_route`, `prior_primary_receipt`, `prior_fallback_route`, `prior_fallback_receipt`, `fresh_primary_receipt` | One ticket: route, write, named test, opposing review, complete, commit, push. `diagnostic-v1` receipts are bounded; `provider-recovery-v1` is a later-invocation evidence check, never an active-session switch. |
 | `graphwing-verify-stack` | `stack`, `port` | Check the stack then one port and retain compact diagnostics. |
 | `graphwing-pr-status` | `pr` | Read remote-only PR state through an API start. Webhook starts remain disabled. |
@@ -70,6 +70,8 @@ If a step is a plain command, give it its own URL. Do not fold it into the agent
 | `graphwing-code-off` | `experiment_id`, `repo`, `base_sha`, `seed`, `category`, `tags`, `category_source`, `prompt`, `tests`, `toolchain`, `budgets`, `commit_message` | Deterministic bounded DAG with two frozen candidates and three blind judgments; only an exact test-green winner can reach commit/push. No redraw, fallback, cycle, or merge. |
 
 The exact catalog input sets are in [graphs/README.md](graphs/README.md). How you sit down and start a run: [docs/USING.md](docs/USING.md). Rules and proof levels: [docs/HUMAN-LOOP.md](docs/HUMAN-LOOP.md).
+
+The source-derived run-control ownership inventory, v1/v2 migration rule, and approval gates are pinned in [docs/notes/run-control-activation-recovery.md](docs/notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline).
 
 ## What lives where
 
