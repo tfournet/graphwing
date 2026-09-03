@@ -6823,40 +6823,6 @@ while True:
             self.assertIsNone(evidence["final"])
             enqueue.assert_called_once()
 
-    def test_merge_evidence_test_starts_while_policy_hold_blocks_merge(self):
-        # #183: a policy hold made test admission return 409 after final_wait
-        # had started. A named test can bind the held head; ghPrMerge still
-        # re-reads the hold and refuses the side effect.
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            repo = self._scratch_git(root)
-            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"],
-                           check=True, capture_output=True)
-            head = subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
-                capture_output=True, text=True,
-            ).stdout.strip()
-            jobs = root / "jobs"
-            spec = {"catalog-compile": {
-                "name": "catalog-compile", "argv": [sys.executable, "-c", "pass"],
-                "cwd": repo.resolve(), "timeout_seconds": 120, "async": True,
-            }}
-            request = {
-                "name": "catalog-compile", "evidence_mode": "pr_merge", "repo": "r",
-                "pr": "7", "run_id": "run-7", "expected_head": head,
-                "response_webhook_url": "https://example.invalid/resume",
-            }
-            held = self._strict_pr_view(head, labels=[{"name": "hold:pm-review"}])
-            with mock.patch.object(server, "JOBS_DIR", jobs), \
-                 mock.patch.object(server, "load_tests", return_value=spec), \
-                 mock.patch.object(server, "gh_json", return_value=held), \
-                 mock.patch.object(server, "enqueue_script") as enqueue:
-                status, payload = server.test_run(json.dumps(request).encode(), {"r": str(repo)})
-            self.assertEqual(status, 202, payload)
-            job = json.loads((jobs / payload["job_id"] / "job.json").read_text())
-            self.assertEqual(job["merge_evidence"]["expected_head"], head)
-            enqueue.assert_called_once()
-
     def test_merge_evidence_creation_requires_valid_writer_before_stamping_writer_mode(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -7242,7 +7208,23 @@ while True:
         # slots ran or whether any of them did anything.
         self.assertIn(("attempts", "done", "join_final"), triples)
         self.assertIn(("join_final", "out", "final_view"), triples)
-        self.assertIn(("final_view", "success", "final_checkout"), triples)
+        self.assertIn(("final_view", "success", "final_state_snap"), triples)
+        self.assertIn(("final_state_snap", "out", "switch_final_state"), triples)
+        self.assertIn(("switch_final_state", "case-0", "final_checkout"), triples)
+        self.assertIn(("switch_final_state", "default", "final_state_blocked"), triples)
+        self.assertFalse(any(e["source"] == "final_state_blocked" for e in edges),
+                         "a blocked final state must terminate before final_wait")
+        state_rules = nodes["switch_final_state"]["config"]["cases"][0]["rules"]
+        self.assertEqual(state_rules, [{"path": "remote_ready", "op": "equals", "value": True}])
+        state_mappings = {m["output"]: m["expression"] for m in nodes["final_state_snap"]["config"]["mappings"]}
+        self.assertEqual(state_mappings["remote_ready"],
+                         {"kind": "getField", "path": "TASKS.final_view.data.remote_ready"})
+        blocked = {m["output"]: m["expression"] for m in nodes["final_state_blocked"]["config"]["mappings"]}
+        self.assertEqual(blocked["status"], {"kind": "literal", "value": "blocked"})
+        self.assertEqual(blocked["reason"],
+                         {"kind": "getField", "path": "TASKS.final_view.data.remote_state"})
+        self.assertEqual(blocked["holds"],
+                         {"kind": "getField", "path": "TASKS.final_view.data.holds"})
         self.assertIn(("final_checkout", "success", "final_wait"), triples)
         self.assertIn(("final_wait", "pending", "final_test"), triples)
         self.assertIn(("final_wait", "out", "switch_final_test"), triples)

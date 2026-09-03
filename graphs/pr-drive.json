@@ -943,6 +943,111 @@
         }
       },
       {
+        "id": "final_state_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Final PR state",
+        "position": {
+          "x": 3090,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_state_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "remote_ready",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.remote_ready"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "remote_state",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.remote_state"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "holds",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.holds"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_final_state",
+        "type": "logic.switch",
+        "label": "Final PR ready?",
+        "position": {
+          "x": 3180,
+          "y": 240
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "ready",
+              "rules": [
+                {
+                  "path": "remote_ready",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "blocked"
+          }
+        }
+      },
+      {
+        "id": "final_state_blocked",
+        "type": "transforms.objectBuilder",
+        "label": "Final PR policy hold",
+        "position": {
+          "x": 3360,
+          "y": 80
+        },
+        "config": {
+          "alias": "final_state_blocked",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.remote_state"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "holds",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.holds"
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "final_checkout",
         "type": "action.graphwing.POST:/v1/git/checkout",
         "label": "Checkout final PR head",
@@ -1547,7 +1652,28 @@
         "id": "e51",
         "source": "final_view",
         "sourceHandle": "success",
+        "target": "final_state_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e51a",
+        "source": "final_state_snap",
+        "sourceHandle": "out",
+        "target": "switch_final_state",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e51b",
+        "source": "switch_final_state",
+        "sourceHandle": "case-0",
         "target": "final_checkout",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e51c",
+        "source": "switch_final_state",
+        "sourceHandle": "default",
+        "target": "final_state_blocked",
         "targetHandle": "in"
       },
       {

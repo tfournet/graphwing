@@ -9732,12 +9732,8 @@ def prepare_merge_evidence(data: dict[str, Any], spec: dict[str, Any], repos: di
     if not view.get("ok"):
         return None, {**view, "status": int(view.get("status", 502))}
     vd = view.get("data") or {}
-    if (str(vd.get("number")) != number or vd.get("state") != "OPEN"
-            or not isinstance(vd.get("headRefName"), str)
-            or not valid_branch(vd["headRefName"])
-            or not GIT_SHA_RE.fullmatch(str(vd.get("headRefOid") or ""))):
-        return None, {"error": "PR is not an open, well-formed final-evidence target",
-                      "code": str(view.get("remote_state") or "pr_state_invalid"), "status": 409}
+    if str(vd.get("number")) != number or not view.get("remote_ready"):
+        return None, {"error": "PR is not remotely ready for final evidence", "code": str(view.get("remote_state") or "pr_state_invalid"), "status": 409}
     if vd.get("headRefOid") != expected:
         return None, {"error": "declared PR head is stale", "code": "head_moved", "status": 409}
     if writer not in (None, ""):
