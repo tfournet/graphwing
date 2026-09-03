@@ -4142,6 +4142,14 @@ class GrokNodeUnavailable(FileNotFoundError):
     """The exact Node companion required by a Grok script could not be pinned."""
 
 
+CODEX_HOST_NAME = "codex-code-mode-host"
+CODEX_HOST_FINGERPRINT_DOMAIN = b"graphwing/codex-code-mode-host/v1\0"
+
+
+class CodexHostUnavailable(FileNotFoundError):
+    """The exact Codex code-mode-host companion could not be pinned."""
+
+
 def grok_node_shebang(binary: Path) -> bool:
     """Recognize only the exact closed Node shebang forms Graphwing supports."""
     with binary.open("rb") as fh:
@@ -4171,12 +4179,89 @@ def _attach_grok_node(pinned: PinnedLauncher, node_binary: Path | None = None) -
         pinned.fingerprint, pinned.companion.fingerprint)
 
 
+def _codex_composite_fingerprint(codex: str, host: str) -> str:
+    digest = hashlib.sha256(
+        CODEX_HOST_FINGERPRINT_DOMAIN
+        + bytes.fromhex(codex[7:]) + bytes.fromhex(host[7:])
+    )
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _codex_host_source(binary: Path) -> Path:
+    resolved = binary.resolve()
+    if str(resolved).startswith("/proc/self/fd/"):
+        raise CodexHostUnavailable("Codex host cannot be resolved from a memfd path")
+    return resolved.parent / CODEX_HOST_NAME
+
+
+def _attach_codex_host(pinned: PinnedLauncher, host_binary: Path) -> None:
+    try:
+        pinned.companion = pin_launcher(host_binary)
+    except FileNotFoundError as exc:
+        raise CodexHostUnavailable("Codex code-mode host is unavailable") from exc
+    pinned.fingerprint = _codex_composite_fingerprint(
+        pinned.fingerprint, pinned.companion.fingerprint
+    )
+
+
+def _copy_sealed_fd(fd: int, dest: Path) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    dest_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o500)
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(dest_fd, view)
+                if written <= 0:
+                    raise OSError("could not materialize launcher artifact")
+                view = view[written:]
+        os.fchmod(dest_fd, 0o500)
+    finally:
+        os.close(dest_fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def materialize_codex_launch(pinned: PinnedLauncher, dest_dir: Path) -> Path:
+    if pinned.companion is None:
+        raise CodexHostUnavailable("Codex code-mode host is unavailable")
+    staging = dest_dir.with_name(dest_dir.name + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(mode=0o700)
+    try:
+        main = staging / "codex"
+        host = staging / CODEX_HOST_NAME
+        main_fp = _copy_sealed_fd(pinned.fd, main)
+        host_fp = _copy_sealed_fd(pinned.companion.fd, host)
+        if host_fp != pinned.companion.fingerprint:
+            raise OSError("Codex host drifted during materialize")
+        if _codex_composite_fingerprint(main_fp, host_fp) != pinned.fingerprint:
+            raise OSError("Codex launch set drifted during materialize")
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        os.replace(staging, dest_dir)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    os.chmod(dest_dir, 0o700)
+    return dest_dir / "codex"
+
+
 def pin_native_launcher(binary: Path, launcher: str) -> PinnedLauncher:
     """Pin every executable artifact consumed by one supported launcher."""
     pinned = pin_launcher(binary)
     try:
         if launcher == "grok":
             _attach_grok_node(pinned)
+        elif launcher == "codex":
+            _attach_codex_host(pinned, _codex_host_source(binary))
         return pinned
     except BaseException:
         pinned.close()
@@ -4204,6 +4289,10 @@ def repin_native_launcher(accepted: PinnedLauncher, launcher: str):
             if node_script:
                 assert accepted.companion is not None
                 _attach_grok_node(execution, accepted.companion.path)
+        elif launcher == "codex":
+            if accepted.companion is None:
+                raise OSError("accepted Codex launcher shape changed")
+            _attach_codex_host(execution, accepted.companion.path)
         yield execution
     finally:
         execution.close()
@@ -4214,7 +4303,7 @@ def launcher_version_fingerprint(binary: Path, launcher: str | None = None) -> s
     try:
         with pinned_native_launcher(binary, launcher or "") as pinned:
             return pinned.fingerprint
-    except GrokNodeUnavailable:
+    except (GrokNodeUnavailable, CodexHostUnavailable):
         return "missing_companion"
     except FileNotFoundError:
         return "missing"
@@ -4723,8 +4812,8 @@ def review_diff_rejection(code: str) -> dict[str, str]:
 
 
 def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any]:
-    """Re-pin accepted Grok artifacts into one execution authority."""
-    if context.launcher != "grok":
+    """Re-pin accepted companion launchers into one execution authority."""
+    if context.launcher not in ("grok", "codex"):
         return _native_review_result_pinned(context)
     mismatch = {
         "ok": False, "verdict": "NACK", "no_verdict": True,
@@ -4732,7 +4821,7 @@ def native_review_result(context: NativeReviewExecutionContext) -> dict[str, Any
         "code": "review_execution_identity_mismatch",
     }
     try:
-        with repin_native_launcher(context.pinned_launcher, "grok") as execution:
+        with repin_native_launcher(context.pinned_launcher, context.launcher) as execution:
             if execution.fingerprint != context.execution_identity.get("launcher_version"):
                 return mismatch
             return _native_review_result_pinned(replace(context, pinned_launcher=execution))
@@ -4824,6 +4913,16 @@ def _native_review_result_pinned(context: NativeReviewExecutionContext) -> dict[
         path = job_dir(run_id)
         path.mkdir(parents=True, exist_ok=True)
         if launcher == "codex":
+            try:
+                binary = materialize_codex_launch(
+                    context.pinned_launcher, path / "codex-launch"
+                )
+            except (CodexHostUnavailable, OSError):
+                return {
+                    "ok": False, "verdict": "NACK", "no_verdict": True,
+                    "error": "review execution identity changed before launch",
+                    "code": "review_execution_identity_mismatch",
+                }
             cmd = codex_command(
                 adapter_job, path / "prompt.txt", str(resolved), binary, sandbox="read-only"
             )
@@ -6596,7 +6695,7 @@ def review_runtime_matches_identity(context: NativeReviewExecutionContext) -> bo
         and identity.get("route_execution_profile") == context.route_execution_profile
         and identity.get("launcher_version") == context.pinned_launcher.fingerprint
         and (
-            context.launcher == "grok"
+            context.launcher in ("grok", "codex")
             or launcher_version_fingerprint(context.pinned_launcher.path)
                 == context.pinned_launcher.fingerprint
         )
@@ -8748,15 +8847,9 @@ def codex_command(
     valid, effort = native_effort_value(job)
     if not valid or effort is None:
         raise ValueError("unsupported effort profile")
-    # Codex 0.151.0 enables features.code_mode_host by default and resolves
-    # codex-code-mode-host as a sibling of its own executable. Graphwing execs
-    # the sealed memfd copy at /proc/self/fd/N, whose sibling is
-    # /codex-code-mode-host, so the host launch fails before any work starts.
-    # Pinning the launcher is the invariant, so the feature is turned off here.
     command = [
         str(binary), "exec", "--json", "--model", str(job["model"]),
         "-c", f"model_reasoning_effort={effort}",
-        "-c", "features.code_mode_host=false",
         "-C", cwd, "--sandbox", sandbox,
         "--output-last-message", str(prompt_path.parent / "last-message.txt"),
     ]
@@ -8768,9 +8861,22 @@ def codex_command(
 
 
 def spawn_codex(
-    job: dict[str, Any], binary: Path | None = None
+    job: dict[str, Any], binary: Path | None = None, *,
+    pinned_launcher: PinnedLauncher | None = None,
 ) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
     binary = binary or CODEX_BIN
+    if pinned_launcher is not None:
+        try:
+            binary = materialize_codex_launch(
+                pinned_launcher, job_dir(job["job_id"]) / "codex-launch"
+            )
+        except CodexHostUnavailable:
+            return None, {"error": "Codex code-mode host is unavailable", "code": "missing_binary"}
+        except OSError:
+            return None, {
+                "error": "launcher artifact could not be pinned",
+                "code": "launcher_version_mismatch",
+            }
     if not binary.is_file():
         return None, {"error": f"missing codex binary: {binary}", "code": "missing_binary"}
     prompt_path = job_dir(job["job_id"]) / "prompt.txt"
@@ -8798,6 +8904,11 @@ def spawn_codex(
         stdout_f.close()
         stderr_f.close()
         return None, {"error": f"spawn failed: {exc}", "code": "spawn_failed"}
+    except BaseException:
+        stdin_f.close()
+        stdout_f.close()
+        stderr_f.close()
+        raise
     stdin_f.close()
     stdout_f.close()
     stderr_f.close()
@@ -9174,10 +9285,11 @@ def run_grok_acp(
 
 
 def spawn_writer(
-    job: dict[str, Any], binary: Path | None = None
+    job: dict[str, Any], binary: Path | None = None, *,
+    pinned_launcher: PinnedLauncher | None = None,
 ) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any] | None]:
     if job.get("launcher") == "codex":
-        return spawn_codex(job, binary)
+        return spawn_codex(job, binary, pinned_launcher=pinned_launcher)
     if job.get("launcher") == "claude":
         return spawn_claude(job, binary)
     return None, {"error": "unknown native launcher", "code": "bad_launcher"}
@@ -9420,7 +9532,7 @@ def run_agent_job(job_id: str) -> None:
                 )
                 proc, err = None, None
             else:
-                proc, err = spawn_writer(job, pinned.path)
+                proc, err = spawn_writer(job, pinned.path, pinned_launcher=pinned)
     except FileNotFoundError:
         proc, err = None, {"error": "configured launcher is missing", "code": "missing_binary"}
     except OSError:
@@ -11694,7 +11806,7 @@ def agent_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
         classified = classify_agent_failure(failure_code)
         return 501, {
             "error": (
-                "Grok Node interpreter is unavailable"
+                "launcher companion is unavailable"
                 if launcher_version == "missing_companion"
                 else "launcher version is unavailable"
             ),
