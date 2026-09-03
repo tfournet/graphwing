@@ -27434,5 +27434,958 @@ class RunControlAttemptFactsTests(unittest.TestCase):
         self.assertEqual((status, payload["code"]), (400, "unexpected_fields"))
 
 
+class NativeGraphFenced(Exception):
+    """A transforms.regexReplace hard-failure node executed."""
+
+
+class RunControlDatastoreFixture:
+    """In-memory Rewst Data Object Storage on the reviewed v2 contract.
+
+    KV compare-and-swap succeeds only on an exact expected version,
+    records.upsert reports the new version, and records.get reports
+    found/recordKey/data/version. Nothing here invents a value a graph did
+    not write.
+    """
+
+    def __init__(self):
+        self.kv: dict[tuple[str, str], dict[str, Any]] = {}
+        self.records: dict[tuple[str, str], dict[str, Any]] = {}
+        self.writes: list[tuple] = []
+
+    def kv_get(self, namespace, key):
+        entry = self.kv.get((namespace, key))
+        if entry is None:
+            return {"ok": True, "found": False, "value": None, "version": 0}
+        return {"ok": True, "found": True, "value": deepcopy(entry["value"]),
+                "version": entry["version"]}
+
+    def kv_compare_and_swap(self, namespace, key, expected_version, value):
+        entry = self.kv.get((namespace, key))
+        current = entry["version"] if entry else 0
+        if current != expected_version:
+            return {"ok": True, "swapped": False,
+                    "value": deepcopy(entry["value"]) if entry else None, "version": current}
+        self.kv[(namespace, key)] = {"value": deepcopy(value), "version": current + 1}
+        self.writes.append(("kv", namespace, key, current + 1))
+        return {"ok": True, "swapped": True, "value": deepcopy(value), "version": current + 1}
+
+    def records_get(self, collection, record_key):
+        entry = self.records.get((collection, record_key))
+        if entry is None:
+            return {"ok": True, "found": False, "recordKey": record_key, "data": None, "version": 0}
+        return {"ok": True, "found": True, "recordKey": record_key,
+                "data": deepcopy(entry["data"]), "version": entry["version"]}
+
+    def records_upsert(self, collection, record_key, data):
+        entry = self.records.get((collection, record_key))
+        version = (entry["version"] if entry else 0) + 1
+        self.records[(collection, record_key)] = {"data": deepcopy(data), "version": version}
+        self.writes.append(("record", collection, record_key, version))
+        return {"ok": True, "created": entry is None, "version": version}
+
+
+def _native_json(value) -> str:
+    """Model Riftwing's json_stringify of a Go map: sorted keys, no spaces."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _native_sha256(value) -> str:
+    return hashlib.sha256(_native_json(value).encode()).hexdigest()
+
+
+def _native_text(value) -> str:
+    """asteval coercion.toString: an integral float prints without a decimal."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if value is None:
+        return ""
+    return str(value)
+
+
+class NativeGraphRunner:
+    """Walk a catalog graph the way the engine does, over fixture task results.
+
+    A JSON-shape assertion proves nothing about wiring, and the durable v2
+    lanes are pure native nodes, so these fixtures execute the real
+    node/edge graph: transforms publish to CTX.<alias>, actions to
+    TASKS.<alias>, datastore reads and writes hit one shared store, filters
+    route pass/fail, logic.switch routes case-N/default, and a
+    transforms.regexReplace fence raises instead of completing.
+    """
+
+    TEMPLATE = re.compile(r"\{\{(.*?)\}\}")
+    DEFAULT_FILTER = re.compile(
+        r"^(?P<path>[^|]+?)\s*\|\s*default\((?P<quote>['\"])(?P<value>.*?)(?P=quote)\)$"
+    )
+
+    def __init__(self, graph, store, actions=None):
+        self.spec = graph["spec"]
+        self.nodes = {node["id"]: node for node in self.spec["nodes"]}
+        self.store = store
+        self.actions = actions
+        self.adjacency: dict[tuple[str, str], list[str]] = {}
+        for edge in self.spec["edges"]:
+            self.adjacency.setdefault((edge["source"], edge.get("sourceHandle")), []).append(
+                edge["target"]
+            )
+        self.executed: list[str] = []
+        self.context: dict[str, Any] = {"CTX": {"INPUT": {}}, "TASKS": {}}
+
+    # -- expressions -------------------------------------------------------
+    @staticmethod
+    def path(context, dotted):
+        value = context
+        for part in dotted.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    @staticmethod
+    def numeric(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def evaluate(self, expression, context, item=None):
+        kind = expression["kind"]
+        if kind == "literal":
+            return deepcopy(expression.get("value"))
+        if kind == "getField":
+            if expression["path"] == "ITEM":
+                return item
+            if expression["path"].startswith("ITEM."):
+                return self.path({"ITEM": item}, expression["path"])
+            return self.path(context, expression["path"])
+        if kind == "object":
+            return {key: self.evaluate(value, context, item)
+                    for key, value in expression["properties"].items()}
+        if kind == "array":
+            return [self.evaluate(value, context, item) for value in expression["elements"]]
+        if kind == "conditional":
+            branch = "then" if self.evaluate(expression["condition"], context, item) else "else"
+            return self.evaluate(expression[branch], context, item)
+        if kind == "coalesce":
+            primary = self.evaluate(expression["primary"], context, item)
+            return primary if primary is not None else self.evaluate(
+                expression["fallback"], context, item)
+        if kind == "unary":
+            self.assertion(expression["operator"] == "not", expression)
+            return not self.evaluate(expression["operand"], context, item)
+        if kind == "function":
+            args = [self.evaluate(argument, context, item)
+                    for argument in expression.get("args", [])]
+            name = expression["name"]
+            if name == "count":
+                return len(args[0] or [])
+            if name == "length":
+                # asteval's length() is byte length of a coerced string and
+                # errors on arrays; count() is the array primitive.
+                return len(_native_text(args[0]))
+            raise AssertionError(name)
+        if kind == "filter":
+            value = self.evaluate(expression["input"], context, item)
+            if expression["filter"] == "tojson":
+                return _native_json(value)
+            raise AssertionError(expression["filter"])
+        if kind == "binary":
+            left = self.evaluate(expression["left"], context, item)
+            right = self.evaluate(expression["right"], context, item)
+            operator = expression["operator"]
+            if operator in ("==", "!="):
+                if self.numeric(left) and self.numeric(right):
+                    equal = float(left) == float(right)
+                else:
+                    equal = type(left) is type(right) and left == right
+                return equal if operator == "==" else not equal
+            if operator == "and":
+                return bool(left) and bool(right)
+            if operator == "or":
+                return bool(left) or bool(right)
+            if operator == "in":
+                return left in (right or [])
+            if operator == "+":
+                if isinstance(left, str) or isinstance(right, str):
+                    return _native_text(left) + _native_text(right)
+                return (left or 0) + (right or 0)
+            if operator in ("-", "*"):
+                left, right = left or 0, right or 0
+                return left - right if operator == "-" else left * right
+            left = left if self.numeric(left) else 0
+            right = right if self.numeric(right) else 0
+            return {">=": lambda: left >= right, ">": lambda: left > right,
+                    "<=": lambda: left <= right, "<": lambda: left < right}[operator]()
+        raise AssertionError(kind)
+
+    @staticmethod
+    def assertion(condition, detail):
+        if not condition:
+            raise AssertionError(detail)
+
+    def render(self, value):
+        if isinstance(value, dict):
+            return {key: self.render(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.render(item) for item in value]
+        if not isinstance(value, str):
+            return value
+        matches = list(self.TEMPLATE.finditer(value))
+        if not matches:
+            return value
+        if len(matches) == 1 and matches[0].group(0) == value:
+            return self.lookup(matches[0].group(1))
+        rendered, cursor = [], 0
+        for match in matches:
+            rendered.append(value[cursor:match.start()])
+            rendered.append(_native_text(self.lookup(match.group(1))))
+            cursor = match.end()
+        rendered.append(value[cursor:])
+        return "".join(rendered)
+
+    def lookup(self, expression):
+        text, fallback = expression.strip(), None
+        matched = self.DEFAULT_FILTER.match(text)
+        if matched:
+            text, fallback = matched.group("path").strip(), matched.group("value")
+        value = self.path(self.context, text)
+        return fallback if value is None and fallback is not None else value
+
+    # -- nodes -------------------------------------------------------------
+    def object_builder(self, node):
+        built = {mapping["output"]: self.evaluate(mapping["expression"], self.context)
+                 for mapping in node["config"]["mappings"]}
+        self.context["CTX"][node["config"]["alias"]] = built
+        return "out", built
+
+    def transform_array(self, node):
+        config = node["config"]
+        source = self.evaluate(config["array"]["ast"], self.context) or []
+        operation = config["operation"]
+        if operation == "filter":
+            condition = config["filterCondition"]["ast"]
+            built = [item for item in source if self.evaluate(condition, self.context, item)]
+        elif operation == "concat":
+            built = list(source) + list(
+                self.evaluate(config["concatValue"]["ast"], self.context) or [])
+        elif operation == "unique":
+            built = []
+            for item in source:
+                if item not in built:
+                    built.append(item)
+        else:
+            raise AssertionError(operation)
+        self.context["CTX"][config["alias"]] = built
+        return "out", built
+
+    def hash_node(self, node):
+        config = node["config"]
+        self.assertion(
+            (config["algorithm"], config["inputKind"], config["outputFormat"], config["mode"])
+            == ("sha256", "json_stringify", "hex", "hash"), node["id"])
+        digest = _native_sha256(self.render(config["input"]))
+        self.context["CTX"][config["alias"]] = {"value": digest}
+        return "out", {"value": digest}
+
+    @classmethod
+    def rules_pass(cls, config, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        for rule in config.get("rules", []):
+            cls.assertion(rule["op"] == "equals", rule)
+            if cls.path(payload, rule["path"]) != rule["value"]:
+                return False
+        return True
+
+    def datastore(self, node):
+        config, kind = node["config"], node["type"]
+        if kind == "action.datastore.kv.get":
+            result = self.store.kv_get(config["namespace"], self.render(config["key"]))
+        elif kind == "action.datastore.kv.compareAndSwap":
+            result = self.store.kv_compare_and_swap(
+                config["namespace"], self.render(config["key"]),
+                self.render(config["expectedVersion"]), self.render(config["value"]),
+            )
+        elif kind == "action.datastore.records.get":
+            result = self.store.records_get(config["collection"], self.render(config["recordKey"]))
+        else:
+            result = self.store.records_upsert(
+                config["collection"], self.render(config["recordKey"]), self.render(config["data"]),
+            )
+        self.context["TASKS"][config["alias"]] = result
+        return "success", result
+
+    def execute(self, node, payload):
+        kind = node["type"]
+        if kind.startswith("trigger."):
+            return "out", payload
+        if kind == "transforms.objectBuilder":
+            return self.object_builder(node)
+        if kind == "transforms.hash":
+            return self.hash_node(node)
+        if kind == "transforms.transformArray":
+            return self.transform_array(node)
+        if kind == "transforms.regexReplace":
+            raise NativeGraphFenced(node["config"]["input"])
+        if kind == "logic.filter":
+            return ("pass" if self.rules_pass(node["config"], payload) else "fail"), payload
+        if kind == "logic.switch":
+            for index, case in enumerate(node["config"]["cases"]):
+                if self.rules_pass(case, payload):
+                    return f"case-{index}", payload
+            return "default", payload
+        if kind == "logic.join.any":
+            return "out", payload
+        if kind.startswith("action.datastore."):
+            return self.datastore(node)
+        if kind == "action.noop":
+            return "success", payload
+        handle, result = self.actions(node, payload, self.context)
+        self.context["TASKS"][node["config"]["alias"]] = result
+        return handle, result
+
+    def run(self, inputs, start="trigger"):
+        self.context = {"CTX": {"INPUT": deepcopy(inputs)}, "TASKS": {}}
+        queue, joined, guard = [(start, deepcopy(inputs))], set(), 0
+        while queue:
+            node_id, payload = queue.pop(0)
+            node = self.nodes[node_id]
+            if node["type"] == "logic.join.any":
+                if node_id in joined:
+                    continue
+                joined.add(node_id)
+            guard += 1
+            if guard > 500:
+                raise AssertionError(f"runaway traversal at {node_id}")
+            handle, produced = self.execute(node, payload)
+            self.executed.append(node_id)
+            for target in self.adjacency.get((node_id, handle), []):
+                queue.append((target, produced))
+        return self.executed
+
+
+class RunControlDurableStateV2Tests(unittest.TestCase):
+    """Issue #187 PR4: workflow-owned immutable history, budgets, checkpoints.
+
+    Every semantic assertion drives the real graph JSON through
+    NativeGraphRunner, so a fixture cannot pass by describing a shape the
+    engine would never produce.
+    """
+
+    ROOT = Path(server.__file__).parent
+    POINTER_NAMESPACE = "graphwing_run_control_pointer_v2"
+    HISTORY_COLLECTION = "graphwing_run_control_history_v2"
+    V2 = "v2_"
+    ROOT_IDENTITY = {
+        "id_version": "graphwing-run-id-v1",
+        "root_workflow_id": "wf-187", "root_workflow_version_id": "wfv-187",
+        "root_workflow_run_id": "run-187-a", "purpose": "pr-drive",
+    }
+    ROUTE = {"route_version": "workflow-normal-v1", "launcher": "claude",
+             "provider": "anthropic", "model": "claude-opus-5"}
+    BUDGETS = {"attempts": 25, "turns": 1000, "wall_seconds": 36000,
+               "tokens": 100000000, "cost_microusd": 500000000}
+    ENVELOPE = {"turns": 50, "wall_seconds": 660, "tokens": 2000000, "cost_microusd": 25000000}
+
+    @classmethod
+    def graph(cls, stem):
+        return json.loads((cls.ROOT / "graphs" / f"{stem}.json").read_text())
+
+    @classmethod
+    def v2_nodes(cls, stem):
+        return [node for node in cls.graph(stem)["spec"]["nodes"] if node["id"].startswith(cls.V2)]
+
+    @staticmethod
+    def run_hash(root_identity=None):
+        return _native_sha256(root_identity or RunControlDurableStateV2Tests.ROOT_IDENTITY)
+
+    def run_control_id(self, root_identity=None):
+        return "rc1-" + self.run_hash(root_identity)
+
+    def record_key(self, ordinal, root_identity=None):
+        return f"rch2-{self.run_hash(root_identity)}-{ordinal}"
+
+    # -- drivers -----------------------------------------------------------
+    def child_transition(self, store, runner, node):
+        child = NativeGraphRunner(self.graph("run-control-transition"), store)
+        child.run(runner.render(node["config"]["inputMapping"]["values"]))
+        return "success", {"transition_result": child.context["CTX"].get("transition_result")}
+
+    def commit(self, store, inputs):
+        runner = NativeGraphRunner(self.graph("run-control-transition"), store)
+        runner.run(inputs)
+        return runner
+
+    def initialize(self, store, *, budgets=None, route=None):
+        budgets = self.BUDGETS if budgets is None else budgets
+        route = route or self.ROUTE
+
+        def actions(node, payload, context):
+            if node["type"].endswith("POST:/v1/run/control/validate-initialize"):
+                return "success", {"ok": True, "canonical": {"budgets": deepcopy(budgets),
+                                                             "initial_route": deepcopy(route)}}
+            if node["type"] == "action.subworkflow":
+                return self.child_transition(store, runner, node)
+            raise AssertionError(node["id"])
+
+        runner = NativeGraphRunner(self.graph("run-control-initialize"), store, actions)
+        runner.run({"root_identity": deepcopy(self.ROOT_IDENTITY), "budgets": deepcopy(budgets),
+                    "initial_route": deepcopy(route), "state_version": "v2",
+                    "evaluator_contract_sha256": None})
+        return runner
+
+    def reserve(self, store, *, envelope=None, route=None, owner_run_id="run-187-a"):
+        def actions(node, payload, context):
+            if node["type"].endswith("GET:/v1/rewst/server-challenge"):
+                return "success", {"server_instance_challenge": "c" * 64}
+            if node["type"] == "action.subworkflow":
+                return self.child_transition(store, runner, node)
+            raise AssertionError(node["id"])
+
+        runner = NativeGraphRunner(self.graph("run-control-state"), store, actions)
+        runner.run({
+            "run_control_id": self.run_control_id(), "state_version": "v2",
+            "candidate_route": deepcopy(route or self.ROUTE),
+            "next_envelope": deepcopy(envelope or self.ENVELOPE),
+            "launcher_fingerprint": "graphwing-loop-attempt-v1", "endpoint": "/v1/agent/run",
+            "exact_request_body_sha256": "b" * 64, "repository": "graphwing",
+            "branch": "feature/x", "head_sha": "e" * 40, "task_sha256": "b" * 64,
+            "permission_profile": "pr-drive-writer-v1", "callback_binding_sha256": "f" * 64,
+            "handoff": {"reason_code": "provider_switch"}, "owner_workflow_run_id": owner_run_id,
+        })
+        return runner
+
+    def reconcile(self, store, *, facts, progress, owner_run_id="run-187-a", envelope=None):
+        def actions(node, payload, context):
+            if node["type"].endswith("POST:/v1/run/control/attempt-facts"):
+                return "success", deepcopy(facts)
+            if node["type"] == "action.subworkflow":
+                return self.child_transition(store, runner, node)
+            raise AssertionError(node["id"])
+
+        runner = NativeGraphRunner(self.graph("run-control-reconcile"), store, actions)
+        runner.run({
+            "run_control_id": self.run_control_id(), "state_version": "v2",
+            "kind": "terminal_receipt", "receipt": None, "authority_loss_reason": None,
+            "attempt_job_id": facts.get("job_id"),
+            "authorization_identity": {"authorization_id": "rca2-fixture",
+                                       "launch_descriptor_sha256": "d" * 64},
+            "reserved_envelope": deepcopy(envelope or self.ENVELOPE),
+            "progress": deepcopy(progress), "owner_workflow_run_id": owner_run_id,
+        })
+        return runner
+
+    def pointer(self, store):
+        entry = store.kv.get((self.POINTER_NAMESPACE, self.run_control_id()))
+        return None if entry is None else entry["value"]
+
+    def history(self, store, ordinal):
+        entry = store.records.get((self.HISTORY_COLLECTION, self.record_key(ordinal)))
+        return None if entry is None else entry["data"]
+
+    def facts(self, *, turns=None, cost=None, wall=12, tokens=92137, job="j" * 32,
+              status="succeeded", available=True):
+        return {"version": "normalized-attempt-facts-v2", "job_id": job,
+                "authority_available": available, "terminal_status": status,
+                "failure_class": "none", "failure_code": "none", "failover_eligible": False,
+                "turns_observed": turns, "provider_cost_usd": None,
+                "provider_cost_microusd_ceiling": cost, "wall_seconds": wall,
+                "total_tokens": tokens, "receipt_sha256": "a" * 64,
+                "route_execution_profile": deepcopy(self.ROUTE)}
+
+    def progress(self, *, checkpoint=1, pre_red=True, green=True, diff_bytes=412,
+                 fingerprint="9" * 64, head="e" * 40):
+        return {"evidence_version": "run-control-progress-v2", "checkpoint": checkpoint,
+                "pre_attempt_red": pre_red, "focused_tests_green": green,
+                "production_diff_bytes": diff_bytes, "diff_fingerprint": fingerprint,
+                "head_sha": head, "constraint_signals": []}
+
+    def append_attempt(self, store, *, facts=None, progress=None, owner_run_id="run-187-a"):
+        self.reserve(store, owner_run_id=owner_run_id)
+        return self.reconcile(store, facts=facts or self.facts(),
+                              progress=progress or self.progress(), owner_run_id=owner_run_id)
+
+    def append_inputs(self, store, *, ordinal, record=None, previous=None, expected_version=None,
+                      record_key=None):
+        """Build a raw transition v2 append a test can deliberately corrupt."""
+        run_control_id = self.run_control_id()
+        current = self.pointer(store) or {}
+        chain = current.get("record_sha256") if previous is None else previous
+        record = record if record is not None else {
+            "schema": "graphwing-run-control-history-v2", "kind": "attempt",
+            "run_control_id": run_control_id, "run_hash": self.run_hash(), "ordinal": ordinal,
+        }
+        record = {**record, "previous_record_sha256": chain}
+        key = record_key or self.record_key(ordinal)
+        pointer = {**current, "ordinal": ordinal, "record_key": key,
+                   "record_sha256": _native_sha256(record)}
+        version = store.kv[(self.POINTER_NAMESPACE, run_control_id)]["version"]
+        return {
+            "run_control_id": run_control_id, "state_version": "v2", "commit_kind": "append",
+            "operation_id": f"op2-{ordinal}", "owner_workflow_run_id": "run-187-a",
+            "target_ordinal": ordinal, "target_record_key": key, "target_record": record,
+            "target_record_sha256": _native_sha256(record), "previous_record_sha256": chain,
+            "expected_pointer_version": version if expected_version is None else expected_version,
+            "target_pointer": pointer, "target_pointer_sha256": _native_sha256(pointer),
+        }
+
+    # -- 1 -----------------------------------------------------------------
+    def test_run_control_v2_initialization_persists_workflow_owned_immutable_budgets(self):
+        store = RunControlDatastoreFixture()
+        self.initialize(store)
+        anchor, pointer = self.history(store, 0), self.pointer(store)
+        self.assertEqual(anchor["kind"], "initialize")
+        self.assertEqual(anchor["ordinal"], 0)
+        self.assertIsNone(anchor["previous_record_sha256"])
+        self.assertEqual(anchor["immutable"]["budgets"], self.BUDGETS)
+        self.assertEqual(anchor["immutable"]["policy_version"], "run-control-v2")
+        self.assertEqual(anchor["immutable"]["initial_route"], self.ROUTE)
+        self.assertEqual(anchor["origin"], self.ROOT_IDENTITY)
+        self.assertEqual(anchor["run_hash"], self.run_hash())
+        self.assertEqual(pointer["ordinal"], 0)
+        self.assertEqual(pointer["record_key"], self.record_key(0))
+        self.assertEqual(pointer["anchor_record_key"], self.record_key(0))
+        self.assertEqual(pointer["record_sha256"], _native_sha256(anchor))
+        self.assertEqual(pointer["anchor_record_sha256"], _native_sha256(anchor))
+        self.assertEqual(pointer["charges"],
+                         {"turns": 0, "wall_seconds": 0, "tokens": 0, "cost_microusd": 0})
+        self.assertEqual(pointer["attempts_completed"], 0)
+        self.assertEqual(pointer["progress"], {"last": None, "previous": None})
+        self.assertEqual(pointer["checkpoint"], {"value": 0, "no_progress_streak": 0})
+        self.assertIsNone(pointer["terminal"])
+        self.assertIsNone(pointer["outstanding_authorization"])
+        self.assertEqual(pointer["current_route"], self.ROUTE)
+
+        # The budgets are the caller's, never a daemon or graph default.
+        configs = json.dumps([node["config"] for node in self.v2_nodes("run-control-initialize")])
+        for value in (server.RUN_CONTROL_MAX_ATTEMPTS, self.BUDGETS["turns"], self.BUDGETS["tokens"]):
+            self.assertNotIn(str(value), configs)
+
+        # An identical re-initialization is an exact replay: no second write.
+        before = deepcopy(store.records[(self.HISTORY_COLLECTION, self.record_key(0))])
+        writes = len(store.writes)
+        self.initialize(store)
+        self.assertEqual(store.records[(self.HISTORY_COLLECTION, self.record_key(0))], before)
+        self.assertEqual(len(store.writes), writes)
+
+        # Different budgets under the same root identity cannot rewrite it.
+        with self.assertRaises(NativeGraphFenced):
+            self.initialize(store, budgets={**self.BUDGETS, "turns": 999999})
+        self.assertEqual(self.history(store, 0)["immutable"]["budgets"], self.BUDGETS)
+
+    # -- 2 -----------------------------------------------------------------
+    def test_run_control_v2_attempt_records_are_contiguous_hash_chained_and_append_only(self):
+        store = RunControlDatastoreFixture()
+        self.initialize(store)
+        for ordinal in (1, 2, 3):
+            self.append_attempt(store)
+            record = self.history(store, ordinal)
+            self.assertEqual(record["ordinal"], ordinal)
+            self.assertEqual(record["kind"], "attempt")
+            self.assertEqual(record["previous_record_sha256"],
+                             _native_sha256(self.history(store, ordinal - 1)))
+            self.assertEqual(self.pointer(store)["ordinal"], ordinal)
+            self.assertEqual(self.pointer(store)["record_key"], self.record_key(ordinal))
+            self.assertEqual(self.pointer(store)["record_sha256"], _native_sha256(record))
+            self.assertEqual(self.pointer(store)["attempts_completed"], ordinal)
+
+        pointer = deepcopy(self.pointer(store))
+        with self.subTest("gap"):
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=5))
+        with self.subTest("rewrite a committed ordinal"):
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=3))
+        self.assertEqual(self.pointer(store), pointer)
+        self.assertEqual(
+            len([key for key in store.records if key[0] == self.HISTORY_COLLECTION]), 4)
+
+    # -- 3 -----------------------------------------------------------------
+    def test_run_control_v2_rejects_reordered_truncated_replaced_or_reanchored_history(self):
+        store = RunControlDatastoreFixture()
+        self.initialize(store)
+        self.append_attempt(store)
+        self.append_attempt(store)
+        pointer = deepcopy(self.pointer(store))
+        pointer_key = (self.POINTER_NAMESPACE, self.run_control_id())
+        record_key = (self.HISTORY_COLLECTION, self.record_key(2))
+
+        with self.subTest("reordered"):
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=2))
+        with self.subTest("re-anchored"):
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=3, previous="0" * 64))
+        with self.subTest("truncated"):
+            store.kv[pointer_key]["value"] = {
+                **pointer, "ordinal": 1, "record_key": self.record_key(1),
+                "record_sha256": _native_sha256(self.history(store, 1)),
+            }
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=2))
+            store.kv[pointer_key]["value"] = deepcopy(pointer)
+        with self.subTest("replaced"):
+            store.records[record_key]["data"] = {**store.records[record_key]["data"], "ordinal": 99}
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=3))
+            store.records[record_key]["data"] = {**store.records[record_key]["data"], "ordinal": 2}
+        with self.subTest("stale pointer version"):
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=3, expected_version=0))
+        self.assertEqual(self.pointer(store)["ordinal"], 2)
+        self.assertIsNone(self.history(store, 3))
+
+    # -- 4 -----------------------------------------------------------------
+    def test_run_control_v2_keeps_observed_unknown_usage_null_and_tracks_reserved_upper_bound_separately(self):
+        store = RunControlDatastoreFixture()
+        self.initialize(store)
+        self.append_attempt(store, facts=self.facts(turns=None, cost=None, wall=12, tokens=92137))
+        record = self.history(store, 1)
+        self.assertIsNone(record["observed"]["turns"])
+        self.assertIsNone(record["observed"]["cost_microusd"])
+        self.assertEqual(record["observed"]["wall_seconds"], 12)
+        self.assertEqual(record["observed"]["tokens"], 92137)
+        self.assertEqual(record["reserved_charge"], {
+            "turns": self.ENVELOPE["turns"], "wall_seconds": 0, "tokens": 0,
+            "cost_microusd": self.ENVELOPE["cost_microusd"]})
+        self.assertEqual(record["charged"], {
+            "turns": self.ENVELOPE["turns"], "wall_seconds": 12, "tokens": 92137,
+            "cost_microusd": self.ENVELOPE["cost_microusd"]})
+        self.assertEqual(record["reserved_dimensions"], ["cost_microusd", "turns"])
+        self.assertEqual(record["reserved_envelope"], self.ENVELOPE)
+        self.assertEqual(self.pointer(store)["charges"], record["charged"])
+
+        self.append_attempt(store, facts=self.facts(turns=7, cost=248882, wall=30, tokens=1000))
+        known = self.history(store, 2)
+        self.assertEqual(known["observed"], {"turns": 7, "wall_seconds": 30, "tokens": 1000,
+                                             "cost_microusd": 248882})
+        self.assertEqual(known["reserved_charge"],
+                         {"turns": 0, "wall_seconds": 0, "tokens": 0, "cost_microusd": 0})
+        self.assertEqual(known["reserved_dimensions"], [])
+        self.assertEqual(known["charged"], known["observed"])
+        self.assertEqual(self.pointer(store)["charges"], {
+            "turns": self.ENVELOPE["turns"] + 7, "wall_seconds": 42, "tokens": 93137,
+            "cost_microusd": self.ENVELOPE["cost_microusd"] + 248882})
+        for value in self.pointer(store)["charges"].values():
+            self.assertIsInstance(value, int)
+
+        # Authority loss keeps every observed value null and charges the envelope.
+        self.append_attempt(store, facts=self.facts(turns=None, cost=None, wall=None, tokens=None,
+                                                    available=False))
+        lost = self.history(store, 3)
+        self.assertFalse(lost["authority_available"])
+        self.assertEqual(set(lost["observed"].values()), {None})
+        self.assertEqual(lost["charged"], self.ENVELOPE)
+        self.assertEqual(sorted(lost["reserved_dimensions"]),
+                         ["cost_microusd", "tokens", "turns", "wall_seconds"])
+
+    # -- 5 -----------------------------------------------------------------
+    def test_run_control_v2_near_limit_projection_includes_the_next_jobs_maximum_envelope(self):
+        budgets = {"attempts": 25, "turns": 120, "wall_seconds": 36000,
+                   "tokens": 100000000, "cost_microusd": 500000000}
+        store = RunControlDatastoreFixture()
+        self.initialize(store, budgets=budgets)
+        self.append_attempt(store, facts=self.facts(turns=None, cost=1))
+        self.append_attempt(store, facts=self.facts(turns=None, cost=1))
+        self.assertEqual(self.pointer(store)["charges"]["turns"], 100)
+
+        runner = self.reserve(store)
+        projection = runner.context["CTX"]["v2_projection"]
+        self.assertEqual(projection["completed"]["turns"], 100)
+        self.assertEqual(projection["next_envelope"], self.ENVELOPE)
+        self.assertEqual(projection["projected"]["turns"], 150)
+        self.assertEqual(projection["budgets"], budgets)
+        self.assertTrue(projection["completed_within"]["turns"])
+        self.assertFalse(projection["projected_within"]["turns"])
+        self.assertFalse(projection["fits"])
+        self.assertNotIn("v2_reserve_commit", runner.executed)
+        self.assertIsNone(self.pointer(store)["outstanding_authorization"])
+
+        headroom = RunControlDatastoreFixture()
+        self.initialize(headroom, budgets=budgets)
+        allowed = self.reserve(headroom)
+        projection = allowed.context["CTX"]["v2_projection"]
+        self.assertTrue(projection["fits"])
+        self.assertEqual(projection["projected"]["turns"], 50)
+        self.assertEqual(projection["projected_attempts"], 1)
+        self.assertIn("v2_reserve_commit", allowed.executed)
+        outstanding = headroom.kv[(self.POINTER_NAMESPACE, self.run_control_id())]["value"][
+            "outstanding_authorization"]
+        self.assertEqual(outstanding["envelope"], self.ENVELOPE)
+        self.assertEqual(outstanding["route"], self.ROUTE)
+        self.assertEqual(outstanding["ordinal"], 1)
+        self.assertTrue(outstanding["attempt_id"].startswith("att2-"))
+        self.assertTrue(outstanding["authorization_id"].startswith("rca2-"))
+
+    # -- 6 -----------------------------------------------------------------
+    def test_pr_drive_checkpoint_uses_real_red_diff_and_focused_test_evidence_not_daemon_defaults(self):
+        graph = self.graph("pr-drive")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                 for edge in graph["spec"]["edges"]}
+        self.assertEqual(nodes["rc_diff"]["type"], "action.graphwing.GET:/v1/git/diff")
+        self.assertEqual(nodes["rc_diff_hash"]["config"]["input"], "{{ TASKS.rc_diff.data.diff }}")
+        self.assertEqual(nodes["rc_evidence_join"]["type"], "logic.join.any")
+        self.assertIn(("iter_checkout", "success", "rc_pre_evidence"), edges)
+        self.assertIn(("rc_evidence_join", "out", "rc_diff"), edges)
+        self.assertIn(("rc_diff", "success", "rc_diff_hash"), edges)
+        self.assertIn(("rc_progress", "out", "rc_reconcile"), edges)
+        self.assertNotIn(("rc_settle", "success", "rc_reconcile"), edges)
+        for terminal in ("correction_push_receipt", "herdr_receipt", "herdr_test_fail",
+                         "herdr_test_http", "herdr_commit", "herdr_push",
+                         "herdr_correction_head", "herdr_correction_view"):
+            handle = "success" if nodes[terminal]["type"] == "action.noop" else "out"
+            self.assertIn((terminal, handle, "rc_evidence_join"), edges, terminal)
+        # The evidence never comes from the daemon's fabricated settled receipt.
+        progress_config = json.dumps(nodes["rc_progress"]["config"])
+        self.assertNotIn("rc_settle", progress_config)
+        self.assertNotIn("failing_regression_present", progress_config)
+        reconcile_v2 = json.dumps([node["config"] for node in self.v2_nodes("run-control-reconcile")])
+        self.assertIn("CTX.INPUT.progress", reconcile_v2)
+        self.assertNotIn("receipt.progress", reconcile_v2)
+
+        diff = "diff --git a/x b/x\n+fixed\n"
+
+        def evidence(pre_red, test_status, diff_text, pushed=True):
+            runner = NativeGraphRunner(graph, RunControlDatastoreFixture())
+            runner.context = {
+                "CTX": {"INPUT": {}, "rc_pre_evidence": {"pre_attempt_red": pre_red,
+                                                         "head_sha": "0" * 40}},
+                "TASKS": {
+                    "rc_diff": {"data": {"ok": True, "diff": diff_text, "truncated": False}},
+                    "wait_fix_test": {"request": {"body": {"status": test_status}}},
+                    "correction_head": {"data": {"ok": True, "sha": "e" * 40}},
+                    "fix_push": {"data": {"ok": pushed}},
+                }}
+            for node_id in ("rc_diff_hash", "rc_constraint_candidates", "rc_constraint_signals",
+                            "rc_progress"):
+                runner.execute(nodes[node_id], None)
+            return runner.context["CTX"]["rc_progress"]
+
+        green = evidence(True, "ok", diff)
+        self.assertEqual(green["production_diff_bytes"], len(diff))
+        self.assertEqual(green["diff_fingerprint"], _native_sha256(diff))
+        self.assertTrue(green["focused_tests_green"])
+        self.assertTrue(green["pre_attempt_red"])
+        self.assertEqual(green["head_sha"], "e" * 40)
+        self.assertEqual(green["checkpoint"], 1)
+        self.assertEqual(green["evidence_version"], "run-control-progress-v2")
+        self.assertEqual(green["constraint_signals"], [])
+
+        red = evidence(True, "failed", diff)
+        self.assertFalse(red["focused_tests_green"])
+        self.assertEqual(red["checkpoint"], 0)
+        self.assertIn("focused_tests_red", red["constraint_signals"])
+
+        empty = evidence(True, "ok", "", pushed=False)
+        self.assertEqual(empty["production_diff_bytes"], 0)
+        self.assertEqual(empty["checkpoint"], 0)
+        self.assertIn("no_production_diff", empty["constraint_signals"])
+        self.assertIn("unpushed_correction", empty["constraint_signals"])
+
+    # -- 7 -----------------------------------------------------------------
+    def test_run_control_v2_history_rolls_across_workflow_executions_without_a_ten_attempt_product_cap(self):
+        store = RunControlDatastoreFixture()
+        self.initialize(store)
+        for ordinal in range(1, 13):
+            self.append_attempt(store, owner_run_id=f"run-187-{ordinal % 3}")
+        self.assertEqual(self.pointer(store)["ordinal"], 12)
+        self.assertEqual(self.pointer(store)["attempts_completed"], 12)
+        self.assertGreater(12, server.RUN_CONTROL_MAX_ATTEMPTS)
+        for ordinal in range(1, 13):
+            record = self.history(store, ordinal)
+            self.assertEqual(record["ordinal"], ordinal)
+            self.assertEqual(record["previous_record_sha256"],
+                             _native_sha256(self.history(store, ordinal - 1)))
+        self.assertTrue(self.reserve(store).context["CTX"]["v2_projection"]["fits"])
+
+        # Nothing in the v2 path keeps a growing list or a daemon attempt cap.
+        for stem in ("run-control-initialize", "run-control-state", "run-control-reconcile",
+                     "run-control-transition"):
+            configs = json.dumps([node["config"] for node in self.v2_nodes(stem)])
+            self.assertNotIn("attempts_appended", configs, stem)
+            self.assertNotIn("evaluator_history", configs, stem)
+            self.assertNotIn(str(server.RUN_CONTROL_MAX_ATTEMPTS), configs, stem)
+        self.assertNotIn("attempts", self.pointer(store))
+        self.assertNotIn("evaluator_history", self.history(store, 12))
+        # The pointer stays compact however long the run gets.
+        self.assertLess(len(_native_json(self.pointer(store))), 4096)
+
+    # -- 8 -----------------------------------------------------------------
+    def test_run_control_v2_datastore_mutations_are_read_back_by_key_version_and_canonical_hash(self):
+        spec = self.graph("run-control-transition")["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"]) for edge in spec["edges"]}
+        mutations = {node["id"] for node in spec["nodes"]
+                     if node["id"].startswith(self.V2) and node["type"] in (
+                         "action.datastore.records.upsert", "action.datastore.kv.compareAndSwap")}
+        self.assertEqual(mutations, {"v2_record_upsert", "v2_pointer_cas"})
+        self.assertEqual(nodes["v2_record_upsert"]["config"]["collection"], self.HISTORY_COLLECTION)
+        self.assertEqual(nodes["v2_pointer_cas"]["config"]["namespace"], self.POINTER_NAMESPACE)
+        self.assertEqual(nodes["v2_pointer_cas"]["config"]["expectedVersion"],
+                         "{{ CTX.INPUT.expected_pointer_version }}")
+        for readback, check, gate in (("v2_readback", "v2_readback_check", "v2_readback_gate"),
+                                      ("v2_pointer_readback", "v2_pointer_readback_check",
+                                       "v2_pointer_readback_gate")):
+            rules = {rule["path"] for rule in nodes[gate]["config"]["rules"]}
+            emitted = {mapping["output"] for mapping in nodes[check]["config"]["mappings"]}
+            self.assertTrue({"key_matches", "version_matches", "hash_matches"} <= rules, gate)
+            self.assertTrue(rules <= emitted, gate)
+            self.assertIn((check, "out", gate), edges)
+            self.assertIn((readback, "success", f"{readback}_hash"), edges)
+
+        base = RunControlDatastoreFixture()
+        self.initialize(base)
+        self.append_attempt(base)
+
+        def clone():
+            store = RunControlDatastoreFixture()
+            store.kv, store.records = deepcopy(base.kv), deepcopy(base.records)
+            return store
+
+        with self.subTest("record readback hash drift"):
+            store = clone()
+            original = store.records_upsert
+
+            def tamper(collection, record_key, data):
+                result = original(collection, record_key, data)
+                store.records[(collection, record_key)]["data"] = {**data, "tampered": True}
+                return result
+
+            store.records_upsert = tamper
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=2))
+
+        with self.subTest("record readback key drift"):
+            store = clone()
+            original_get = store.records_get
+
+            def wrong_key(collection, record_key):
+                result = original_get(collection, record_key)
+                return {**result, "recordKey": record_key + "-other"} if result["found"] else result
+
+            store.records_get = wrong_key
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=2))
+
+        with self.subTest("pointer readback version drift"):
+            store = clone()
+            original_cas = store.kv_compare_and_swap
+
+            def rewind(namespace, key, expected_version, value):
+                result = original_cas(namespace, key, expected_version, value)
+                if result["swapped"]:
+                    store.kv[(namespace, key)]["version"] = expected_version + 5
+                return result
+
+            store.kv_compare_and_swap = rewind
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, self.append_inputs(store, ordinal=2))
+
+        with self.subTest("pointer readback hash drift"):
+            store = clone()
+            inputs = self.append_inputs(store, ordinal=2)
+            inputs["target_pointer_sha256"] = "1" * 64
+            with self.assertRaises(NativeGraphFenced):
+                self.commit(store, inputs)
+        self.assertEqual(self.pointer(base)["ordinal"], 1)
+
+    # -- 9 -----------------------------------------------------------------
+    STEMS = ("run-control-initialize", "run-control-state", "run-control-reconcile",
+             "run-control-transition", "run-control-authorize", "run-control-consume", "pr-drive")
+
+    def test_run_control_v2_graphs_use_only_native_nodes_and_lint_with_zero_riftwing_diagnostics(self):
+        native = {
+            "trigger.manual", "trigger.form", "trigger.webhook", "transforms.objectBuilder",
+            "transforms.hash", "transforms.transformArray", "transforms.aggregate",
+            "transforms.regexReplace", "logic.filter", "logic.switch", "logic.join.any",
+            "logic.loop", "action.noop", "action.wait.webhook", "action.datastore.kv.get",
+            "action.datastore.kv.compareAndSwap", "action.datastore.records.get",
+            "action.datastore.records.upsert", "action.subworkflow",
+        }
+        procedural = r"\{%-?\s*(?:set|for|if|macro|include|import|raw|filter)\b"
+        for stem in self.STEMS:
+            graph = self.graph(stem)
+            with self.subTest(graph=stem):
+                self.assertNotRegex(json.dumps(graph), procedural)
+                for node in graph["spec"]["nodes"]:
+                    self.assertTrue(node["type"] in native
+                                    or node["type"].startswith("action.graphwing."),
+                                    (stem, node["id"], node["type"]))
+        self.assertTrue(self.v2_nodes("run-control-transition"))
+
+        riftwing = os.environ.get("RIFTWING_CHECKOUT")
+        if not riftwing:
+            self.skipTest("RIFTWING_CHECKOUT unset; authoritative Riftwing lint unavailable")
+        go_source = r'''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/rewstapp/riftwing/rewst-go/services/api/domain/workflows/linter"
+)
+func main() {
+    total := 0
+    for _, path := range os.Args[1:] {
+        raw, err := os.ReadFile(path); if err != nil { panic(err) }
+        var envelope map[string]any
+        if err := json.Unmarshal(raw, &envelope); err != nil { panic(err) }
+        result := linter.Lint(envelope["spec"].(map[string]any))
+        for _, issue := range result.Issues {
+            encoded, _ := json.Marshal(issue)
+            fmt.Printf("%s %s\n", path, string(encoded))
+        }
+        total += len(result.Issues)
+    }
+    fmt.Printf("issues=%d\n", total)
+    if total != 0 { os.Exit(1) }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp) / "graphwing_run_control_v2_lint.go"
+            checker.write_text(go_source)
+            result = subprocess.run(
+                ["go", "run", str(checker),
+                 *[str(self.ROOT / "graphs" / f"{stem}.json") for stem in self.STEMS]],
+                cwd=Path(riftwing) / "rewst-go", text=True, capture_output=True,
+                timeout=600, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "issues=0")
+
+    # -- migration barrier -------------------------------------------------
+    def test_run_control_v2_activation_is_blocked_by_an_unresolved_v1_reservation(self):
+        store = RunControlDatastoreFixture()
+        run_control_id = self.run_control_id()
+        store.kv[("graphwing_run_control_pointer_v1", run_control_id)] = {
+            "value": {"schema": "graphwing-run-control-pointer-v1", "phase": "stable",
+                      "run_control_id": run_control_id, "state_record_key": "rcs1-old"},
+            "version": 4}
+        store.records[("graphwing_run_control_states_v1", "rcs1-old")] = {
+            "data": {"run_control_id": run_control_id, "logical_revision": 3,
+                     "outstanding_reservation": {"attempt_id": "att1-" + "b" * 64}},
+            "version": 3}
+        with self.assertRaises(NativeGraphFenced):
+            self.initialize(store)
+        self.assertIsNone(self.pointer(store))
+        self.assertEqual(len([key for key in store.records if key[0] == self.HISTORY_COLLECTION]), 0)
+
+        store.records[("graphwing_run_control_states_v1", "rcs1-old")]["data"][
+            "outstanding_reservation"] = None
+        self.initialize(store)
+        self.assertEqual(self.pointer(store)["ordinal"], 0)
+        # v1 rows are read for the barrier only: never inferred, copied, or deleted.
+        anchor = _native_json(self.history(store, 0))
+        self.assertNotIn("rcs1-old", anchor)
+        self.assertNotIn("logical_revision", anchor)
+        self.assertIn(("graphwing_run_control_states_v1", "rcs1-old"), store.records)
+        self.assertEqual(store.records[("graphwing_run_control_states_v1", "rcs1-old")]["version"], 3)
+        for stem in ("run-control-initialize", "run-control-state", "run-control-reconcile",
+                     "run-control-transition"):
+            for node in self.v2_nodes(stem):
+                self.assertNotIn("delete", node["type"], (stem, node["id"]))
+                if node["type"] in ("action.datastore.records.upsert",
+                                    "action.datastore.kv.compareAndSwap"):
+                    target = node["config"].get("collection") or node["config"]["namespace"]
+                    self.assertTrue(target.endswith("_v2"), (stem, node["id"], target))
+
 if __name__ == "__main__":
     unittest.main()
