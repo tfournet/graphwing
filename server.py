@@ -11096,6 +11096,59 @@ def _codeoff_events(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
         raise RuntimeError("event chain genesis is invalid")
     return list(reversed(events))
 
+
+def _codeoff_v2_safety_seal_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+        return None
+    candidates = state.get("candidates")
+    if not isinstance(candidates, dict):
+        return {"error": "candidate safety seal evidence differs", "code": "candidate_safety_seal_tampered"}
+    seal_events = [event for event in events if event.get("kind") == "v2_candidate_safety_sealed"]
+    by_slot: dict[str, list[dict[str, Any]]] = {}
+    for event in seal_events:
+        data = event.get("data")
+        slot = data.get("slot") if isinstance(data, dict) else None
+        if slot not in ("author-1", "author-2"):
+            return {"error": "candidate safety seal evidence differs", "code": "candidate_safety_seal_tampered"}
+        by_slot.setdefault(slot, []).append(data)
+    for slot in ("author-1", "author-2"):
+        candidate = candidates.get(slot)
+        seal = candidate.get("safety_seal") if isinstance(candidate, dict) else None
+        anchored = by_slot.get(slot, [])
+        if seal is None and not anchored:
+            continue
+        if not isinstance(seal, dict) or len(anchored) != 1:
+            return {"error": "candidate safety seal evidence differs", "code": "candidate_safety_seal_tampered"}
+        body = {key: value for key, value in seal.items() if key != "seal_hash"}
+        seal_hash = seal.get("seal_hash")
+        expected_event = {
+            "experiment_id": root.name, "slot": slot,
+            "code": seal.get("code"), "seal_hash": seal_hash,
+        }
+        try:
+            exact = (
+                set(seal) == {"version", "experiment_id", "slot", "code", "seal_hash"}
+                and body.get("version") == "code-off-v2-candidate-safety-seal-v1"
+                and body.get("experiment_id") == root.name
+                and body.get("slot") == slot
+                and isinstance(body.get("code"), str)
+                and bool(body["code"])
+                and isinstance(seal_hash, str)
+                and hmac.compare_digest(
+                    seal_hash, hashlib.sha256(codeoff_canonical_json(body)).hexdigest()
+                )
+                and _codeoff_read_artifact(root, seal_hash) == codeoff_canonical_json(body)
+                and anchored[0] == expected_event
+            )
+        except (CodeOffArtifactError, OSError, TypeError):
+            exact = False
+        if not exact:
+            return {"error": "candidate safety seal evidence differs", "code": "candidate_safety_seal_tampered"}
+    return None
+
 def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     exp, err = _codeoff_id(experiment_id)
     if err:
@@ -11113,9 +11166,12 @@ def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | N
     if hashlib.sha256(manifest_bytes).hexdigest() != state.get("manifest_file_hash"):
         return None, None, None, {"error": "immutable manifest hash mismatch", "code": "manifest_tampered"}
     try:
-        _codeoff_events(root, state)
+        events = _codeoff_events(root, state)
     except (OSError, RuntimeError, json.JSONDecodeError):
         return None, None, None, {"error": "event hash chain is invalid", "code": "event_chain_tampered"}
+    seal_err = _codeoff_v2_safety_seal_error(root, manifest, state, events)
+    if seal_err:
+        return None, None, None, seal_err
     final_path = root / "final.json"
     if state.get("finalized"):
         final_bytes = codeoff_canonical_json(_codeoff_final_value(manifest, state)) + b"\n"
@@ -12122,6 +12178,502 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
     return 200, _codeoff_v2_result(manifest, state)
 
 
+def _codeoff_v2_candidate_transition(
+    data: dict[str, Any], experiment_id: str, slot: str, action: str,
+) -> dict[str, Any] | None:
+    ordinal = {("freeze", "author-1"): 10, ("test", "author-1"): 11,
+               ("freeze", "author-2"): 20, ("test", "author-2"): 21}[(action, slot)]
+    expected = (
+        f"graphwing-codeoff-v2:{experiment_id}:transition:{action}-{slot}:{ordinal}"
+    )
+    transition_id = data.get("transition_id")
+    payload_hash = data.get("transition_payload_hash")
+    if transition_id != expected:
+        return {
+            "error": "transition_id does not bind the exact candidate effect",
+            "code": "bad_transition_id",
+        }
+    payload = {
+        "schema_version": "code-off-transition-payload-v2",
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "routing_version": "code-off-candidate-routing-v2",
+        "experiment_id": experiment_id, "stage": f"{action}-{slot}",
+        "ordinal": ordinal,
+        "reason": "freeze_requested" if action == "freeze" else "candidate_test_requested",
+        "attempt_ids": [slot], "terminal": False, "slot": slot,
+    }
+    if action == "freeze":
+        payload["author_job_id"] = data.get("job_id")
+    else:
+        payload.update({
+            key: data.get(key)
+            for key in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash")
+        })
+    expected_payload_hash = hashlib.sha256(_codeoff_v2_policy_json(payload)).hexdigest()
+    if (
+        not isinstance(payload_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None
+        or not hmac.compare_digest(payload_hash, expected_payload_hash)
+    ):
+        return {
+            "error": "transition_payload_hash must bind the exact candidate effect payload",
+            "code": "bad_transition_payload_hash",
+        }
+    return None
+
+
+def _codeoff_v2_candidate_safety_locked(
+    root: Path, state: dict[str, Any], slot: str, code: str,
+) -> tuple[int, dict[str, Any]]:
+    candidate = state.get("candidates", {}).get(slot)
+    if not isinstance(candidate, dict):
+        return 409, {
+            "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+            "policy_version": CODEOFF_V2_POLICY_VERSION,
+            "experiment_id": root.name, "slot": slot,
+            "code": "codeoff_v2_authority_unavailable",
+            "error": "candidate safety authority is unavailable",
+        }
+    seal = candidate.get("safety_seal")
+    if seal is None:
+        seal_body = {
+            "version": "code-off-v2-candidate-safety-seal-v1",
+            "experiment_id": root.name, "slot": slot, "code": code,
+        }
+        seal_hash = _codeoff_artifact(root, codeoff_canonical_json(seal_body))
+        seal = {**seal_body, "seal_hash": seal_hash}
+        candidate["safety_seal"] = seal
+        _codeoff_commit_event(root, state, "v2_candidate_safety_sealed", {
+            "experiment_id": root.name, "slot": slot, "code": code,
+            "seal_hash": seal_hash,
+        })
+    return 422, {
+        "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": root.name, "slot": slot,
+        "safety_rejected": True, "code": seal["code"],
+        "safety_seal_hash": seal["seal_hash"],
+        "error": "candidate failed a non-bypassable safety check",
+    }
+
+
+def _codeoff_v2_candidate_safety(
+    experiment_id: Any, slot: str, code: str,
+) -> tuple[int, dict[str, Any]]:
+    with CODEOFF_LOCK:
+        root, manifest, state, err = _codeoff_load(experiment_id, active=True)
+        if err:
+            return 409, err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "candidate belongs to another protocol", "code": "protocol_mismatch"}
+        return _codeoff_v2_candidate_safety_locked(root, state, slot, code)
+
+
+def _codeoff_v2_freeze_result(
+    manifest: dict[str, Any], candidate: dict[str, Any], transition_id: str,
+    transition_payload_hash: str,
+) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "slot": candidate["slot"],
+        "transition_id": transition_id,
+        "transition_payload_hash": transition_payload_hash,
+        "status": "frozen", "author_job_id": candidate["job_id"],
+        "tree_manifest_hash": candidate["tree_manifest_hash"],
+        "artifact_hash": candidate["artifact_hash"],
+        "freeze_receipt_hash": candidate["freeze_receipt_hash"],
+        "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"],
+        "bytes": candidate["bytes"], "entry_count": candidate["entry_count"],
+        "change_count": candidate["change_count"],
+    }
+
+
+def _codeoff_v2_frozen_integrity_error(
+    root: Path, manifest: dict[str, Any], candidate: dict[str, Any], workspace: Path,
+) -> str | None:
+    try:
+        if _codeoff_ignored(workspace):
+            return "candidate_ignored_paths"
+        _branch, head, git_err = current_branch_head(workspace)
+        if git_err or head != manifest["base_sha"]:
+            return "candidate_mutated"
+        current = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+        frozen_manifest = _codeoff_read_artifact(root, candidate.get("tree_manifest_hash"))
+        if (
+            current["manifest_hash"] != candidate.get("tree_manifest_hash")
+            or current["manifest_bytes"] != frozen_manifest
+        ):
+            return "candidate_mutated"
+        tar_bytes = _codeoff_read_artifact(root, candidate.get("artifact_hash"))
+        receipt = json.loads(_codeoff_read_artifact(root, candidate.get("freeze_receipt_hash")))
+        freeze = candidate.get("freeze")
+        if any(
+            receipt.get(key) != candidate.get(key)
+            for key in ("slot", "job_id", "tree_manifest_hash", "artifact_hash", "bytes")
+        ) or not isinstance(freeze, dict) or any(
+            receipt.get(key) != freeze.get(key)
+            for key in ("transition_id", "transition_payload_hash")
+        ):
+            return "candidate_receipt_mismatch"
+        extracted = Path(tempfile.mkdtemp(prefix=".replay-v2-", dir=root.parent))
+        try:
+            extracted.rmdir()
+            _codeoff_extract(tar_bytes, extracted)
+            entries, total = _codeoff_fs_entries(extracted)
+            if entries != current["manifest"]["entries"] or total != current["bytes"]:
+                return "candidate_artifact_invalid"
+        finally:
+            shutil.rmtree(extracted, ignore_errors=True)
+    # A missing, malformed, or unsafe frozen artifact is permanent local
+    # evidence.  Infrastructure failures are deliberately not folded into
+    # that evidence: the boundary turns them into a sanitized retryable 500.
+    except (CodeOffArtifactError, FileNotFoundError, tarfile.TarError,
+            json.JSONDecodeError, TypeError):
+        return "candidate_artifact_invalid"
+    return None
+
+
+def codeoff_v2_freeze_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
+    fields = {
+        "experiment_id", "slot", "job_id", "transition_id", "transition_payload_hash",
+    }
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, (
+            {"error": "request must contain the exact freeze fields", "code": "unexpected_fields"}
+            if err.get("code") == "unexpected_fields" else err
+        )
+    assert data is not None
+    slot = data.get("slot")
+    if slot not in ("author-1", "author-2"):
+        return 400, {"error": "slot must be author-1 or author-2", "code": "bad_slot"}
+    if not isinstance(data.get("job_id"), str) or JOB_ID_RE.fullmatch(data["job_id"]) is None:
+        return 400, {"error": "job_id must be one exact server job identifier", "code": "bad_job_id"}
+    experiment_id, eid_err = _codeoff_id(data.get("experiment_id"))
+    if eid_err:
+        return 400, eid_err
+    assert experiment_id is not None
+    transition_err = _codeoff_v2_candidate_transition(data, experiment_id, slot, "freeze")
+    if transition_err:
+        return 400, transition_err
+    transition_id = data["transition_id"]
+    payload_hash = data["transition_payload_hash"]
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(experiment_id, active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "candidate belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("status") != "prepared":
+            return 409, {
+                "error": "candidate effects require prepared v2 local authority",
+                "code": "codeoff_v2_not_prepared",
+            }
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, "codeoff_identity_unpinned"
+            )
+        candidate = state.get("candidates", {}).get(slot)
+        if not isinstance(candidate, dict):
+            return 409, {"error": "candidate authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        if candidate.get("safety_seal"):
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, candidate["safety_seal"].get("code", "candidate_safety_sealed")
+            )
+        if candidate.get("freeze"):
+            request_hash = hashlib.sha256(codeoff_canonical_json(data)).hexdigest()
+            binding = candidate["freeze"]
+            exact = (
+                isinstance(binding, dict)
+                and binding.get("transition_id") == transition_id
+                and binding.get("transition_payload_hash") == payload_hash
+                and binding.get("request_hash") == request_hash
+                and candidate.get("job_id") == data.get("job_id")
+            )
+            if not exact:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, "codeoff_v2_transition_conflict"
+                )
+            integrity_error = _codeoff_v2_frozen_integrity_error(
+                root, manifest, candidate, codeoff_workspace_path(experiment_id, slot)
+            )
+            if integrity_error:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, integrity_error
+                )
+            return 200, _codeoff_v2_freeze_result(
+                manifest, candidate, transition_id, payload_hash
+            )
+        job, job_err = _codeoff_validate_job(data.get("job_id"), state, manifest, slot)
+        if job_err:
+            if job_err.get("code") == "agent_receipt_mismatch":
+                return _codeoff_v2_candidate_safety_locked(root, state, slot, "agent_receipt_mismatch")
+            return 409, job_err
+        assert job is not None
+        workspace = codeoff_workspace_path(experiment_id, slot)
+        try:
+            if _codeoff_ignored(workspace):
+                return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_ignored_paths")
+            _branch, head, git_err = current_branch_head(workspace)
+            if git_err or head != manifest["base_sha"]:
+                return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_mutated")
+            snapshot = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+            tar_bytes = _codeoff_tar(workspace, snapshot["manifest"]["entries"])
+            after = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+            if after["manifest_hash"] != snapshot["manifest_hash"]:
+                return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_mutated")
+            tree_manifest_hash = _codeoff_artifact(root, snapshot["manifest_bytes"])
+            artifact_hash = _codeoff_artifact(root, tar_bytes)
+        except CodeOffArtifactError as exc:
+            code = str(exc) if str(exc).startswith("candidate_") else "candidate_freeze_failed"
+            return _codeoff_v2_candidate_safety_locked(root, state, slot, code)
+        except RuntimeError:
+            return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_freeze_failed")
+        receipt = {
+            "version": "code-off-v2-freeze-receipt-v1", "slot": slot,
+            "job_id": job["job_id"], "transition_id": transition_id,
+            "transition_payload_hash": payload_hash,
+            "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
+            "execution_identity": job["execution_identity"],
+            "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
+            "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")),
+            "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash,
+            "base_sha": manifest["base_sha"], "base_tree": manifest["base_tree"],
+            "bytes": snapshot["bytes"],
+        }
+        receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
+        candidate.update({
+            "slot": slot, "job_id": job["job_id"],
+            "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash,
+            "freeze_receipt_hash": receipt_hash, "bytes": snapshot["bytes"],
+            "entry_count": len(snapshot["manifest"]["entries"]),
+            "change_count": len(snapshot["manifest"]["changes"]),
+            "freeze": {
+                "transition_id": transition_id, "transition_payload_hash": payload_hash,
+                "request_hash": hashlib.sha256(codeoff_canonical_json(data)).hexdigest(),
+            },
+            "test": None,
+        })
+        _codeoff_commit_event(root, state, "v2_candidate_frozen", {
+            "slot": slot, "transition_id": transition_id,
+            "transition_payload_hash": payload_hash,
+            "tree_manifest_hash": tree_manifest_hash, "artifact_hash": artifact_hash,
+            "receipt_hash": receipt_hash,
+        })
+        return 200, _codeoff_v2_freeze_result(manifest, candidate, transition_id, payload_hash)
+
+
+def _codeoff_v2_test_result(
+    manifest: dict[str, Any], candidate: dict[str, Any], tests: dict[str, Any],
+    transition_id: str, transition_payload_hash: str,
+) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "slot": candidate["slot"],
+        "transition_id": transition_id,
+        "transition_payload_hash": transition_payload_hash,
+        "status": "tested", "tests_pass": tests["pass"],
+        "tree_manifest_hash": candidate["tree_manifest_hash"],
+        "artifact_hash": candidate["artifact_hash"],
+        "freeze_receipt_hash": candidate["freeze_receipt_hash"],
+        "test_receipt_hash": tests["receipt_hash"],
+        "elapsed_seconds": tests["elapsed_seconds"], "no_mutation": True,
+        "tests": [{
+            "name": item["name"], "status": "passed" if item["pass"] else "failed",
+            "returncode": item["returncode"], "elapsed_seconds": item["elapsed_seconds"],
+            "log_hash": item["log_hash"],
+        } for item in tests["tests"]],
+    }
+
+
+def codeoff_v2_test_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
+    fields = {
+        "experiment_id", "slot", "tree_manifest_hash", "artifact_hash",
+        "freeze_receipt_hash", "transition_id", "transition_payload_hash",
+    }
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, (
+            {"error": "request must contain the exact candidate-test fields", "code": "unexpected_fields"}
+            if err.get("code") == "unexpected_fields" else err
+        )
+    assert data is not None
+    slot = data.get("slot")
+    if slot not in ("author-1", "author-2"):
+        return 400, {"error": "slot must be author-1 or author-2", "code": "bad_slot"}
+    if any(
+        not isinstance(data.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None
+        for key in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash")
+    ):
+        return 400, {"error": "candidate hashes must be lowercase SHA-256 digests", "code": "bad_candidate_hash"}
+    experiment_id, eid_err = _codeoff_id(data.get("experiment_id"))
+    if eid_err:
+        return 400, eid_err
+    assert experiment_id is not None
+    transition_err = _codeoff_v2_candidate_transition(data, experiment_id, slot, "test")
+    if transition_err:
+        return 400, transition_err
+    transition_id = data["transition_id"]
+    payload_hash = data["transition_payload_hash"]
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(experiment_id, active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "candidate belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("status") != "prepared":
+            return 409, {
+                "error": "candidate effects require prepared v2 local authority",
+                "code": "codeoff_v2_not_prepared",
+            }
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, "codeoff_identity_unpinned"
+            )
+        candidate = state.get("candidates", {}).get(slot)
+        if not isinstance(candidate, dict) or not candidate.get("freeze"):
+            return 409, {"error": "candidate must be frozen first", "code": "codeoff_v2_candidate_not_frozen"}
+        if candidate.get("safety_seal"):
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, candidate["safety_seal"].get("code", "candidate_safety_sealed")
+            )
+        locked = {
+            key: candidate.get(key)
+            for key in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash")
+        }
+        if any(data.get(key) != value for key, value in locked.items()):
+            return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_receipt_mismatch")
+        if candidate.get("test"):
+            request_hash = hashlib.sha256(codeoff_canonical_json(data)).hexdigest()
+            binding = candidate["test"]
+            exact = (
+                isinstance(binding, dict)
+                and binding.get("transition_id") == transition_id
+                and binding.get("transition_payload_hash") == payload_hash
+                and binding.get("request_hash") == request_hash
+            )
+            if not exact:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, "codeoff_v2_transition_conflict"
+                )
+            if binding.get("state") != "completed":
+                return 409, {
+                    "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+                    "policy_version": CODEOFF_V2_POLICY_VERSION,
+                    "experiment_id": experiment_id, "slot": slot,
+                    "code": "codeoff_v2_effect_in_progress", "retryable": False,
+                    "error": "candidate test effect has no completed local authority",
+                }
+            integrity_error = _codeoff_v2_frozen_integrity_error(
+                root, manifest, candidate, codeoff_workspace_path(experiment_id, slot)
+            )
+            tests = candidate.get("tests")
+            if integrity_error:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, integrity_error
+                )
+            try:
+                if not isinstance(tests, dict) or _codeoff_read_artifact(
+                    root, tests.get("receipt_hash")
+                ) != codeoff_canonical_json({
+                    key: value for key, value in tests.items() if key != "receipt_hash"
+                }):
+                    raise CodeOffArtifactError("test receipt mismatch")
+            except (CodeOffArtifactError, FileNotFoundError, OSError, TypeError):
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, "candidate_receipt_mismatch"
+                )
+            return 200, _codeoff_v2_test_result(
+                manifest, candidate, tests, transition_id, payload_hash
+            )
+        integrity_error = _codeoff_v2_frozen_integrity_error(
+            root, manifest, candidate, codeoff_workspace_path(experiment_id, slot)
+        )
+        if integrity_error:
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, integrity_error
+            )
+        request_hash = hashlib.sha256(codeoff_canonical_json(data)).hexdigest()
+        candidate["test"] = {
+            "transition_id": transition_id, "transition_payload_hash": payload_hash,
+            "request_hash": request_hash, "state": "running", "receipt_hash": None,
+        }
+        _codeoff_commit_event(root, state, "v2_candidate_test_started", {
+            "slot": slot, "transition_id": transition_id,
+            "transition_payload_hash": payload_hash,
+        })
+        frozen = dict(candidate)
+        workspace = codeoff_workspace_path(experiment_id, slot)
+    try:
+        current = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+    except (CodeOffArtifactError, RuntimeError):
+        return _codeoff_v2_candidate_safety(experiment_id, slot, "candidate_mutated")
+    if current["manifest_hash"] != frozen["tree_manifest_hash"]:
+        return _codeoff_v2_candidate_safety(experiment_id, slot, "candidate_mutated")
+    try:
+        verified = _codeoff_verify_artifact(root, manifest, workspace, frozen, "candidate-v2")
+    except (CodeOffArtifactError, FileNotFoundError, tarfile.TarError):
+        return _codeoff_v2_candidate_safety(experiment_id, slot, "candidate_artifact_invalid")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return _codeoff_v2_candidate_safety(
+            experiment_id, slot, "codeoff_v2_candidate_test_interrupted"
+        )
+    if not verified["no_mutation"]:
+        return _codeoff_v2_candidate_safety(experiment_id, slot, "candidate_test_mutated")
+    try:
+        current = codeoff_tree_snapshot(workspace, manifest["base_sha"])
+    except (CodeOffArtifactError, RuntimeError):
+        return _codeoff_v2_candidate_safety(experiment_id, slot, "candidate_mutated")
+    except OSError:
+        return _codeoff_v2_candidate_safety(
+            experiment_id, slot, "codeoff_v2_candidate_test_interrupted"
+        )
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(experiment_id, active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        candidate = state.get("candidates", {}).get(slot)
+        if not isinstance(candidate, dict):
+            return 409, {"error": "candidate authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        if candidate.get("safety_seal"):
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, candidate["safety_seal"].get("code", "candidate_safety_sealed")
+            )
+        if any(candidate.get(key) != value for key, value in locked.items()) or current["manifest_hash"] != locked["tree_manifest_hash"]:
+            return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_mutated")
+        binding = candidate.get("test")
+        if not (
+            isinstance(binding, dict)
+            and binding.get("transition_id") == transition_id
+            and binding.get("transition_payload_hash") == payload_hash
+            and binding.get("request_hash") == request_hash
+            and binding.get("state") == "running"
+            and binding.get("receipt_hash") is None
+        ):
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, "codeoff_v2_transition_conflict"
+            )
+        tests = verified["tests"]
+        binding.update({"state": "completed", "receipt_hash": tests["receipt_hash"]})
+        candidate["tests"] = tests
+        _codeoff_commit_event(root, state, "v2_candidate_tested", {
+            "slot": slot, "transition_id": transition_id,
+            "transition_payload_hash": payload_hash, "pass": tests["pass"],
+            "receipt_hash": tests["receipt_hash"], "no_mutation": True,
+        })
+        return 200, _codeoff_v2_test_result(
+            manifest, candidate, tests, transition_id, payload_hash,
+        )
+
+
 def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id", "repo", "base_sha", "seed", "category", "tags", "category_source", "prompt", "tests", "toolchain", "budgets", "commit_message"})
     if err:
@@ -12426,6 +12978,13 @@ def _codeoff_park_candidate(experiment_id: Any, slot: str, code: str) -> tuple[i
         _codeoff_finalize_record(root, manifest, state, "parked", f"{code}:{slot}")
     return 422, {"ok": False, "error": "candidate failed an immutable terminal gate", "code": code, "experiment_id": manifest["experiment_id"], "slot": slot, "status": "parked"}
 
+
+def _codeoff_require_v1_protocol(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Close legacy writers before they interpret a v2 record's state shape."""
+    if manifest.get("protocol_version") != CODEOFF_PROTOCOL_VERSION:
+        return {"error": "experiment belongs to another protocol", "code": "protocol_mismatch"}
+    return None
+
 def codeoff_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id", "slot", "action", "job_id"})
     if err:
@@ -12441,6 +13000,9 @@ def codeoff_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         identity_err = codeoff_manifest_identity_error(manifest)
         if identity_err:
             return 409, identity_err
@@ -12551,6 +13113,9 @@ def codeoff_blind(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         identity_err = codeoff_manifest_identity_error(manifest)
         if identity_err:
             return 409, identity_err
@@ -12664,6 +13229,9 @@ def codeoff_judge(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         identity_err = codeoff_manifest_identity_error(manifest)
         if identity_err:
             return 409, identity_err
@@ -12733,6 +13301,9 @@ def codeoff_aggregate(body: bytes) -> tuple[int, dict[str, Any]]:
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         identity_err = codeoff_manifest_identity_error(manifest)
         if identity_err:
             return 409, identity_err
@@ -12801,6 +13372,9 @@ def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str,
         if load_err:
             return 409 if load_err["code"] == "experiment_finalized" else 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         identity_err = codeoff_manifest_identity_error(manifest)
         if identity_err:
             return 409, identity_err
@@ -12978,6 +13552,9 @@ def codeoff_terminal(body: bytes) -> tuple[int, dict[str, Any]]:
                 return 200, {"ok": True, "experiment_id": data["experiment_id"], "status": "absent", "reason": None, "finalized": False, "economics": None, "economics_hash": None}
             return 400, load_err
         assert root and manifest and state
+        protocol_err = _codeoff_require_v1_protocol(manifest)
+        if protocol_err:
+            return 409, protocol_err
         if state.get("finalized"):
             return 200, _codeoff_terminal_result(manifest, state)
         if outcome == "succeeded":
@@ -13563,6 +14140,12 @@ def dispatch_inner(
 
     if method == "POST" and path == "/v1/code-off/v2/initialize":
         status, payload = _codeoff_boundary(codeoff_v2_initialize, body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/freeze-candidate":
+        status, payload = _codeoff_boundary(codeoff_v2_freeze_candidate, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/test-candidate":
+        status, payload = _codeoff_boundary(codeoff_v2_test_candidate, body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/prepare":
         status, payload = _codeoff_boundary(codeoff_prepare, body, repos)

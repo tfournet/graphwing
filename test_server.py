@@ -21807,12 +21807,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "f0e72fb9c1e1bc91eec1225e9ee304fdb7108842b8cd90180742d104b3053b23",
+            "814ee48002a1433f9339f2024b5fd3b5e668ff5e794632f9cce03a4181b56392",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 123)
-        self.assertEqual(len(graph["spec"]["edges"]), 168)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 123)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 168)
+        self.assertEqual(len(graph["spec"]["nodes"]), 348)
+        self.assertEqual(len(graph["spec"]["edges"]), 411)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 348)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 411)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21834,6 +21834,7 @@ class CodeOffTests(unittest.TestCase):
             "action.datastore.records.get": {"success", "failure"},
             "action.time.now": {"out"},
             "action.time.compare": {"before", "after", "equal"},
+            "action.noop": {"success", "failure"},
         }
         for edge in edges:
             self.assertEqual(edge.get("targetHandle"), "in", edge)
@@ -21921,9 +21922,24 @@ class CodeOffTests(unittest.TestCase):
         self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
         self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
-        expected_v2_leaves = {"v2_continuation_disabled", "policy_v2_parked"} | {
+        expected_v2_leaves = {"policy_v2_parked"} | {
             f"{prefix}_{suffix}"
             for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch")
+        }
+        pr3_transition_prefixes = (
+            "v2_author_1_launch", "v2_author_1_callback", "v2_freeze_1",
+            "v2_frozen_1", "v2_test_1", "v2_test_1_result",
+            "v2_author_2_launch", "v2_author_2_callback", "v2_freeze_2",
+            "v2_frozen_2", "v2_test_2", "v2_test_2_result",
+            "v2_candidates_ready", "v2_candidate_parked",
+        )
+        expected_v2_leaves |= {
+            "v2_candidate_contract_disabled", "v2_blind_ready",
+            "v2_candidate_parked",
+        } | {
+            f"{prefix}_{suffix}"
+            for prefix in pr3_transition_prefixes
             for suffix in ("write_failed", "readback_failed", "readback_mismatch")
         }
         self.assertEqual(leaves, {
@@ -22061,6 +22077,12 @@ class CodeOffTests(unittest.TestCase):
                 "terminalize_failed": "terminal_error",
                 "terminalize_success": "success_confirmation_error",
                 "initialize_v2": "policy_v2_park_join",
+                "v2_author_1": "v2_candidate_park_join",
+                "v2_author_2": "v2_candidate_park_join",
+                "v2_freeze_1": "v2_candidate_park_join",
+                "v2_freeze_2": "v2_candidate_park_join",
+                "v2_test_1": "v2_candidate_park_join",
+                "v2_test_2": "v2_candidate_park_join",
             }.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
@@ -22083,7 +22105,14 @@ class CodeOffTests(unittest.TestCase):
             color[node] = 2
         for node in nodes:
             if color[node] == 0: visit(node)
-        self.assertNotIn("retry", json.dumps(graph).lower())
+        self.assertFalse(any("retry" in node["type"].lower() for node in nodes.values()))
+        self.assertEqual(
+            {mapping["output"]: mapping["expression"]
+             for mapping in nodes["v2_candidate_stage_contract"]["config"]["mappings"]}[
+                "retry_policy"
+            ],
+            {"kind": "literal", "value": "prohibited"},
+        )
 
     def test_codeoff_economics_persistence_failures_hard_fail_with_proven_rewst_regex_contract(self):
         graph = json.loads(
@@ -22111,7 +22140,15 @@ class CodeOffTests(unittest.TestCase):
             [node["id"] for node in graph["nodes"]
              if node["type"] == "action.datastore.records.upsert"],
             ["economics_upsert", "v2_experiment_upsert", "v2_initialization_upsert",
-             "v2_initialized_upsert", "v2_parked_upsert"],
+             "v2_initialized_upsert", "v2_parked_upsert"] + [
+                f"{prefix}_upsert" for prefix in (
+                    "v2_author_1_launch", "v2_author_1_callback", "v2_freeze_1",
+                    "v2_frozen_1", "v2_test_1", "v2_test_1_result",
+                    "v2_author_2_launch", "v2_author_2_callback", "v2_freeze_2",
+                    "v2_frozen_2", "v2_test_2", "v2_test_2_result",
+                    "v2_candidates_ready", "v2_candidate_parked",
+                )
+             ],
         )
         key_expression = json.dumps(
             nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
@@ -22157,7 +22194,9 @@ class CodeOffTests(unittest.TestCase):
         self._prepare("graph-effort-01")
         manifest = json.loads((self.records / "graph-effort-01" / "manifest.json").read_text())
         launches = server._codeoff_launch_plan(manifest)
-        runs = [node for node in graph["nodes"] if node["type"] == "action.graphwing.POST:/v1/agent/run"]
+        runs = [node for node in graph["nodes"]
+                if node["type"] == "action.graphwing.POST:/v1/agent/run"
+                and not node["id"].startswith("v2_")]
         self.assertEqual(len(runs), 5)
         for node in runs:
             with self.subTest(node=node["id"]):
@@ -22172,6 +22211,37 @@ class CodeOffTests(unittest.TestCase):
                         server.codeoff_slot_work_role(node["config"]["codeoff_workspace"]["slot"])
                     ],
                 )
+        v2_runs = [node for node in graph["nodes"]
+                   if node["type"] == "action.graphwing.POST:/v1/agent/run"
+                   and node["id"].startswith("v2_")]
+        self.assertEqual([node["id"] for node in v2_runs], ["v2_author_1", "v2_author_2"])
+        for node in v2_runs:
+            index = node["id"].rsplit("_", 1)[1]
+            slot = node["config"]["codeoff_workspace"]["slot"]
+            projection = next(candidate for candidate in graph["nodes"]
+                              if candidate["id"] == f"v2_author_{index}_slot")
+            self.assertEqual(projection["type"], "transforms.objectBuilder")
+            self.assertEqual(projection["config"]["alias"], f"v2_author_{index}_slot")
+            fields = {mapping["output"]: mapping["expression"]
+                      for mapping in projection["config"]["mappings"]}
+            self.assertEqual(fields, {
+                "launcher": {"kind": "getField",
+                             "path": f"TASKS.initialize_v2.data.slots.{slot}.launcher"},
+                "provider": {"kind": "getField",
+                             "path": f"TASKS.initialize_v2.data.slots.{slot}.provider"},
+                "exact_model": {"kind": "getField",
+                                "path": f"TASKS.initialize_v2.data.slots.{slot}.exact_model"},
+                "requested_effort": {"kind": "getField",
+                                     "path": f"TASKS.initialize_v2.data.slots.{slot}.requested_effort"},
+            })
+            self.assertEqual(node["config"]["launcher"],
+                             f"{{{{ CTX.v2_author_{index}_slot.launcher }}}}")
+            self.assertEqual(node["config"]["provider"],
+                             f"{{{{ CTX.v2_author_{index}_slot.provider }}}}")
+            self.assertEqual(node["config"]["model"],
+                             f"{{{{ CTX.v2_author_{index}_slot.exact_model }}}}")
+            self.assertEqual(node["config"]["effort"],
+                             f"{{{{ CTX.v2_author_{index}_slot.requested_effort }}}}")
 
     def test_codeoff_graph_converges_every_terminal_into_the_durable_record(self):
         graph = json.loads(
@@ -22179,17 +22249,28 @@ class CodeOffTests(unittest.TestCase):
         )["spec"]
         sources = {edge["source"] for edge in graph["edges"]}
         terminals = {node["id"] for node in graph["nodes"] if node["id"] not in sources}
-        # V1 retains its economics terminals. PR2 adds immutable v2 record
-        # readback terminals and deliberately stops continuation after init.
-        self.assertEqual(terminals, {
+        expected = {
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
-            "v2_continuation_disabled", "policy_v2_parked",
+            "policy_v2_parked", "v2_candidate_contract_disabled",
+            "v2_blind_ready", "v2_candidate_parked",
         } | {
             f"{prefix}_{suffix}"
             for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
             for suffix in ("write_failed", "readback_failed", "readback_mismatch")
-        })
+        }
+        expected |= {
+            f"{prefix}_{suffix}"
+            for prefix in (
+                "v2_author_1_launch", "v2_author_1_callback", "v2_freeze_1",
+                "v2_frozen_1", "v2_test_1", "v2_test_1_result",
+                "v2_author_2_launch", "v2_author_2_callback", "v2_freeze_2",
+                "v2_frozen_2", "v2_test_2", "v2_test_2_result",
+                "v2_candidates_ready", "v2_candidate_parked",
+            )
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch")
+        }
+        self.assertEqual(terminals, expected)
         joined = {
             edge["source"] for edge in graph["edges"] if edge["target"] == "join_economics"
         }
@@ -22288,15 +22369,29 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         ).stdout.strip()
         self.records = root / "codeoffs"
         self.workspaces = root / "codeoff-workspaces"
+        self.jobs = root / "jobs"
         self.launcher_bin = _write_fake_codex(root / "launcher", Path(__file__).read_bytes())
         self.tests_path = root / "tests.json"
-        self.tests_path.write_text(json.dumps({"tests": [{
-            "name": "fixture-pass", "argv": [sys.executable, "-c", "pass"],
-            "cwd": "scratch", "timeout_seconds": 10, "async": False,
-        }]}) + "\n")
+        self.tests_path.write_text(json.dumps({"tests": [
+            {
+                "name": "fixture-pass", "argv": [sys.executable, "-c", "pass"],
+                "cwd": "scratch", "timeout_seconds": 10, "async": False,
+            },
+            {
+                "name": "fixture-fail",
+                "argv": [sys.executable, "-c", "raise SystemExit(7)"],
+                "cwd": "scratch", "timeout_seconds": 10, "async": False,
+            },
+            {
+                "name": "fixture-mutates",
+                "argv": [sys.executable, "-c", "from pathlib import Path; Path('test-output').write_text('changed')"],
+                "cwd": "scratch", "timeout_seconds": 10, "async": False,
+            },
+        ]}) + "\n")
         for patcher in (
             mock.patch.object(server, "CODEOFFS_DIR", self.records),
             mock.patch.object(server, "CODEOFF_WORKSPACES_DIR", self.workspaces),
+            mock.patch.object(server, "JOBS_DIR", self.jobs),
             mock.patch.object(server, "TESTS_PATH", self.tests_path),
             mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
             mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin),
@@ -22363,6 +22458,919 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         return server.dispatch(
             "POST", "/v1/code-off/v2/initialize", {}, True, json.dumps(body).encode(),
         )[:2]
+
+    def _post_v2(self, operation, body):
+        return server.dispatch(
+            "POST", f"/v1/code-off/v2/{operation}", {}, True, json.dumps(body).encode(),
+        )[:2]
+
+    def _initialize(self, experiment_id="policy-v2-experiment", *, tests=None):
+        body = self._body(experiment_id)
+        if tests is not None:
+            body["tests"] = tests
+        status, payload = self._post(body)
+        self.assertEqual(status, 200, payload)
+        return payload
+
+    @staticmethod
+    def _v2_job(job_id="a" * 32):
+        return {
+            "job_id": job_id,
+            "execution_identity": {
+                "version": "code-off-execution-identity-v1",
+                "source": "codex-rollout-v1",
+                "launcher": "codex", "provider": "openai",
+                "model": "gpt-5.6-sol", "native_session_id": "fixture-author",
+            },
+            "started_at": "2026-09-03T12:00:00Z",
+            "finished_at": "2026-09-03T12:00:01Z",
+        }
+
+    @staticmethod
+    def _v2_transition(experiment_id, stage, ordinal, payload):
+        return {
+            "transition_id": (
+                f"graphwing-codeoff-v2:{experiment_id}:transition:{stage}:{ordinal}"
+            ),
+            "transition_payload_hash": hashlib.sha256(
+                server._codeoff_v2_policy_json(payload)
+            ).hexdigest(),
+        }
+
+    def _v2_freeze_body(self, experiment_id, slot="author-1", job_id="a" * 32):
+        ordinal = 10 if slot == "author-1" else 20
+        stage = f"freeze-{slot}"
+        payload = {
+            "schema_version": "code-off-transition-payload-v2",
+            "policy_version": "code-off-policy-v2",
+            "routing_version": "code-off-candidate-routing-v2",
+            "experiment_id": experiment_id, "stage": stage, "ordinal": ordinal,
+            "reason": "freeze_requested", "attempt_ids": [slot],
+            "terminal": False, "slot": slot, "author_job_id": job_id,
+        }
+        return {
+            "experiment_id": experiment_id, "slot": slot, "job_id": job_id,
+            **self._v2_transition(experiment_id, stage, ordinal, payload),
+        }
+
+    def _v2_test_body(self, experiment_id, frozen, slot="author-1"):
+        ordinal = 11 if slot == "author-1" else 21
+        stage = f"test-{slot}"
+        payload = {
+            "schema_version": "code-off-transition-payload-v2",
+            "policy_version": "code-off-policy-v2",
+            "routing_version": "code-off-candidate-routing-v2",
+            "experiment_id": experiment_id, "stage": stage, "ordinal": ordinal,
+            "reason": "candidate_test_requested", "attempt_ids": [slot],
+            "terminal": False, "slot": slot,
+            "tree_manifest_hash": frozen["tree_manifest_hash"],
+            "artifact_hash": frozen["artifact_hash"],
+            "freeze_receipt_hash": frozen["freeze_receipt_hash"],
+        }
+        return {
+            "experiment_id": experiment_id, "slot": slot,
+            "tree_manifest_hash": frozen["tree_manifest_hash"],
+            "artifact_hash": frozen["artifact_hash"],
+            "freeze_receipt_hash": frozen["freeze_receipt_hash"],
+            **self._v2_transition(experiment_id, stage, ordinal, payload),
+        }
+
+    def _bind_v2_terminal_job(self, experiment_id, slot="author-1", job_id="a" * 32):
+        root = self.records / experiment_id
+        manifest = json.loads((root / "manifest.json").read_text())
+        state = json.loads((root / "state.json").read_text())
+        identity = manifest["identities"][slot]
+        branch, head, git_error = server.current_branch_head(
+            server.codeoff_workspace_path(experiment_id, slot)
+        )
+        self.assertIsNone(git_error)
+        profile = {
+            "launcher": identity["launcher"], "provider": identity["provider"],
+            "model": identity["exact_model"],
+            "requested_effort": identity["requested_effort"],
+            "effective_effort": identity["effective_effort"],
+            "effort_source": server.CODEOFF_EFFORT_SOURCE,
+            "launcher_version": identity["launcher_version"],
+        }
+        session_identity = {
+            **profile, "repo": f"codeoff:{experiment_id}:{slot}",
+            "branch": branch, "starting_head": head,
+            "native_session_id": f"fixture-{slot}",
+        }
+        source = {
+            "claude": "claude-result-v1", "codex": "codex-rollout-v1",
+            "grok": "grok-acp-v1",
+        }[identity["launcher"]]
+        execution_identity = {
+            "version": "code-off-execution-identity-v1", "source": source,
+            **{key: session_identity[key] for key in (
+                "launcher", "provider", "model", "native_session_id",
+            )},
+        }
+        receipt = {
+            "status": "ok", "job_id": job_id, **profile,
+            "session_identity": session_identity,
+            "execution_identity": execution_identity, "summary": "fixture",
+        }
+        job = {
+            "job_id": job_id, "kind": "agent", "status": "completed",
+            "repo": session_identity["repo"], "branch": branch,
+            "starting_head": head,
+            "cwd": str(server.codeoff_workspace_path(experiment_id, slot)),
+            **profile, "session_identity": session_identity,
+            "launch_native_session_id": None,
+            "codeoff_workspace": {"experiment_id": experiment_id, "slot": slot},
+            "prompt_hash": manifest["prompt_hash"],
+            "max_turns": manifest["policy"]["budgets"]["max_turns"],
+            "run_budget_seconds": manifest["policy"]["budgets"]["author_seconds"],
+            "started_at": "2026-09-03T12:00:00Z",
+            "finished_at": "2026-09-03T12:00:01Z",
+            "execution_identity": execution_identity, "receipt": receipt,
+        }
+        launch = server._codeoff_launch_execution_manifest(job)
+        self.assertIsNotNone(launch)
+        launch_hash = server._codeoff_artifact(
+            root, server.codeoff_canonical_json(launch)
+        )
+        state["agent_jobs"][slot].append(job_id)
+        state["execution_manifests"][slot][job_id] = {
+            "launch_manifest_hash": launch_hash, "terminal_manifest_hash": None,
+        }
+        server._codeoff_commit_event(root, state, "agent_launched", {
+            "slot": slot, "job_id": job_id,
+            "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
+            "execution_manifest_hash": launch_hash,
+            "prompt_hash": manifest["prompt_hash"],
+        })
+        server.write_job(job)
+        self.assertTrue(server._codeoff_record_terminal_manifest(job))
+        return job
+
+    def test_v2_candidate_test_returns_facts_and_does_not_choose_park_or_advance(self):
+        experiment_id = "candidate-facts-v2"
+        self._initialize(experiment_id)
+        workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+        (workspace / "candidate.py").write_text("VALUE = 1\n")
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ), mock.patch.object(
+            server, "_codeoff_park_candidate",
+            side_effect=AssertionError("v2 must not call the v1 park policy"),
+        ), mock.patch.object(
+            server, "_codeoff_finalize_record",
+            side_effect=AssertionError("v2 must not choose a terminal state"),
+        ):
+            freeze_status, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(experiment_id),
+            )
+            self.assertEqual(freeze_status, 200, frozen)
+            test_status, facts = self._post_v2(
+                "test-candidate", self._v2_test_body(experiment_id, frozen),
+            )
+        self.assertEqual(test_status, 200, facts)
+        self.assertEqual(set(facts), {
+            "ok", "protocol_version", "policy_version", "experiment_id", "slot",
+            "transition_id", "transition_payload_hash", "status", "tests_pass",
+            "tree_manifest_hash", "artifact_hash", "freeze_receipt_hash",
+            "test_receipt_hash", "elapsed_seconds", "no_mutation", "tests",
+        })
+        self.assertEqual((facts["status"], facts["tests_pass"], facts["no_mutation"]),
+                         ("tested", True, True))
+        self.assertEqual(facts["tree_manifest_hash"], frozen["tree_manifest_hash"])
+        self.assertEqual([item["name"] for item in facts["tests"]], ["fixture-pass"])
+        self.assertEqual(set(facts["tests"][0]), {
+            "name", "status", "returncode", "elapsed_seconds", "log_hash",
+        })
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        self.assertEqual(state["status"], "prepared")
+        self.assertFalse(state["finalized"])
+        self.assertIsNone(state["reason"])
+
+    def test_v1_candidate_freeze_and_test_cannot_consume_or_mutate_v2_candidates(self):
+        experiment_id = "candidate-protocol-separation-v2"
+        self._initialize(experiment_id)
+        workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+        (workspace / "candidate.py").write_text("VALUE = 1\n")
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ):
+            freeze_status, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(experiment_id),
+            )
+        self.assertEqual(freeze_status, 200, frozen)
+        (workspace / "README.md").write_text("drift after freeze\n")
+        seal_status, seal = self._post_v2(
+            "test-candidate", self._v2_test_body(experiment_id, frozen),
+        )
+        self.assertEqual((seal_status, seal["code"]), (422, "candidate_mutated"))
+
+        root = self.records / experiment_id
+        before_state = (root / "state.json").read_bytes()
+        before_events = sorted(path.name for path in (root / "events").iterdir())
+        for action, extra in (("freeze", {"job_id": "b" * 32}), ("test", {})):
+            status, rejected = server.dispatch(
+                "POST", "/v1/code-off/candidate", {}, True,
+                json.dumps({
+                    "experiment_id": experiment_id, "slot": "author-1",
+                    "action": action, **extra,
+                }).encode(),
+            )[:2]
+            self.assertEqual((status, rejected["code"]), (409, "protocol_mismatch"))
+            self.assertEqual((root / "state.json").read_bytes(), before_state)
+            self.assertEqual(
+                sorted(path.name for path in (root / "events").iterdir()), before_events,
+            )
+
+    def test_v1_mutating_codeoff_operations_reject_v2_without_changing_record_bytes(self):
+        """Every v1 writer closes before reading a v2-shaped candidate state."""
+        experiment_id = "v1-writer-matrix-v2"
+        self._initialize(experiment_id)
+        root = self.records / experiment_id
+
+        def record_bytes():
+            return (
+                (root / "state.json").read_bytes(),
+                {path.name: path.read_bytes() for path in (root / "events").iterdir()},
+                (root / "final.json").read_bytes() if (root / "final.json").exists() else None,
+            )
+
+        cases = (
+            ("candidate", {"slot": "author-1", "action": "freeze", "job_id": "a" * 32}),
+            ("candidate", {"slot": "author-1", "action": "test"}),
+            ("blind", {}),
+            ("judge", {"slot": "judge-1", "job_id": "a" * 32}),
+            ("aggregate", {}),
+            ("finalize", {}),
+            ("terminal", {"outcome": "failed"}),
+        )
+        for operation, fields in cases:
+            before = record_bytes()
+            status, payload = server.dispatch(
+                "POST", f"/v1/code-off/{operation}", {}, True,
+                json.dumps({"experiment_id": experiment_id, **fields}).encode(),
+            )[:2]
+            self.assertEqual((status, payload["code"]), (409, "protocol_mismatch"),
+                             (operation, payload))
+            self.assertEqual(record_bytes(), before, operation)
+            self.assertFalse((root / "final.json").exists(), operation)
+
+    def test_v2_replay_transients_retry_without_seal_and_nonprepared_candidate_calls_do_nothing(self):
+        experiment_id = "candidate-transient-replay-v2"
+        self._initialize(experiment_id)
+        workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+        (workspace / "candidate.py").write_text("VALUE = 1\n")
+        with mock.patch.object(server, "_codeoff_validate_job", return_value=(self._v2_job(), None)):
+            freeze_status, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(experiment_id),
+            )
+        self.assertEqual(freeze_status, 200, frozen)
+
+        root = self.records / experiment_id
+        with mock.patch.object(server, "current_branch_head", side_effect=OSError("transient git failure")):
+            status, payload = self._post_v2("freeze-candidate", self._v2_freeze_body(experiment_id))
+        self.assertEqual((status, payload["code"], payload["retryable"]),
+                         (500, "codeoff_runtime_failure", True))
+        state = json.loads((root / "state.json").read_text())
+        self.assertNotIn("safety_seal", state["candidates"]["author-1"])
+        status, replay = self._post_v2("freeze-candidate", self._v2_freeze_body(experiment_id))
+        self.assertEqual((status, replay["status"]), (200, "frozen"))
+
+        test_body = self._v2_test_body(experiment_id, frozen)
+        with mock.patch.object(server, "current_branch_head", side_effect=RuntimeError("transient fs failure")):
+            status, payload = self._post_v2("test-candidate", test_body)
+        self.assertEqual((status, payload["code"], payload["retryable"]),
+                         (500, "codeoff_runtime_failure", True))
+        state = json.loads((root / "state.json").read_text())
+        self.assertNotIn("safety_seal", state["candidates"]["author-1"])
+        self.assertIsNone(state["candidates"]["author-1"]["test"])
+        status, facts = self._post_v2("test-candidate", test_body)
+        self.assertEqual((status, facts["status"]), (200, "tested"))
+
+        parked_id = "candidate-locally-parked-v2"
+        self._initialize(parked_id)
+        parked_root = self.records / parked_id
+        with server.CODEOFF_LOCK:
+            _root, _manifest, state, error = server._codeoff_load(parked_id, active=True)
+            self.assertIsNone(error)
+            server._codeoff_v2_park(_root, state, "fixture_parked")
+        before = (parked_root / "state.json").read_bytes()
+        for operation, body in (
+            ("freeze-candidate", self._v2_freeze_body(parked_id)),
+            ("test-candidate", {
+                "experiment_id": parked_id, "slot": "author-1",
+                "tree_manifest_hash": "0" * 64, "artifact_hash": "1" * 64,
+                "freeze_receipt_hash": "2" * 64,
+                **self._v2_transition(parked_id, "test-author-1", 11, {
+                    "schema_version": "code-off-transition-payload-v2",
+                    "policy_version": "code-off-policy-v2",
+                    "routing_version": "code-off-candidate-routing-v2",
+                    "experiment_id": parked_id, "stage": "test-author-1", "ordinal": 11,
+                    "reason": "candidate_test_requested", "attempt_ids": ["author-1"],
+                    "terminal": False, "slot": "author-1",
+                    "tree_manifest_hash": "0" * 64, "artifact_hash": "1" * 64,
+                    "freeze_receipt_hash": "2" * 64,
+                }),
+            }),
+        ):
+            status, payload = self._post_v2(operation, body)
+            self.assertEqual((status, payload["code"]), (409, "codeoff_v2_not_prepared"))
+            self.assertEqual((parked_root / "state.json").read_bytes(), before)
+
+    def test_graph_candidate_payloads_are_server_canonical_and_actionable_before_results(self):
+        nodes, edges = self._v2_durable_graph()
+        edge_set = set(edges)
+        for index in (1, 2):
+            for action in ("freeze", "test"):
+                prefix = f"v2_{action}_{index}"
+                actionability = self._v2_mappings(nodes[f"{prefix}_actionability"])
+                self.assertEqual(nodes[f"{prefix}_actionability"]["type"], "transforms.objectBuilder")
+                self.assertEqual(nodes[f"{prefix}_actionable"]["type"], "logic.filter")
+                self.assertEqual(set(actionability), {
+                    "protocol_matches", "policy_matches", "transition_id_matches",
+                    "transition_payload_hash_matches", *( {"tests_pass", "no_mutation"} if action == "test" else set()),
+                })
+                expected_id = {"kind": "getField", "path": f"CTX.{prefix}_identity.transition_id"}
+                expected_hash = {"kind": "getField", "path": f"CTX.{prefix}_payload_hash.value"}
+                self.assertEqual(actionability["transition_id_matches"]["right"], expected_id)
+                self.assertEqual(actionability["transition_payload_hash_matches"]["right"], expected_hash)
+                self.assertIn((prefix, "success", f"{prefix}_actionability"), edge_set)
+                destination = f"v2_frozen_{index}_identity" if action == "freeze" else f"{prefix}_result_identity"
+                self.assertIn((f"{prefix}_actionable", "pass", destination), edge_set)
+
+        def evaluate(expression, values):
+            if expression["kind"] == "literal":
+                return expression["value"]
+            self.assertEqual(expression["kind"], "getField")
+            return values[expression["path"]]
+
+        experiment_id = "graph-canonical-payloads-v2"
+        self._initialize(experiment_id)
+        values = {"CTX.INPUT.experiment_id": experiment_id}
+        frozen = {}
+        for index in (1, 2):
+            prefix, slot, job_id = f"v2_freeze_{index}", f"author-{index}", chr(96 + index) * 32
+            values[f"CTX.v2_author_{index}_callback.job_id"] = job_id
+            payload = {key: evaluate(value, values) for key, value in self._v2_mappings(nodes[f"{prefix}_payload"]).items()}
+            transition_id = f"graphwing-codeoff-v2:{experiment_id}:transition:{payload['stage']}:{payload['ordinal']}"
+            body = {"experiment_id": experiment_id, "slot": slot, "job_id": job_id,
+                    "transition_id": transition_id,
+                    "transition_payload_hash": hashlib.sha256(server._codeoff_v2_policy_json(payload)).hexdigest()}
+            with mock.patch.object(server, "_codeoff_validate_job", return_value=(self._v2_job(job_id), None)):
+                status, frozen[slot] = self._post_v2("freeze-candidate", body)
+            self.assertEqual(status, 200, frozen[slot])
+            for field in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash"):
+                values[f"TASKS.{prefix}.data.{field}"] = frozen[slot][field]
+        for index in (1, 2):
+            prefix, slot = f"v2_test_{index}", f"author-{index}"
+            payload = {key: evaluate(value, values) for key, value in self._v2_mappings(nodes[f"{prefix}_payload"]).items()}
+            body = {"experiment_id": experiment_id, "slot": slot,
+                    **{field: frozen[slot][field] for field in ("tree_manifest_hash", "artifact_hash", "freeze_receipt_hash")},
+                    "transition_id": f"graphwing-codeoff-v2:{experiment_id}:transition:{payload['stage']}:{payload['ordinal']}",
+                    "transition_payload_hash": hashlib.sha256(server._codeoff_v2_policy_json(payload)).hexdigest()}
+            status, response = self._post_v2("test-candidate", body)
+            self.assertEqual((status, response["status"]), (200, "tested"))
+
+    def test_v2_safety_seal_is_immutable_experiment_bound_event_evidence(self):
+        def sealed_candidate(experiment_id):
+            self._initialize(experiment_id)
+            workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+            (workspace / "candidate.py").write_text("VALUE = 1\n")
+            with mock.patch.object(
+                server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+            ):
+                freeze_status, frozen = self._post_v2(
+                    "freeze-candidate", self._v2_freeze_body(experiment_id),
+                )
+            self.assertEqual(freeze_status, 200, frozen)
+            (workspace / "README.md").write_text("drift after freeze\n")
+            seal_status, seal = self._post_v2(
+                "test-candidate", self._v2_test_body(experiment_id, frozen),
+            )
+            self.assertEqual((seal_status, seal["code"]), (422, "candidate_mutated"))
+            return frozen, seal
+
+        intact_id = "candidate-seal-intact-v2"
+        intact_frozen, intact_seal = sealed_candidate(intact_id)
+        for operation, body in (
+            ("freeze-candidate", self._v2_freeze_body(intact_id)),
+            ("test-candidate", self._v2_test_body(intact_id, intact_frozen)),
+        ):
+            status, replay = self._post_v2(operation, body)
+            self.assertEqual((status, replay["code"]), (422, "candidate_mutated"))
+            self.assertEqual(replay["safety_seal_hash"], intact_seal["safety_seal_hash"])
+
+        for tamper in ("delete-state", "change-state", "delete-artifact", "change-artifact"):
+            experiment_id = f"candidate-seal-{tamper}-v2"
+            frozen, _seal_response = sealed_candidate(experiment_id)
+            root = self.records / experiment_id
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text())
+            seal = state["candidates"]["author-1"]["safety_seal"]
+            self.assertEqual(seal["experiment_id"], experiment_id)
+            self.assertEqual(seal["slot"], "author-1")
+            artifact = root / "artifacts" / seal["seal_hash"]
+            self.assertEqual(
+                artifact.read_bytes(),
+                server.codeoff_canonical_json({
+                    key: value for key, value in seal.items() if key != "seal_hash"
+                }),
+            )
+            if tamper == "delete-state":
+                del state["candidates"]["author-1"]["safety_seal"]
+                state_path.write_text(json.dumps(state))
+            elif tamper == "change-state":
+                seal["code"] = "candidate_artifact_invalid"
+                state_path.write_text(json.dumps(state))
+            elif tamper == "delete-artifact":
+                artifact.unlink()
+            else:
+                artifact.chmod(0o600)
+                artifact.write_bytes(b"{}")
+            for operation, body in (
+                ("freeze-candidate", self._v2_freeze_body(experiment_id)),
+                ("test-candidate", self._v2_test_body(experiment_id, frozen)),
+            ):
+                status, rejected = self._post_v2(operation, body)
+                self.assertEqual(
+                    (status, rejected["code"]),
+                    (409, "candidate_safety_seal_tampered"),
+                    (tamper, operation, rejected),
+                )
+
+    def test_v2_graph_owns_author_freeze_test_and_both_candidates_ready_transitions(self):
+        nodes, edges = self._v2_durable_graph()
+        contract = self._v2_mappings(nodes["v2_candidate_stage_contract"])
+        self.assertEqual(contract["routing_version"], {
+            "kind": "literal", "value": "code-off-candidate-routing-v2",
+        })
+        self.assertEqual(contract["activation_enabled"], {
+            "kind": "literal", "value": False,
+        })
+        self.assertEqual(contract["retry_policy"], {
+            "kind": "literal", "value": "prohibited",
+        })
+        self.assertEqual(nodes["v2_candidate_activation_gate"]["type"], "logic.filter")
+        self.assertIn(
+            ("v2_candidate_activation_gate", "fail", "v2_candidate_contract_disabled"),
+            edges,
+        )
+        self.assertIn(
+            ("v2_candidate_activation_gate", "pass", "v2_author_1_launch_identity"),
+            edges,
+        )
+        self.assertEqual(nodes["v2_author_1"]["type"], "action.graphwing.POST:/v1/agent/run")
+        self.assertEqual(nodes["v2_author_2"]["type"], "action.graphwing.POST:/v1/agent/run")
+        self.assertEqual(
+            nodes["v2_freeze_1"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/freeze-candidate",
+        )
+        self.assertEqual(
+            nodes["v2_test_1"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/test-candidate",
+        )
+        self.assertEqual(
+            nodes["v2_freeze_2"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/freeze-candidate",
+        )
+        self.assertEqual(
+            nodes["v2_test_2"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/test-candidate",
+        )
+        self.assertIn(("v2_author_1_callback_gate", "pass", "v2_author_1_callback_identity"), edges)
+        self.assertIn(("v2_author_1_callback_readback_gate", "pass", "v2_freeze_1_identity"), edges)
+        self.assertIn(("v2_test_1_result_readback_gate", "pass", "v2_author_2_launch_identity"), edges)
+        self.assertIn(("v2_author_2_callback_gate", "pass", "v2_author_2_callback_identity"), edges)
+        self.assertIn(("v2_author_2_callback_readback_gate", "pass", "v2_freeze_2_identity"), edges)
+        self.assertIn(("v2_test_2_result_readback_gate", "pass", "v2_candidates_join"), edges)
+        self.assertEqual(nodes["v2_candidates_join"]["type"], "logic.join.all")
+        self.assertIn(("v2_candidates_join", "out", "v2_candidates_ready_identity"), edges)
+        self.assertIn(
+            ("v2_candidates_ready_readback_gate", "pass", "v2_blind_ready"), edges,
+        )
+        ready = self._v2_mappings(nodes["v2_candidates_ready_record"])
+        self.assertEqual(set(ready["candidate_test_receipts"]["properties"]), {
+            "author-1", "author-2",
+        })
+        for wait in ("v2_wait_author_1", "v2_wait_author_2"):
+            self.assertIn((wait, "timeout", "v2_candidate_park_join"), edges)
+            self.assertIn((wait, "failure", "v2_candidate_park_join"), edges)
+        for gate in (
+            "v2_author_1_callback_gate", "v2_author_2_callback_gate",
+            "v2_test_1_actionable", "v2_test_2_actionable",
+        ):
+            self.assertIn((gate, "fail", "v2_candidate_park_join"), edges)
+        self.assertIn(
+            ("v2_candidate_parked_readback_gate", "pass", "v2_candidate_parked"),
+            edges,
+        )
+        callback = self._v2_mappings(nodes["v2_author_1_callback"])
+        self.assertEqual(set(callback), {
+            "status_ok", "callback_status", "job_id",
+        })
+        for index in (1, 2):
+            callback = self._v2_mappings(nodes[f"v2_author_{index}_callback"])
+            callback_paths = self._v2_paths(list(callback.values()))
+            self.assertEqual(
+                callback_paths,
+                [
+                    f"TASKS.v2_wait_author_{index}.request.body.status",
+                    f"TASKS.v2_wait_author_{index}.request.body.status",
+                    f"TASKS.v2_wait_author_{index}.request.body.job_id",
+                ],
+            )
+            gate_paths = {rule["path"] for rule in nodes[f"v2_author_{index}_callback_gate"]["config"]["rules"]}
+            self.assertEqual(gate_paths, {"status_ok"})
+            self.assertEqual(
+                nodes[f"v2_freeze_{index}"]["config"]["job_id"],
+                f"{{{{ CTX.v2_author_{index}_callback.job_id }}}}",
+            )
+            self.assertNotIn(f"TASKS.v2_author_{index}", json.dumps(callback))
+        for prefix, effect in (
+            ("v2_author_1_launch", "v2_author_1_slot"),
+            ("v2_author_1_callback", "v2_freeze_1_identity"),
+            ("v2_freeze_1", "v2_freeze_1"),
+            ("v2_test_1", "v2_test_1"),
+            ("v2_author_2_launch", "v2_author_2_slot"),
+            ("v2_author_2_callback", "v2_freeze_2_identity"),
+            ("v2_freeze_2", "v2_freeze_2"),
+            ("v2_test_2", "v2_test_2"),
+            ("v2_candidates_ready", "v2_blind_ready"),
+            ("v2_candidate_parked", "v2_candidate_parked"),
+        ):
+            self.assertEqual(nodes[f"{prefix}_upsert"]["type"],
+                             "action.datastore.records.upsert")
+            self.assertEqual(nodes[f"{prefix}_readback"]["type"],
+                             "action.datastore.records.get")
+            self.assertIn((f"{prefix}_upsert", "success", f"{prefix}_readback"), edges)
+            self.assertIn((f"{prefix}_readback_gate", "pass", effect), edges)
+        pr3_nodes = [node for node_id, node in nodes.items()
+                     if node_id.startswith("v2_") and any(token in node_id for token in (
+                         "candidate", "author_", "freeze_", "test_", "blind_ready",
+                     ))]
+        serialized = json.dumps(pr3_nodes)
+        routing_surface = json.dumps([
+            {"id": node["id"], "label": node["label"], "type": node["type"]}
+            for node in pr3_nodes
+        ])
+        self.assertFalse(any(node["type"] == "transforms.codeExpression" for node in pr3_nodes))
+        self.assertNotIn("{%", serialized)
+        for forbidden in ("fallback", "redraw", "replacement", "resume_job_id"):
+            self.assertNotIn(forbidden, routing_surface.lower())
+        forward = {}
+        for source, _handle, target in edges:
+            forward.setdefault(source, set()).add(target)
+        reachable, frontier = {"policy_v2"}, ["policy_v2"]
+        while frontier:
+            source = frontier.pop()
+            for target in forward.get(source, set()):
+                if target not in reachable:
+                    reachable.add(target)
+                    frontier.append(target)
+        self.assertIn("v2_candidate_stage_contract", reachable)
+        self.assertIn(
+            ("v2_continuation_disabled", "success", "v2_candidate_stage_contract"), edges,
+        )
+        inbound = {}
+        for source, handle, target in edges:
+            inbound.setdefault(target, set()).add((source, handle))
+        self.assertEqual(inbound["v2_author_1_launch_identity"], {
+            ("v2_candidate_activation_gate", "pass"),
+        })
+        self.assertFalse(contract["activation_enabled"]["value"])
+
+    def test_v2_callback_uses_terminal_receipt_fields_and_duplicate_delivery_replays_one_effect(self):
+        nodes, edges = self._v2_durable_graph()
+        inbound = {}
+        for source, handle, target in edges:
+            inbound.setdefault(target, set()).add((source, handle))
+        for index in (1, 2):
+            callback_id = f"v2_author_{index}_callback"
+            callback = self._v2_mappings(nodes[callback_id])
+            self.assertEqual(set(callback), {"status_ok", "callback_status", "job_id"})
+            self.assertEqual(self._v2_paths(list(callback.values())), [
+                f"TASKS.v2_wait_author_{index}.request.body.status",
+                f"TASKS.v2_wait_author_{index}.request.body.status",
+                f"TASKS.v2_wait_author_{index}.request.body.job_id",
+            ])
+            self.assertEqual(
+                {rule["path"] for rule in nodes[f"{callback_id}_gate"]["config"]["rules"]},
+                {"status_ok"},
+            )
+            callback_record = self._v2_mappings(nodes[f"{callback_id}_record"])
+            self.assertNotIn("delivery_count", callback_record)
+            self.assertEqual(callback_record["job_id"], {
+                "kind": "getField", "path": f"CTX.{callback_id}.job_id",
+            })
+            self.assertEqual(
+                inbound[f"v2_freeze_{index}_identity"],
+                {(f"{callback_id}_readback_gate", "pass")},
+            )
+            self.assertEqual(
+                nodes[f"v2_freeze_{index}"]["config"]["job_id"],
+                f"{{{{ CTX.{callback_id}.job_id }}}}",
+            )
+        serialized = json.dumps([
+            node for node_id, node in nodes.items()
+            if node_id.startswith("v2_author_") and "callback" in node_id
+        ])
+        self.assertNotIn("delivery_count", serialized)
+        self.assertNotIn("RIFTWING", serialized.upper())
+
+    def test_v2_interrupted_candidate_test_seals_once_and_workflow_durably_parks_action_failures(self):
+        interruptions = {
+            "oserror": OSError("private path TOKEN_SECRET"),
+            "runtime": RuntimeError("private path TOKEN_SECRET"),
+            "timeout": subprocess.TimeoutExpired("private path TOKEN_SECRET", 1),
+        }
+        for kind, interruption in interruptions.items():
+            experiment_id = f"candidate-test-interrupted-{kind}-v2"
+            self._initialize(experiment_id)
+            workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+            (workspace / "candidate.py").write_text("VALUE = 1\n")
+            with mock.patch.object(
+                server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+            ):
+                freeze_status, frozen = self._post_v2(
+                    "freeze-candidate", self._v2_freeze_body(experiment_id),
+                )
+            self.assertEqual(freeze_status, 200, frozen)
+            test_body = self._v2_test_body(experiment_id, frozen)
+            with mock.patch.object(
+                server, "_codeoff_verify_artifact", side_effect=interruption,
+            ) as run_tests:
+                first_status, first = self._post_v2("test-candidate", test_body)
+                replay_status, replay = self._post_v2("test-candidate", test_body)
+            self.assertEqual((first_status, first["code"]),
+                             (422, "codeoff_v2_candidate_test_interrupted"))
+            self.assertEqual(replay_status, 422)
+            self.assertEqual(replay, first)
+            self.assertEqual(run_tests.call_count, 1)
+            self.assertNotIn("TOKEN_SECRET", json.dumps(first))
+            self.assertNotIn("private path", json.dumps(first))
+            state = json.loads((self.records / experiment_id / "state.json").read_text())
+            candidate = state["candidates"]["author-1"]
+            self.assertEqual(candidate["test"]["state"], "running")
+            self.assertEqual(candidate["safety_seal"]["code"],
+                             "codeoff_v2_candidate_test_interrupted")
+
+        nodes, edges = self._v2_durable_graph()
+        for action in ("v2_freeze_1", "v2_test_1", "v2_freeze_2", "v2_test_2"):
+            self.assertIn((action, "failure", "v2_candidate_park_join"), edges)
+            self.assertFalse(any(
+                source == action and handle == "failure" and target != "v2_candidate_park_join"
+                for source, handle, target in edges
+            ))
+        self.assertIn(
+            ("v2_candidate_parked_readback_gate", "pass", "v2_candidate_parked"), edges,
+        )
+        self.assertIn(
+            ("v2_candidate_parked_upsert", "failure", "v2_candidate_parked_write_failed"),
+            edges,
+        )
+        self.assertIn(
+            ("v2_candidate_parked_readback", "failure", "v2_candidate_parked_readback_failed"),
+            edges,
+        )
+        for failure in (
+            "v2_candidate_parked_write_failed", "v2_candidate_parked_readback_failed",
+            "v2_candidate_parked_readback_mismatch",
+        ):
+            self.assertNotIn(failure, {source for source, _handle, _target in edges})
+
+    def test_v2_job_routing_conflict_is_409_but_canonical_terminal_boundary_succeeds_and_drift_seals(self):
+        mismatch_id = "candidate-job-routing-v2"
+        self._initialize(mismatch_id)
+        mismatch_root = self.records / mismatch_id
+        before = (mismatch_root / "state.json").read_bytes()
+        status, mismatch = self._post_v2(
+            "freeze-candidate", self._v2_freeze_body(mismatch_id, job_id="b" * 32),
+        )
+        self.assertEqual((status, mismatch["code"]), (409, "job_mismatch"))
+        self.assertEqual((mismatch_root / "state.json").read_bytes(), before)
+        mismatch_state = json.loads(before)
+        self.assertNotIn("safety_seal", mismatch_state["candidates"]["author-1"])
+
+        success_id = "candidate-canonical-boundary-v2"
+        self._initialize(success_id)
+        workspace = server.codeoff_workspace_path(success_id, "author-1")
+        (workspace / "candidate.py").write_text("VALUE = 1\n")
+        canonical = self._bind_v2_terminal_job(success_id)
+        status, frozen = self._post_v2(
+            "freeze-candidate", self._v2_freeze_body(success_id, job_id=canonical["job_id"]),
+        )
+        self.assertEqual(status, 200, frozen)
+        self.assertEqual(frozen["author_job_id"], canonical["job_id"])
+        success_state = json.loads(
+            (self.records / success_id / "state.json").read_text()
+        )
+        manifest_entry = success_state["execution_manifests"]["author-1"][canonical["job_id"]]
+        self.assertRegex(manifest_entry["launch_manifest_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(manifest_entry["terminal_manifest_hash"], r"^[0-9a-f]{64}$")
+
+        drift_id = "candidate-terminal-drift-v2"
+        self._initialize(drift_id)
+        drift_job = self._bind_v2_terminal_job(drift_id)
+        drift_job["receipt"]["execution_identity"]["model"] = "drifted-model"
+        server.write_job(drift_job)
+        status, rejected = self._post_v2(
+            "freeze-candidate", self._v2_freeze_body(drift_id, job_id=drift_job["job_id"]),
+        )
+        self.assertEqual((status, rejected["code"]), (422, "agent_receipt_mismatch"))
+        self.assertTrue(rejected["safety_rejected"])
+        drift_state = json.loads((self.records / drift_id / "state.json").read_text())
+        self.assertEqual(
+            drift_state["candidates"]["author-1"]["safety_seal"]["code"],
+            "agent_receipt_mismatch",
+        )
+
+    def test_v2_frozen_receipt_binds_transition_id_and_payload_hash(self):
+        for field, changed in (
+            ("transition_id", "graphwing-codeoff-v2:forged:transition:freeze-author-1:10"),
+            ("transition_payload_hash", "f" * 64),
+        ):
+            experiment_id = f"candidate-freeze-receipt-{field.replace('_', '-')}-v2"
+            self._initialize(experiment_id)
+            workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+            (workspace / "candidate.py").write_text("VALUE = 1\n")
+            with mock.patch.object(
+                server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+            ):
+                freeze_status, frozen = self._post_v2(
+                    "freeze-candidate", self._v2_freeze_body(experiment_id),
+                )
+            self.assertEqual(freeze_status, 200, frozen)
+            root = self.records / experiment_id
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text())
+            candidate = state["candidates"]["author-1"]
+            receipt = json.loads(
+                server._codeoff_read_artifact(root, candidate["freeze_receipt_hash"])
+            )
+            receipt[field] = changed
+            forged_hash = server._codeoff_artifact(
+                root, server.codeoff_canonical_json(receipt)
+            )
+            candidate["freeze_receipt_hash"] = forged_hash
+            server._codeoff_write_state(root, state)
+            forged = dict(frozen, freeze_receipt_hash=forged_hash)
+            status, rejected = self._post_v2(
+                "test-candidate", self._v2_test_body(experiment_id, forged),
+            )
+            self.assertEqual(
+                (status, rejected["code"]), (422, "candidate_receipt_mismatch"), field,
+            )
+
+    def test_v2_duplicate_freeze_and_test_are_idempotent_by_transition_and_never_create_a_replacement_candidate(self):
+        experiment_id = "candidate-idempotency-v2"
+        self._initialize(experiment_id)
+        workspace = server.codeoff_workspace_path(experiment_id, "author-1")
+        (workspace / "candidate.py").write_text("VALUE = 1\n")
+        freeze_body = self._v2_freeze_body(experiment_id)
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ):
+            first_status, first_freeze = self._post_v2("freeze-candidate", freeze_body)
+            replay_status, replay_freeze = self._post_v2("freeze-candidate", freeze_body)
+        self.assertEqual((first_status, replay_status), (200, 200))
+        self.assertEqual(first_freeze, replay_freeze)
+        test_body = self._v2_test_body(experiment_id, first_freeze)
+        first_status, first_test = self._post_v2("test-candidate", test_body)
+        replay_status, replay_test = self._post_v2("test-candidate", test_body)
+        self.assertEqual((first_status, replay_status), (200, 200))
+        self.assertEqual(first_test, replay_test)
+        root = self.records / experiment_id
+        artifact_names = sorted(path.name for path in (root / "artifacts").iterdir())
+        state = json.loads((root / "state.json").read_text())
+        self.assertEqual(state["candidates"]["author-1"]["job_id"], "a" * 32)
+        self.assertEqual(state["candidates"]["author-1"]["tree_manifest_hash"],
+                         first_freeze["tree_manifest_hash"])
+
+        changed = deepcopy(freeze_body)
+        changed["transition_payload_hash"] = "4" * 64
+        changed_status, changed_result = self._post_v2("freeze-candidate", changed)
+        self.assertEqual((changed_status, changed_result["code"]),
+                         (400, "bad_transition_payload_hash"))
+        self.assertEqual(
+            sorted(path.name for path in (root / "artifacts").iterdir()), artifact_names,
+        )
+        sealed = json.loads((root / "state.json").read_text())
+        self.assertEqual(sealed["candidates"]["author-1"]["job_id"], "a" * 32)
+        self.assertEqual(sealed["status"], "prepared")
+        self.assertFalse(sealed["finalized"])
+
+        replacement_id = "candidate-second-attempt-v2"
+        self._initialize(replacement_id)
+        replacement_workspace = server.codeoff_workspace_path(replacement_id, "author-1")
+        (replacement_workspace / "candidate.py").write_text("VALUE = 1\n")
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ):
+            status, original = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(replacement_id),
+            )
+        self.assertEqual(status, 200, original)
+        second = self._v2_freeze_body(replacement_id, job_id="b" * 32)
+        with mock.patch.object(
+            server, "_codeoff_validate_job",
+            side_effect=AssertionError("a second author attempt must not be consumed"),
+        ):
+            status, rejected = self._post_v2("freeze-candidate", second)
+        self.assertEqual((status, rejected["code"]),
+                         (422, "codeoff_v2_transition_conflict"))
+        replacement_state = json.loads(
+            (self.records / replacement_id / "state.json").read_text()
+        )
+        self.assertEqual(replacement_state["candidates"]["author-1"]["job_id"], "a" * 32)
+
+    def test_v2_failed_named_test_is_durably_parked_by_workflow_while_mutation_and_receipt_drift_are_daemon_safety_rejections(self):
+        nodes, edges = self._v2_durable_graph()
+        parked = self._v2_mappings(nodes["v2_candidate_parked_record"])
+        self.assertEqual(parked["terminal"], {"kind": "literal", "value": True})
+        self.assertEqual(parked["reason"], {
+            "kind": "literal", "value": "author_or_named_test_not_actionable",
+        })
+        self.assertIn(("v2_test_1_actionable", "fail", "v2_candidate_park_join"), edges)
+        self.assertIn(("v2_candidate_park_join", "out", "v2_candidate_parked_identity"), edges)
+        self.assertIn(
+            ("v2_candidate_parked_readback_gate", "pass", "v2_candidate_parked"), edges,
+        )
+        self.assertIn(("v2_test_1", "failure", "v2_candidate_park_join"), edges)
+        self.assertNotIn(("v2_test_1", "failure", "v2_candidate_safety_join"), edges)
+
+        failed_id = "candidate-test-failed-v2"
+        self._initialize(failed_id, tests=["fixture-fail"])
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ), mock.patch.object(server, "_codeoff_park_candidate") as v1_park, \
+             mock.patch.object(server, "_codeoff_finalize_record") as v1_finalize:
+            freeze_status, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(failed_id),
+            )
+            test_status, facts = self._post_v2(
+                "test-candidate", self._v2_test_body(failed_id, frozen),
+            )
+        self.assertEqual((freeze_status, test_status), (200, 200))
+        self.assertFalse(facts["tests_pass"])
+        self.assertEqual(facts["tests"][0]["status"], "failed")
+        v1_park.assert_not_called()
+        v1_finalize.assert_not_called()
+        failed_state = json.loads((self.records / failed_id / "state.json").read_text())
+        self.assertEqual(failed_state["status"], "prepared")
+        self.assertFalse(failed_state["finalized"])
+        self.assertNotIn("safety_seal", failed_state["candidates"]["author-1"])
+
+        mutated_id = "candidate-mutated-v2"
+        self._initialize(mutated_id)
+        with mock.patch.object(
+            server, "_codeoff_validate_job", return_value=(self._v2_job(), None),
+        ):
+            _, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(mutated_id),
+            )
+        workspace = server.codeoff_workspace_path(mutated_id, "author-1")
+        (workspace / "README.md").write_text("mutated after freeze\n")
+        status, rejected = self._post_v2(
+            "test-candidate", self._v2_test_body(mutated_id, frozen),
+        )
+        self.assertEqual((status, rejected["code"]), (422, "candidate_mutated"))
+        self.assertTrue(rejected["safety_rejected"])
+        mutated_state = json.loads((self.records / mutated_id / "state.json").read_text())
+        self.assertEqual(mutated_state["status"], "prepared")
+        self.assertFalse(mutated_state["finalized"])
+        self.assertRegex(
+            mutated_state["candidates"]["author-1"]["safety_seal"]["seal_hash"],
+            r"^[0-9a-f]{64}$",
+        )
+
+        receipt_id = "candidate-receipt-drift-v2"
+        self._initialize(receipt_id)
+        with mock.patch.object(server, "_codeoff_validate_job", return_value=(None, {
+            "error": "hostile TOKEN_SECRET /private/path", "code": "agent_receipt_mismatch",
+        })):
+            status, rejected = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(receipt_id),
+            )
+        self.assertEqual((status, rejected["code"]), (422, "agent_receipt_mismatch"))
+        self.assertNotIn("TOKEN_SECRET", json.dumps(rejected))
+        self.assertNotIn("/private/path", json.dumps(rejected))
+        receipt_state = json.loads((self.records / receipt_id / "state.json").read_text())
+        self.assertEqual(receipt_state["status"], "prepared")
+        self.assertFalse(receipt_state["finalized"])
+
+        openapi = json.loads(server.openapi_bytes())
+        for endpoint, request_schema, result_schema in (
+            ("freeze-candidate", "CodeOffV2FreezeCandidateRequest", "CodeOffV2FreezeCandidateResult"),
+            ("test-candidate", "CodeOffV2TestCandidateRequest", "CodeOffV2TestCandidateResult"),
+        ):
+            operation = openapi["paths"][f"/v1/code-off/v2/{endpoint}"]["post"]
+            self.assertEqual(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                f"#/components/schemas/{request_schema}",
+            )
+            self.assertEqual(
+                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                f"#/components/schemas/{result_schema}",
+            )
 
     @staticmethod
     def _secret_keys(value):
@@ -22750,8 +23758,6 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
                          {"kind": "getField", "path": "CTX.v2_initialization_identity.transition_id"})
         self.assertEqual(binding["payload_hash"],
                          {"kind": "getField", "path": "CTX.v2_initialization_payload_hash.value"})
-        # A concurrent second advance can only repeat the same effect: the v2
-        # branch owns exactly one daemon call and no replacement participant.
         v2_reachable, frontier = set(), ["policy_v2"]
         forward = {}
         for source, _handle, target in edges:
@@ -22763,11 +23769,19 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
                     v2_reachable.add(child)
                     frontier.append(child)
         effects = {n for n in v2_reachable if nodes[n]["type"].startswith("action.graphwing.")}
-        self.assertEqual(effects, {"initialize_v2"})
-        # Mutable continuation stays off: the success leg ends at a noop and
-        # never loops back into a write, an effect, or the v1 pipeline.
+        self.assertEqual(effects, {
+            "initialize_v2", "v2_author_1", "v2_author_2",
+            "v2_freeze_1", "v2_freeze_2", "v2_test_1", "v2_test_2",
+        })
         self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
-        self.assertEqual(forward.get("v2_continuation_disabled"), None)
+        self.assertEqual(forward.get("v2_continuation_disabled"), {"v2_candidate_stage_contract"})
+        contract = self._v2_mappings(nodes["v2_candidate_stage_contract"])
+        self.assertEqual(contract["activation_enabled"], {"kind": "literal", "value": False})
+        self.assertEqual(forward["v2_candidate_stage_contract"], {"v2_candidate_activation_gate"})
+        self.assertEqual(
+            {source for source, _handle in inbound["v2_author_1_launch_identity"]},
+            {"v2_candidate_activation_gate"},
+        )
         self.assertIn(
             "disabled",
             self._v2_mappings(nodes["v2_experiment_record"])["continuation"]["value"],
