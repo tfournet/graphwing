@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: one bounded run reserves and settles each attempt through a capped in-run retry loop (up to three slots; a slot re-reads the PR and does nothing once green), then one final head-bound named test and persisted evidence gate before optional merge. Every attempt is run-control reservation-backed; start after graphwing-run-control-initialize with run_control_id. The webhook/doorbell start is a known-disabled operator path because current webhook runs do not create CTX.INPUT.",
+  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: one bounded run reserves and settles each attempt through a capped in-run retry loop (up to three slots; a slot re-reads the PR and does nothing once green), then a fresh remote-state gate terminates policy-held or otherwise non-ready PRs before any callback wait; ready PRs run one final head-bound named test and persisted evidence gate before optional merge. Every attempt is run-control reservation-backed; start after graphwing-run-control-initialize with run_control_id. The webhook/doorbell start is a known-disabled operator path because current webhook runs do not create CTX.INPUT.",
   "spec": {
     "meta": {
       "useSearchAttributes": true
@@ -1011,7 +1011,7 @@
       {
         "id": "final_state_blocked",
         "type": "transforms.objectBuilder",
-        "label": "Final PR policy hold",
+        "label": "Final PR blocked",
         "position": {
           "x": 3360,
           "y": 80
