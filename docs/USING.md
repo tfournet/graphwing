@@ -252,13 +252,52 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 
 ## Run a deterministic code-off
 
-### Additive workflow-owned initialization (policy v2)
+### Additive workflow-owned candidate lifecycle (policy v2)
 
-The catalog contains a parallel initialization-only v2 branch selected explicitly with `policy_version: code-off-policy-v2`. Omitting that field keeps the complete v1 workflow unchanged. The v2 branch builds and hashes one closed policy with native object-builder, hash, time, and filter nodes. That policy owns the ordered participant roster, fixed/random judge census, exact launcher identities, role effort, rubric and aggregation versions, classification, budgets, and its 2026-09-03 through 2026-10-03 approval window. An expired policy or an ineligible participant parks in the workflow before Graphwing resolves launcher bytes.
+The catalog contains a parallel v2 branch selected explicitly with `policy_version: code-off-policy-v2`; its activation gate currently permits initialization only. Omitting that field keeps the complete v1 workflow unchanged. The v2 branch builds and hashes one closed policy with native object-builder, hash, time, and filter nodes. That policy owns the ordered participant roster, fixed/random judge census, exact launcher identities, role effort, rubric and aggregation versions, classification, budgets, and its 2026-09-03 through 2026-10-03 approval window. An expired policy or an ineligible participant parks in the workflow before Graphwing resolves launcher bytes.
 
 `codeOffV2Initialize` receives the policy and canonical hash plus the normal repository/task/test inputs. It does not accept a seed or blind map. Graphwing privately creates the seed, performs the cryptographic draw, pins exact launcher fingerprints and slot identities, creates only the two opaque author worktrees, and returns the commitment, public slot descriptors, hashes, and path-free workspace receipts. An exact untouched replay returns the same result. Policy drift, expiry after initialization, missing private seed authority, or missing/mutated worktrees parks without redraw, substitution, fallback, or a new launch.
 
-This is PR 1 compatibility scaffolding only. V2 stops after initialization; v1 still owns the published full experiment lifecycle. Local Graphwing records remain disposable execution authority. V2 durable transitions, activation, OpenAPI re-import, publication/readback, and live canaries require later approved phases.
+`codeOffV2FreezeCandidate` binds one exact successful pinned author job to the
+workflow's immutable freeze transition. It rejects ignored paths, unsafe links,
+receipt drift, and mutation, then content-addresses the complete tree and returns
+only closed hashes, counts, and repository facts. `codeOffV2TestCandidate` accepts
+those exact frozen hashes plus its immutable test transition, materializes the
+artifact in a disposable Git worktree, runs only the initialization-locked named
+recipes, and returns normalized per-recipe pass/failure, timing, log-hash,
+mutation, and receipt facts. Identical completed transition replays return the
+stored result; changed payloads and second attempts fail closed. Neither operation
+chooses parked, blind-ready, or another business stage. A receipt mismatch,
+cryptographic/artifact corruption, path escape, ignored content, or mutation seals
+the local candidate against later promotion without naming a workflow outcome.
+The content-addressed seal binds experiment, slot, and rejection code, and its
+hash is anchored in the verified local event chain. Missing or contradictory
+state, event, or seal-artifact evidence fails closed. This uses the existing
+immutable-record protocol; it does not claim protection from arbitrary deletion
+by the same operating-system user. An interrupted test after its running marker
+creates the same irreversible seal, and exact replay returns it without rerunning
+the recipes.
+
+The native `code-off-candidate-routing-v2` source topology owns ordered author
+launches, terminal-success callback interpretation from the normalized `status`
+and `job_id` receipt fields, one-attempt/no-retry gates, freeze/test transition
+write-readback chains, both-candidate completion, and the workflow choice between
+blind-ready and parked. Duplicate callback delivery addresses the same
+deterministic transition; freeze revalidates the exact pinned job and local slot
+idempotency prohibits a replacement. Freeze/test action failures flow through the
+durable candidate-parked write and exact readback, while datastore write/readback
+failure remains a hard-fail leaf.
+
+The candidate topology remains behind a literal-false activation safety gate
+because tenant Datastore Records have not proven atomic creation/version fencing.
+The graph persists an author-launch transition, but `agentRun` intentionally does
+not accept that transition binding and positively rejects v2 workspaces while the
+gate is false. The topology is therefore an inactive source contract, not an
+activated or live-operable author-effect path and not simulated CAS. The active
+explicit v2 run still stops safely after initialization; the complete v1
+author/freeze/test path remains unchanged and default. Activation, an `agentRun`
+transition-binding contract, OpenAPI re-import, publication/readback, and live
+canaries require separate direct approval.
 
 ### Existing v1 workflow
 
@@ -344,3 +383,29 @@ PYTHONDONTWRITEBYTECODE=1 GRAPHWING_HOME=. python3 test_server.py
 ### Issue #188 PR 2 durable-controller boundary
 
 The explicit `code-off-policy-v2` branch writes closed tenant Datastore Records for `code-off-experiment-v2` and deterministic `code-off-transition-v2` facts. Keys are experiment-scoped: `graphwing-codeoff-v2:<experiment_id>:experiment` and `graphwing-codeoff-v2:<experiment_id>:transition:<stage>:<ordinal>`. Each write is followed by same-key tenant `get` and exact data-hash, key, and version comparison; any failure/mismatch uses the graph's hard-failure node before another expensive effect. Initialization is downstream of a persisted workflow-generated transition and sends its exact ID and payload hash through the closed initialize request; Graphwing returns and seals that binding with its local idempotency authority. Records allowlist policy/workflow/experiment identity, seed commitment (never seed), selected public identities, receipt hashes, stage/reason/attempt IDs, and terminality; they exclude prompts, blind maps, logs, paths, tokens, and webhook material. Deterministic transition keys and transition-bound daemon idempotency make exact replay safe and reject a conflicting replacement effect. Mutable continuation is deliberately disabled because Datastore Records upsert/get has not proven atomic create/version fencing: transition immutability is not activated, and no read-then-upsert sequence is treated as CAS. A local initialization-authority failure writes only a durable parked fact and cannot reconstruct selection, judgment, or a winner. Source fixtures do not prove tenant atomicity, import, publication, retention, or live behavior.
+
+### Issue #188 PR 3 candidate-stage boundary
+
+The additive v2 freeze and candidate-test operations are transition-bound local
+safety effects. Freeze consumes exactly one pinned successful author receipt and
+content-addresses a complete-tree manifest and archive. Candidate test consumes
+the exact frozen hashes, uses a disposable worktree and the initialization-locked
+recipe specifications, and returns facts even when a named test fails. Business
+failure never calls the v1 park/finalization policy. Non-bypassable receipt,
+artifact, ignored-path, path-escape, mutation, and post-marker interruption
+failures create one experiment/slot/code-bound, content-addressed local safety
+seal anchored in the verified event chain while leaving the workflow to name the
+durable outcome. V1 candidate operations reject v2 experiments before mutation
+and cannot bypass that seal.
+
+The graph contains the fully native, explicitly versioned candidate-stage source
+topology and exact transition write/readback gates. It orders the two authors,
+uses only normalized terminal callback status and job ID, prohibits retries,
+joins two actionable candidate-test results, and durably selects blind-ready or
+parked. Freeze/test action failures also reach that durable parked write/readback;
+datastore persistence failures still hard-fail. Atomic tenant fencing is still
+unproven, so a fixed false activation gate prevents this topology from launching
+any v2 author, and Graphwing independently rejects a v2 `agentRun`. Author-launch
+transition binding is not yet an active `agentRun` contract. This change claims
+local source/fixture behavior only: no deployment, re-import, publication, tenant
+readback, retention proof, or live canary was performed.
