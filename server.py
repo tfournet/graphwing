@@ -4661,15 +4661,120 @@ def pr_merge_allowed(
 
 
 FINDINGS_MARKER = "<!-- engineering-findings-json"
+PR_AUDIT_FINDINGS_MARKER = "<!-- pr-audit-findings v1"
+PR_AUDIT_SHA_RE = re.compile(r"<!--\s*pr-audit-sha:\s*([0-9a-f]+)\s*-->", re.I)
 FINDINGS_SEVERITIES = ("blocker", "critical", "major", "minor")
+PR_AUDIT_SEVERITY = {"MUST": "blocker", "SHOULD": "major", "MAY": "minor", "NIT": "minor"}
 
 
-def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, Any]:
-    """Turn a PR's labels and review comments into a fix brief.
+def _review_commit_id(review: dict[str, Any]) -> str:
+    commit_id = review.get("commit_id")
+    if isinstance(commit_id, str) and commit_id:
+        return commit_id
+    commit = review.get("commit")
+    if isinstance(commit, dict) and isinstance(commit.get("oid"), str):
+        return commit["oid"]
+    if isinstance(commit, str) and commit:
+        return commit
+    return ""
+
+
+def _pr_audit_exact_head(review: dict[str, Any], body: str, head_sha: str) -> bool:
+    """True only when every present review identity equals the live head."""
+    commit_id = _review_commit_id(review)
+    marker = PR_AUDIT_SHA_RE.search(body)
+    marker_sha = marker.group(1) if marker else ""
+    present = [value for value in (commit_id, marker_sha) if value]
+    return bool(present) and all(value == head_sha for value in present)
+
+
+def _normalize_pr_audit_finding(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict) or str(raw.get("status") or "").lower() != "open":
+        return None
+    fingerprint = str(raw.get("id") or raw.get("fingerprint") or "").strip()
+    if not fingerprint:
+        return None
+    severity_raw = str(raw.get("severity") or "")
+    severity = PR_AUDIT_SEVERITY.get(severity_raw.upper())
+    if severity is None:
+        lowered = severity_raw.lower()
+        severity = lowered if lowered in FINDINGS_SEVERITIES else "major"
+    location = raw.get("location") if isinstance(raw.get("location"), dict) else {}
+    path = str(raw.get("file") or location.get("path") or "") or "?"
+    line = raw.get("line")
+    if line is None:
+        line = location.get("line")
+    return {
+        "fingerprint": fingerprint,
+        "severity": severity,
+        "category": str(raw.get("domain") or raw.get("category") or "behavior"),
+        "location": {"path": path, "line": line},
+        "remedy": str(raw.get("fix_guidance") or raw.get("remedy") or ""),
+    }
+
+
+def _pr_audit_from_reviews(
+    reviews: list[Any], head_sha: str | None,
+) -> dict[str, Any] | None:
+    """Parse submitted exact-head pr-audit-findings v1 reviews, or None."""
+    if not head_sha or not isinstance(head_sha, str):
+        return None
+    findings: dict[str, dict[str, Any]] = {}
+    grade = None
+    saw_block = False
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if str(review.get("state") or "").upper() in ("", "PENDING"):
+            continue
+        body = review.get("body")
+        if not isinstance(body, str) or not _pr_audit_exact_head(review, body, head_sha):
+            continue
+        start = body.find(PR_AUDIT_FINDINGS_MARKER)
+        if start < 0:
+            continue
+        end = body.find("-->", start)
+        if end < 0:
+            return {"error": "findings marker is not closed"}
+        raw = body[start + len(PR_AUDIT_FINDINGS_MARKER):end]
+        try:
+            block = json.loads(raw)
+        except ValueError as exc:
+            return {"error": f"findings block is not JSON: {exc}"}
+        if not isinstance(block, dict):
+            return {"error": "findings block is not JSON: expected object"}
+        block_sha = block.get("sha")
+        if isinstance(block_sha, str) and block_sha and block_sha != head_sha:
+            continue
+        saw_block = True
+        if isinstance(block.get("grade"), str) and block["grade"]:
+            grade = block["grade"]
+        for item in block.get("findings") or []:
+            normalized = _normalize_pr_audit_finding(item)
+            if normalized and normalized["fingerprint"] not in findings:
+                findings[normalized["fingerprint"]] = normalized
+    if not saw_block:
+        return None
+    return {"grade": grade, "findings": findings}
+
+
+def pr_findings_from(
+    labels: list[str],
+    comment_bodies: list[str],
+    *,
+    reviews: list[Any] | None = None,
+    head_sha: str | None = None,
+) -> dict[str, Any]:
+    """Turn a PR's labels, comments, and submitted reviews into a fix brief.
 
     pr-drive used to take its instructions from CTX.INPUT.prompt, so getting a
-    PR green started with a human reading the review. Both reviewers already
-    publish a machine-readable block; parse that and skip the prose.
+    PR green started with a human reading the review. Reviewers publish a
+    machine-readable block; parse that and skip the prose.
+
+    The authoritative PM audit is a submitted pull-request review whose closed
+    `pr-audit-findings v1` block and `pr-audit-sha` match the live head. Issue
+    comments still carry Clean Code `engineering-findings-json`; that grade
+    must not hide an exact-head Path-to-A ledger. #191.
 
     Two reviewers routinely raise the same defect, so findings are deduped by
     fingerprint: that is one thing to fix, not two. A malformed block is an
@@ -4680,27 +4785,36 @@ def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, 
     holds = sorted(l for l in labels if l.startswith("hold:"))
 
     findings: dict[str, dict[str, Any]] = {}
-    for body in comment_bodies:
-        start = 0
-        while True:
-            i = body.find(FINDINGS_MARKER, start)
-            if i < 0:
-                break
-            end = body.find("-->", i)
-            if end < 0:
-                return {"ok": False, "blocking": True, "code": "unparsable_findings",
-                        "error": "findings marker is not closed", "grade": grade, "holds": holds}
-            raw = body[i + len(FINDINGS_MARKER):end]
-            start = end + 3
-            try:
-                block = json.loads(raw)
-            except ValueError as exc:
-                return {"ok": False, "blocking": True, "code": "unparsable_findings",
-                        "error": f"findings block is not JSON: {exc}", "grade": grade, "holds": holds}
-            for f in block.get("findings") or []:
-                fp = str(f.get("fingerprint") or "")
-                if fp and fp not in findings:
-                    findings[fp] = f
+    audit = _pr_audit_from_reviews(reviews or [], head_sha)
+    if audit is not None and audit.get("error"):
+        return {"ok": False, "blocking": True, "code": "unparsable_findings",
+                "error": audit["error"], "grade": grade, "holds": holds}
+    if audit is not None:
+        findings = dict(audit["findings"])
+        if audit.get("grade"):
+            grade = audit["grade"]
+    else:
+        for body in comment_bodies:
+            start = 0
+            while True:
+                i = body.find(FINDINGS_MARKER, start)
+                if i < 0:
+                    break
+                end = body.find("-->", i)
+                if end < 0:
+                    return {"ok": False, "blocking": True, "code": "unparsable_findings",
+                            "error": "findings marker is not closed", "grade": grade, "holds": holds}
+                raw = body[i + len(FINDINGS_MARKER):end]
+                start = end + 3
+                try:
+                    block = json.loads(raw)
+                except ValueError as exc:
+                    return {"ok": False, "blocking": True, "code": "unparsable_findings",
+                            "error": f"findings block is not JSON: {exc}", "grade": grade, "holds": holds}
+                for f in block.get("findings") or []:
+                    fp = str(f.get("fingerprint") or "")
+                    if fp and fp not in findings:
+                        findings[fp] = f
 
     ordered = sorted(
         findings.values(),
@@ -12226,14 +12340,17 @@ def dispatch_inner(
             number = first_query(qs, "number")
             if not number:
                 return json_out(400, {"error": "number is required", "code": "missing_number"})
-            raw = gh_json(repo_path, ["pr", "view", number, "--json", "labels,comments"])
+            raw = gh_json(repo_path, ["pr", "view", number, "--json", "labels,comments,reviews,headRefOid"])
             if not raw.get("ok"):
                 out = raw
             else:
                 d = raw.get("data") or {}
+                head = d.get("headRefOid")
                 out = pr_findings_from(
                     labels=[l.get("name", "") for l in (d.get("labels") or [])],
                     comment_bodies=[c.get("body", "") for c in (d.get("comments") or [])],
+                    reviews=list(d.get("reviews") or []),
+                    head_sha=head if isinstance(head, str) else None,
                 )
                 # Fold the check state in here. The graph cannot read it from
                 # the checks node: that output is ~21KB and Rewst replaces it

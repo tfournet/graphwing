@@ -187,9 +187,11 @@ that reaches the commit has already spent a full writer session. The graph defau
 too, so a caller that forgets loses nothing.
 
 The writer's prompt is not yours to write. Each attempt slot's `iter_findings` node
-reads the reviewers' `engineering-findings-json`, dedupes by fingerprint (two reviewers
-raising one defect is one fix), orders by severity, and hands over the remedies without
-the argument.
+reads submitted exact-head `pr-audit-findings v1` reviews first (commit / `pr-audit-sha`
+must match `headRefOid`; only `open` items), else Clean Code `engineering-findings-json`
+issue comments. It prefers the PM audit grade over a separate Clean Code grade, dedupes
+by fingerprint (two reviewers raising one defect is one fix), orders by severity, and
+hands over the remedies without the argument. Stale reviews do not feed the writer.
 
 Two node-output traps worth knowing before editing this graph. `action.graphwing` results
 are exposed as `TASKS.<node>.data.<field>`, while a `transforms.objectBuilder` publishes
