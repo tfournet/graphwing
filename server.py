@@ -386,6 +386,9 @@ GROK_ACP_AUTH_METHODS = frozenset({
     GROK_ACP_INTERACTIVE_AUTH_METHOD,
 })
 CODEOFF_PROTOCOL_VERSION = "code-off-v1"
+CODEOFF_V2_PROTOCOL_VERSION = "code-off-v2"
+CODEOFF_V2_POLICY_VERSION = "code-off-policy-v2"
+CODEOFF_V2_SEED_COMMITMENT_VERSION = "code-off-seed-commitment-v1"
 CODEOFF_CATEGORY_VERSION = "code-category-v1"
 CODEOFF_DRAW_VERSION = "code-off-draw-v1"
 CODEOFF_POLICY_VERSION = "code-off-policy-v1"
@@ -10357,6 +10360,18 @@ def rr_run(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
 def codeoff_canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
+
+def _codeoff_v2_policy_json(value: Any) -> bytes:
+    """Match Go encoding/json bytes used by the workflow hash node."""
+    encoded = codeoff_canonical_json(value)
+    for raw, escaped in (
+        (b"&", b"\\u0026"), (b"<", b"\\u003c"), (b">", b"\\u003e"),
+        ("\u2028".encode(), b"\\u2028"), ("\u2029".encode(), b"\\u2029"),
+    ):
+        encoded = encoded.replace(raw, escaped)
+    return encoded
+
+
 def _codeoff_atomic_bytes(path: Path, data: bytes, *, immutable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -10421,7 +10436,9 @@ def codeoff_slot_work_role(slot: Any) -> str:
 def codeoff_identity_snapshot_hash(identity: dict[str, Any]) -> str:
     return hashlib.sha256(codeoff_canonical_json(identity)).hexdigest()
 
-def codeoff_identity_is_pinned(slot: str, identity: Any) -> bool:
+def codeoff_identity_is_pinned(
+    slot: str, identity: Any, *, requested_effort: str | None = None,
+) -> bool:
     """Require one complete, self-consistent inference identity for a slot."""
     if not isinstance(identity, dict) or not all(
         isinstance(identity.get(field), str) and identity.get(field)
@@ -10431,6 +10448,10 @@ def codeoff_identity_is_pinned(slot: str, identity: Any) -> bool:
     launcher, provider, model = (
         identity["launcher"], identity["provider"], identity["exact_model"]
     )
+    expected_effort = (
+        CODEOFF_SLOT_REQUESTED_EFFORT[codeoff_slot_work_role(slot)]
+        if requested_effort is None else requested_effort
+    )
     profile, error = normalize_effort(
         launcher, provider, model, identity["requested_effort"], CODEOFF_EFFORT_SOURCE,
     ) if identity["requested_effort"] in EFFORT_VALUES else (None, {"code": "bad_effort"})
@@ -10438,10 +10459,20 @@ def codeoff_identity_is_pinned(slot: str, identity: Any) -> bool:
         launcher in NATIVE_LAUNCHERS
         and LAUNCHER_VERSION_RE.fullmatch(identity["launcher_version"])
         and identity["inference_profile_version"] == CODEOFF_INFERENCE_PROFILE_VERSION
-        and identity["requested_effort"] == CODEOFF_SLOT_REQUESTED_EFFORT[codeoff_slot_work_role(slot)]
+        and identity["requested_effort"] == expected_effort
         and error is None and profile is not None
         and identity["effective_effort"] == profile["effective_effort"]
     )
+
+
+def _codeoff_manifest_requested_effort(manifest: dict[str, Any], slot: str) -> str | None:
+    if manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION:
+        policy = manifest.get("policy")
+        role_effort = policy.get("role_effort") if isinstance(policy, dict) else None
+        value = role_effort.get(codeoff_slot_work_role(slot)) if isinstance(role_effort, dict) else None
+        return value if isinstance(value, str) else ""
+    return CODEOFF_SLOT_REQUESTED_EFFORT[codeoff_slot_work_role(slot)]
+
 
 def codeoff_manifest_identity_error(manifest: dict[str, Any]) -> dict[str, Any] | None:
     """Fail closed unless every immutable slot identity is fully pinned."""
@@ -10451,7 +10482,10 @@ def codeoff_manifest_identity_error(manifest: dict[str, Any]) -> dict[str, Any] 
         return {"error": "code-off slot identities are not fully pinned", "code": "codeoff_identity_unpinned"}
     unpinned = sorted(
         slot for slot, identity in identities.items()
-        if not codeoff_identity_is_pinned(slot, identity)
+        if not codeoff_identity_is_pinned(
+            slot, identity,
+            requested_effort=_codeoff_manifest_requested_effort(manifest, slot),
+        )
         or snapshots.get(slot) != codeoff_identity_snapshot_hash(identity)
     )
     if (
@@ -11170,6 +11204,482 @@ def _codeoff_remove_worktree(repo: Path, path: Path) -> None:
     if path.exists() and not run_git(repo, ["worktree", "remove", "--force", str(path)]).get("ok"):
         shutil.rmtree(path, ignore_errors=True)
     run_git(repo, ["worktree", "prune"])
+
+
+def _codeoff_v2_policy_current(policy: dict[str, Any], now: datetime | None = None) -> bool:
+    try:
+        as_of = datetime.strptime(policy["as_of"], "%Y-%m-%d").date()
+        expires = datetime.strptime(policy["expires_at"], "%Y-%m-%d").date()
+    except (KeyError, TypeError, ValueError):
+        return False
+    today = (now or datetime.now(timezone.utc)).date()
+    return as_of <= today <= expires
+
+
+def _codeoff_v2_policy(raw: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate a closed workflow policy and only daemon hard-safety bounds."""
+    if isinstance(raw, str):
+        if len(raw) > 32768:
+            return None, {"error": "policy exceeds the closed size limit", "code": "bad_policy"}
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, RecursionError):
+            return None, {"error": "policy must be a closed JSON object", "code": "bad_policy"}
+    required = {
+        "version", "draw_algorithm_version", "seed_commitment_version", "participants",
+        "fixed_judge", "fixed_judge_count", "author_count", "random_judge_count",
+        "role_effort", "rubric", "aggregation", "classification", "budgets",
+        "as_of", "expires_at",
+    }
+    if not isinstance(raw, dict) or set(raw) != required:
+        return None, {"error": "policy must have the exact code-off-policy-v2 shape", "code": "bad_policy"}
+    if (
+        raw.get("version") != CODEOFF_V2_POLICY_VERSION
+        or raw.get("draw_algorithm_version") != CODEOFF_DRAW_VERSION
+        or raw.get("seed_commitment_version") != CODEOFF_V2_SEED_COMMITMENT_VERSION
+    ):
+        return None, {"error": "policy versions are unsupported", "code": "bad_policy_version"}
+
+    participants = raw.get("participants")
+    participant_fields = {
+        "logical_model", "exact_model", "provider", "launcher",
+        "author", "random_judge", "eligible",
+    }
+    if not isinstance(participants, list) or not 3 <= len(participants) <= 16:
+        return None, {"error": "participants must be a bounded ordered roster", "code": "bad_policy"}
+    logicals: list[str] = []
+    by_logical: dict[str, dict[str, Any]] = {}
+    for participant in participants:
+        if not (
+            isinstance(participant, dict) and set(participant) == participant_fields
+            and isinstance(participant.get("logical_model"), str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", participant["logical_model"])
+            and all(
+                isinstance(participant.get(key), str) and 1 <= len(participant[key]) <= 80
+                for key in ("exact_model", "provider", "launcher")
+            )
+            and all(type(participant.get(key)) is bool for key in ("author", "random_judge", "eligible"))
+        ):
+            return None, {"error": "participant descriptors must be exact and bounded", "code": "bad_policy"}
+        logical = participant["logical_model"]
+        logicals.append(logical)
+        by_logical[logical] = participant
+    if len(set(logicals)) != len(logicals):
+        return None, {"error": "participant logical identities must be unique", "code": "bad_policy"}
+    unsupported = [
+        participant["logical_model"] for participant in participants
+        if (
+            participant["launcher"], participant["provider"], participant["exact_model"]
+        ) not in EFFORT_PROFILES
+    ]
+    if unsupported:
+        return None, {
+            "error": "policy contains an unsupported exact launcher identity",
+            "code": "codeoff_v2_unsupported_identity", "participants": sorted(unsupported),
+        }
+
+    fixed = raw.get("fixed_judge")
+    counts = (raw.get("fixed_judge_count"), raw.get("author_count"), raw.get("random_judge_count"))
+    author_pool = [p["logical_model"] for p in participants if p["author"]]
+    random_pool = [p["logical_model"] for p in participants if p["random_judge"]]
+    if not (
+        isinstance(fixed, str) and fixed in by_logical
+        and counts == (1, 2, 2)
+        and not by_logical[fixed]["author"] and not by_logical[fixed]["random_judge"]
+        and len(author_pool) >= 4 and len(random_pool) >= 4
+        and set(author_pool) == set(random_pool)
+    ):
+        return None, {"error": "participant counts exceed the supported fixed slot shape", "code": "bad_policy"}
+
+    role_effort = raw.get("role_effort")
+    if not (
+        isinstance(role_effort, dict)
+        and set(role_effort) == {"author", "judge", "source", "inference_profile_version"}
+        and role_effort.get("author") in EFFORT_VALUES
+        and role_effort.get("judge") in EFFORT_VALUES
+        and role_effort.get("source") == CODEOFF_EFFORT_SOURCE
+        and role_effort.get("inference_profile_version") == CODEOFF_INFERENCE_PROFILE_VERSION
+    ):
+        return None, {"error": "role effort is not a supported closed profile", "code": "bad_policy"}
+    for participant in participants:
+        roles = []
+        if participant["author"]:
+            roles.append("author")
+        if participant["random_judge"] or participant["logical_model"] == fixed:
+            roles.append("judge")
+        for role in roles:
+            profile, effort_error = normalize_effort(
+                participant["launcher"], participant["provider"], participant["exact_model"],
+                role_effort[role], CODEOFF_EFFORT_SOURCE,
+            )
+            if effort_error is not None or profile is None:
+                return None, {"error": "role effort is unsupported for an exact identity", "code": "codeoff_v2_unsupported_identity"}
+
+    rubric = raw.get("rubric")
+    dimensions = rubric.get("dimensions") if isinstance(rubric, dict) else None
+    preference = rubric.get("preference") if isinstance(rubric, dict) else None
+    if not (
+        isinstance(rubric, dict) and set(rubric) == {"version", "dimensions", "preference"}
+        and isinstance(rubric.get("version"), str) and 1 <= len(rubric["version"]) <= 80
+        and isinstance(dimensions, dict) and 1 <= len(dimensions) <= 16
+        and all(isinstance(key, str) and 1 <= len(key) <= 40 and type(value) is int and 1 <= value <= 1000 for key, value in dimensions.items())
+        and isinstance(preference, list) and 1 <= len(preference) <= 8
+        and len(set(preference)) == len(preference)
+        and all(isinstance(value, str) and 1 <= len(value) <= 40 for value in preference)
+    ):
+        return None, {"error": "rubric must be a closed bounded descriptor", "code": "bad_policy"}
+
+    aggregation = raw.get("aggregation")
+    if not (
+        isinstance(aggregation, dict)
+        and set(aggregation) == {"version", "preference_votes_required", "fallback", "exact_tie", "winner_must_pass_candidate_tests"}
+        and isinstance(aggregation.get("version"), str) and 1 <= len(aggregation["version"]) <= 80
+        and type(aggregation.get("preference_votes_required")) is int
+        and 1 <= aggregation["preference_votes_required"] <= 3
+        and all(isinstance(aggregation.get(key), str) and 1 <= len(aggregation[key]) <= 80 for key in ("fallback", "exact_tie"))
+        and type(aggregation.get("winner_must_pass_candidate_tests")) is bool
+    ):
+        return None, {"error": "aggregation must be a closed bounded descriptor", "code": "bad_policy"}
+
+    classification = raw.get("classification")
+    if not (
+        isinstance(classification, dict)
+        and set(classification) == {"version", "category", "tags", "source"}
+        and all(isinstance(classification.get(key), str) and 1 <= len(classification[key]) <= 120 for key in ("version", "category", "source"))
+        and isinstance(classification.get("tags"), list) and len(classification["tags"]) <= 12
+        and len(set(classification["tags"])) == len(classification["tags"])
+        and all(isinstance(tag, str) and 1 <= len(tag) <= 80 for tag in classification["tags"])
+    ):
+        return None, {"error": "classification must be a closed bounded descriptor", "code": "bad_policy"}
+
+    budgets = raw.get("budgets")
+    limits = {
+        "author_seconds": (30, CODEOFF_MAX_AGENT_SECONDS),
+        "judge_seconds": (30, CODEOFF_MAX_AGENT_SECONDS),
+        "test_seconds": (1, 1200), "max_turns": (1, 80),
+    }
+    if not isinstance(budgets, dict) or set(budgets) != set(limits) or any(
+        type(budgets.get(key)) is not int or not low <= budgets[key] <= high
+        for key, (low, high) in limits.items()
+    ):
+        return None, {"error": "budgets exceed the hard supported ceilings", "code": "bad_budgets"}
+    try:
+        as_of = datetime.strptime(raw["as_of"], "%Y-%m-%d").date()
+        expires = datetime.strptime(raw["expires_at"], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None, {"error": "policy dates must be exact ISO dates", "code": "bad_policy"}
+    if not as_of <= expires or (expires - as_of).days > 30:
+        return None, {"error": "policy validity exceeds the hard 30-day ceiling", "code": "bad_policy"}
+    return json.loads(json.dumps(raw)), None
+
+
+def _codeoff_v2_draw(seed_hex: str, policy: dict[str, Any]) -> dict[str, Any]:
+    seed = bytes.fromhex(seed_hex)
+    participants = policy["participants"]
+    author_pool = [p["logical_model"] for p in participants if p["author"]]
+    authors = _codeoff_rank(seed, "authors", author_pool)[:policy["author_count"]]
+    random_pool = [
+        p["logical_model"] for p in participants
+        if p["random_judge"] and p["logical_model"] not in authors
+    ]
+    random_judges = _codeoff_rank(seed, "judges", random_pool)[:policy["random_judge_count"]]
+    return {
+        "algorithm_version": policy["draw_algorithm_version"],
+        "policy_version": policy["version"],
+        "authors": authors, "fixed_judge": policy["fixed_judge"],
+        "random_judges": random_judges,
+        "seed_commitment_version": policy["seed_commitment_version"],
+        "seed_commitment": hashlib.sha256(
+            b"graphwing/code-off/seed-commitment/v1\0" + seed
+        ).hexdigest(),
+    }
+
+
+def _codeoff_v2_result(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    public_fields = {
+        "slot", "logical_model", "exact_model", "provider", "launcher",
+        "requested_effort", "effective_effort", "inference_profile_version",
+        "launcher_version",
+    }
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "status": "initialized",
+        "policy_hash": manifest["policy_hash"],
+        "seed_commitment": manifest["selection"]["seed_commitment"],
+        "slots": {
+            slot: {key: value for key, value in descriptor.items() if key in public_fields}
+            for slot, descriptor in manifest["slots"].items()
+        },
+        "identity_snapshot_hashes": manifest["identity_snapshot_hashes"],
+        "identities_hash": manifest["identities_hash"],
+        "manifest_file_hash": state["manifest_file_hash"],
+        "workspace_receipts": manifest["workspace_receipts"],
+    }
+
+
+def _codeoff_v2_park(root: Path, state: dict[str, Any], code: str) -> tuple[int, dict[str, Any]]:
+    if state.get("status") != "parked":
+        state["status"] = "parked"
+        state["reason"] = code
+        _codeoff_commit_event(root, state, "v2_initialization_parked", {"code": code})
+    return 409, {
+        "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": root.name, "status": "parked", "code": code,
+        "error": "code-off v2 initialization authority is unavailable",
+    }
+
+
+def _codeoff_v2_replay(
+    root: Path, policy: dict[str, Any], policy_hash: str, request_hash: str,
+) -> tuple[int, dict[str, Any]]:
+    loaded_root, manifest, state, err = _codeoff_load(root.name, active=True)
+    if err or loaded_root != root or manifest is None or state is None:
+        return 409, {
+            "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+            "policy_version": CODEOFF_V2_POLICY_VERSION, "experiment_id": root.name,
+            "status": "parked", "code": "codeoff_v2_authority_unavailable",
+            "error": "code-off v2 local authority is unavailable",
+        }
+    if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+        return 409, {
+            "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+            "policy_version": CODEOFF_V2_POLICY_VERSION, "experiment_id": root.name,
+            "status": "parked", "code": "codeoff_v2_experiment_id_conflict",
+            "error": "experiment_id belongs to another code-off protocol",
+        }
+    if (
+        manifest.get("policy") != policy or manifest.get("policy_hash") != policy_hash
+        or manifest.get("initialize_request_hash") != request_hash
+    ):
+        return _codeoff_v2_park(root, state, "codeoff_v2_policy_mismatch")
+    if not _codeoff_v2_policy_current(policy):
+        return _codeoff_v2_park(root, state, "codeoff_v2_policy_expired")
+    seed_path = root / "private" / "seed"
+    try:
+        seed_hex = seed_path.read_text()
+    except OSError:
+        return _codeoff_v2_park(root, state, "codeoff_v2_authority_unavailable")
+    if not CODEOFF_SEED_RE.fullmatch(seed_hex) or _codeoff_v2_draw(seed_hex, policy) != manifest.get("selection"):
+        return _codeoff_v2_park(root, state, "codeoff_v2_authority_unavailable")
+    if state.get("status") != "prepared" or state.get("reason") is not None:
+        return _codeoff_v2_park(root, state, "codeoff_v2_authority_unavailable")
+    for receipt in manifest.get("workspace_receipts", []):
+        slot = receipt.get("slot") if isinstance(receipt, dict) else None
+        path = codeoff_workspace_path(root.name, slot) if isinstance(slot, str) else None
+        if not (
+            path is not None and path.is_dir()
+            and codeoff_tree_snapshot(path, manifest["base_sha"])["manifest_hash"]
+            == receipt.get("base_snapshot_hash")
+        ):
+            return _codeoff_v2_park(root, state, "codeoff_v2_authority_unavailable")
+    return 200, _codeoff_v2_result(manifest, state)
+
+
+def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    fields = {
+        "experiment_id", "repo", "base_sha", "policy", "policy_hash",
+        "prompt", "tests", "toolchain", "commit_message",
+    }
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    for key in ("tests", "toolchain"):
+        raw = data.get(key)
+        if isinstance(raw, str):
+            if len(raw) > 8192:
+                return 400, {"error": f"{key} exceeds the closed size limit", "code": f"bad_{key}"}
+            try:
+                data[key] = json.loads(raw)
+            except (json.JSONDecodeError, RecursionError):
+                return 400, {"error": f"{key} must be native JSON", "code": f"bad_{key}"}
+    policy, policy_err = _codeoff_v2_policy(data.get("policy"))
+    if policy_err:
+        return 400, policy_err
+    assert policy is not None
+    policy_hash = data.get("policy_hash")
+    expected_policy_hash = hashlib.sha256(_codeoff_v2_policy_json(policy)).hexdigest()
+    if not isinstance(policy_hash, str) or policy_hash != expected_policy_hash:
+        return 400, {"error": "policy_hash must bind the complete canonical policy", "code": "bad_policy_hash"}
+    experiment_id, eid_err = _codeoff_id(data.get("experiment_id"))
+    if eid_err:
+        return 400, eid_err
+    assert experiment_id is not None
+    task = data.get("prompt")
+    if not isinstance(task, str) or not task.strip() or len(task) > PROMPT_MAX_CHARS:
+        return 400, {"error": "prompt is required and bounded", "code": "bad_prompt"}
+    names = data.get("tests")
+    if not isinstance(names, list) or not 1 <= len(names) <= 10 or len(set(names)) != len(names) or not all(
+        isinstance(name, str) and 1 <= len(name) <= 120 for name in names
+    ):
+        return 400, {"error": "tests must be 1-10 unique named recipes", "code": "bad_tests"}
+    toolchain = data.get("toolchain")
+    if not isinstance(toolchain, dict) or not 1 <= len(toolchain) <= 20 or not all(
+        isinstance(key, str) and 1 <= len(key) <= 40
+        and isinstance(value, str) and 1 <= len(value) <= 120
+        for key, value in toolchain.items()
+    ):
+        return 400, {"error": "toolchain must be a bounded string map", "code": "bad_toolchain"}
+    commit_message = data.get("commit_message")
+    if not isinstance(commit_message, str) or not commit_message.strip() or len(commit_message) > 300:
+        return 400, {"error": "commit_message is required and bounded", "code": "bad_commit_message"}
+    name, repo = repo_from_body(data, repos)
+    if name is None:
+        return 400, repo
+    base_sha = data.get("base_sha")
+    if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40,64}", base_sha):
+        return 400, {"error": "base_sha must be an exact object id", "code": "bad_base_sha"}
+    branch, head, git_err = current_branch_head(repo)
+    if git_err or head != base_sha:
+        return 409, {"error": "repo HEAD does not equal base_sha", "code": "base_mismatch"}
+    status = run_git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])
+    ignored = run_git(repo, ["ls-files", "--others", "--ignored", "--exclude-standard"])
+    if not status.get("ok") or not ignored.get("ok") or status.get("stdout") or ignored.get("stdout"):
+        return 409, {"error": "base worktree must contain only the exact committed tree", "code": "base_not_pristine"}
+    tree = run_git(repo, ["rev-parse", f"{base_sha}^{{tree}}"])
+    if not tree.get("ok"):
+        return 400, {"error": "base tree is unavailable", "code": "bad_base_sha"}
+    base_tree = str(tree["stdout"]).strip()
+    catalog = load_tests(repos)
+    specs = []
+    for test_name in names:
+        spec = catalog.get(test_name)
+        if spec is None or Path(spec["cwd"]).resolve() != Path(repo).resolve():
+            return 400, {"error": "test is not allowlisted for repo", "code": "unknown_test", "allowed": sorted(catalog)}
+        specs.append({"name": test_name, "argv": list(spec["argv"]), "timeout_seconds": int(spec["timeout_seconds"])})
+
+    request_projection = {
+        "experiment_id": experiment_id, "repo": name, "base_sha": base_sha,
+        "policy_hash": policy_hash, "prompt_hash": hashlib.sha256(task.encode()).hexdigest(),
+        "tests": names, "toolchain": dict(sorted(toolchain.items())),
+        "commit_message": commit_message.strip(),
+    }
+    request_hash = hashlib.sha256(codeoff_canonical_json(request_projection)).hexdigest()
+    record_root = _codeoff_root(experiment_id)
+    workspace_root = CODEOFF_WORKSPACES_DIR / experiment_id
+    with CODEOFF_LOCK:
+        if record_root.exists():
+            return _codeoff_v2_replay(record_root, policy, policy_hash, request_hash)
+        if workspace_root.exists():
+            return 409, {"ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION, "policy_version": CODEOFF_V2_POLICY_VERSION, "experiment_id": experiment_id, "status": "parked", "code": "codeoff_v2_authority_unavailable", "error": "opaque workspace exists without local initialization authority"}
+
+        seed_hex = secrets.token_hex(32)
+        selection = _codeoff_v2_draw(seed_hex, policy)
+        participants = {p["logical_model"]: p for p in policy["participants"]}
+        slot_logical = {
+            "author-1": selection["authors"][0], "author-2": selection["authors"][1],
+            "judge-fable": selection["fixed_judge"],
+            "judge-1": selection["random_judges"][0], "judge-2": selection["random_judges"][1],
+        }
+        identities: dict[str, dict[str, Any]] = {}
+        fingerprints: dict[str, str | None] = {}
+        for slot, logical in slot_logical.items():
+            participant = participants[logical]
+            launcher = participant["launcher"]
+            if launcher not in fingerprints:
+                fingerprints[launcher] = launcher_version_fingerprint(
+                    resolve_launcher_binary_now(launcher), launcher,
+                )
+            requested = policy["role_effort"][codeoff_slot_work_role(slot)]
+            profile, effort_error = normalize_effort(
+                launcher, participant["provider"], participant["exact_model"],
+                requested, CODEOFF_EFFORT_SOURCE,
+            )
+            if effort_error is not None or profile is None or fingerprints[launcher] in (None, "missing_companion"):
+                return 501, {"error": "exact launcher bytes cannot be pinned", "code": "codeoff_v2_launcher_unavailable"}
+            identities[slot] = {
+                "logical_model": logical, "exact_model": participant["exact_model"],
+                "provider": participant["provider"], "launcher": launcher,
+                "launcher_version": fingerprints[launcher],
+                "requested_effort": requested,
+                "effective_effort": profile["effective_effort"],
+                "inference_profile_version": CODEOFF_INFERENCE_PROFILE_VERSION,
+            }
+        snapshots = {slot: codeoff_identity_snapshot_hash(identity) for slot, identity in identities.items()}
+        identities_hash = hashlib.sha256(codeoff_canonical_json(identities)).hexdigest()
+        canonical_prompt = (
+            "CODE-OFF AUTHOR CONTRACT code-off-v2\n"
+            "Work only in the current isolated worktree. Do not inspect other worktrees, use network, commit, or push.\n"
+            f"Base SHA: {base_sha}\nBase tree: {base_tree}\nNamed tests: {json.dumps(names, separators=(',', ':'))}\n"
+            f"Toolchain: {json.dumps(dict(sorted(toolchain.items())), separators=(',', ':'))}\n"
+            f"Budgets: {json.dumps(policy['budgets'], sort_keys=True, separators=(',', ':'))}\n"
+            "Finish with exactly one bounded JSON receipt.\n\nTask:\n"
+            f"{task}"
+        ).encode()
+        if len(canonical_prompt) > PROMPT_MAX_CHARS + 8192:
+            return 400, {"error": "canonical prompt exceeds limit", "code": "prompt_too_large"}
+        base_snapshot = codeoff_tree_snapshot(repo, base_sha)
+        slots = {slot: {"slot": slot, **identity} for slot, identity in identities.items()}
+        workspace_receipts = [
+            {"slot": slot, "base_sha": base_sha, "base_snapshot_hash": base_snapshot["manifest_hash"]}
+            for slot in ("author-1", "author-2")
+        ]
+        locked = {
+            "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+            "policy_version": CODEOFF_V2_POLICY_VERSION,
+            "experiment_id": experiment_id, "repo": name, "branch": branch,
+            "base_sha": base_sha, "base_tree": base_tree,
+            "base_snapshot_hash": base_snapshot["manifest_hash"],
+            "policy": policy, "policy_hash": policy_hash,
+            "initialize_request_hash": request_hash,
+            "selection": selection, "slots": slots, "identities": identities,
+            "identity_snapshot_hashes": snapshots, "identities_hash": identities_hash,
+            "inference_profile_version": CODEOFF_INFERENCE_PROFILE_VERSION,
+            "task": task, "tests": names, "test_specs": specs,
+            "toolchain": dict(sorted(toolchain.items())), "budgets": policy["budgets"],
+            "classification": policy["classification"],
+            "rubric_hash": hashlib.sha256(codeoff_canonical_json(policy["rubric"])).hexdigest(),
+            "prompt_hash": hashlib.sha256(canonical_prompt).hexdigest(),
+            "workspace_receipts": workspace_receipts,
+            "artifact_limits": {"max_files": CODEOFF_MAX_FILES, "max_file_bytes": CODEOFF_MAX_FILE_BYTES, "max_tree_bytes": CODEOFF_MAX_TREE_BYTES, "max_log_bytes": CODEOFF_MAX_LOG_BYTES},
+            "worktree_isolation": {"version": "opaque-worktree-v1", "slots": ["author-1", "author-2"], "caller_paths": False, "os_security_boundary": False},
+            "commit_message": commit_message.strip(),
+        }
+        CODEOFFS_DIR.mkdir(parents=True, exist_ok=True)
+        record_build = Path(tempfile.mkdtemp(prefix=f".initialize-v2-{experiment_id}-", dir=CODEOFFS_DIR))
+        created: list[Path] = []
+        try:
+            _codeoff_atomic_bytes(record_build / "private" / "seed", seed_hex.encode(), immutable=True)
+            prompt_hash = _codeoff_artifact(record_build, canonical_prompt)
+            manifest = {**locked, "created_at": utcnow()}
+            _codeoff_atomic_json(record_build / "manifest.json", manifest, immutable=True)
+            manifest_file_hash = hashlib.sha256((record_build / "manifest.json").read_bytes()).hexdigest()
+            state = {
+                "status": "preparing", "reason": None, "finalized": False,
+                "manifest_file_hash": manifest_file_hash,
+                "event_count": 0, "event_head": "0" * 64,
+                "agent_jobs": {slot: [] for slot in slot_logical},
+                "execution_manifests": {slot: {} for slot in slot_logical},
+                "candidates": {"author-1": {}, "author-2": {}},
+                "judges": {}, "aggregation": None,
+            }
+            _codeoff_commit_event(record_build, state, "v2_initialized", {
+                "policy_hash": policy_hash, "seed_commitment": selection["seed_commitment"],
+                "identities_hash": identities_hash, "prompt_hash": prompt_hash,
+            })
+            workspace_root.mkdir(parents=True, mode=0o700)
+            for slot in ("author-1", "author-2"):
+                path = codeoff_workspace_path(experiment_id, slot)
+                created.append(path)
+                if not run_git(repo, ["worktree", "add", "--detach", str(path), base_sha]).get("ok"):
+                    raise RuntimeError(f"isolated worktree creation failed: {slot}")
+                if codeoff_tree_snapshot(path, base_sha)["manifest_hash"] != base_snapshot["manifest_hash"]:
+                    raise RuntimeError(f"isolated worktree base mismatch: {slot}")
+            state["status"] = "prepared"
+            _codeoff_commit_event(record_build, state, "v2_workspaces_created", {
+                "workspace_receipts": workspace_receipts,
+            })
+            record_build.replace(record_root)
+        except BaseException:
+            for path in reversed(created):
+                _codeoff_remove_worktree(repo, path)
+            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(record_build, ignore_errors=True)
+            raise
+    return 200, _codeoff_v2_result(manifest, state)
+
 
 def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id", "repo", "base_sha", "seed", "category", "tags", "category_source", "prompt", "tests", "toolchain", "budgets", "commit_message"})
@@ -12497,6 +13007,9 @@ def dispatch_inner(
     if method == "GET" and path == "/v1/watch":
         return json_out(200, watch_snapshot())
 
+    if method == "POST" and path == "/v1/code-off/v2/initialize":
+        status, payload = _codeoff_boundary(codeoff_v2_initialize, body, repos)
+        return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/prepare":
         status, payload = _codeoff_boundary(codeoff_prepare, body, repos)
         return json_out(status, payload)

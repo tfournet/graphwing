@@ -21307,12 +21307,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "75376763e610ee0fdfa76519535a294efbbc0b2b3ecf9d6f6a665fc551a58240",
+            "a738b6d307f79f018e2cca5b14ca90ef721ededcef68f16304d4123d63dfe0c1",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 54)
-        self.assertEqual(len(graph["spec"]["edges"]), 94)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 54)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 94)
+        self.assertEqual(len(graph["spec"]["nodes"]), 68)
+        self.assertEqual(len(graph["spec"]["edges"]), 113)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 68)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 113)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21332,6 +21332,8 @@ class CodeOffTests(unittest.TestCase):
             "transforms.hash": {"out"},
             "action.datastore.records.upsert": {"success", "failure"},
             "action.datastore.records.get": {"success", "failure"},
+            "action.time.now": {"out"},
+            "action.time.compare": {"before", "after", "equal"},
         }
         for edge in edges:
             self.assertEqual(edge.get("targetHandle"), "in", edge)
@@ -21340,7 +21342,9 @@ class CodeOffTests(unittest.TestCase):
             self.assertIsNotNone(expected, edge)
             self.assertIn(edge.get("sourceHandle"), expected, edge)
 
-        self.assertIn(("trigger", "out", "prepare"), triples)
+        self.assertIn(("trigger", "out", "policy_version"), triples)
+        self.assertIn(("policy_version", "default", "prepare"), triples)
+        self.assertIn(("policy_version", "case-0", "policy_v2"), triples)
         self.assertIn(("prepare", "success", "switch_prepare"), triples)
         self.assertIn(("switch_prepare", "default", "wait_author_1"), triples)
         self.assertIn(("switch_prepare", "case-0", "join_terminal"), triples)
@@ -21419,10 +21423,12 @@ class CodeOffTests(unittest.TestCase):
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
         self.assertEqual(leaves, {
             "economics_recorded", "economics_write_failed", "economics_readback_failed",
-            "economics_readback_mismatch",
+            "economics_readback_mismatch", "policy_v2_initialized", "policy_v2_parked",
         })
-        for leaf in leaves:
+        for leaf in leaves - {"policy_v2_initialized", "policy_v2_parked"}:
             self.assertTrue(all({"terminalize_failed", "terminalize_success"} & set(path) for path in paths_to(leaf)), leaf)
+        self.assertTrue(all("policy_version" in path for path in paths_to("initialize_v2")))
+        self.assertTrue(all("policy_version" in path for path in paths_to("policy_v2_parked")))
 
         # Rewst owns the permanent code-off economics/audit record. Every
         # terminal path converges once on deterministic native Datastore
@@ -21539,7 +21545,11 @@ class CodeOffTests(unittest.TestCase):
             self.assertIn(endpoint, openapi_paths, node_id)
             request_schema = openapi_paths[endpoint][action.lower()]["requestBody"]["content"]["application/json"]["schema"]
             accepts({key: value for key, value in node["config"].items() if key not in {"integrationInstanceId", "timeout"}}, request_schema, node_id)
-            expected_target = {"terminalize_failed": "terminal_error", "terminalize_success": "success_confirmation_error"}.get(node_id, "join_terminal")
+            expected_target = {
+                "terminalize_failed": "terminal_error",
+                "terminalize_success": "success_confirmation_error",
+                "initialize_v2": "policy_v2_park_join",
+            }.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
         self.assertEqual(nodes["freeze_1"]["config"]["job_id"], "{{ TASKS.wait_author_1.request.body.job_id }}")
@@ -21656,12 +21666,13 @@ class CodeOffTests(unittest.TestCase):
         )["spec"]
         sources = {edge["source"] for edge in graph["edges"]}
         terminals = {node["id"] for node in graph["nodes"] if node["id"] not in sources}
-        # The only paths that end without a durable economics record are the
-        # four economics markers themselves; every workflow outcome before them
-        # must fund exactly one record.
+        # V1 still converges only through the four economics markers. The
+        # additive v2 slice intentionally ends after initialization or a
+        # workflow-owned pre-launch park; durable v2 transitions land in PR 2.
         self.assertEqual(terminals, {
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
+            "policy_v2_initialized", "policy_v2_parked",
         })
         joined = {
             edge["source"] for edge in graph["edges"] if edge["target"] == "join_economics"
@@ -21735,6 +21746,287 @@ func main() {
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(hashlib.sha256(spec).hexdigest(), "a4bbe173f184745bea547008f7723c3044353d3d1c4208103e385dc7c634ec4b")
+
+
+class CodeOffPolicyMigrationTests(unittest.TestCase):
+    """Issue 188 PR 1: workflow policy with daemon-private draw authority."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        root = Path(self.td.name)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        for args in (
+            ("init", "-b", "main"),
+            ("config", "user.email", "codeoff-v2@test"),
+            ("config", "user.name", "code-off-v2-test"),
+        ):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        (self.repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "base"], check=True, capture_output=True)
+        self.base_sha = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        self.records = root / "codeoffs"
+        self.workspaces = root / "codeoff-workspaces"
+        self.launcher_bin = _write_fake_codex(root / "launcher", Path(__file__).read_bytes())
+        self.tests_path = root / "tests.json"
+        self.tests_path.write_text(json.dumps({"tests": [{
+            "name": "fixture-pass", "argv": [sys.executable, "-c", "pass"],
+            "cwd": "scratch", "timeout_seconds": 10, "async": False,
+        }]}) + "\n")
+        for patcher in (
+            mock.patch.object(server, "CODEOFFS_DIR", self.records),
+            mock.patch.object(server, "CODEOFF_WORKSPACES_DIR", self.workspaces),
+            mock.patch.object(server, "TESTS_PATH", self.tests_path),
+            mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}),
+            mock.patch.object(server, "resolve_launcher_binary_now", return_value=self.launcher_bin),
+            mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _policy():
+        return {
+            "version": "code-off-policy-v2",
+            "draw_algorithm_version": "code-off-draw-v1",
+            "seed_commitment_version": "code-off-seed-commitment-v1",
+            "participants": [
+                {"logical_model": "grok", "exact_model": "grok-4.6", "provider": "xai", "launcher": "grok", "author": True, "random_judge": True, "eligible": True},
+                {"logical_model": "sol", "exact_model": "gpt-5.6-sol", "provider": "openai", "launcher": "codex", "author": True, "random_judge": True, "eligible": True},
+                {"logical_model": "terra", "exact_model": "gpt-5.6-terra", "provider": "openai", "launcher": "codex", "author": True, "random_judge": True, "eligible": True},
+                {"logical_model": "sonnet", "exact_model": "claude-sonnet-5", "provider": "anthropic", "launcher": "claude", "author": True, "random_judge": True, "eligible": True},
+                {"logical_model": "opus", "exact_model": "claude-opus-5", "provider": "anthropic", "launcher": "claude", "author": True, "random_judge": True, "eligible": True},
+                {"logical_model": "fable", "exact_model": "claude-fable-5", "provider": "anthropic", "launcher": "claude", "author": False, "random_judge": False, "eligible": True},
+            ],
+            "fixed_judge": "fable", "fixed_judge_count": 1,
+            "author_count": 2, "random_judge_count": 2,
+            "role_effort": {
+                "author": "default", "judge": "default", "source": "explicit",
+                "inference_profile_version": "code-off-inference-profile-v1",
+            },
+            "rubric": {
+                "version": "code-off-rubric-v2",
+                "dimensions": {"correctness": 40, "tests": 20, "quality": 20, "scope": 10, "maintainability": 10},
+                "preference": ["candidate-1", "candidate-2", "abstain"],
+            },
+            "aggregation": {
+                "version": "code-off-aggregation-v2", "preference_votes_required": 2,
+                "fallback": "summed_scores", "exact_tie": "no_winner",
+                "winner_must_pass_candidate_tests": True,
+            },
+            "classification": {
+                "version": "code-category-v2", "category": "backend",
+                "tags": ["api", "testing"], "source": "issue-188-fixture",
+            },
+            "budgets": {
+                "author_seconds": 60, "judge_seconds": 60,
+                "test_seconds": 20, "max_turns": 4,
+            },
+            "as_of": "2026-09-03", "expires_at": "2026-10-03",
+        }
+
+    def _body(self, experiment_id="policy-v2-experiment", policy=None):
+        policy = deepcopy(policy or self._policy())
+        return {
+            "experiment_id": experiment_id, "repo": "scratch", "base_sha": self.base_sha,
+            "policy": policy,
+            "policy_hash": hashlib.sha256(server.codeoff_canonical_json(policy)).hexdigest(),
+            "prompt": "Implement the provider-free fixture.", "tests": ["fixture-pass"],
+            "toolchain": {"python": sys.version.split()[0]},
+            "commit_message": "feat: promote code-off winner",
+        }
+
+    def _post(self, body):
+        return server.dispatch(
+            "POST", "/v1/code-off/v2/initialize", {}, True, json.dumps(body).encode(),
+        )[:2]
+
+    @staticmethod
+    def _secret_keys(value):
+        found = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"seed", "blind_map", "blinding", "blinding_map"}:
+                    found.add(key)
+                found |= CodeOffPolicyMigrationTests._secret_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                found |= CodeOffPolicyMigrationTests._secret_keys(child)
+        return found
+
+    def test_v2_graph_builds_one_closed_native_code_off_policy_and_hash_without_code_expression_or_procedural_nunjucks(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = {(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["spec"]["edges"]}
+        self.assertEqual(nodes["policy_v2"]["type"], "transforms.objectBuilder")
+        mapping, = nodes["policy_v2"]["config"]["mappings"]
+        self.assertEqual(mapping["output"], "value")
+        self.assertEqual(mapping["expression"]["kind"], "object")
+        rendered = json.dumps(mapping["expression"], sort_keys=True)
+        for required in (
+            "code-off-policy-v2", "participants", "fixed_judge_count", "author_count",
+            "random_judge_count", "role_effort", "rubric", "aggregation",
+            "classification", "budgets", "as_of", "expires_at",
+        ):
+            self.assertIn(required, rendered)
+        self.assertEqual(nodes["policy_v2_hash"]["type"], "transforms.hash")
+        self.assertEqual(nodes["policy_v2_hash"]["config"]["input"], "{{ CTX.codeoff_policy_v2.value }}")
+        self.assertEqual(nodes["policy_v2_now"]["type"], "action.time.now")
+        self.assertEqual(nodes["policy_v2_expiry"]["type"], "action.time.compare")
+        self.assertEqual(nodes["policy_v2_eligible"]["type"], "logic.filter")
+        self.assertEqual(nodes["initialize_v2"]["type"], "action.graphwing.POST:/v1/code-off/v2/initialize")
+        self.assertIn(("policy_version", "default", "prepare"), edges)
+        self.assertIn(("policy_version", "case-0", "policy_v2"), edges)
+        self.assertEqual(nodes["policy_version"]["config"]["cases"][0]["rules"][0]["path"], "policy_version")
+        self.assertEqual(nodes["policy_v2_as_of"]["type"], "action.time.compare")
+        self.assertEqual(nodes["policy_v2_as_of"]["config"]["timeA"], "{{ CTX.codeoff_policy_v2.value.as_of }}")
+        self.assertEqual(nodes["policy_v2_expiry"]["config"]["timeA"], "{{ CTX.codeoff_policy_v2.value.expires_at }}")
+        self.assertEqual(nodes["policy_v2_eligibility"]["type"], "transforms.objectBuilder")
+        self.assertEqual(
+            {rule["path"] for rule in nodes["policy_v2_eligible"]["config"]["rules"]},
+            {f"p{index}" for index in range(6)},
+        )
+        self.assertIn(("policy_v2_eligible", "pass", "initialize_v2"), edges)
+        self.assertIn(("policy_v2_eligible", "fail", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_park_join", "out", "policy_v2_parked"), edges)
+        v2_nodes = [node for node in nodes.values() if "v2" in node["id"]]
+        self.assertFalse(any(node["type"] == "transforms.codeExpression" for node in v2_nodes))
+        self.assertNotIn("{%", json.dumps(v2_nodes))
+        self.assertNotIn('"seed"', json.dumps(v2_nodes))
+
+    def test_v2_initialize_mints_seed_privately_and_no_graph_openapi_audit_or_receipt_surface_contains_seed_or_blind_map(self):
+        status, payload = self._post(self._body())
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["status"], "initialized")
+        self.assertEqual(self._secret_keys(payload), set())
+        self.assertEqual(set(payload), {
+            "ok", "protocol_version", "policy_version", "experiment_id", "status",
+            "policy_hash", "seed_commitment", "slots", "identity_snapshot_hashes",
+            "identities_hash", "manifest_file_hash", "workspace_receipts",
+        })
+        private_seed = self.records / "policy-v2-experiment" / "private" / "seed"
+        self.assertRegex(private_seed.read_text(), r"^[0-9a-f]{64}$")
+        self.assertEqual(stat.S_IMODE(private_seed.stat().st_mode), 0o600)
+        manifest = json.loads((self.records / "policy-v2-experiment" / "manifest.json").read_text())
+        self.assertEqual(self._secret_keys(manifest), set())
+        self.assertFalse((private_seed.parent / "blinding.json").exists())
+        self.assertEqual(payload["seed_commitment"], manifest["selection"]["seed_commitment"])
+        spec = json.loads(server.openapi_bytes())
+        request = spec["components"]["schemas"]["CodeOffV2InitializeRequest"]
+        result = spec["components"]["schemas"]["CodeOffV2InitializeResult"]
+        self.assertNotIn("seed", request["properties"])
+        self.assertNotIn("seed", result["properties"])
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
+        initialize = next(node for node in graph["spec"]["nodes"] if node["id"] == "initialize_v2")
+        self.assertNotIn("seed", initialize["config"])
+
+    def test_v2_replay_returns_the_same_commitment_and_slots_but_changed_policy_local_loss_or_expiry_cannot_redraw_or_launch(self):
+        body = self._body("policy-v2-replay")
+        first_status, first = self._post(body)
+        self.assertEqual(first_status, 200, first)
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("replay resolved launcher")), \
+             mock.patch.object(server, "run_git", wraps=server.run_git) as git:
+            replay_status, replay = self._post(body)
+        self.assertEqual(replay_status, 200, replay)
+        self.assertEqual(replay["seed_commitment"], first["seed_commitment"])
+        self.assertEqual(replay["slots"], first["slots"])
+        self.assertFalse(any(call.args[1][:2] == ["worktree", "add"] for call in git.call_args_list))
+
+        changed = deepcopy(body)
+        changed["policy"]["classification"]["category"] = "different-workflow-policy"
+        changed["policy_hash"] = hashlib.sha256(server.codeoff_canonical_json(changed["policy"])).hexdigest()
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("changed policy resolved launcher")):
+            status, rejected = self._post(changed)
+        self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_policy_mismatch", "parked"))
+
+        lost_body = self._body("policy-v2-local-loss")
+        self.assertEqual(self._post(lost_body)[0], 200)
+        (self.records / "policy-v2-local-loss" / "private" / "seed").unlink()
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("loss resolved launcher")):
+            status, rejected = self._post(lost_body)
+        self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_authority_unavailable", "parked"))
+
+        expiry_body = self._body("policy-v2-expiry-replay")
+        self.assertEqual(self._post(expiry_body)[0], 200)
+        with mock.patch.object(server, "_codeoff_v2_policy_current", return_value=False), \
+             mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("expired replay resolved launcher")):
+            status, rejected = self._post(expiry_body)
+        self.assertEqual((status, rejected["code"], rejected["status"]), (409, "codeoff_v2_policy_expired", "parked"))
+
+    def test_v2_collision_with_v1_is_read_only_and_policy_hash_matches_go_json(self):
+        v1_id = "policy-v1-collision"
+        v1_body = {
+            "experiment_id": v1_id, "repo": "scratch", "base_sha": self.base_sha,
+            "seed": "00" * 32, "category": "backend", "tags": ["api"],
+            "category_source": "issue-188-fixture", "prompt": "v1 stays intact",
+            "tests": ["fixture-pass"], "toolchain": {"python": sys.version.split()[0]},
+            "budgets": {"author_seconds": 60, "judge_seconds": 60, "test_seconds": 20, "max_turns": 4},
+            "commit_message": "feat: v1 fixture",
+        }
+        status, prepared = server.dispatch(
+            "POST", "/v1/code-off/prepare", {}, True, json.dumps(v1_body).encode(),
+        )[:2]
+        self.assertEqual((status, prepared["status"]), (200, "prepared"), prepared)
+        root = self.records / v1_id
+        state_before = (root / "state.json").read_bytes()
+        events_before = sorted(path.name for path in (root / "events").iterdir())
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("collision resolved launcher")):
+            status, rejected = self._post(self._body(v1_id))
+        self.assertEqual((status, rejected["code"]), (409, "codeoff_v2_experiment_id_conflict"))
+        self.assertEqual((root / "state.json").read_bytes(), state_before)
+        self.assertEqual(sorted(path.name for path in (root / "events").iterdir()), events_before)
+
+        policy = self._policy()
+        policy["classification"]["category"] = "backend & <data>"
+        policy["classification"]["source"] = "workflow > daemon"
+        go_json_bytes = server._codeoff_v2_policy_json(policy)
+        self.assertIn(b"\\u0026", go_json_bytes)
+        self.assertIn(b"\\u003c", go_json_bytes)
+        self.assertIn(b"\\u003e", go_json_bytes)
+        body = self._body("policy-v2-go-json", policy)
+        body["policy_hash"] = hashlib.sha256(go_json_bytes).hexdigest()
+        status, payload = self._post(body)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["policy_hash"], body["policy_hash"])
+
+    def test_v2_workflow_expiry_and_participant_eligibility_park_before_launcher_resolution_while_daemon_only_enforces_hard_supported_identity_bounds(self):
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())["spec"]
+        edges = {(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["edges"]}
+        self.assertIn(("policy_v2_as_of", "after", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_as_of", "before", "policy_v2_started_join"), edges)
+        self.assertIn(("policy_v2_as_of", "equal", "policy_v2_started_join"), edges)
+        self.assertIn(("policy_v2_expiry", "before", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_expiry", "after", "policy_v2_current_join"), edges)
+        self.assertIn(("policy_v2_expiry", "equal", "policy_v2_current_join"), edges)
+        self.assertIn(("policy_v2_current_join", "out", "policy_v2_eligibility"), edges)
+        self.assertIn(("policy_v2_eligibility", "out", "policy_v2_eligible"), edges)
+        self.assertIn(("policy_v2_eligible", "fail", "policy_v2_park_join"), edges)
+
+        workflow_ineligible = self._policy()
+        workflow_ineligible["participants"][0]["eligible"] = False
+        workflow_ineligible["classification"] = {
+            "version": "tenant-owned-category-v9", "category": "workflow-defined",
+            "tags": ["workflow-defined-tag"], "source": "workflow",
+        }
+        status, payload = self._post(self._body("policy-v2-workflow-owned", workflow_ineligible))
+        self.assertEqual(status, 200, payload)
+
+        unsupported = self._policy()
+        unsupported["participants"][0]["exact_model"] = "grok-unbounded-alias"
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("unsupported identity resolved launcher")):
+            status, payload = self._post(self._body("policy-v2-unsupported", unsupported))
+        self.assertEqual((status, payload["code"]), (400, "codeoff_v2_unsupported_identity"))
+
+        over_budget = self._policy()
+        over_budget["budgets"]["author_seconds"] = server.CODEOFF_MAX_AGENT_SECONDS + 1
+        with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("over-budget policy resolved launcher")):
+            status, payload = self._post(self._body("policy-v2-over-budget", over_budget))
+        self.assertEqual((status, payload["code"]), (400, "bad_budgets"))
 
 
 class InstallTests(unittest.TestCase):
@@ -22939,6 +23231,10 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
     def expected_handles(node_type):
         if node_type == "action.wait.webhook":
             return {"pending", "out", "timeout", "failure"}
+        if node_type == "action.time.now":
+            return {"out"}
+        if node_type == "action.time.compare":
+            return {"before", "after", "equal"}
         if node_type == "logic.filter":
             return {"pass", "fail"}
         if node_type == "logic.loop":
