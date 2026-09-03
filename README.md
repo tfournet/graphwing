@@ -8,11 +8,11 @@ That is the product.
 
 One chat session that writes code, runs git, judges its own work, and opens a PR is a mess. Graphwing splits the jobs:
 
-- **Rewst** stores the order of steps. Checkout, then one agent, then test, then commit. That order is a workflow JSON file in `graphs/`.
-- **Graphwing** performs each step when Rewst hits a URL (`/v1/git/checkout`, `/v1/test/run`, `/v1/agent/run`, …).
-- **You** still decide what to build, write the ticket files, start the workflow, and merge the PR.
+- **Rewst** owns business policy, durable workflow state, and the order of steps. The complete boundary is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- **Graphwing** reports normalized facts and performs bounded local effects when Rewst hits a named URL (`/v1/git/checkout`, `/v1/test/run`, `/v1/agent/run`, …). It enforces non-bypassable safety but does not choose product policy.
+- **You** decide what to build, approve the workflow intent, and authorize whether merge may be automatic.
 
-Cloud issue and pull-request operations stay in Rewst integrations. Graphwing does not hold those keys.
+Cloud issue and Shortcut operations stay in Rewst integrations. Graphwing may use the seat's allowlisted local `gh` executable for normalized PR facts and an exact workflow-authorized merge; credentials never enter workflow data.
 
 ```mermaid
 flowchart LR

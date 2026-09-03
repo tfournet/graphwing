@@ -11,6 +11,16 @@ Use your normal editor or terminal. Do not reconstruct operating rules from an o
 - Native `codex`, `claude`, and `grok` launchers must already be installed. Graphwing never installs or wraps them.
 - Herdr is optional. Session `graphwing`, tab `graph`, is a deterministic job dashboard. Do not use it as a planner or chat seat.
 
+## Hard architecture boundary
+
+[ARCHITECTURE.md](ARCHITECTURE.md) is authoritative. Rewst workflows own business policy and durable workflow state, including routing, retries, review actionability, lifecycle transitions, winner selection, merge eligibility, and terminal outcomes.
+
+Graphwing performs bounded local execution, reports normalized facts, and enforces authentication, allowlists, identity and receipt verification, atomic local effects, and non-bypassable safety. The daemon rejects unsafe work but does not choose product policy. The north star is one resumable, live-proven pre- and post-PR lifecycle.
+
+Workflow decides whether merge is requested. The daemon freshly verifies the exact head, named-test evidence, checks, holds, authorization, and merge operation. Each workflow replacement must be live-proven before the superseded daemon policy is removed.
+
+Source implementation and high-confidence Graphwing PR merges are authorized. Live deployment, OpenAPI re-import, workflow publication, live canaries, and destructive historical cleanup require separate direct approval.
+
 ## Flow
 
 1. Grill the idea and record the accepted behavior on its GitHub issue.

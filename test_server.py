@@ -7802,6 +7802,29 @@ while True:
             actual = sum(route[f"reviewer{i}_launcher"] != "none" for i in (1, 2))
             self.assertEqual(actual, count, f"{class_name}/{size}")
 
+    def test_workflow_owned_business_policy_is_a_hard_repository_rule(self):
+        root = Path(__file__).parent
+        architecture = (root / "docs" / "ARCHITECTURE.md").read_text()
+        agents = (root / "AGENTS.md").read_text()
+        human_loop = (root / "docs" / "HUMAN-LOOP.md").read_text()
+
+        for text in (architecture, agents, human_loop):
+            self.assertIn("Rewst workflows own business policy", text)
+            self.assertIn("non-bypassable safety", text)
+            self.assertIn("pre- and post-PR", text)
+        for policy in (
+            "routing", "retries", "review actionability", "lifecycle transitions",
+            "winner selection", "merge eligibility", "terminal outcomes",
+        ):
+            self.assertIn(policy, architecture)
+        for daemon_boundary in (
+            "bounded local execution", "normalized facts", "authentication", "allowlists",
+            "identity and receipt verification", "atomic local effects",
+        ):
+            self.assertIn(daemon_boundary, architecture)
+        self.assertIn("Live deployment, OpenAPI re-import, workflow publication, live canaries, and destructive cleanup require separate direct approval", architecture)
+        self.assertIn("live-proven before the superseded daemon policy is removed", architecture)
+
     def test_routing_policy_v2_note_records_evidence_gate_and_activation_boundary(self):
         note = (Path(__file__).parent / "docs/notes/routing-policy-v2.md").read_text()
         human_loop = (Path(__file__).parent / "docs/HUMAN-LOOP.md").read_text()
