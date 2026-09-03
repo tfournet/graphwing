@@ -285,10 +285,12 @@ class RewstExactAgentAuthorizationTests(unittest.TestCase):
         self.binary = _write_fake_codex(root / "codex")
         server.reset_rewst_authority_registry_for_test()
 
-    def dispatch_authorized(self, body, headers, *, enqueue=None, binary=None):
+    def dispatch_authorized(
+        self, body, headers, *, enqueue=None, binary=None, now=1_700_000_000,
+    ):
         binary = binary or self.binary
         enqueue = enqueue or (lambda job: None)
-        with mock.patch.object(server.time, "time", return_value=1_700_000_000), \
+        with mock.patch.object(server.time, "time", return_value=now), \
              mock.patch.object(server, "load_rewst_issuer_secret", return_value=b"r" * 32), \
              mock.patch.object(server, "load_repos", return_value={"scratch": str(self.repo)}), \
              mock.patch.object(server, "JOBS_DIR", self.jobs), \
@@ -380,6 +382,12 @@ class RewstExactAgentAuthorizationTests(unittest.TestCase):
         reused_status, reused, _ = self.dispatch_authorized(body, reused_headers)
         self.assertEqual(reused_status, 401, reused)
         self.assertEqual(reused["code"], "rewst_authorization_replayed")
+
+        expired_status, expired, _ = self.dispatch_authorized(
+            body, headers, now=1_700_000_101
+        )
+        self.assertEqual(expired_status, 401, expired)
+        self.assertEqual(expired["code"], "rewst_authorization_invalid")
 
     def test_daemon_restart_challenge_rejects_an_old_consumed_authorization(self):
         body, headers, _ = _exact_authorized_agent_request(self.repo, self.binary)
