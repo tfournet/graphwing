@@ -21,6 +21,8 @@ Workflow decides whether merge is requested. The daemon freshly verifies the exa
 
 Source implementation and high-confidence Graphwing PR merges are authorized. Live deployment, OpenAPI re-import, workflow publication, live canaries, and destructive historical cleanup require separate direct approval.
 
+The current run-control path and temporary daemon owners are frozen in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). Do not remove a v1 compatibility surface or infer a v2 record from v1 state before the separately approved cutover proof.
+
 ## Flow
 
 1. Grill the idea and record the accepted behavior on its GitHub issue.

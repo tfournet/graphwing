@@ -1,5 +1,17 @@
 # Run-control activation: recovery and next milestone
 
+## Issue #187 ownership and call-path baseline
+
+This baseline is pinned to `origin/main` `631e10f9fa5ae4aa7a0ae511161e1a7faab99016` and the owner ruling in issue #184. `scripts/drive-pr.py` first calls `graphwing-run-control-initialize`, then starts `graphwing-pr-drive`. Publication-resolved `action.subworkflow` references mechanically reach `state`, `consume`, the `authorize` operation implemented by `consume-authorization`, `reconcile`, and `transition`. The older `graphwing-run-control-authorize` graph has no caller and is compatibility-only. `scripts/publish_graphs.py` holds the complete graph, pin-source, and daemon-symbol classification; `RunControlOwnershipBaselineTests` derives the graph references and server symbol set instead of trusting this prose.
+
+The current daemon business-policy owners are `run_control_evaluate`, `_run_control_checkpoint`, `RUN_CONTROL_MAX_ATTEMPTS`, `RUN_CONTROL_CONSTRAINT_SIGNALS`, and `RUN_CONTROL_GAMING_SIGNALS`. Normalized-fact helpers, non-bypassable continuity checks, and v1 local settlement/ledger compatibility are classified separately. The challenge generator/read is active hard safety; the exact Rewst request HMAC, descriptor match, and process-local claim/consume enforcement primitives remain dormant until the dispatch call path invokes them. This inventory describes the migration debt; it does not legitimize daemon-owned policy or local durability. Rewst workflows own aggregate budgets, immutable attempt history, checkpoint interpretation, continuation, handoff, restructure, park, and terminal outcomes under [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+The checked-in v1 graph payloads still carry historical `description: "Dormant."` and `spec.meta.dormant` fields. Reachability and publisher pin resolution prove those labels false for the active chain, but this no-runtime-change slice does not rewrite graph JSON. The source classification above is canonical for migration planning until a behavior-bearing graph version is separately approved.
+
+Migration is versioned and non-inferential: v1 in-flight records remain readable and finish under v1 or are explicitly parked, but are never inferred or guessed into v2. V2 uses new namespaces and cannot activate while an unresolved v1 reservation exists for the same run. No v1 graph, endpoint, ledger path, or historical record is removed in this baseline slice.
+
+Source implementation and high-confidence Graphwing PR merges are authorized. Deployment, OpenAPI re-import, workflow publication, live canaries, and historical cleanup each remain separately approval-gated. This slice performs none of them and changes no runtime behavior.
+
 Status, 2026-09-01. The dormant durable run-control foundation (PR #139) is merged
 at `f242c90`. The first pr-drive wiring attempt (`98c5d69`) is blocked and archived
 on local branch `archive/pr-drive-run-control-wiring-98c5d69-blocked`; do not push

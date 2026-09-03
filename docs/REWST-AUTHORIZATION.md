@@ -1,6 +1,6 @@
 # Rewst launch-authorization foundation
 
-This prerequisite remains dormant for launches: existing launch endpoints and launch-routing graphs do not consume or enforce it. The only live surface added here is a closed, authenticated, non-launching challenge read. A later phase combines the ordinary Graphwing API key with the dedicated Rewst exact-request signature and claim/consume boundary.
+The daemon's exact HMAC/descriptor/one-time-consumption enforcement primitives remain dormant for launches: existing launch endpoints do not call them. The authenticated challenge read is live and its process-start generator is hard safety. The active v1 graph-side authorization path is `graphwing-run-control-consume-authorization`; the older `graphwing-run-control-authorize` foundation graph is compatibility-only. Neither graph enforces the dormant daemon boundary. The source-derived distinction and migration gates are pinned in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline).
 
 ## Server-instance challenge
 
