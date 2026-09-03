@@ -4712,21 +4712,50 @@ def pr_findings_from(labels: list[str], comment_bodies: list[str]) -> dict[str, 
         ),
     )
     counts = {s: sum(1 for f in ordered if f.get("severity") == s) for s in FINDINGS_SEVERITIES}
+    # blocking = merge bar (holds / missing grade / below A). needs_fix =
+    # writer dispatch: nonempty findings below that bar. A hold is not a
+    # code fix; nits on A/A-/A+ stay advisory. #177.
+    blocking = bool(holds) or grade is None or grade.rstrip("+-") != "A"
+    needs_fix = bool(ordered) and (grade is None or grade.rstrip("+-") != "A")
     return {
         "ok": True,
         "grade": grade,
         "holds": holds,
-        # "Any finding at all" never converges: at grade A the reviewer still
-        # lists nits, so a loop gated on that spends writer sessions forever.
-        # review-hold.yml clears hold:pm-review at A/A-, so that is the real
-        # merge bar. Findings on an A-graded PR stay in the payload as
-        # advisory. No grade means the audit has not spoken yet, which is not
-        # the same as clear.
-        "blocking": bool(holds) or grade is None or grade.rstrip("+-") != "A",
+        "blocking": blocking,
+        "needs_fix": needs_fix,
         "findings": ordered,
-        "brief": render_findings_brief(ordered),
+        "brief": render_findings_brief(ordered if needs_fix else []),
         **counts,
     }
+
+
+def fold_pr_findings_checks(out: dict[str, Any], ck: dict[str, Any]) -> dict[str, Any]:
+    """Fold GitHub check reds into writer dispatch without touching merge blocking."""
+    failing = [name for name in (ck.get("failing") or [])[:20] if isinstance(name, str) and name.strip()]
+    out["all_green"] = bool(ck.get("all_green"))
+    out["any_red"] = bool(ck.get("any_red"))
+    out["failing"] = failing
+    if not out.get("ok"):
+        return out
+    review_fix = bool(out.get("needs_fix"))
+    out["needs_fix"] = review_fix or bool(failing)
+    out["brief"] = render_pr_drive_brief(out.get("findings") or [] if review_fix else [], failing)
+    return out
+
+
+def render_pr_drive_brief(findings: list[dict[str, Any]], failing: list[str]) -> str:
+    """Writer Task: actionable review remedies plus failing check names."""
+    parts: list[str] = []
+    if findings:
+        parts.append(render_findings_brief(findings))
+    if failing:
+        lines = ["Fix every failing GitHub check below.", ""]
+        for i, name in enumerate(failing, 1):
+            lines.append("%d. [check/fail] %s" % (i, name))
+            lines.append("   remedy: make this check pass on the current head")
+            lines.append("")
+        parts.append("\n".join(lines).rstrip())
+    return "\n\n".join(parts) if parts else "No blocking findings."
 
 
 def render_findings_brief(findings: list[dict[str, Any]]) -> str:
@@ -12206,9 +12235,7 @@ def dispatch_inner(
                 ck = annotate_pr_checks(
                     gh_json(repo_path, ["pr", "checks", number, "--json", "name,state,bucket,link"])
                 )
-                out["all_green"] = bool(ck.get("all_green"))
-                out["any_red"] = bool(ck.get("any_red"))
-                out["failing"] = (ck.get("failing") or [])[:20]
+                out = fold_pr_findings_checks(out, ck)
                 # Flat, not nested under "data": the connector already exposes
                 # this as TASKS.<node>.data.<field>, so nesting made every path
                 # a double .data.data and drive_snap read nulls.

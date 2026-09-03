@@ -307,7 +307,7 @@
               "output": "needs_fix",
               "expression": {
                 "kind": "getField",
-                "path": "TASKS.iter_findings.data.blocking"
+                "path": "TASKS.iter_findings.data.needs_fix"
               }
             },
             {

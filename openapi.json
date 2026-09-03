@@ -1821,6 +1821,7 @@
           "remote_state": { "type": "string", "description": "ghPrView remote-only readiness; ready still lacks named-test evidence" },
           "remote_ready": { "type": "boolean", "description": "Remote state only, never a merge-safety attestation" },
           "failing": { "type": "array", "items": { "type": "string" } },
+          "needs_fix": { "type": "boolean", "description": "Writer dispatch: nonempty sub-A findings or folded red checks; not hold:* alone" },
           "pending": { "type": "array", "items": { "type": "string" } }
         }
       },

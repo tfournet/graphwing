@@ -305,7 +305,21 @@ REVIEW_WAIT_SECONDS = int(os.environ.get("GRAPHWING_REVIEW_WAIT", "2700"))
 REVIEW_POLL_SECONDS = 30
 
 
+def audit_is_in_flight(opening: dict) -> bool:
+    """True only while hold:* is present and no grade has settled.
+
+    A returning hold:pm-review after A/A- is merge policy, not an unfinished
+    audit. Waiting GRAPHWING_REVIEW_WAIT for it never clears. #177.
+    """
+    if not opening.get("holds"):
+        return False
+    grade = opening.get("grade")
+    return grade in (None, "")
+
+
 def wait_for_fresh_review(repo, pr, previous, tries: int = 0, gap: int = 0) -> bool:
+    if not audit_is_in_flight(previous):
+        return True
     gap = gap or REVIEW_POLL_SECONDS
     tries = tries or max(1, REVIEW_WAIT_SECONDS // gap)
     before = {f.get("fingerprint") for f in (previous.get("findings") or [])}
@@ -314,10 +328,10 @@ def wait_for_fresh_review(repo, pr, previous, tries: int = 0, gap: int = 0) -> b
         now = findings(repo, pr)
         if now is None:
             return False
-        if now.get("holds"):
+        if audit_is_in_flight(now):
             continue
         after = {f.get("fingerprint") for f in (now.get("findings") or [])}
-        if after != before or not now.get("blocking"):
+        if after != before or not now.get("blocking") or now.get("grade"):
             print("review re-ran: grade=%s blocking=%s" % (now.get("grade"), now.get("blocking")))
             return True
     print("review did not settle within %ds; stopping rather than acting on a stale read"
@@ -410,7 +424,7 @@ def main() -> int:
     opening = findings(args.repo, args.pr)
     if opening is None:
         return 1
-    if opening.get("holds"):
+    if audit_is_in_flight(opening):
         print("audit is still running on this commit (%s); waiting for a verdict "
               "before starting, or the first attempt works from a stale brief"
               % ", ".join(opening["holds"]))

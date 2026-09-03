@@ -7408,6 +7408,72 @@ while True:
         self.assertTrue(out["blocking"])
         self.assertEqual(out["code"], "unparsable_findings")
 
+    def test_pr_findings_hold_only_does_not_need_a_writer(self):
+        # Live #177: grade A-, findings [], hold:pm-review, blocking true.
+        # pr-drive keyed the writer off blocking, so Codex got
+        # "No blocking findings." and git/commit 400 nothing_staged.
+        # Holds still block merge; they must not synthesize a fix task.
+        held = server.pr_findings_from(
+            labels=["grade-A-", "hold:pm-review"], comment_bodies=[],
+        )
+        self.assertTrue(held["ok"])
+        self.assertEqual(held["grade"], "A-")
+        self.assertEqual(held["holds"], ["hold:pm-review"])
+        self.assertEqual(held["findings"], [])
+        self.assertTrue(held["blocking"])
+        self.assertFalse(held["needs_fix"])
+        self.assertEqual(held["brief"], "No blocking findings.")
+
+        empty_below_bar = server.pr_findings_from(labels=["grade-B+"], comment_bodies=[])
+        self.assertTrue(empty_below_bar["blocking"])
+        self.assertFalse(empty_below_bar["needs_fix"])
+
+        nits_at_bar = server.pr_findings_from(
+            labels=["grade-A"],
+            comment_bodies=['<!-- engineering-findings-json\n'
+                            '{"findings":[{"severity":"minor","fingerprint":"nit",'
+                            '"remedy":"tidy"}]}\n-->'],
+        )
+        self.assertFalse(nits_at_bar["blocking"])
+        self.assertFalse(nits_at_bar["needs_fix"], nits_at_bar)
+
+        below_bar = server.pr_findings_from(
+            labels=["grade-B-"],
+            comment_bodies=['<!-- engineering-findings-json\n'
+                            '{"findings":[{"severity":"major","fingerprint":"shim-path",'
+                            '"remedy":"prepend"}]}\n-->'],
+        )
+        self.assertTrue(below_bar["blocking"])
+        self.assertTrue(below_bar["needs_fix"])
+        self.assertIn("shim-path", below_bar["brief"])
+
+    def test_pr_findings_red_checks_enter_the_writer_brief(self):
+        # Checks never appeared in engineering-findings-json, so a red Go
+        # suite with an empty review list launched no useful brief. Fold
+        # failing names into needs_fix and the writer Task.
+        held = server.pr_findings_from(
+            labels=["grade-A-", "hold:pm-review"], comment_bodies=[],
+        )
+        out = server.fold_pr_findings_checks(
+            held,
+            {"ok": True, "all_green": False, "any_red": True,
+             "failing": ["Go Unit Tests / 1/2", "ci-status"]},
+        )
+        self.assertTrue(out["blocking"])
+        self.assertTrue(out["needs_fix"])
+        self.assertTrue(out["any_red"])
+        self.assertIn("Go Unit Tests / 1/2", out["brief"])
+        self.assertIn("ci-status", out["brief"])
+        self.assertNotEqual(out["brief"], "No blocking findings.")
+
+        green = server.fold_pr_findings_checks(
+            server.pr_findings_from(labels=["grade-A-", "hold:pm-review"], comment_bodies=[]),
+            {"ok": True, "all_green": True, "any_red": False, "failing": []},
+        )
+        self.assertTrue(green["blocking"])
+        self.assertFalse(green["needs_fix"])
+        self.assertEqual(green["brief"], "No blocking findings.")
+
     def test_review_no_verdict_is_flagged_not_an_opinion(self):
         # "Reached max turns (1)" parsed as NACK, so a reviewer that never ran
         # counted as a reviewer that said no. Both SC-110290 review passes died
@@ -12931,16 +12997,13 @@ func main() {
                 self.assertIn(rule["path"], produced,
                               f"case {case['label']} reads {rule['path']}, which "
                               f"{feeders[0]} never produces")
-        # The feeder must read the findings payload's own blocking verdict
-        # (holds, or no grade, or grade below A), not GitHub check status:
-        # /v1/gh/pr/findings's all_green is check status only, folded in
-        # because the checks node's own output is artifact-stubbed, and a PR
-        # with a passing check but an open blocking finding reads all_green
-        # true. Gating on it made every attempt skip a genuinely red PR (live
-        # proof run bdc72f98, PR #172: three slots, zero fixes, one open
-        # blocker).
+        # Writer dispatch is findings.needs_fix (actionable review items or
+        # folded red checks), not merge blocking: hold:pm-review alone is a
+        # merge hold, and all_green is check status only. Gating on
+        # all_green skipped a genuine review blocker (live bdc72f98 / #172);
+        # gating on blocking spent a writer on an empty brief (live #177).
         by_output = {m["output"]: m["expression"] for m in feeder["config"]["mappings"]}
-        self.assertEqual(by_output["needs_fix"], {"kind": "getField", "path": "TASKS.iter_findings.data.blocking"})
+        self.assertEqual(by_output["needs_fix"], {"kind": "getField", "path": "TASKS.iter_findings.data.needs_fix"})
 
     def test_implement_slice_rewst_templates_are_path_valid_and_jinja_lite_safe(self):
         graph = json.loads(
@@ -22682,6 +22745,27 @@ class DrivePrScriptTests(unittest.TestCase):
         mock_findings.assert_not_called()
         self.assertEqual(rc, 1)
 
+    def test_settled_grade_plus_sticky_hold_is_not_an_in_flight_audit(self):
+        # GRAPHWING_REVIEW_WAIT used to treat any holds as "audit still
+        # looking". After a settled A/A-, hold:pm-review is merge policy.
+        m = self.module
+        self.assertTrue(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": None}))
+        self.assertFalse(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": "A-"}))
+        self.assertFalse(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": "B"}))
+        self.assertFalse(m.audit_is_in_flight({"holds": [], "grade": None}))
+
+        sticky = {"holds": ["hold:pm-review"], "grade": "A-", "findings": [], "blocking": True}
+        with mock.patch.object(m, "findings") as mock_findings, mock.patch.object(m.time, "sleep") as mock_sleep:
+            self.assertTrue(m.wait_for_fresh_review("riftwing", "3914", sticky, tries=3, gap=1))
+        mock_sleep.assert_not_called()
+        mock_findings.assert_not_called()
+
+        in_flight = {"holds": ["hold:pm-review"], "grade": None, "findings": [], "blocking": True}
+        with mock.patch.object(m, "findings") as mock_findings, mock.patch.object(m.time, "sleep"):
+            mock_findings.return_value = sticky
+            self.assertTrue(m.wait_for_fresh_review("riftwing", "3914", in_flight, tries=3, gap=1))
+        self.assertEqual(mock_findings.call_count, 1)
+
 
 class PrDriveGraphTests(unittest.TestCase):
     """The shipped pr-drive graph: one capped logic.loop instead of a kick
@@ -22738,9 +22822,9 @@ class PrDriveGraphTests(unittest.TestCase):
         # stubbed), not the review-findings verdict. A PR with a passing CI
         # check and an unresolved blocking finding reads all_green=true, so
         # every slot skipped it in live proof run bdc72f98 on PR #172: three
-        # attempts, zero fixes, on a PR with one open blocker. blocking (from
-        # pr_findings_from: holds present, or no grade, or grade below A) is
-        # the field that actually means "this needs a writer".
+        # attempts, zero fixes, on a PR with one open blocker. needs_fix
+        # (actionable review findings or folded red checks) is the field that
+        # means "this needs a writer"; merge blocking stays on holds/grade.
         self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
         self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [{"label": "red", "rules": [{"path": "needs_fix", "op": "equals", "value": True}]}])
         self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
