@@ -4665,6 +4665,272 @@ PR_AUDIT_FINDINGS_MARKER = "<!-- pr-audit-findings v1"
 PR_AUDIT_SHA_RE = re.compile(r"<!--\s*pr-audit-sha:\s*([0-9a-f]+)\s*-->", re.I)
 FINDINGS_SEVERITIES = ("blocker", "critical", "major", "minor")
 PR_AUDIT_SEVERITY = {"MUST": "blocker", "SHOULD": "major", "MAY": "minor", "NIT": "minor"}
+PR_POLICY_LABEL_LIMIT = 100
+PR_POLICY_SOURCE_LIMIT = 20
+PR_POLICY_FINDING_LIMIT = 20
+PR_POLICY_CHECK_LIMIT = 100
+
+
+def _bounded_pr_policy_facts(items: list[Any], total: int, limit: int) -> dict[str, Any]:
+    return {"items": items[:limit], "total": total, "truncated": total > limit}
+
+
+def _pr_policy_text(
+    value: Any, limit: int, incomplete: list[str], reason: str, *, lower: bool = False,
+) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value)
+    if lower:
+        text = text.lower()
+    if len(text) > limit:
+        incomplete.append(reason)
+        return text[:limit]
+    return text
+
+
+def _pr_policy_finding(
+    raw: Any, source: str, incomplete: list[str], reason: str,
+) -> dict[str, Any] | None:
+    """Project one observed finding without filtering or policy classification."""
+    if not isinstance(raw, dict):
+        return None
+    location_value = raw.get("location")
+    location: dict[str, Any] = location_value if isinstance(location_value, dict) else {}
+    finding_id = raw.get("id") if source == "pr_audit" else raw.get("fingerprint")
+    if finding_id in (None, ""):
+        finding_id = raw.get("fingerprint") if source == "pr_audit" else raw.get("id")
+    line = raw.get("line") if raw.get("line") is not None else location.get("line")
+    if isinstance(line, bool) or not isinstance(line, (int, str)):
+        line = None
+    elif isinstance(line, str) and len(line) > 64:
+        incomplete.append(reason)
+        line = line[:64]
+    path = raw.get("file") if raw.get("file") not in (None, "") else location.get("path")
+    return {
+        "source": source,
+        "id": _pr_policy_text(finding_id, 512, incomplete, reason),
+        "status": _pr_policy_text(raw.get("status"), 64, incomplete, reason, lower=True),
+        "severity": _pr_policy_text(raw.get("severity"), 64, incomplete, reason),
+        "location": {
+            "path": _pr_policy_text(path, 4096, incomplete, reason),
+            "line": line,
+        },
+        "remedy": _pr_policy_text(
+            raw.get("fix_guidance") or raw.get("remedy"), 8192, incomplete, reason,
+        ) or "",
+    }
+
+
+def _pr_policy_finding_facts(
+    raw_findings: Any, source: str, incomplete: list[str], reason: str,
+) -> dict[str, Any]:
+    if not isinstance(raw_findings, list):
+        incomplete.append(f"{reason}_malformed")
+        raw_findings = []
+    projected = []
+    for raw in raw_findings:
+        finding = _pr_policy_finding(raw, source, incomplete, f"{reason}_malformed")
+        if finding is None:
+            incomplete.append(f"{reason}_malformed")
+            continue
+        projected.append(finding)
+    if len(raw_findings) > PR_POLICY_FINDING_LIMIT:
+        incomplete.append(f"{reason}_truncated")
+    return _bounded_pr_policy_facts(projected, len(raw_findings), PR_POLICY_FINDING_LIMIT)
+
+
+def _pr_policy_audit_sources(
+    reviews: list[Any], head_sha: str | None, incomplete: list[str],
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    total = 0
+    for review in reviews:
+        if not isinstance(review, dict):
+            incomplete.append("pr_audit_malformed")
+            continue
+        state = str(review.get("state") or "").upper()
+        if state in ("", "PENDING"):
+            continue
+        body = review.get("body")
+        if not isinstance(body, str):
+            continue
+        start = 0
+        while True:
+            marker_start = body.find(PR_AUDIT_FINDINGS_MARKER, start)
+            if marker_start < 0:
+                break
+            total += 1
+            end = body.find("-->", marker_start)
+            if end < 0:
+                incomplete.append("pr_audit_malformed")
+                break
+            raw = body[marker_start + len(PR_AUDIT_FINDINGS_MARKER):end]
+            start = end + 3
+            try:
+                block = json.loads(raw)
+            except ValueError:
+                incomplete.append("pr_audit_malformed")
+                continue
+            if not isinstance(block, dict):
+                incomplete.append("pr_audit_malformed")
+                continue
+            commit_sha = _review_commit_id(review).lower() or None
+            marker = PR_AUDIT_SHA_RE.search(body)
+            marker_sha = marker.group(1).lower() if marker else None
+            block_sha_value = block.get("sha")
+            block_sha = block_sha_value.lower() if isinstance(block_sha_value, str) else None
+            if len(state) > 64:
+                incomplete.append("pr_audit_malformed")
+            identity_values = [commit_sha, marker_sha, block_sha]
+            if any(value is not None and not GIT_SHA_RE.fullmatch(value) for value in identity_values):
+                incomplete.append("pr_audit_malformed")
+                commit_sha = commit_sha if commit_sha and GIT_SHA_RE.fullmatch(commit_sha) else None
+                marker_sha = marker_sha if marker_sha and GIT_SHA_RE.fullmatch(marker_sha) else None
+                block_sha = block_sha if block_sha and GIT_SHA_RE.fullmatch(block_sha) else None
+            identities = [value for value in (commit_sha, marker_sha, block_sha) if value]
+            records.append({
+                "source": "pr_audit",
+                "submitted_state": state[:64],
+                "commit_sha": commit_sha,
+                "marker_sha": marker_sha,
+                "block_sha": block_sha,
+                "exact_head": bool(head_sha and identities and all(value == head_sha for value in identities)),
+                "grade": _pr_policy_text(
+                    block.get("grade"), 64, incomplete, "pr_audit_malformed",
+                ),
+                "findings": _pr_policy_finding_facts(
+                    block.get("findings"), "pr_audit", incomplete, "pr_audit_findings",
+                ),
+            })
+    if total > PR_POLICY_SOURCE_LIMIT:
+        incomplete.append("pr_audit_truncated")
+    return _bounded_pr_policy_facts(records, total, PR_POLICY_SOURCE_LIMIT)
+
+
+def _pr_policy_clean_code_sources(
+    comment_bodies: list[str], incomplete: list[str],
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    total = 0
+    for body in comment_bodies:
+        if not isinstance(body, str):
+            incomplete.append("clean_code_malformed")
+            continue
+        start = 0
+        while True:
+            marker_start = body.find(FINDINGS_MARKER, start)
+            if marker_start < 0:
+                break
+            total += 1
+            end = body.find("-->", marker_start)
+            if end < 0:
+                incomplete.append("clean_code_malformed")
+                break
+            raw = body[marker_start + len(FINDINGS_MARKER):end]
+            start = end + 3
+            try:
+                block = json.loads(raw)
+            except ValueError:
+                incomplete.append("clean_code_malformed")
+                continue
+            if not isinstance(block, dict):
+                incomplete.append("clean_code_malformed")
+                continue
+            records.append({
+                "source": "clean_code",
+                "findings": _pr_policy_finding_facts(
+                    block.get("findings"), "clean_code", incomplete, "clean_code_findings",
+                ),
+            })
+    if total > PR_POLICY_SOURCE_LIMIT:
+        incomplete.append("clean_code_truncated")
+    return _bounded_pr_policy_facts(records, total, PR_POLICY_SOURCE_LIMIT)
+
+
+def _pr_policy_check_state(row: dict[str, Any]) -> str:
+    observed = [
+        str(row[key]).strip().lower().replace("-", "_")
+        for key in ("bucket", "state") if row.get(key) not in (None, "")
+    ]
+    mapping = {
+        **{value: "pass" for value in GH_CHECK_PASS},
+        **{value: "fail" for value in GH_CHECK_FAIL},
+        **{value: "pending" for value in GH_CHECK_PENDING},
+    }
+    normalized = [mapping.get(value) for value in observed]
+    if not normalized or None in normalized:
+        return "unknown"
+    if len(set(normalized)) != 1:
+        return "inconsistent"
+    return normalized[0] or "unknown"
+
+
+def _pr_policy_check_facts(checks: dict[str, Any], incomplete: list[str]) -> dict[str, Any]:
+    if not checks.get("ok") or not isinstance(checks.get("data"), list):
+        incomplete.append("checks_unavailable")
+        return _bounded_pr_policy_facts([], 0, PR_POLICY_CHECK_LIMIT)
+    rows = checks["data"]
+    projected = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip():
+            incomplete.append("checks_malformed")
+            continue
+        name = row["name"].strip()
+        if len(name) > 512:
+            incomplete.append("checks_malformed")
+            name = name[:512]
+        projected.append({"name": name, "observed_state": _pr_policy_check_state(row)})
+    if len(rows) > PR_POLICY_CHECK_LIMIT:
+        incomplete.append("checks_truncated")
+    return _bounded_pr_policy_facts(projected, len(rows), PR_POLICY_CHECK_LIMIT)
+
+
+def pr_policy_inputs_from(
+    *,
+    head_sha: str | None,
+    confirming_head_sha: str | None,
+    labels: list[str],
+    comment_bodies: list[str],
+    reviews: list[Any],
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    """Return bounded observations only; Rewst owns all policy over these facts."""
+    incomplete: list[str] = []
+    if not head_sha or not GIT_SHA_RE.fullmatch(head_sha):
+        incomplete.append("invalid_head")
+    if confirming_head_sha != head_sha:
+        incomplete.append("head_moved")
+    label_items = []
+    for label in labels:
+        if not isinstance(label, str):
+            incomplete.append("labels_malformed")
+            continue
+        if len(label) > 512:
+            incomplete.append("labels_malformed")
+            label = label[:512]
+        label_items.append(label)
+    label_items.sort()
+    if len(labels) > PR_POLICY_LABEL_LIMIT:
+        incomplete.append("labels_truncated")
+    audit = _pr_policy_audit_sources(reviews, head_sha, incomplete)
+    clean_code = _pr_policy_clean_code_sources(comment_bodies, incomplete)
+    check_facts = _pr_policy_check_facts(checks, incomplete)
+    reasons = list(dict.fromkeys(incomplete))
+    return {
+        "version": "pr-policy-inputs-v1",
+        "complete": not reasons,
+        "observed_head_sha": head_sha if head_sha and GIT_SHA_RE.fullmatch(head_sha) else None,
+        "confirming_head_sha": (
+            confirming_head_sha
+            if confirming_head_sha and GIT_SHA_RE.fullmatch(confirming_head_sha)
+            else None
+        ),
+        "labels": _bounded_pr_policy_facts(label_items, len(labels), PR_POLICY_LABEL_LIMIT),
+        "review_sources": {"pr_audit": audit, "clean_code": clean_code},
+        "checks": check_facts,
+        "incomplete_reasons": reasons,
+    }
 
 
 def _review_commit_id(review: dict[str, Any]) -> str:
@@ -12397,26 +12663,63 @@ def dispatch_inner(
             else:
                 d = raw.get("data") or {}
                 head = d.get("headRefOid")
+                labels = [l.get("name", "") for l in (d.get("labels") or [])]
+                comment_bodies = [c.get("body", "") for c in (d.get("comments") or [])]
+                reviews = list(d.get("reviews") or [])
                 out = pr_findings_from(
-                    labels=[l.get("name", "") for l in (d.get("labels") or [])],
-                    comment_bodies=[c.get("body", "") for c in (d.get("comments") or [])],
-                    reviews=list(d.get("reviews") or []),
+                    labels=labels,
+                    comment_bodies=comment_bodies,
+                    reviews=reviews,
                     head_sha=head if isinstance(head, str) else None,
                 )
                 # Fold the check state in here. The graph cannot read it from
                 # the checks node: that output is ~21KB and Rewst replaces it
                 # with an artifact stub, so TASKS.checks.all_green is null.
-                ck = annotate_pr_checks(
-                    gh_json(repo_path, ["pr", "checks", number, "--json", GH_PR_CHECKS_JSON])
+                raw_checks = gh_json(
+                    repo_path, ["pr", "checks", number, "--json", GH_PR_CHECKS_JSON]
                 )
+                ck = annotate_pr_checks(raw_checks)
                 out = fold_pr_findings_checks(out, ck)
-                # Flat, not nested under "data": the connector already exposes
-                # this as TASKS.<node>.data.<field>, so nesting made every path
-                # a double .data.data and drive_snap read nulls.
-                out["status"] = 200 if out.get("ok") else 422
-                # The findings list is for humans reading the trace; the brief
-                # is what the writer consumes. Keep the payload small.
-                out["findings"] = out.get("findings", [])[:20]
+                confirming = gh_json(
+                    repo_path, ["pr", "view", number, "--json", "headRefOid"]
+                )
+                if not confirming.get("ok"):
+                    out = {
+                        "ok": False,
+                        "code": "head_confirmation_failed",
+                        "error": "could not confirm the PR head after collecting checks",
+                        "status": 502,
+                    }
+                else:
+                    confirming_data = confirming.get("data") or {}
+                    confirming_head = confirming_data.get("headRefOid")
+                    if head != confirming_head:
+                        out = {
+                            "ok": False,
+                            "code": "head_moved",
+                            "error": "the PR head changed while facts were collected",
+                            "observed_head_sha": head,
+                            "confirming_head_sha": confirming_head,
+                            "status": 409,
+                        }
+                    else:
+                        out["pr_policy_inputs_v1"] = pr_policy_inputs_from(
+                            head_sha=head if isinstance(head, str) else None,
+                            confirming_head_sha=(
+                                confirming_head if isinstance(confirming_head, str) else None
+                            ),
+                            labels=labels,
+                            comment_bodies=comment_bodies,
+                            reviews=reviews,
+                            checks=raw_checks,
+                        )
+                        # Flat, not nested under "data": the connector already exposes
+                        # this as TASKS.<node>.data.<field>, so nesting made every path
+                        # a double .data.data and drive_snap read nulls.
+                        out["status"] = 200 if out.get("ok") else 422
+                        # The findings list is for humans reading the trace; the brief
+                        # is what the writer consumes. Keep the payload small.
+                        out["findings"] = out.get("findings", [])[:20]
         elif method == "GET" and path == "/v1/gh/pr/checks":
             number = first_query(qs, "number")
             if not number:
