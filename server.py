@@ -11511,6 +11511,8 @@ def _codeoff_v2_result(manifest: dict[str, Any], state: dict[str, Any]) -> dict[
         "policy_version": CODEOFF_V2_POLICY_VERSION,
         "experiment_id": manifest["experiment_id"], "status": "initialized",
         "policy_hash": manifest["policy_hash"],
+        "transition_id": manifest["transition_id"],
+        "transition_payload_hash": manifest["transition_payload_hash"],
         "seed_commitment": manifest["selection"]["seed_commitment"],
         "slots": {
             slot: {key: value for key, value in descriptor.items() if key in public_fields}
@@ -11572,6 +11574,8 @@ def _codeoff_v2_replay(
         or manifest.get("slots") != expected_slots
         or not isinstance(initialized_data, dict)
         or initialized_data.get("policy_hash") != manifest.get("policy_hash")
+        or initialized_data.get("transition_id") != manifest.get("transition_id")
+        or initialized_data.get("transition_payload_hash") != manifest.get("transition_payload_hash")
         or initialized_data.get("seed_commitment") != manifest.get("selection", {}).get("seed_commitment")
         or initialized_data.get("identities_hash") != manifest.get("identities_hash")
         or initialized_data.get("prompt_hash") != manifest.get("prompt_hash")
@@ -11603,6 +11607,7 @@ def _codeoff_v2_replay(
 def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     fields = {
         "experiment_id", "repo", "base_sha", "policy", "policy_hash",
+        "transition_id", "transition_payload_hash",
         "prompt", "tests", "toolchain", "commit_message",
     }
     data, err = _codeoff_body(body, fields, exact=True)
@@ -11633,6 +11638,19 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
     if eid_err:
         return 400, eid_err
     assert experiment_id is not None
+    transition_id = data.get("transition_id")
+    expected_transition_id = f"graphwing-codeoff-v2:{experiment_id}:transition:initialization:0"
+    if transition_id != expected_transition_id:
+        return 400, {
+            "error": "transition_id must bind this experiment to initialization ordinal 0",
+            "code": "bad_transition_id",
+        }
+    transition_payload_hash = data.get("transition_payload_hash")
+    if not isinstance(transition_payload_hash, str) or re.fullmatch(r"[0-9a-f]{64}", transition_payload_hash) is None:
+        return 400, {
+            "error": "transition_payload_hash must be a lowercase SHA-256 digest",
+            "code": "bad_transition_payload_hash",
+        }
     task = data.get("prompt")
     if not isinstance(task, str) or not task.strip() or len(task) > PROMPT_MAX_CHARS:
         return 400, {"error": "prompt is required and bounded", "code": "bad_prompt"}
@@ -11679,6 +11697,8 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
     request_projection = {
         "experiment_id": experiment_id, "repo": name, "base_sha": base_sha,
         "policy_hash": policy_hash, "prompt_hash": hashlib.sha256(task.encode()).hexdigest(),
+        "transition_id": transition_id,
+        "transition_payload_hash": transition_payload_hash,
         "tests": names, "toolchain": dict(sorted(toolchain.items())),
         "commit_message": commit_message.strip(),
     }
@@ -11753,6 +11773,8 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
             "base_sha": base_sha, "base_tree": base_tree,
             "base_snapshot_hash": base_snapshot["manifest_hash"],
             "policy": policy, "policy_hash": policy_hash,
+            "transition_id": transition_id,
+            "transition_payload_hash": transition_payload_hash,
             "initialize_request_hash": request_hash,
             "selection": selection, "slots": slots, "identities": identities,
             "identity_snapshot_hashes": snapshots, "identities_hash": identities_hash,
@@ -11790,6 +11812,8 @@ def codeoff_v2_initialize(body: bytes, repos: dict[str, str]) -> tuple[int, dict
             _codeoff_commit_event(record_build, state, "v2_initialized", {
                 "policy_hash": policy_hash, "seed_commitment": selection["seed_commitment"],
                 "identities_hash": identities_hash, "prompt_hash": prompt_hash,
+                "transition_id": transition_id,
+                "transition_payload_hash": transition_payload_hash,
             })
             for slot in ("author-1", "author-2"):
                 path = codeoff_workspace_path(experiment_id, slot)

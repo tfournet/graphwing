@@ -21309,12 +21309,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "a738b6d307f79f018e2cca5b14ca90ef721ededcef68f16304d4123d63dfe0c1",
+            "f0e72fb9c1e1bc91eec1225e9ee304fdb7108842b8cd90180742d104b3053b23",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 68)
-        self.assertEqual(len(graph["spec"]["edges"]), 113)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 68)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 113)
+        self.assertEqual(len(graph["spec"]["nodes"]), 123)
+        self.assertEqual(len(graph["spec"]["edges"]), 168)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 123)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 168)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21423,11 +21423,23 @@ class CodeOffTests(unittest.TestCase):
         self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
         self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
+        expected_v2_leaves = {"v2_continuation_disabled", "policy_v2_parked"} | {
+            f"{prefix}_{suffix}"
+            for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch")
+        }
         self.assertEqual(leaves, {
             "economics_recorded", "economics_write_failed", "economics_readback_failed",
-            "economics_readback_mismatch", "policy_v2_initialized", "policy_v2_parked",
-        })
-        for leaf in leaves - {"policy_v2_initialized", "policy_v2_parked"}:
+            "economics_readback_mismatch",
+        } | expected_v2_leaves)
+        # Neither v2 outcome marker is itself a leaf any more: both sit behind
+        # a durable write and its exact readback.
+        for marker in ("policy_v2_initialized", "policy_v2_parked"):
+            self.assertTrue(all(
+                {"v2_initialized_readback_gate", "v2_parked_readback_gate"} & set(path)
+                for path in paths_to(marker)
+            ), marker)
+        for leaf in leaves - expected_v2_leaves:
             self.assertTrue(all({"terminalize_failed", "terminalize_success"} & set(path) for path in paths_to(leaf)), leaf)
         self.assertTrue(all("policy_version" in path for path in paths_to("initialize_v2")))
         self.assertTrue(all("policy_version" in path for path in paths_to("policy_v2_parked")))
@@ -21600,7 +21612,8 @@ class CodeOffTests(unittest.TestCase):
         self.assertEqual(
             [node["id"] for node in graph["nodes"]
              if node["type"] == "action.datastore.records.upsert"],
-            ["economics_upsert"],
+            ["economics_upsert", "v2_experiment_upsert", "v2_initialization_upsert",
+             "v2_initialized_upsert", "v2_parked_upsert"],
         )
         key_expression = json.dumps(
             nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
@@ -21668,13 +21681,16 @@ class CodeOffTests(unittest.TestCase):
         )["spec"]
         sources = {edge["source"] for edge in graph["edges"]}
         terminals = {node["id"] for node in graph["nodes"] if node["id"] not in sources}
-        # V1 still converges only through the four economics markers. The
-        # additive v2 slice intentionally ends after initialization or a
-        # workflow-owned pre-launch park; durable v2 transitions land in PR 2.
+        # V1 retains its economics terminals. PR2 adds immutable v2 record
+        # readback terminals and deliberately stops continuation after init.
         self.assertEqual(terminals, {
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
-            "policy_v2_initialized", "policy_v2_parked",
+            "v2_continuation_disabled", "policy_v2_parked",
+        } | {
+            f"{prefix}_{suffix}"
+            for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch")
         })
         joined = {
             edge["source"] for edge in graph["edges"] if edge["target"] == "join_economics"
@@ -21751,7 +21767,7 @@ func main() {
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
-    """Issue 188 PR 1: workflow policy with daemon-private draw authority."""
+    """Issue 188: workflow policy and durable controller with private draw authority."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -21838,6 +21854,8 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "experiment_id": experiment_id, "repo": "scratch", "base_sha": self.base_sha,
             "policy": policy,
             "policy_hash": hashlib.sha256(server.codeoff_canonical_json(policy)).hexdigest(),
+            "transition_id": f"graphwing-codeoff-v2:{experiment_id}:transition:initialization:0",
+            "transition_payload_hash": "1" * 64,
             "prompt": "Implement the provider-free fixture.", "tests": ["fixture-pass"],
             "toolchain": {"python": sys.version.split()[0]},
             "commit_message": "feat: promote code-off winner",
@@ -21893,9 +21911,13 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             {rule["path"] for rule in nodes["policy_v2_eligible"]["config"]["rules"]},
             {f"p{index}" for index in range(6)},
         )
-        self.assertIn(("policy_v2_eligible", "pass", "initialize_v2"), edges)
+        self.assertIn(("policy_v2_hash", "out", "v2_experiment_record"), edges)
+        self.assertIn(("v2_experiment_readback_gate", "pass", "policy_v2_now"), edges)
+        self.assertIn(("policy_v2_eligible", "pass", "v2_initialization_identity"), edges)
+        self.assertIn(("v2_initialization_effect_binding", "out", "initialize_v2"), edges)
         self.assertIn(("policy_v2_eligible", "fail", "policy_v2_park_join"), edges)
-        self.assertIn(("policy_v2_park_join", "out", "policy_v2_parked"), edges)
+        self.assertIn(("policy_v2_park_join", "out", "v2_parked_identity"), edges)
+        self.assertIn(("v2_parked_readback_gate", "pass", "policy_v2_parked"), edges)
         v2_nodes = [node for node in nodes.values() if "v2" in node["id"]]
         self.assertFalse(any(node["type"] == "transforms.codeExpression" for node in v2_nodes))
         self.assertNotIn("{%", json.dumps(v2_nodes))
@@ -21908,9 +21930,12 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(self._secret_keys(payload), set())
         self.assertEqual(set(payload), {
             "ok", "protocol_version", "policy_version", "experiment_id", "status",
-            "policy_hash", "seed_commitment", "slots", "identity_snapshot_hashes",
-            "identities_hash", "manifest_file_hash", "workspace_receipts",
+            "policy_hash", "transition_id", "transition_payload_hash", "seed_commitment",
+            "slots", "identity_snapshot_hashes", "identities_hash", "manifest_file_hash",
+            "workspace_receipts",
         })
+        self.assertEqual(payload["transition_id"], self._body()["transition_id"])
+        self.assertEqual(payload["transition_payload_hash"], self._body()["transition_payload_hash"])
         private_seed = self.records / "policy-v2-experiment" / "private" / "seed"
         self.assertRegex(private_seed.read_text(), r"^[0-9a-f]{64}$")
         self.assertEqual(stat.S_IMODE(private_seed.stat().st_mode), 0o600)
@@ -21952,6 +21977,16 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(replay["seed_commitment"], first["seed_commitment"])
         self.assertEqual(replay["slots"], first["slots"])
         self.assertFalse(any(call.args[1][:2] == ["worktree", "add"] for call in git.call_args_list))
+
+        binding_body = self._body("policy-v2-transition-binding")
+        self.assertEqual(self._post(binding_body)[0], 200)
+        changed_binding = deepcopy(binding_body)
+        changed_binding["transition_payload_hash"] = "2" * 64
+        with mock.patch.object(server, "resolve_launcher_binary_now",
+                               side_effect=AssertionError("changed binding repeated effect")):
+            status, rejected = self._post(changed_binding)
+        self.assertEqual((status, rejected["code"], rejected["status"]),
+                         (409, "codeoff_v2_policy_mismatch", "parked"))
 
         changed = deepcopy(body)
         changed["policy"]["classification"]["category"] = "different-workflow-policy"
@@ -22079,6 +22114,322 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         with mock.patch.object(server, "resolve_launcher_binary_now", side_effect=AssertionError("over-budget policy resolved launcher")):
             status, payload = self._post(self._body("policy-v2-over-budget", over_budget))
         self.assertEqual((status, payload["code"]), (400, "bad_budgets"))
+
+
+    V2_STAGES = (
+        ("v2_initialization", "initialization", 0, False),
+        ("v2_initialized", "initialized", 1, False),
+        ("v2_parked", "parked", 0, True),
+    )
+
+    def _v2_durable_graph(self):
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())["spec"]
+        return {node["id"]: node for node in spec["nodes"]}, {
+            (edge["source"], edge["sourceHandle"], edge["target"])
+            for edge in spec["edges"]
+        }
+
+    @staticmethod
+    def _v2_mappings(node):
+        return {mapping["output"]: mapping["expression"] for mapping in node["config"]["mappings"]}
+
+    @staticmethod
+    def _v2_resolve(expression):
+        """Fold a native literal/getField/binary-concat expression into a template string."""
+        kind = expression["kind"]
+        if kind == "literal":
+            return expression["value"] if isinstance(expression["value"], str) else expression
+        if kind == "getField":
+            return "{" + expression["path"] + "}"
+        if kind == "binary" and expression["operator"] == "+":
+            left = CodeOffPolicyMigrationTests._v2_resolve(expression["left"])
+            right = CodeOffPolicyMigrationTests._v2_resolve(expression["right"])
+            self_test = isinstance(left, str) and isinstance(right, str)
+            return left + right if self_test else expression
+        return expression
+
+    @staticmethod
+    def _v2_paths(expression, found=None):
+        found = [] if found is None else found
+        if isinstance(expression, dict):
+            if expression.get("kind") == "getField":
+                found.append(expression["path"])
+            for value in expression.values():
+                CodeOffPolicyMigrationTests._v2_paths(value, found)
+        elif isinstance(expression, list):
+            for value in expression:
+                CodeOffPolicyMigrationTests._v2_paths(value, found)
+        return found
+
+    def _v2_durable_nodes(self, nodes):
+        return [
+            node_id for node_id in nodes
+            if node_id.startswith("v2_") and node_id.endswith(("_record", "_payload", "_key", "_identity"))
+        ]
+
+    def test_v2_graph_persists_policy_status_and_every_transition_under_experiment_scoped_deterministic_keys(self):
+        nodes, edges = self._v2_durable_graph()
+        # Every policy-v2 run persists its experiment fact before eligibility,
+        # so expiry and ineligibility are durable rather than recordless exits.
+        self.assertIn(("policy_v2_hash", "out", "v2_experiment_record"), edges)
+        self.assertIn(("v2_experiment_readback_gate", "pass", "policy_v2_now"), edges)
+        self.assertIn(("policy_v2_eligible", "pass", "v2_initialization_identity"), edges)
+        self.assertEqual(
+            self._v2_resolve(self._v2_mappings(nodes["v2_experiment_key"])["value"]),
+            "graphwing-codeoff-v2:{CTX.INPUT.experiment_id}:experiment",
+        )
+        self.assertEqual(nodes["v2_experiment_upsert"]["config"]["scope"], "tenant")
+        self.assertEqual(
+            nodes["v2_experiment_upsert"]["config"]["collection"], "graphwing_codeoff_experiment_v2",
+        )
+        experiment = self._v2_mappings(nodes["v2_experiment_record"])
+        self.assertEqual(experiment["current_stage"],
+                         {"kind": "literal", "value": "policy_evaluation"})
+        self.assertEqual(experiment["reason"],
+                         {"kind": "literal", "value": "policy_received"})
+        for prefix, stage, ordinal, _terminal in self.V2_STAGES:
+            identity = self._v2_mappings(nodes[f"{prefix}_identity"])
+            # The key is exactly the workflow-generated transition id, so a
+            # record can never be filed under a stage/ordinal it does not claim.
+            self.assertEqual(identity["stage"], {"kind": "literal", "value": stage})
+            self.assertEqual(identity["ordinal"], {"kind": "literal", "value": ordinal})
+            self.assertEqual(
+                self._v2_resolve(identity["transition_id"]),
+                "graphwing-codeoff-v2:{CTX.INPUT.experiment_id}:transition:%s:%d" % (stage, ordinal),
+            )
+            self.assertEqual(
+                self._v2_mappings(nodes[f"{prefix}_key"])["value"],
+                {"kind": "getField", "path": f"CTX.{prefix}_identity.transition_id"},
+            )
+            upsert = nodes[f"{prefix}_upsert"]["config"]
+            self.assertEqual(upsert["scope"], "tenant")
+            self.assertEqual(upsert["collection"], "graphwing_codeoff_transition_v2")
+            self.assertEqual(upsert["recordKey"], "{{ CTX.%s_key.value }}" % prefix)
+            self.assertEqual(upsert["data"], "{{ CTX.%s_record }}" % prefix)
+            record = self._v2_mappings(nodes[f"{prefix}_record"])
+            self.assertEqual(record["stage"], {"kind": "literal", "value": stage})
+            self.assertEqual(record["ordinal"], {"kind": "literal", "value": ordinal})
+            # Every indexed field is a string field the record actually carries.
+            for field in upsert["indexedFields"]:
+                self.assertIn(field, record, (prefix, field))
+                resolved = self._v2_resolve(record[field])
+                self.assertIsInstance(resolved, str, (prefix, field))
+        for field in nodes["v2_experiment_upsert"]["config"]["indexedFields"]:
+            expression = self._v2_mappings(nodes["v2_experiment_record"])[field]
+            self.assertIsInstance(self._v2_resolve(expression), str, field)
+
+    def test_v2_duplicate_transition_replays_identically_and_concurrent_different_advance_cannot_launch_two_effects(self):
+        nodes, edges = self._v2_durable_graph()
+        # A replay under a fresh WORKFLOW.runId has to produce byte-identical
+        # keys and payloads, so no per-run or wall-clock value may reach them.
+        for node_id in self._v2_durable_nodes(nodes):
+            paths = self._v2_paths(nodes[node_id]["config"]["mappings"])
+            for path in paths:
+                self.assertNotIn("runId", path, node_id)
+                self.assertNotIn("runUrl", path, node_id)
+                self.assertNotIn("WORKFLOW.version", path, node_id)
+            self.assertTrue(
+                all(path.startswith(("CTX.", "TASKS.", "WORKFLOW.id")) for path in paths), node_id,
+            )
+        volatile = {"action.time.now", "action.random.generate", "action.uuid.generate"}
+        self.assertEqual(volatile & {nodes[n]["type"] for n in nodes if n.startswith("v2_")}, set())
+        # One effect entry point, reached only from the persisted transition,
+        # and the daemon contract receives the exact workflow binding.
+        inbound = {}
+        for source, handle, target in edges:
+            inbound.setdefault(target, set()).add((source, handle))
+        self.assertEqual(inbound["initialize_v2"], {("v2_initialization_effect_binding", "out")})
+        initialize_config = nodes["initialize_v2"]["config"]
+        self.assertEqual(initialize_config["transition_id"],
+                         "{{ CTX.v2_initialization_effect_binding.transition_id }}")
+        self.assertEqual(initialize_config["transition_payload_hash"],
+                         "{{ CTX.v2_initialization_effect_binding.payload_hash }}")
+        initialize_schema = json.loads(server.openapi_bytes())["components"]["schemas"]["CodeOffV2InitializeRequest"]
+        self.assertIn("transition_id", initialize_schema["required"])
+        self.assertIn("transition_payload_hash", initialize_schema["required"])
+        binding = self._v2_mappings(nodes["v2_initialization_effect_binding"])
+        self.assertEqual(binding["transition_id"],
+                         {"kind": "getField", "path": "CTX.v2_initialization_identity.transition_id"})
+        self.assertEqual(binding["payload_hash"],
+                         {"kind": "getField", "path": "CTX.v2_initialization_payload_hash.value"})
+        # A concurrent second advance can only repeat the same effect: the v2
+        # branch owns exactly one daemon call and no replacement participant.
+        v2_reachable, frontier = set(), ["policy_v2"]
+        forward = {}
+        for source, _handle, target in edges:
+            forward.setdefault(source, set()).add(target)
+        while frontier:
+            node_id = frontier.pop()
+            for child in forward.get(node_id, ()):
+                if child not in v2_reachable:
+                    v2_reachable.add(child)
+                    frontier.append(child)
+        effects = {n for n in v2_reachable if nodes[n]["type"].startswith("action.graphwing.")}
+        self.assertEqual(effects, {"initialize_v2"})
+        # Mutable continuation stays off: the success leg ends at a noop and
+        # never loops back into a write, an effect, or the v1 pipeline.
+        self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
+        self.assertEqual(forward.get("v2_continuation_disabled"), None)
+        self.assertIn(
+            "disabled",
+            self._v2_mappings(nodes["v2_experiment_record"])["continuation"]["value"],
+        )
+        self.assertEqual(v2_reachable & {"prepare", "aggregate", "finalize", "commit", "push"}, set())
+
+    def test_v2_transition_write_get_hash_key_and_version_mismatch_hard_fail_before_the_next_action(self):
+        nodes, edges = self._v2_durable_graph()
+        forward = {}
+        for source, handle, target in edges:
+            forward.setdefault(source, set()).add((handle, target))
+        for prefix, continuation in (
+            ("v2_experiment", "policy_v2_now"),
+            ("v2_initialization", "v2_initialization_effect_binding"),
+            ("v2_initialized", "policy_v2_initialized"),
+            ("v2_parked", "policy_v2_parked"),
+        ):
+            self.assertEqual(nodes[f"{prefix}_upsert"]["type"], "action.datastore.records.upsert")
+            self.assertEqual(nodes[f"{prefix}_readback"]["type"], "action.datastore.records.get")
+            # Write and read address the identical key; neither is a read-then-write claim.
+            self.assertEqual(
+                nodes[f"{prefix}_readback"]["config"]["recordKey"],
+                nodes[f"{prefix}_upsert"]["config"]["recordKey"],
+            )
+            self.assertEqual(forward[f"{prefix}_upsert"], {
+                ("success", f"{prefix}_readback"), ("failure", f"{prefix}_write_failed"),
+            })
+            self.assertEqual(forward[f"{prefix}_readback"], {
+                ("success", f"{prefix}_readback_hash"), ("failure", f"{prefix}_readback_failed"),
+            })
+            self.assertEqual(forward[f"{prefix}_readback_gate"], {
+                ("pass", continuation), ("fail", f"{prefix}_readback_mismatch"),
+            })
+            check = self._v2_mappings(nodes[f"{prefix}_readback_check"])
+            self.assertEqual(set(check), {"found_matches", "key_matches", "data_matches", "version_matches"})
+            self.assertEqual(check["found_matches"]["left"],
+                             {"kind": "getField", "path": f"TASKS.{prefix}_readback.found"})
+            self.assertEqual(check["key_matches"], {"kind": "binary", "operator": "==",
+                "left": {"kind": "getField", "path": f"TASKS.{prefix}_readback.recordKey"},
+                "right": {"kind": "getField", "path": f"CTX.{prefix}_key.value"}})
+            self.assertEqual(check["data_matches"], {"kind": "binary", "operator": "==",
+                "left": {"kind": "getField", "path": f"CTX.{prefix}_readback_hash.value"},
+                "right": {"kind": "getField", "path": f"CTX.{prefix}_expected_hash.value"}})
+            self.assertEqual(check["version_matches"], {"kind": "binary", "operator": "==",
+                "left": {"kind": "getField", "path": f"TASKS.{prefix}_readback.version"},
+                "right": {"kind": "getField", "path": f"TASKS.{prefix}_upsert.version"}})
+            self.assertEqual(nodes[f"{prefix}_expected_hash"]["config"]["input"],
+                             "{{ CTX.%s_record }}" % prefix)
+            self.assertEqual(nodes[f"{prefix}_readback_hash"]["config"]["input"],
+                             "{{ TASKS.%s_readback.data }}" % prefix)
+            gate = nodes[f"{prefix}_readback_gate"]["config"]
+            self.assertEqual(gate["group"], "AND")
+            self.assertEqual(
+                {rule["path"]: rule["value"] for rule in gate["rules"]},
+                {"found_matches": True, "key_matches": True, "data_matches": True, "version_matches": True},
+            )
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch"):
+                failure = nodes[f"{prefix}_{suffix}"]
+                self.assertEqual(failure["type"], "transforms.regexReplace")
+                # RE2 has no lookahead, so this static pattern hard-fails the
+                # native node instead of silently passing a value on.
+                self.assertIn("(?=", failure["config"]["pattern"])
+                self.assertNotIn(f"{prefix}_{suffix}", {source for source, _, _ in edges})
+        # The daemon effect is strictly downstream of both durable readbacks.
+        plain = {(source, target) for source, _handle, target in edges}
+        reach = {"trigger"}
+        for _ in range(len(nodes)):
+            reach |= {t for s, t in plain if s in reach}
+        for gate in ("v2_experiment_readback_gate", "v2_initialization_readback_gate"):
+            without = {"trigger"}
+            for _ in range(len(nodes)):
+                without |= {t for s, t in plain if s in without and s != gate}
+            self.assertNotIn("initialize_v2", without, gate)
+
+    def test_v2_local_authority_loss_records_parked_without_manufacturing_selection_judgment_or_winner(self):
+        nodes, edges = self._v2_durable_graph()
+        self.assertIn(("initialize_v2", "failure", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_eligible", "fail", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_expiry", "before", "policy_v2_park_join"), edges)
+        self.assertIn(("policy_v2_as_of", "after", "policy_v2_park_join"), edges)
+        self.assertEqual(nodes["policy_v2_park_join"]["type"], "logic.join.any")
+        self.assertIn(("policy_v2_park_join", "out", "v2_parked_identity"), edges)
+        # Every expiry, ineligibility, and initialization-failure leg is durable
+        # before the terminal marker: the park terminal is only reachable
+        # through the parked write and its exact readback.
+        inbound = {}
+        for source, handle, target in edges:
+            inbound.setdefault(target, set()).add((source, handle))
+        self.assertEqual(inbound["policy_v2_parked"], {("v2_parked_readback_gate", "pass")})
+        parked = self._v2_mappings(nodes["v2_parked_record"])
+        self.assertEqual(parked["terminal"], {"kind": "literal", "value": True})
+        self.assertEqual(parked["stage"], {"kind": "literal", "value": "parked"})
+        self.assertEqual(parked["reason"],
+                         {"kind": "literal", "value": "initialization_authority_not_established"})
+        # A parked run states no participant, judgment, or winner, and reads
+        # nothing back out of the daemon to invent one.
+        self.assertEqual(
+            set(parked) & {"seed_commitment", "selected_identities", "receipt_hashes",
+                           "winner", "judgments", "selection", "promotion_requested"},
+            set(),
+        )
+        self.assertEqual(self._v2_paths(nodes["v2_parked_record"]["config"]["mappings"]),
+                         self._v2_paths(nodes["v2_parked_payload"]["config"]["mappings"]) + [
+                             "CTX.v2_parked_identity.transition_id",
+                             "CTX.v2_parked_payload_hash.value"])
+        for path in self._v2_paths(nodes["v2_parked_payload"]["config"]["mappings"]):
+            self.assertNotIn("TASKS.", path)
+        # Fan-in stays explicit: only join nodes may take a second inbound edge.
+        for target, sources in inbound.items():
+            if len(sources) > 1:
+                self.assertTrue(nodes[target]["type"].startswith("logic.join."), target)
+
+    def test_v2_durable_records_have_a_closed_sanitized_allowlist_excluding_seed_blind_map_prompt_log_path_token_and_webhook_material(self):
+        nodes, _ = self._v2_durable_graph()
+        transition_fields = [
+            "schema_version", "policy_version", "policy_hash", "workflow_slug", "workflow_id",
+            "experiment_id", "stage", "ordinal", "reason", "attempt_ids", "terminal",
+        ]
+        self.assertEqual(list(self._v2_mappings(nodes["v2_experiment_record"])), [
+            "schema_version", "policy_version", "policy_hash", "workflow_slug", "workflow_id",
+            "experiment_id", "seed_commitment", "selected_identities", "receipt_hashes",
+            "current_stage", "reason", "attempt_ids", "terminal", "continuation",
+        ])
+        self.assertEqual(list(self._v2_mappings(nodes["v2_initialization_record"])),
+                         transition_fields + ["transition_id", "payload_hash"])
+        self.assertEqual(list(self._v2_mappings(nodes["v2_parked_record"])),
+                         transition_fields + ["transition_id", "payload_hash"])
+        self.assertEqual(list(self._v2_mappings(nodes["v2_initialized_record"])),
+                         transition_fields + ["seed_commitment", "selected_identities",
+                                              "receipt_hashes", "effect_transition_id",
+                                              "effect_payload_hash", "transition_id", "payload_hash"])
+        # The one record that carries daemon output takes public commitments and
+        # receipt hashes only, never the seed, blind map, or prompt behind them.
+        initialized = self._v2_mappings(nodes["v2_initialized_record"])
+        self.assertEqual(initialized["seed_commitment"],
+                         {"kind": "getField", "path": "TASKS.initialize_v2.data.seed_commitment"})
+        self.assertEqual(initialized["selected_identities"],
+                         {"kind": "getField", "path": "TASKS.initialize_v2.data.slots"})
+        self.assertEqual(set(initialized["receipt_hashes"]["properties"]),
+                         {"identities_hash", "identity_snapshot_hashes", "manifest_file_hash"})
+        self.assertEqual(initialized["effect_transition_id"],
+                         {"kind": "getField", "path": "TASKS.initialize_v2.data.transition_id"})
+        self.assertEqual(initialized["effect_payload_hash"],
+                         {"kind": "getField", "path": "TASKS.initialize_v2.data.transition_payload_hash"})
+        public = server._codeoff_v2_result.__code__.co_consts
+        self.assertIn("seed_commitment", repr(public))
+        forbidden = {
+            "seed", "seeds", "private", "blinding", "blind", "blind_map", "blind_labels",
+            "prompt", "task", "log", "logs", "path", "paths", "token", "tokens", "secret",
+            "webhook", "response_webhook_url", "workspace", "argv", "stdout", "stderr",
+        }
+        for node_id in self._v2_durable_nodes(nodes):
+            config = nodes[node_id]["config"]
+            names = {mapping["output"] for mapping in config["mappings"]}
+            for mapping in config["mappings"]:
+                if mapping["expression"].get("kind") == "object":
+                    names |= set(mapping["expression"]["properties"])
+            self.assertEqual(names & forbidden, set(), node_id)
+            for path in self._v2_paths(config["mappings"]):
+                self.assertEqual(set(path.split(".")) & forbidden, set(), (node_id, path))
 
 
 class InstallTests(unittest.TestCase):
