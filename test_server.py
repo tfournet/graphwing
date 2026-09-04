@@ -25237,6 +25237,21 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
         }
         self.assertIn("authorize", consume_nodes)
 
+    def test_hash_transform_outputs_are_read_from_ctx_not_tasks(self):
+        hits = []
+        for stem, graph in sorted(self.graphs.items()):
+            hash_ids = {
+                node["id"]
+                for node in graph["spec"]["nodes"]
+                if node.get("type") == "transforms.hash"
+            }
+            blob = json.dumps(graph)
+            for node_id in sorted(hash_ids):
+                token = f"TASKS.{node_id}"
+                if token in blob:
+                    hits.append(f"{stem}:{node_id}")
+        self.assertEqual(hits, [])
+
     def test_run_control_authorize_is_unreferenced_and_marked_compatibility_only(self):
         callers = {
             source for source, targets in self._run_control_calls().items()
@@ -25457,7 +25472,7 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         attempt = next(m for m in nodes["attempt_entry"]["config"]["mappings"] if m["output"] == "attempt")["expression"]
         downgraded = attempt["properties"]["reconciliation"]["else"]["properties"]
         self.assertEqual(downgraded["receipt_id"], {"kind": "getField", "path": "CTX.INPUT.receipt.receipt_id"})
-        self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "TASKS.receipt_hash.value"})
+        self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "CTX.receipt_hash.value"})
 
     def test_same_model_retries_are_bounded_by_the_attempts_budget_only(self):
         # Policy decision 2026-09-01: the runaway protection is the attempts
