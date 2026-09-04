@@ -235,7 +235,43 @@
           },
           "outputMapping": {
             "mode": "select",
-            "keys": ["ok", "policy_version", "compatibility_behavior", "decision_id", "decision_sha256", "class", "work_kind", "size_floor", "size", "ac_count", "seams", "launcher", "provider", "model", "effort", "reason", "max_turns", "run_budget_seconds", "reviewer_count", "reviewer1", "reviewer1_launcher", "reviewer1_provider", "reviewer1_model", "reviewer1_effort", "reviewer1_reason", "reviewer2", "reviewer2_launcher", "reviewer2_provider", "reviewer2_model", "reviewer2_effort", "reviewer2_reason", "review", "writer_execution_profile", "reviewer1_execution_profile", "reviewer2_execution_profile"]
+            "keys": [
+              "ok",
+              "policy_version",
+              "compatibility_behavior",
+              "decision_id",
+              "decision_sha256",
+              "class",
+              "work_kind",
+              "size_floor",
+              "size",
+              "ac_count",
+              "seams",
+              "launcher",
+              "provider",
+              "model",
+              "effort",
+              "reason",
+              "max_turns",
+              "run_budget_seconds",
+              "reviewer_count",
+              "reviewer1",
+              "reviewer1_launcher",
+              "reviewer1_provider",
+              "reviewer1_model",
+              "reviewer1_effort",
+              "reviewer1_reason",
+              "reviewer2",
+              "reviewer2_launcher",
+              "reviewer2_provider",
+              "reviewer2_model",
+              "reviewer2_effort",
+              "reviewer2_reason",
+              "review",
+              "writer_execution_profile",
+              "reviewer1_execution_profile",
+              "reviewer2_execution_profile"
+            ]
           },
           "timeout": 480
         }
@@ -1739,6 +1775,73 @@
         }
       },
       {
+        "id": "rc_pre_evidence",
+        "type": "transforms.objectBuilder",
+        "label": "Capture pre-attempt red evidence",
+        "position": {
+          "x": 1380,
+          "y": 240
+        },
+        "config": {
+          "alias": "rc_pre_evidence",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "pre_attempt_red",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_actionable_review_findings"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_ordered_root_cause_check_names"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_selected_review_facts.exact_head_sha"
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "rc_task_material",
         "type": "transforms.objectBuilder",
         "config": {
@@ -2049,7 +2152,8 @@
               "run_control_id": "{{ CTX.run_input.run_control_id }}",
               "kind": "{{ TASKS.rc_settle.data.kind }}",
               "receipt": "{{ TASKS.rc_settle.data.receipt }}",
-              "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}"
+              "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}",
+              "progress": "{{ CTX.rc_progress }}"
             }
           },
           "outputMapping": {
@@ -2402,6 +2506,302 @@
         "type": "action.noop",
         "label": "Herdr: pushed head read failed",
         "config": {}
+      },
+      {
+        "id": "rc_evidence_join",
+        "type": "logic.join.any",
+        "label": "Join post-attempt evidence paths",
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "rc_diff",
+        "type": "action.graphwing.GET:/v1/git/diff",
+        "label": "Read authoritative attempt diff",
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "ref": "{{ CTX.rc_pre_evidence.head_sha }}"
+        }
+      },
+      {
+        "id": "rc_diff_hash",
+        "type": "transforms.hash",
+        "label": "Fingerprint authoritative attempt diff",
+        "config": {
+          "alias": "rc_diff_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ TASKS.rc_diff.data.diff }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "rc_constraint_candidates",
+        "type": "transforms.objectBuilder",
+        "label": "Derive checkpoint constraint candidates",
+        "config": {
+          "alias": "rc_constraint_candidates",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "signals",
+              "expression": {
+                "kind": "array",
+                "elements": [
+                  {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "!=",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.wait_fix_test.request.body.status"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "ok"
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "focused_tests_red"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": null
+                    }
+                  },
+                  {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "function",
+                        "name": "length",
+                        "args": [
+                          {
+                            "kind": "getField",
+                            "path": "TASKS.rc_diff.data.diff"
+                          }
+                        ]
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": 0
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "no_production_diff"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": null
+                    }
+                  },
+                  {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "!=",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.fix_push.data.ok"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "unpushed_correction"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": null
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_constraint_signals",
+        "type": "transforms.transformArray",
+        "label": "Select checkpoint constraint signals",
+        "config": {
+          "alias": "rc_constraint_signals",
+          "operation": "filter",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "CTX.rc_constraint_candidates.signals"
+            }
+          },
+          "filterCondition": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "binary",
+              "operator": "!=",
+              "left": {
+                "kind": "getField",
+                "path": "ITEM"
+              },
+              "right": {
+                "kind": "literal",
+                "value": null
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "rc_progress",
+        "type": "transforms.objectBuilder",
+        "label": "Build run-control progress evidence",
+        "config": {
+          "alias": "rc_progress",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "evidence_version",
+              "expression": {
+                "kind": "literal",
+                "value": "run-control-progress-v2"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "checkpoint",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.rc_pre_evidence.pre_attempt_red"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "function",
+                      "name": "count",
+                      "args": [
+                        {
+                          "kind": "getField",
+                          "path": "CTX.rc_constraint_signals"
+                        }
+                      ]
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": 0
+                    }
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": 1
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": 0
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "pre_attempt_red",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.rc_pre_evidence.pre_attempt_red"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "focused_tests_green",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.wait_fix_test.request.body.status"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "ok"
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "production_diff_bytes",
+              "expression": {
+                "kind": "function",
+                "name": "length",
+                "args": [
+                  {
+                    "kind": "getField",
+                    "path": "TASKS.rc_diff.data.diff"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "m6",
+              "output": "diff_fingerprint",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.rc_diff_hash.value"
+              }
+            },
+            {
+              "id": "m7",
+              "output": "head_sha",
+              "expression": {
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.correction_head.data.sha"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "CTX.rc_pre_evidence.head_sha"
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "constraint_signals",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.rc_constraint_signals"
+              }
+            }
+          ]
+        }
       },
       {
         "id": "join_fix_test_fail",
@@ -3053,7 +3453,7 @@
         "id": "e16",
         "source": "iter_checkout",
         "sourceHandle": "success",
-        "target": "rc_task_material",
+        "target": "rc_pre_evidence",
         "targetHandle": "in"
       },
       {
@@ -3158,7 +3558,7 @@
         "id": "e30",
         "source": "rc_settle",
         "sourceHandle": "success",
-        "target": "rc_reconcile",
+        "target": "receipt",
         "targetHandle": "in"
       },
       {
@@ -3166,13 +3566,6 @@
         "source": "rc_settle",
         "sourceHandle": "failure",
         "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e32",
-        "source": "rc_reconcile",
-        "sourceHandle": "success",
-        "target": "receipt",
         "targetHandle": "in"
       },
       {
@@ -3488,6 +3881,118 @@
         "source": "iter_below_bar_review_findings",
         "sourceHandle": "out",
         "target": "iter_actionable_review_findings",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e16a",
+        "source": "rc_pre_evidence",
+        "sourceHandle": "out",
+        "target": "rc_task_material",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e69",
+        "source": "correction_push_receipt",
+        "sourceHandle": "out",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e70",
+        "source": "herdr_receipt",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e71",
+        "source": "herdr_test_fail",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e72",
+        "source": "herdr_test_http",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e73",
+        "source": "herdr_commit",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e74",
+        "source": "herdr_push",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e75",
+        "source": "herdr_correction_head",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e76",
+        "source": "herdr_correction_view",
+        "sourceHandle": "success",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e77",
+        "source": "rc_evidence_join",
+        "sourceHandle": "out",
+        "target": "rc_diff",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e78",
+        "source": "rc_diff",
+        "sourceHandle": "success",
+        "target": "rc_diff_hash",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e79",
+        "source": "rc_diff",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e80",
+        "source": "rc_diff_hash",
+        "sourceHandle": "out",
+        "target": "rc_constraint_candidates",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e81",
+        "source": "rc_constraint_candidates",
+        "sourceHandle": "out",
+        "target": "rc_constraint_signals",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e82",
+        "source": "rc_constraint_signals",
+        "sourceHandle": "out",
+        "target": "rc_progress",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e83",
+        "source": "rc_progress",
+        "sourceHandle": "out",
+        "target": "rc_reconcile",
         "targetHandle": "in"
       }
     ]

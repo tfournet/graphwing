@@ -27,6 +27,11 @@ TENANT = ""
 # docs/ARCHITECTURE.md + issue #184. Keep this inventory complete until the
 # separately gated v2 cutover removes the compatibility owners.
 RUN_CONTROL_BASELINE_SHA = "631e10f9fa5ae4aa7a0ae511161e1a7faab99016"
+RUN_CONTROL_V2_POLICY_VERSION = "run-control-v2"
+RUN_CONTROL_V2_NAMESPACES = (
+    "graphwing_run_control_history_v2",
+    "graphwing_run_control_pointer_v2",
+)
 RUN_CONTROL_GRAPH_CLASSIFICATION = {
     "run-control-authorize": "compatibility-only",
     "run-control-consume": "active",

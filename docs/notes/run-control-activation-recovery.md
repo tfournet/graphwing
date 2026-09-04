@@ -12,6 +12,25 @@ Migration is versioned and non-inferential: v1 in-flight records remain readable
 
 Source implementation and high-confidence Graphwing PR merges are authorized. Deployment, OpenAPI re-import, workflow publication, live canaries, and historical cleanup each remain separately approval-gated. This slice performs none of them and changes no runtime behavior.
 
+## PR4 source-contract checkpoint, 2026-09-03
+
+PR4 adds opt-in `state_version: v2` paths under the immutable
+`run-control-v2` policy. New durable writes use only
+`graphwing_run_control_history_v2` and `graphwing_run_control_pointer_v2`:
+history is an immutable, contiguous hash chain while the pointer remains a
+compact, hash-bound current-state projection. Observed usage stays truthfully
+nullable when unavailable; separately recorded reservation charges are upper
+bounds rather than invented observations. Checkpoints consume real post-attempt
+diff, test, push, and head evidence, and the chain rolls over across bounded
+workflow executions instead of imposing the v1 per-run attempt ceiling.
+
+Initialization reads v1 state only to enforce the unresolved-reservation
+barrier; it does not infer, copy, rewrite, or delete v1 history. Every v2 record
+and pointer mutation requires exact key/version/canonical-hash readback before
+success. This is a source-local contract checkpoint only: no deployment,
+OpenAPI re-import, workflow publication, live canary, or historical cleanup was
+performed or authorized by PR4.
+
 Status, 2026-09-01. The dormant durable run-control foundation (PR #139) is merged
 at `f242c90`. The first pr-drive wiring attempt (`98c5d69`) is blocked and archived
 on local branch `archive/pr-drive-run-control-wiring-98c5d69-blocked`; do not push
