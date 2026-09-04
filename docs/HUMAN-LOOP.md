@@ -27,7 +27,9 @@ For v2 runs, Rewst owns policy, immutable history, conservative aggregate charge
 and terminal outcomes. Each writer launch uses fresh daemon launch-authority facts and
 one exact consumed authorization. A callback timeout must poll and wait for the job
 before recording full-envelope authority loss; a later workflow execution may resume
-the same durable run. The bounded in-graph loop is not a product attempt limit.
+the same durable run. PR correction is a bounded DAG with at most one writer per
+invocation, not a local attempt limit. A tenant-scoped exact-head CAS claim prevents
+two writers from launching for the same run and commit.
 
 The additive `POST /v1/run/control/attempt-facts` boundary reports one exact-authorized,
 authority-sealed terminal agent attempt as closed `normalized-attempt-facts-v2`. It
