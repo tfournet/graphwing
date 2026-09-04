@@ -5109,7 +5109,7 @@
       },
       {
         "id": "final_label_names",
-        "type": "transforms.transformArray",
+        "type": "transforms.objectBuilder",
         "label": "Normalize label names",
         "position": {
           "x": 3200,
@@ -5117,18 +5117,17 @@
         },
         "config": {
           "alias": "final_label_names",
-          "operation": "map",
-          "array": {
-            "inputKind": "ast",
-            "ast": {
-              "kind": "getField",
-              "path": "TASKS.final_confirm_view.data.data.labels"
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "names",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.label_names"
+              }
             }
-          },
-          "mapConfig": {
-            "mode": "field",
-            "fieldPath": "name"
-          }
+          ]
         }
       },
       {
@@ -5146,7 +5145,7 @@
             "inputKind": "ast",
             "ast": {
               "kind": "getField",
-              "path": "CTX.final_label_names"
+              "path": "CTX.final_label_names.names"
             }
           },
           "filterCondition": {
@@ -5229,7 +5228,7 @@
               "output": "labels",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.final_label_names"
+                "path": "CTX.final_label_names.names"
               }
             },
             {
@@ -5519,6 +5518,162 @@
                   }
                 }
               }
+            },
+            {
+              "id": "mfacts_valid",
+              "output": "facts_valid",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.final_view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.final_confirm_view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.final_view.data.number_matches"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.final_confirm_view.data.number_matches"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                }
+              }
+            },
+            {
+              "id": "mmalformed",
+              "output": "malformed",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "unary",
+                  "operator": "not",
+                  "operand": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "and",
+                        "left": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.final_view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        },
+                        "right": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.final_confirm_view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.final_view.data.number_matches"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": true
+                        }
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.final_confirm_view.data.number_matches"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.final_checks.data.checks_state"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "malformed"
+                  }
+                }
+              }
+            },
+            {
+              "id": "mrequested_number",
+              "output": "requested_number",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.requested_number"
+              }
             }
           ]
         }
@@ -5534,6 +5689,16 @@
         "config": {
           "mode": "rules",
           "cases": [
+            {
+              "label": "malformed",
+              "rules": [
+                {
+                  "path": "malformed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
             {
               "label": "closed",
               "rules": [
@@ -6194,7 +6359,7 @@
       },
       {
         "id": "post_test_label_names",
-        "type": "transforms.transformArray",
+        "type": "transforms.objectBuilder",
         "label": "Normalize label names",
         "position": {
           "x": 3900,
@@ -6202,18 +6367,17 @@
         },
         "config": {
           "alias": "post_test_label_names",
-          "operation": "map",
-          "array": {
-            "inputKind": "ast",
-            "ast": {
-              "kind": "getField",
-              "path": "TASKS.post_test_confirm_view.data.data.labels"
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "names",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.label_names"
+              }
             }
-          },
-          "mapConfig": {
-            "mode": "field",
-            "fieldPath": "name"
-          }
+          ]
         }
       },
       {
@@ -6231,7 +6395,7 @@
             "inputKind": "ast",
             "ast": {
               "kind": "getField",
-              "path": "CTX.post_test_label_names"
+              "path": "CTX.post_test_label_names.names"
             }
           },
           "filterCondition": {
@@ -6314,7 +6478,7 @@
               "output": "labels",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.post_test_label_names"
+                "path": "CTX.post_test_label_names.names"
               }
             },
             {
@@ -6628,6 +6792,162 @@
                   "path": "TASKS.final_view.data.data.headRefOid"
                 }
               }
+            },
+            {
+              "id": "mfacts_valid",
+              "output": "facts_valid",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.post_test_view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.post_test_confirm_view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.post_test_view.data.number_matches"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.post_test_confirm_view.data.number_matches"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                }
+              }
+            },
+            {
+              "id": "mmalformed",
+              "output": "malformed",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "unary",
+                  "operator": "not",
+                  "operand": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "and",
+                        "left": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.post_test_view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        },
+                        "right": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.post_test_confirm_view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.post_test_view.data.number_matches"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": true
+                        }
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.post_test_confirm_view.data.number_matches"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.post_test_checks.data.checks_state"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "malformed"
+                  }
+                }
+              }
+            },
+            {
+              "id": "mrequested_number",
+              "output": "requested_number",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.requested_number"
+              }
             }
           ]
         }
@@ -6643,6 +6963,16 @@
         "config": {
           "mode": "rules",
           "cases": [
+            {
+              "label": "malformed",
+              "rules": [
+                {
+                  "path": "malformed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
             {
               "label": "closed",
               "rules": [
@@ -7391,54 +7721,6 @@
         }
       },
       {
-        "id": "final_join_unknown",
-        "type": "logic.join.any",
-        "label": "Join unknown reasons",
-        "position": {
-          "x": 0,
-          "y": 0
-        },
-        "config": {
-          "stopOnFirst": true
-        }
-      },
-      {
-        "id": "final_join_conflicting",
-        "type": "logic.join.any",
-        "label": "Join conflicting reasons",
-        "position": {
-          "x": 0,
-          "y": 0
-        },
-        "config": {
-          "stopOnFirst": true
-        }
-      },
-      {
-        "id": "post_test_join_unknown",
-        "type": "logic.join.any",
-        "label": "Join unknown reasons",
-        "position": {
-          "x": 0,
-          "y": 0
-        },
-        "config": {
-          "stopOnFirst": true
-        }
-      },
-      {
-        "id": "post_test_join_conflicting",
-        "type": "logic.join.any",
-        "label": "Join conflicting reasons",
-        "position": {
-          "x": 0,
-          "y": 0
-        },
-        "config": {
-          "stopOnFirst": true
-        }
-      },
-      {
         "id": "final_callback_snap",
         "type": "transforms.objectBuilder",
         "label": "Bind final callback to accepted test",
@@ -7502,6 +7784,148 @@
           "y": 300
         },
         "config": {}
+      },
+      {
+        "id": "final_reason_malformed_default",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed fallback",
+        "position": {
+          "x": 3460,
+          "y": 280
+        },
+        "config": {
+          "alias": "final_reason_malformed_default",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_join_unknown",
+        "type": "logic.join.any",
+        "label": "Join unknown reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "final_join_conflicting",
+        "type": "logic.join.any",
+        "label": "Join conflicting reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "post_test_reason_malformed_default",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed fallback",
+        "position": {
+          "x": 4160,
+          "y": 280
+        },
+        "config": {
+          "alias": "post_test_reason_malformed_default",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_join_unknown",
+        "type": "logic.join.any",
+        "label": "Join unknown reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "post_test_join_conflicting",
+        "type": "logic.join.any",
+        "label": "Join conflicting reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
       }
     ],
     "edges": [
@@ -8772,202 +9196,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "final_policy_case_0",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-0",
-        "target": "final_reason_closed",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_1",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-1",
-        "target": "final_reason_held",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_2",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-2",
-        "target": "final_reason_review_red",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_3",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-3",
-        "target": "final_reason_ci_red",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_4",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-4",
-        "target": "final_reason_pending",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_5",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-5",
-        "target": "final_reason_no_checks",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_6",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-6",
-        "target": "final_join_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_7",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-7",
-        "target": "final_join_conflicting",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_8",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-8",
-        "target": "final_join_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_9",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-9",
-        "target": "final_join_conflicting",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_case_10",
-        "source": "switch_final_policy",
-        "sourceHandle": "case-10",
-        "target": "final_reason_ready",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_policy_default",
-        "source": "switch_final_policy",
-        "sourceHandle": "default",
-        "target": "final_reason_malformed",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_joined_unknown",
-        "source": "final_join_unknown",
-        "sourceHandle": "out",
-        "target": "final_reason_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "final_joined_conflicting",
-        "source": "final_join_conflicting",
-        "sourceHandle": "out",
-        "target": "final_reason_conflicting",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_0",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-0",
-        "target": "post_test_reason_closed",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_1",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-1",
-        "target": "post_test_reason_held",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_2",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-2",
-        "target": "post_test_reason_review_red",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_3",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-3",
-        "target": "post_test_reason_ci_red",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_4",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-4",
-        "target": "post_test_reason_pending",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_5",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-5",
-        "target": "post_test_reason_no_checks",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_6",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-6",
-        "target": "post_test_join_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_7",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-7",
-        "target": "post_test_join_conflicting",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_8",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-8",
-        "target": "post_test_join_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_9",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-9",
-        "target": "post_test_join_conflicting",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_case_10",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "case-10",
-        "target": "post_test_report_ready",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_policy_default",
-        "source": "switch_post_test_policy",
-        "sourceHandle": "default",
-        "target": "post_test_reason_malformed",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_joined_unknown",
-        "source": "post_test_join_unknown",
-        "sourceHandle": "out",
-        "target": "post_test_reason_unknown",
-        "targetHandle": "in"
-      },
-      {
-        "id": "post_test_joined_conflicting",
-        "source": "post_test_join_conflicting",
-        "sourceHandle": "out",
-        "target": "post_test_reason_conflicting",
-        "targetHandle": "in"
-      },
-      {
         "id": "e_pr4_merge_done",
         "source": "merge",
         "sourceHandle": "success",
@@ -9000,6 +9228,216 @@
         "source": "final_callback_join",
         "sourceHandle": "out",
         "target": "final_callback_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_0",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-0",
+        "target": "final_reason_malformed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_1",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-1",
+        "target": "final_reason_closed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_2",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-2",
+        "target": "final_reason_held",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_3",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-3",
+        "target": "final_reason_review_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_4",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-4",
+        "target": "final_reason_ci_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_5",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-5",
+        "target": "final_reason_pending",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_6",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-6",
+        "target": "final_reason_no_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_7",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-7",
+        "target": "final_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_8",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-8",
+        "target": "final_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_9",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-9",
+        "target": "final_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_10",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-10",
+        "target": "final_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_11",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-11",
+        "target": "final_reason_ready",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_joined_unknown",
+        "source": "final_join_unknown",
+        "sourceHandle": "out",
+        "target": "final_reason_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_joined_conflicting",
+        "source": "final_join_conflicting",
+        "sourceHandle": "out",
+        "target": "final_reason_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_default",
+        "source": "switch_final_policy",
+        "sourceHandle": "default",
+        "target": "final_reason_malformed_default",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_0",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-0",
+        "target": "post_test_reason_malformed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_1",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-1",
+        "target": "post_test_reason_closed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_2",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-2",
+        "target": "post_test_reason_held",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_3",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-3",
+        "target": "post_test_reason_review_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_4",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-4",
+        "target": "post_test_reason_ci_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_5",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-5",
+        "target": "post_test_reason_pending",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_6",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-6",
+        "target": "post_test_reason_no_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_7",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-7",
+        "target": "post_test_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_8",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-8",
+        "target": "post_test_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_9",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-9",
+        "target": "post_test_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_10",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-10",
+        "target": "post_test_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_11",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-11",
+        "target": "post_test_report_ready",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_joined_unknown",
+        "source": "post_test_join_unknown",
+        "sourceHandle": "out",
+        "target": "post_test_reason_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_joined_conflicting",
+        "source": "post_test_join_conflicting",
+        "sourceHandle": "out",
+        "target": "post_test_reason_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_default",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "default",
+        "target": "post_test_reason_malformed_default",
         "targetHandle": "in"
       }
     ]
