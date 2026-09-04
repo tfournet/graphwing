@@ -23,6 +23,12 @@ Source implementation and high-confidence Graphwing PR merges are authorized. Li
 
 The current run-control path and temporary daemon owners are frozen in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). Do not remove a v1 compatibility surface or infer a v2 record from v1 state before the separately approved cutover proof.
 
+For v2 runs, Rewst owns policy, immutable history, conservative aggregate charges,
+and terminal outcomes. Each writer launch uses fresh daemon launch-authority facts and
+one exact consumed authorization. A callback timeout must poll and wait for the job
+before recording full-envelope authority loss; a later workflow execution may resume
+the same durable run. The bounded in-graph loop is not a product attempt limit.
+
 The additive `POST /v1/run/control/attempt-facts` boundary reports one exact-authorized,
 authority-sealed terminal agent attempt as closed `normalized-attempt-facts-v2`. It
 reports identity, route profile, terminal/failure state, nullable observed usage, exact

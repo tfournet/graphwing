@@ -2,6 +2,17 @@
 
 Agent dispatch has an additive exact-authorization path. A request containing the closed `rewst_authorization` object is authenticated over its exact body bytes, reconstructed against the daemon-observed launch, claimed once under the server job ID, and consumed immediately before the queued job is persisted. Published v1 callers that omit `rewst_authorization` remain temporarily compatible until the workflow cutover is separately deployed and live-proven. The active v1 graph-side authorization path is `graphwing-run-control-consume-authorization`; the older `graphwing-run-control-authorize` graph remains compatibility-only. The source-derived call graph and migration gates remain pinned in the [issue #187 baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline).
 
+`POST /v1/rewst/launch-authority-facts` is the non-launching v2 preparation
+boundary. Given one closed unsigned `agent_run` request, it resolves the current
+daemon challenge, actual launcher artifact fingerprint, normalized effort and git
+identity, callback/request/prompt hashes, permission profile, validity window, and
+per-launch hard ceilings. Rewst persists that closed preparation, adds only the
+authorization record identity produced by its readback/CAS chain, consumes it once,
+and lets the request-aware credential sign the resulting exact body. A changed
+launcher artifact, worktree head, callback, request field, or daemon challenge is
+rejected by the existing descriptor comparison; the endpoint never chooses a route,
+budget, retry, or lifecycle outcome.
+
 This path is enforcement, not routing policy. Rewst still owns continuation, cross-model handoff, restructure, park, aggregate budgets, and durable attempt history. Every Rewst-authorized fresh launch, same-model resume, or cross-model launch needs a new consumed authorization and nonce. `/v1/pr/continue` and `/v1/slice/continue` only request later workflow executions; they do not mint or substitute launch authority.
 
 ## Server-instance challenge

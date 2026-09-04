@@ -77,7 +77,7 @@ On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review na
 
 `graphwing-routing-policy` accepts only `class`, `work_kind`, `size`, `ac_count`, and `seams`. Native AST/object nodes validate and normalize those values, apply at most one size bump, select the current normal-v1 writer and class/effective-size budget, and choose zero, one, or two distinct opposing-provider reviewers. Writer effort remains work-kind-specific; reviewer effort is independently `medium` or `high`. Every present role carries one complete `route-execution-profile-v2` bound to the deterministic decision hash.
 
-The graph's policy version is `workflow-normal-v1`, with `normal-v1` retained as its compatibility behavior label. `implement-slice` and `pr-drive` invoke the exact published workflow/version and feed their initial writers and routed reviewers from its v2 profiles. Same-session corrections reuse the successful receipt identity and never invoke policy again. `scripts/drive-pr.py` runs the same Rewst policy before run-control initialization and projects its compatibility tuple; it no longer calls `/v1/slice/route`. The v1 endpoint/profile and the fallback/recovery branches remain for rollback and later migration. This source change performs no import, publication, provider call, or live canary.
+The graph's policy version is `workflow-normal-v1`, with `normal-v1` retained as its compatibility behavior label. `implement-slice` and `pr-drive` invoke the exact published workflow/version and feed their initial writers and routed reviewers from its v2 profiles. Same-session corrections reuse the successful receipt identity and never invoke policy again. `scripts/drive-pr.py` does not select a route or initialize aggregate policy; it submits intent for an existing Rewst-owned v2 run. The v1 endpoint/profile and the fallback/recovery branches remain for rollback and later migration. This source change performs no import, publication, provider call, or live canary.
 
 ### Native effort contract (Phases 2–3)
 
@@ -183,16 +183,19 @@ zero-caller proof.
 The active v1 call path is source-derived and pinned in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). It remains compatibility behavior during the workflow-owned v2 migration; do not treat local run-control state as permanent authority.
 
 ```bash
-python3 scripts/drive-pr.py 3526 --message "fix: address review findings [SC-110507]"
+python3 scripts/drive-pr.py 3526 --run-control-id rc1-... \
+  --message "fix: address review findings [SC-110507]"
 ```
 
-Every attempt is run-control reservation-backed, and there is no predecessor run to
-reserve the first one, so the script does two things: it calls
-`graphwing-run-control-initialize` for a fresh `run_control_id`, then starts
-`graphwing-pr-drive` with it. One Graph run now carries up to three in-run attempts:
-a capped `logic.loop` reserves, launches, settles, and reconciles each attempt slot
-itself, re-reading the PR every pass and doing nothing once it is green. There is no
-outer Python-level retry loop or cross-run kick chain any more; `--wait` defaults to
+The owning Rewst lifecycle creates and retains the v2 run. The script accepts that
+durable `run_control_id`, starts `graphwing-pr-drive`, and reads back its trace; it has
+no route, aggregate-budget, evaluator-contract, or local JSONL authority. One Graph
+execution carries a bounded three-slot window, but the durable run may continue in a
+later execution. Each launched slot gets fresh daemon descriptor-preparation facts,
+one read-back consumed authorization, and an exact request body signed by the
+request-aware credential. Callback loss first polls and waits for the canonical job;
+only confirmed authority loss records a full-envelope charge before native Rewst
+policy decides again. `--wait` defaults to
 the loop's own worst case (`worst_case_run_seconds`, derived from the graph's wait
 timeouts and `maxIterations`, not guessed), and refuses a smaller value rather than
 abandon a run that is still working. The script prints each run's node trace, which is

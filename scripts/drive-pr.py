@@ -3,8 +3,8 @@
 
 Every attempt is now run-control reservation-backed and the retry loop lives
 inside the graph (graphs/pr-drive.json's capped `attempts` logic.loop), not
-here. This script resolves the exact workflow policy, initializes the run-control
-record, and starts the graph. One call, one run, up to three in-graph attempts.
+here. This script submits operator intent for an existing Rewst-owned durable run and
+reads back the bounded graph result. It does not select routes or create aggregate limits.
 
 Why REST and not the webhook: a webhook-triggered run leaves CTX.INPUT empty,
 so every {{ CTX.INPUT.* }} in the graph resolves to nothing and pr-drive dies at
@@ -33,7 +33,6 @@ Needs the Rewst MCP token: GRAPHWING_REWST_MCP_TOKEN, or mcp_bws_key in
 rewst-install.json plus BWS_ACCESS_TOKEN.
 """
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -49,74 +48,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import publish_graphs as pg  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from server import parse_route_execution_profile, resolve_executable  # noqa: E402
+from server import resolve_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DAEMON_BASE = "http://127.0.0.1:8645"
 
 
 # --------------------------------------------------------------------------
-# Canonical hashing, same convention as every run-control descriptor hash in
-# the catalog (server.py, e.g. run_control_settle's receipt hash).
-# --------------------------------------------------------------------------
-
-def canonical_json(obj: Any) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
-
-
-def sha256_hex(obj: Any) -> str:
-    return hashlib.sha256(canonical_json(obj)).hexdigest()
-
-
-def evaluator_contract_sha256(openapi_path: Path = ROOT / "openapi.json") -> str:
-    spec = json.loads(openapi_path.read_text())
-    schema = spec["components"]["schemas"]["RunControlRequest"]
-    return sha256_hex(schema)
-
-
-# --------------------------------------------------------------------------
 # Pure payload builders, pinned by DrivePrScriptTests without a daemon, a
 # repo, or a Rewst token.
 # --------------------------------------------------------------------------
-
-def root_workflow_run_id(pr: str, timestamp: str) -> str:
-    return f"rc-{pr}-{timestamp}"
-
-
-def utc_compact_timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def build_root_identity(root_workflow_id: str, root_workflow_version_id: str,
-                         run_id: str) -> dict[str, str]:
-    return {
-        "root_workflow_id": root_workflow_id,
-        "root_workflow_version_id": root_workflow_version_id,
-        "root_workflow_run_id": run_id,
-        "purpose": "pr_drive",
-    }
-
-
-def build_budgets(attempts: int, turns: int, wall_seconds: int, tokens: int,
-                   provider_cost_usd: str) -> dict[str, Any]:
-    return {
-        "attempts": attempts,
-        "turns": turns,
-        "wall_seconds": wall_seconds,
-        "tokens": tokens,
-        "provider_cost_usd": provider_cost_usd,
-    }
-
-
-def build_initialize_input(root_identity: dict, budgets: dict, initial_route: dict,
-                            evaluator_contract_sha256_value: str) -> dict[str, Any]:
-    return {
-        "root_identity": root_identity,
-        "budgets": budgets,
-        "initial_route": initial_route,
-        "evaluator_contract_sha256": evaluator_contract_sha256_value,
-    }
-
 
 def build_pr_drive_input(repo: str, pr: str, test: str, auto_merge: bool,
                           klass: str, size: str, work_kind: str, prompt: str,
@@ -255,54 +196,6 @@ def api_key() -> str:
     return path.read_text().strip()
 
 
-def resolve_route(mcp: str, policy_ref: dict[str, Any], klass: str, size: str, work_kind: str,
-                  wait: int = 90) -> dict[str, str]:
-    workflow_id = policy_ref.get("workflow_id")
-    version_id = policy_ref.get("workflow_version_id")
-    slug = policy_ref.get("slug")
-    if not all(isinstance(value, str) and value for value in (workflow_id, version_id, slug)):
-        raise SystemExit("install['routing_policy'] has no exact workflow/version/slug; publish it first")
-    assert isinstance(workflow_id, str) and isinstance(version_id, str) and isinstance(slug, str)
-    if slug != "graphwing-routing-policy":
-        raise SystemExit("install['routing_policy'] names the wrong workflow")
-    pg.read_back_exact_published_version(mcp, workflow_id, version_id, slug)
-    status, _run_id, _run, trace = pg.run_slug(
-        mcp, slug,
-        {"input": {"class": klass, "size": size, "work_kind": work_kind}},
-        wait=wait,
-    )
-    if status != "completed":
-        raise SystemExit(f"routing policy run ended {status}")
-    output = next((
-        entry.get("output") for entry in trace_entries(trace)
-        if isinstance(entry, dict)
-        and (entry.get("nodeId") or entry.get("id")) == "route_output"
-    ), None)
-    if not isinstance(output, dict):
-        raise SystemExit("routing policy did not return route_output")
-    profile = output.get("writer_execution_profile")
-    launcher, provider = output.get("launcher"), output.get("provider")
-    model, effort = output.get("model"), output.get("effort")
-    if not all(isinstance(value, str) for value in (launcher, provider, model, effort)):
-        raise SystemExit("routing policy returned a noncanonical writer profile")
-    assert isinstance(launcher, str) and isinstance(provider, str)
-    assert isinstance(model, str) and isinstance(effort, str)
-    parsed, error = parse_route_execution_profile(
-        profile, expected_role="writer", launcher=launcher,
-        provider=provider, model=model, effort=effort,
-    )
-    if (
-        error is not None or parsed != profile or not isinstance(profile, dict)
-        or output.get("compatibility_behavior") != "normal-v1"
-    ):
-        raise SystemExit("routing policy returned a noncanonical writer profile")
-    return {
-        "route_version": output["compatibility_behavior"],
-        "launcher": profile["launcher"], "provider": profile["provider"],
-        "model": profile["model"],
-    }
-
-
 def gh_pr_view(repo_path: Path, pr: str) -> tuple[str, str]:
     gh_bin = resolve_executable(
         "gh", "GRAPHWING_GH_BIN", Path.home() / ".local" / "bin" / "gh",
@@ -377,46 +270,6 @@ def wait_for_fresh_review(repo, pr, previous, tries: int = 0, gap: int = 0) -> b
     return False
 
 
-# --------------------------------------------------------------------------
-# workflow-runs.jsonl, same shape as server.py's record_workflow_run.
-# --------------------------------------------------------------------------
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def workflow_run_title(workflow: str, inp: dict[str, Any]) -> str:
-    pr = inp.get("pr_number") or inp.get("pr")
-    if pr not in (None, ""):
-        return f"{workflow} PR {pr}"
-    repo = str(inp.get("repo") or "").strip()
-    return f"{workflow} {repo}" if repo else workflow
-
-
-def record_workflow_run(row: dict[str, Any]) -> None:
-    payload = {
-        "workflow": str(row.get("workflow") or ""),
-        "status": str(row.get("status") or "fired"),
-        "source": str(row.get("source") or "fire"),
-        "input": row.get("input") if isinstance(row.get("input"), dict) else {},
-        "run_id": row.get("run_id"),
-        "created_at": str(row.get("created_at") or utcnow()),
-    }
-    if row.get("run_control_id"):
-        payload["run_control_id"] = row["run_control_id"]
-    payload["title"] = workflow_run_title(payload["workflow"], payload["input"])
-    path = pg.HOME / "workflow-runs.jsonl"
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as fh:
-            fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    except OSError as exc:
-        print("could not record workflow run:", exc)
-
-
-def resolved(value, default):
-    return value if value is not None else default
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -430,12 +283,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--work-kind", dest="work_kind", default="go_coding")
     ap.add_argument("--message", default="fix: address review findings",
                      help="commit message; git_commit rejects an empty one")
-    ap.add_argument("--attempts", type=int, default=None, help="budgets.attempts (default 3)")
-    ap.add_argument("--turns", type=int, default=None, help="budgets.turns (default 150)")
-    ap.add_argument("--wall-seconds", dest="wall_seconds", type=int, default=None,
-                     help="budgets.wall_seconds (default 3600)")
-    ap.add_argument("--tokens", type=int, default=None, help="budgets.tokens (default 6000000)")
-    ap.add_argument("--cost", default=None, help="budgets.provider_cost_usd (default 75)")
+    ap.add_argument("--run-control-id", required=True,
+                     help="existing v2 durable run selected by the owning Rewst lifecycle")
     ap.add_argument("--wait", type=int, default=0,
                      help="seconds to poll the run; defaults to the graph's own worst case")
     return ap
@@ -475,44 +324,7 @@ def main() -> int:
     branch, head_sha = gh_pr_view(repo_path, args.pr)
     print("branch", branch, "head_sha", head_sha)
 
-    print("=== resolving the opening route ===")
-    initial_route = resolve_route(
-        mcp, install.get("routing_policy") or {}, args.klass, args.size, args.work_kind,
-    )
-    print("initial_route", json.dumps(initial_route))
-
-    budgets = build_budgets(
-        resolved(args.attempts, 3), resolved(args.turns, 150),
-        resolved(args.wall_seconds, 3600), resolved(args.tokens, 6000000),
-        resolved(args.cost, "75"),
-    )
-    pr_drive = install.get("pr_drive") or {}
-    workflow_id, workflow_version_id = pr_drive.get("workflow_id"), pr_drive.get("workflow_version_id")
-    if not workflow_id or not workflow_version_id:
-        raise SystemExit("install['pr_drive'] has no workflow_id/workflow_version_id; publish it first "
-                          "(scripts/publish_graphs.py --only pr-drive)")
-    root_identity = build_root_identity(
-        workflow_id, workflow_version_id, root_workflow_run_id(args.pr, utc_compact_timestamp()),
-    )
-    initialize_input = build_initialize_input(
-        root_identity, budgets, initial_route, evaluator_contract_sha256(),
-    )
-    print("=== graphwing-run-control-initialize ===")
-    status, rid, _run, trace = pg.run_slug(mcp, "graphwing-run-control-initialize",
-                                            {"input": initialize_input}, wait=args.wait)
-    print("run", rid, "->", status)
-    summarize(trace)
-    if status != "completed":
-        return 1
-    identity_output = None
-    for entry in trace_entries(trace):
-        if isinstance(entry, dict) and (entry.get("nodeId") or entry.get("id")) == "identity":
-            identity_output = entry.get("output")
-            break
-    if not isinstance(identity_output, dict) or not identity_output.get("run_control_id"):
-        print("initialize did not produce a run_control_id")
-        return 1
-    run_control_id = identity_output["run_control_id"]
+    run_control_id = args.run_control_id
     print("run_control_id", run_control_id)
 
     payload = build_pr_drive_input(
@@ -532,10 +344,6 @@ def main() -> int:
         node, err = why
         print("run stopped at %s: %s" % (node, err[:200]))
 
-    record_workflow_run({
-        "workflow": "graphwing-pr-drive", "status": status, "source": "drive-pr",
-        "input": payload, "run_id": rid, "run_control_id": run_control_id,
-    })
 
     state = findings(args.repo, args.pr)
     if state is not None:
