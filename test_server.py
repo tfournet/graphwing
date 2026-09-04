@@ -25361,6 +25361,20 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                 self.assertIn(("v2_state_version_snap", "out", "v2_state_version_route"), edges)
                 self.assertNotIn(("trigger", "out", "v2_state_version_route"), edges)
 
+    def test_v2_policy_route_reads_decision_via_snap(self):
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-state.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn("v2_policy_route_snap", nodes)
+        snap = nodes["v2_policy_route_snap"]
+        self.assertEqual(snap["type"], "transforms.objectBuilder")
+        mapping = next(item for item in snap["config"]["mappings"] if item["output"] == "decision")
+        self.assertEqual(mapping["expression"],
+                         {"kind": "getField", "path": "CTX.v2_policy.decision"})
+        self.assertIn(("v2_decision_mode_route", "default", "v2_policy_route_snap"), edges)
+        self.assertIn(("v2_policy_route_snap", "out", "v2_policy_route"), edges)
+        self.assertNotIn(("v2_decision_mode_route", "default", "v2_policy_route"), edges)
+
     def test_subworkflow_children_get_enough_temporal_budget_to_start(self):
         # The engine refused to start a child under a 120 s parent timeout:
         # "required=7m12s (node maximum=1m5s + settlement margin=6m7s),
