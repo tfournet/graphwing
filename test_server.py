@@ -8023,7 +8023,27 @@ while True:
         self.assertIn(("fix_push", "success", "correction_head"), triples)
         self.assertIn(("correction_head", "success", "correction_view"), triples)
         self.assertIn(("correction_view", "success", "correction_push_receipt"), triples)
-        self.assertFalse(any(edge[0] == "correction_push_receipt" for edge in triples))
+        self.assertEqual(
+            {edge for edge in triples if edge[0] == "correction_push_receipt"},
+            {("correction_push_receipt", "out", "rc_evidence_join")},
+        )
+        outgoing = {}
+        for source, _handle, target in triples:
+            outgoing.setdefault(source, set()).add(target)
+        reachable, pending = set(), ["rc_evidence_join"]
+        while pending:
+            source = pending.pop()
+            if source in reachable:
+                continue
+            reachable.add(source)
+            pending.extend(outgoing.get(source, ()))
+        self.assertEqual(reachable, {
+            "rc_evidence_join", "rc_diff", "rc_diff_hash", "rc_constraint_candidates",
+            "rc_constraint_signals", "rc_progress", "rc_reconcile", "rc_failure_join",
+            "rc_failure",
+        })
+        self.assertTrue({"iter_writer_task", "rc_state", "rc_consume", "agent", "wait_fix"}
+                        .isdisjoint(reachable))
         self.assertFalse(any(edge[0] == "review_infrastructure_hold" for edge in triples))
         self.assertFalse(any(edge[0] == "exact_head_audit_hold" for edge in triples))
         for node_id in ("review_infrastructure_hold", "exact_head_audit_hold",
@@ -18152,6 +18172,12 @@ func main() {
                     for item in value.values(): walk(item)
             for node in graph["spec"]["nodes"]:
                 walk(node.get("config", {}))
+                if node["id"] == "v2_state_version_route":
+                    found.update(
+                        rule["path"]
+                        for case in node["config"]["cases"]
+                        for rule in case["rules"]
+                    )
             return found
 
         inputs = {stem: input_fields(graph) for stem, graph in graphs.items()}
@@ -27803,11 +27829,28 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
     def record_key(self, ordinal, root_identity=None):
         return f"rch2-{self.run_hash(root_identity)}-{ordinal}"
 
+    def test_run_control_v2_catalog_metadata_is_exact_and_immutable(self):
+        from scripts import publish_graphs as catalog
+
+        self.assertEqual(catalog.RUN_CONTROL_V2_POLICY_VERSION, "run-control-v2")
+        self.assertEqual(catalog.RUN_CONTROL_V2_NAMESPACES, (
+            "graphwing_run_control_history_v2",
+            "graphwing_run_control_pointer_v2",
+        ))
+        v2_targets = set()
+        for stem in self.STEMS:
+            for node in self.v2_nodes(stem):
+                target = node["config"].get("collection") or node["config"].get("namespace")
+                if isinstance(target, str) and target.endswith("_v2"):
+                    v2_targets.add(target)
+        self.assertEqual(v2_targets, set(catalog.RUN_CONTROL_V2_NAMESPACES))
+
     # -- drivers -----------------------------------------------------------
     def child_transition(self, store, runner, node):
         child = NativeGraphRunner(self.graph("run-control-transition"), store)
         child.run(runner.render(node["config"]["inputMapping"]["values"]))
-        return "success", {"transition_result": child.context["CTX"].get("transition_result")}
+        output_keys = node["config"]["outputMapping"]["keys"]
+        return "success", {key: child.context["CTX"].get(key) for key in output_keys}
 
     def commit(self, store, inputs):
         runner = NativeGraphRunner(self.graph("run-control-transition"), store)
@@ -27854,9 +27897,16 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
         return runner
 
     def reconcile(self, store, *, facts, progress, owner_run_id="run-187-a", envelope=None):
+        outstanding = self.pointer(store)["outstanding_authorization"]
+
         def actions(node, payload, context):
             if node["type"].endswith("POST:/v1/run/control/attempt-facts"):
-                return "success", deepcopy(facts)
+                return "success", {
+                    **deepcopy(facts),
+                    "authorization_identity": deepcopy(context["CTX"]["INPUT"][
+                        "authorization_identity"
+                    ]),
+                }
             if node["type"] == "action.subworkflow":
                 return self.child_transition(store, runner, node)
             raise AssertionError(node["id"])
@@ -27866,8 +27916,11 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
             "run_control_id": self.run_control_id(), "state_version": "v2",
             "kind": "terminal_receipt", "receipt": None, "authority_loss_reason": None,
             "attempt_job_id": facts.get("job_id"),
-            "authorization_identity": {"authorization_id": "rca2-fixture",
-                                       "launch_descriptor_sha256": "d" * 64},
+            "authorization_identity": {
+                "version": "graphwing-rewst-authorization-identity-v1",
+                "authorization_id": outstanding["authorization_id"],
+                "descriptor_sha256": outstanding["effect_descriptor_sha256"],
+            },
             "reserved_envelope": deepcopy(envelope or self.ENVELOPE),
             "progress": deepcopy(progress), "owner_workflow_run_id": owner_run_id,
         })
@@ -27884,10 +27937,14 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
     def facts(self, *, turns=None, cost=None, wall=12, tokens=92137, job="j" * 32,
               status="succeeded", available=True):
         return {"version": "normalized-attempt-facts-v2", "job_id": job,
-                "authority_available": available, "terminal_status": status,
+                "authority_available": available, "session_identity": None,
+                "terminal_status": status,
                 "failure_class": "none", "failure_code": "none", "failover_eligible": False,
                 "turns_observed": turns, "provider_cost_usd": None,
                 "provider_cost_microusd_ceiling": cost, "wall_seconds": wall,
+                "fresh_input_tokens": None, "cached_input_tokens": None,
+                "cache_write_tokens": None, "output_tokens": None,
+                "reasoning_tokens": None,
                 "total_tokens": tokens, "receipt_sha256": "a" * 64,
                 "route_execution_profile": deepcopy(self.ROUTE)}
 
@@ -28203,7 +28260,9 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
             configs = json.dumps([node["config"] for node in self.v2_nodes(stem)])
             self.assertNotIn("attempts_appended", configs, stem)
             self.assertNotIn("evaluator_history", configs, stem)
-            self.assertNotIn(str(server.RUN_CONTROL_MAX_ATTEMPTS), configs, stem)
+            self.assertNotIn(
+                f'"value": {server.RUN_CONTROL_MAX_ATTEMPTS}', configs, stem
+            )
         self.assertNotIn("attempts", self.pointer(store))
         self.assertNotIn("evaluator_history", self.history(store, 12))
         # The pointer stays compact however long the run gets.
