@@ -2628,6 +2628,45 @@
                       "kind": "literal",
                       "value": null
                     }
+                  },
+                  {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.correction_head.data.ok"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": true
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "!=",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.correction_head.data.sha"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": null
+                        }
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": null
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": "authoritative_head_unavailable"
+                    }
                   }
                 ]
               }
@@ -2704,20 +2743,52 @@
                   },
                   "right": {
                     "kind": "binary",
-                    "operator": "==",
+                    "operator": "and",
                     "left": {
-                      "kind": "function",
-                      "name": "count",
-                      "args": [
-                        {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
                           "kind": "getField",
-                          "path": "CTX.rc_constraint_signals"
+                          "path": "TASKS.correction_head.data.ok"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": true
                         }
-                      ]
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "!=",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.correction_head.data.sha"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": null
+                        }
+                      }
                     },
                     "right": {
-                      "kind": "literal",
-                      "value": 0
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "function",
+                        "name": "count",
+                        "args": [
+                          {
+                            "kind": "getField",
+                            "path": "CTX.rc_constraint_signals"
+                          }
+                        ]
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": 0
+                      }
                     }
                   }
                 },
@@ -2781,14 +2852,42 @@
               "id": "m7",
               "output": "head_sha",
               "expression": {
-                "kind": "coalesce",
-                "primary": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.correction_head.data.ok"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "!=",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.correction_head.data.sha"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": null
+                    }
+                  }
+                },
+                "then": {
                   "kind": "getField",
                   "path": "TASKS.correction_head.data.sha"
                 },
-                "fallback": {
-                  "kind": "getField",
-                  "path": "CTX.rc_pre_evidence.head_sha"
+                "else": {
+                  "kind": "literal",
+                  "value": null
                 }
               }
             },

@@ -28201,7 +28201,7 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
 
         diff = "diff --git a/x b/x\n+fixed\n"
 
-        def evidence(pre_red, test_status, diff_text, pushed=True):
+        def evidence(pre_red, test_status, diff_text, pushed=True, head_available=True):
             runner = NativeGraphRunner(graph, RunControlDatastoreFixture())
             runner.context = {
                 "CTX": {"INPUT": {}, "rc_pre_evidence": {"pre_attempt_red": pre_red,
@@ -28209,7 +28209,8 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
                 "TASKS": {
                     "rc_diff": {"data": {"ok": True, "diff": diff_text, "truncated": False}},
                     "wait_fix_test": {"request": {"body": {"status": test_status}}},
-                    "correction_head": {"data": {"ok": True, "sha": "e" * 40}},
+                    "correction_head": {"data": {"ok": head_available,
+                                                   "sha": "e" * 40 if head_available else None}},
                     "fix_push": {"data": {"ok": pushed}},
                 }}
             for node_id in ("rc_diff_hash", "rc_constraint_candidates", "rc_constraint_signals",
@@ -28237,6 +28238,11 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
         self.assertEqual(empty["checkpoint"], 0)
         self.assertIn("no_production_diff", empty["constraint_signals"])
         self.assertIn("unpushed_correction", empty["constraint_signals"])
+
+        missing_head = evidence(True, "ok", diff, head_available=False)
+        self.assertEqual(missing_head["checkpoint"], 0)
+        self.assertIsNone(missing_head["head_sha"])
+        self.assertIn("authoritative_head_unavailable", missing_head["constraint_signals"])
 
     # -- 7 -----------------------------------------------------------------
     def test_run_control_v2_history_rolls_across_workflow_executions_without_a_ten_attempt_product_cap(self):
