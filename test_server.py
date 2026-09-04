@@ -7053,6 +7053,19 @@ while True:
         self.assertTrue(ok, err)
         self.assertIsNone(err)
 
+    def test_pr_merge_rejects_string_auto_merge_authorization(self):
+        head = "1" * 40
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, jobs = root / "repo", root / "jobs"
+            repo.mkdir()
+            self._write_merge_job(jobs, repo, head)
+            status, payload, merge, _ = self._merge_with_fakes(
+                jobs, repo, head, body=self._merge_body(auto_merge="true"),
+            )
+        self.assertEqual((status, payload["code"]), (409, "auto_merge_not_requested"))
+        merge.assert_not_called()
+
     @staticmethod
     def _strict_pr_view(head, **overrides):
         data = {
@@ -7723,7 +7736,11 @@ while True:
         self.assertFalse(any(e["source"] == "post_correction_lifecycle" for e in edges))
         self.assertIn(("final_view", "success", "final_checks"), triples)
         self.assertIn(("final_checks", "success", "final_confirm_view"), triples)
-        self.assertIn(("final_confirm_view", "success", "final_label_names"), triples)
+        self.assertIn(("final_confirm_view", "success", "final_policy_fact_validity_snap"), triples)
+        self.assertIn(("final_policy_fact_validity_snap", "out",
+                       "switch_final_policy_fact_validity"), triples)
+        self.assertIn(("switch_final_policy_fact_validity", "case-0",
+                       "final_label_names"), triples)
         self.assertIn(("final_policy_snap", "out", "switch_final_policy"), triples)
         self.assertIn(("final_reason_ready", "out", "final_checkout"), triples)
         for node_id in nodes:
@@ -18461,7 +18478,7 @@ func main() {
         self.assertEqual(json.loads(spec_bytes), pr_status["spec"])
         self.assertEqual(
             hashlib.sha256(spec_bytes).hexdigest(),
-            "32831ebc4f37dc85880fcf0fc1405aa0a9ed274507220d92067aa6c5133873b8",
+            "110cd8d11d7739a55c19fec313da0833cf557f74a7fa925a22c410c6ba02c34b",
         )
 
     def test_pr_status_graph_is_read_only_and_webhook_disabled(self):
@@ -26574,10 +26591,26 @@ class PrDriveGraphTests(unittest.TestCase):
                 self.load(), RunControlDatastoreFixture(),
                 lambda node, payload, ctx: ("halt", {}),
             )
-            runner.run({}, start="final_label_names", context=context)
-            self.assertIn("final_reason_" + expected, runner.executed)
+            runner.run({}, start="final_policy_fact_validity_snap", context=context)
+            self.assertTrue(any(node_id.startswith("final_reason_" + expected)
+                                for node_id in runner.executed), runner.executed)
             self.assertNotIn("final_wait", runner.executed)
             self.assertEqual("final_checkout" in runner.executed, expected == "ready")
+        for field, malformed_value in (("pr_facts_valid", "true"),
+                                       ("number_matches", 1)):
+            annotated = server.annotate_pr_view({"ok": True, "data": deepcopy(base)})
+            annotated["number_matches"] = True
+            annotated[field] = malformed_value
+            context = {"CTX": {"INPUT": {}}, "TASKS": {
+                "final_view": {"data": deepcopy(annotated)},
+                "final_confirm_view": {"data": deepcopy(annotated)},
+                "final_checks": {"data": {"checks_state": "green"}},
+            }}
+            runner = NativeGraphRunner(self.load(), RunControlDatastoreFixture(),
+                                       lambda node, payload, ctx: ("halt", {}))
+            runner.run({}, start="final_policy_fact_validity_snap", context=context)
+            self.assertIn("final_reason_malformed_identity", runner.executed)
+            self.assertNotIn("final_wait", runner.executed)
 
     def test_synchronous_policy_rejection_never_feeds_a_callback_wait(self):
         spec = self.load()["spec"]
@@ -26589,6 +26622,7 @@ class PrDriveGraphTests(unittest.TestCase):
                         if edge["target"].startswith("final_reason_")}
         self.assertTrue(predecessors <= {
             "switch_final_policy", "final_join_unknown", "final_join_conflicting",
+            "switch_final_policy_fact_validity",
         })
         nonready = [edge for edge in edges if edge["source"] == "switch_final_policy"
                     and edge["target"] != "final_reason_ready"]
@@ -26614,16 +26648,21 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertIn(("final_callback_join", "out", "final_callback_snap"), edges)
         self.assertIn(("final_callback_snap", "out", "switch_final_test"), edges)
         self.assertIn(("switch_final_test", "case-0", "post_test_view"), edges)
-        self.assertIn(("post_test_confirm_view", "success", "post_test_label_names"), edges)
+        self.assertIn(("post_test_confirm_view", "success",
+                       "post_test_policy_fact_validity_snap"), edges)
+        self.assertIn(("switch_post_test_policy_fact_validity", "case-0",
+                       "post_test_label_names"), edges)
         self.assertIn(("post_test_report_ready", "out", "rc_verified_state"), edges)
-        self.assertIn(("rc_verified_route", "case-0", "switch_merge_intent"), edges)
+        self.assertIn(("rc_verified_route", "case-0", "merge_intent_snap"), edges)
+        self.assertIn(("merge_intent_snap", "out", "switch_merge_intent"), edges)
         self.assertIn(("switch_merge_intent", "case-0", "request_merge"), edges)
         self.assertIn(("switch_merge_intent", "default", "human_merge"), edges)
         self.assertIn(("request_merge", "out", "merge"), edges)
         self.assertEqual([(s, h) for s, h, target in edges if target == "merge"],
                          [("request_merge", "out")])
         merge = nodes["merge"]["config"]
-        self.assertEqual(merge["auto_merge"], "{{ CTX.run_input.auto_merge_authorized }}")
+        self.assertEqual(merge["auto_merge"],
+                         "{{ CTX.merge_authorization.auto_merge_authorized }}")
         self.assertEqual(merge["evidence_job_id"],
                          "{{ TASKS.final_wait.request.body.job_id }}")
         callback = {m["output"]: m["expression"]
@@ -26635,8 +26674,13 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertIn({"path": "job_bound", "op": "equals", "value": True}, rules)
         run_input = {m["output"]: m["expression"]
                      for m in nodes["run_input"]["config"]["mappings"]}
-        self.assertIn("auto_merge_authorized", run_input)
-        self.assertNotIn("auto_merge", run_input)
+        self.assertIn("auto_merge_requested", run_input)
+        self.assertNotIn("auto_merge_authorized", run_input)
+        self.assertIn(("run_input", "out", "switch_auto_merge_input"), edges)
+        self.assertIn(("merge_authorization", "out", "git"), edges)
+        auth_rules = nodes["switch_auto_merge_input"]["config"]["cases"][0]["rules"]
+        self.assertEqual(auth_rules, [{"path": "auto_merge_requested", "op": "equals",
+                                      "value": True}])
         self.assertEqual(nodes["form"]["config"]["inputs"]["auto_merge"]["type"],
                          "boolean")
 
@@ -28035,7 +28079,8 @@ class NativeGraphRunner:
         payload = payload if isinstance(payload, dict) else {}
         for rule in config.get("rules", []):
             cls.assertion(rule["op"] == "equals", rule)
-            if cls.path(payload, rule["path"]) != rule["value"]:
+            actual, expected = cls.path(payload, rule["path"]), rule["value"]
+            if type(actual) is not type(expected) or actual != expected:
                 return False
         return True
 

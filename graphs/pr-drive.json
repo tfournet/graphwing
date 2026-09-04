@@ -128,18 +128,10 @@
             },
             {
               "id": "mauto_merge_authorized",
-              "output": "auto_merge_authorized",
+              "output": "auto_merge_requested",
               "expression": {
-                "kind": "binary",
-                "operator": "==",
-                "left": {
-                  "kind": "getField",
-                  "path": "CTX.INPUT.auto_merge"
-                },
-                "right": {
-                  "kind": "literal",
-                  "value": true
-                }
+                "kind": "getField",
+                "path": "CTX.INPUT.auto_merge"
               }
             },
             {
@@ -3885,7 +3877,7 @@
           "timeout": 60,
           "repo": "{{ CTX.run_input.repo }}",
           "number": "{{ CTX.run_input.pr_number }}",
-          "auto_merge": "{{ CTX.run_input.auto_merge_authorized }}",
+          "auto_merge": "{{ CTX.merge_authorization.auto_merge_authorized }}",
           "run_id": "{{ WORKFLOW.runId }}",
           "test": "{{ CTX.run_input.test }}",
           "evidence_job_id": "{{ TASKS.final_wait.request.body.job_id }}",
@@ -5520,154 +5512,6 @@
               }
             },
             {
-              "id": "mfacts_valid",
-              "output": "facts_valid",
-              "expression": {
-                "kind": "binary",
-                "operator": "and",
-                "left": {
-                  "kind": "binary",
-                  "operator": "and",
-                  "left": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.final_view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.final_confirm_view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  },
-                  "right": {
-                    "kind": "binary",
-                    "operator": "==",
-                    "left": {
-                      "kind": "getField",
-                      "path": "TASKS.final_view.data.number_matches"
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": true
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.final_confirm_view.data.number_matches"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": true
-                  }
-                }
-              }
-            },
-            {
-              "id": "mmalformed",
-              "output": "malformed",
-              "expression": {
-                "kind": "binary",
-                "operator": "or",
-                "left": {
-                  "kind": "unary",
-                  "operator": "not",
-                  "operand": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "and",
-                      "left": {
-                        "kind": "binary",
-                        "operator": "and",
-                        "left": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.final_view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        },
-                        "right": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.final_confirm_view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        }
-                      },
-                      "right": {
-                        "kind": "binary",
-                        "operator": "==",
-                        "left": {
-                          "kind": "getField",
-                          "path": "TASKS.final_view.data.number_matches"
-                        },
-                        "right": {
-                          "kind": "literal",
-                          "value": true
-                        }
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.final_confirm_view.data.number_matches"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.final_checks.data.checks_state"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": "malformed"
-                  }
-                }
-              }
-            },
-            {
               "id": "mrequested_number",
               "output": "requested_number",
               "expression": {
@@ -5693,9 +5537,9 @@
               "label": "malformed",
               "rules": [
                 {
-                  "path": "malformed",
+                  "path": "checks_state",
                   "op": "equals",
-                  "value": true
+                  "value": "malformed"
                 }
               ]
             },
@@ -6794,154 +6638,6 @@
               }
             },
             {
-              "id": "mfacts_valid",
-              "output": "facts_valid",
-              "expression": {
-                "kind": "binary",
-                "operator": "and",
-                "left": {
-                  "kind": "binary",
-                  "operator": "and",
-                  "left": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.post_test_view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.post_test_confirm_view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  },
-                  "right": {
-                    "kind": "binary",
-                    "operator": "==",
-                    "left": {
-                      "kind": "getField",
-                      "path": "TASKS.post_test_view.data.number_matches"
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": true
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.post_test_confirm_view.data.number_matches"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": true
-                  }
-                }
-              }
-            },
-            {
-              "id": "mmalformed",
-              "output": "malformed",
-              "expression": {
-                "kind": "binary",
-                "operator": "or",
-                "left": {
-                  "kind": "unary",
-                  "operator": "not",
-                  "operand": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "and",
-                      "left": {
-                        "kind": "binary",
-                        "operator": "and",
-                        "left": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.post_test_view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        },
-                        "right": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.post_test_confirm_view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        }
-                      },
-                      "right": {
-                        "kind": "binary",
-                        "operator": "==",
-                        "left": {
-                          "kind": "getField",
-                          "path": "TASKS.post_test_view.data.number_matches"
-                        },
-                        "right": {
-                          "kind": "literal",
-                          "value": true
-                        }
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.post_test_confirm_view.data.number_matches"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.post_test_checks.data.checks_state"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": "malformed"
-                  }
-                }
-              }
-            },
-            {
               "id": "mrequested_number",
               "output": "requested_number",
               "expression": {
@@ -6967,9 +6663,9 @@
               "label": "malformed",
               "rules": [
                 {
-                  "path": "malformed",
+                  "path": "checks_state",
                   "op": "equals",
-                  "value": true
+                  "value": "malformed"
                 }
               ]
             },
@@ -7926,6 +7622,416 @@
         "config": {
           "stopOnFirst": true
         }
+      },
+      {
+        "id": "switch_auto_merge_input",
+        "type": "logic.switch",
+        "label": "Strict automatic merge authorization",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "authorized",
+              "rules": [
+                {
+                  "path": "auto_merge_requested",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "not_authorized"
+          }
+        }
+      },
+      {
+        "id": "auto_merge_true",
+        "type": "transforms.objectBuilder",
+        "label": "Authorize automatic merge",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "auto_merge_true",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "authorized",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "auto_merge_false",
+        "type": "transforms.objectBuilder",
+        "label": "Do not authorize automatic merge",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "auto_merge_false",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "authorized",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "join_auto_merge",
+        "type": "logic.join.any",
+        "label": "Join merge authorization",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "merge_authorization",
+        "type": "transforms.objectBuilder",
+        "label": "Normalize explicit merge authorization",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "merge_authorization",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "auto_merge_authorized",
+              "expression": {
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "CTX.auto_merge_true.authorized"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "CTX.auto_merge_false.authorized"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "merge_intent_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Merge intent input",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "merge_intent_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "auto_merge_authorized",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.merge_authorization.auto_merge_authorized"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_policy_fact_validity_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Closed normalized PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "final_policy_fact_validity_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "first_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "confirm_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "first_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.number_matches"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "confirm_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.number_matches"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_final_policy_fact_validity",
+        "type": "logic.switch",
+        "label": "Strict PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "valid",
+              "rules": [
+                {
+                  "path": "first_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "first_number_matches",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_number_matches",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "malformed"
+          }
+        }
+      },
+      {
+        "id": "final_reason_malformed_identity",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed identity",
+        "position": {
+          "x": 3460,
+          "y": 280
+        },
+        "config": {
+          "alias": "final_reason_malformed_identity",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_policy_fact_validity_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Closed normalized PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "post_test_policy_fact_validity_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "first_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "confirm_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "first_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_view.data.number_matches"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "confirm_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.number_matches"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_post_test_policy_fact_validity",
+        "type": "logic.switch",
+        "label": "Strict PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "valid",
+              "rules": [
+                {
+                  "path": "first_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "first_number_matches",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_number_matches",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "malformed"
+          }
+        }
+      },
+      {
+        "id": "post_test_reason_malformed_identity",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed identity",
+        "position": {
+          "x": 4160,
+          "y": 280
+        },
+        "config": {
+          "alias": "post_test_reason_malformed_identity",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
       }
     ],
     "edges": [
@@ -7955,13 +8061,6 @@
         "source": "join_start",
         "sourceHandle": "out",
         "target": "run_input",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e2",
-        "source": "run_input",
-        "sourceHandle": "out",
-        "target": "git",
         "targetHandle": "in"
       },
       {
@@ -9045,7 +9144,7 @@
         "id": "e_pr4_final_labels",
         "source": "final_confirm_view",
         "sourceHandle": "success",
-        "target": "final_label_names",
+        "target": "final_policy_fact_validity_snap",
         "targetHandle": "in"
       },
       {
@@ -9115,7 +9214,7 @@
         "id": "e_pr4_post_labels",
         "source": "post_test_confirm_view",
         "sourceHandle": "success",
-        "target": "post_test_label_names",
+        "target": "post_test_policy_fact_validity_snap",
         "targetHandle": "in"
       },
       {
@@ -9165,13 +9264,6 @@
         "source": "post_test_report_ready",
         "sourceHandle": "out",
         "target": "rc_verified_state",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e_pr4_verified_intent",
-        "source": "rc_verified_route",
-        "sourceHandle": "case-0",
-        "target": "switch_merge_intent",
         "targetHandle": "in"
       },
       {
@@ -9438,6 +9530,111 @@
         "source": "switch_post_test_policy",
         "sourceHandle": "default",
         "target": "post_test_reason_malformed_default",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_switch",
+        "source": "run_input",
+        "sourceHandle": "out",
+        "target": "switch_auto_merge_input",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_true",
+        "source": "switch_auto_merge_input",
+        "sourceHandle": "case-0",
+        "target": "auto_merge_true",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_false",
+        "source": "switch_auto_merge_input",
+        "sourceHandle": "default",
+        "target": "auto_merge_false",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_true_join",
+        "source": "auto_merge_true",
+        "sourceHandle": "out",
+        "target": "join_auto_merge",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_false_join",
+        "source": "auto_merge_false",
+        "sourceHandle": "out",
+        "target": "join_auto_merge",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_normalize",
+        "source": "join_auto_merge",
+        "sourceHandle": "out",
+        "target": "merge_authorization",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_auth_git",
+        "source": "merge_authorization",
+        "sourceHandle": "out",
+        "target": "git",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_verified_intent_snap",
+        "source": "rc_verified_route",
+        "sourceHandle": "case-0",
+        "target": "merge_intent_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_intent_switch",
+        "source": "merge_intent_snap",
+        "sourceHandle": "out",
+        "target": "switch_merge_intent",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_fact_validity_switch",
+        "source": "final_policy_fact_validity_snap",
+        "sourceHandle": "out",
+        "target": "switch_final_policy_fact_validity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_fact_validity_pass",
+        "source": "switch_final_policy_fact_validity",
+        "sourceHandle": "case-0",
+        "target": "final_label_names",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_fact_validity_fail",
+        "source": "switch_final_policy_fact_validity",
+        "sourceHandle": "default",
+        "target": "final_reason_malformed_identity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_fact_validity_switch",
+        "source": "post_test_policy_fact_validity_snap",
+        "sourceHandle": "out",
+        "target": "switch_post_test_policy_fact_validity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_fact_validity_pass",
+        "source": "switch_post_test_policy_fact_validity",
+        "sourceHandle": "case-0",
+        "target": "post_test_label_names",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_fact_validity_fail",
+        "source": "switch_post_test_policy_fact_validity",
+        "sourceHandle": "default",
+        "target": "post_test_reason_malformed_identity",
         "targetHandle": "in"
       }
     ]
