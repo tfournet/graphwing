@@ -27983,6 +27983,19 @@ class NativeGraphRunner:
     def numeric(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
+    @staticmethod
+    def tonumber(value):
+        if value is None or isinstance(value, bool):
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return 0.0
+        return 0.0
+
     def evaluate(self, expression, context, item=None):
         kind = expression["kind"]
         if kind == "literal":
@@ -28047,7 +28060,7 @@ class NativeGraphRunner:
                     return _native_text(left) + _native_text(right)
                 return (left or 0) + (right or 0)
             if operator in ("-", "*"):
-                left, right = left or 0, right or 0
+                left, right = NativeGraphRunner.tonumber(left), NativeGraphRunner.tonumber(right)
                 return left - right if operator == "-" else left * right
             left = left if self.numeric(left) else 0
             right = right if self.numeric(right) else 0
@@ -29094,6 +29107,21 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
         self.assertNotIn("v2_terminal_commit", replay.executed)
         self.assertEqual(durable.pointer(store), before)
         self.assertEqual(len(store.writes), writes)
+
+    def test_provider_cost_usd_budget_covers_pr_drive_envelope_microusd(self):
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        budgets = {
+            "attempts": 3, "turns": 200, "wall_seconds": 3600,
+            "tokens": 5000000, "provider_cost_usd": "50",
+        }
+        durable.initialize(store, budgets=budgets)
+        reserved = durable.reserve(store, envelope={
+            "turns": 50, "wall_seconds": 660, "tokens": 2000000, "cost_microusd": 25000000,
+        })
+        self.assertTrue(reserved.context["CTX"]["v2_projection"]["fits"])
+        self.assertTrue(reserved.context["CTX"]["v2_projection"]["projected_within"]["cost_microusd"])
+        self.assertNotEqual(reserved.context["CTX"]["v2_policy"]["decision"], "exhausted")
 
     def test_same_model_continuation_count_spans_all_attempt_records_and_is_not_caller_reanchorable(self):
         initialize = json.dumps(self.nodes("run-control-initialize")["v2_initial_pointer"]["config"])
