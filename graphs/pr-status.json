@@ -523,154 +523,6 @@
               }
             },
             {
-              "id": "mfacts_valid",
-              "output": "facts_valid",
-              "expression": {
-                "kind": "binary",
-                "operator": "and",
-                "left": {
-                  "kind": "binary",
-                  "operator": "and",
-                  "left": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.confirm_view.data.pr_facts_valid"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  },
-                  "right": {
-                    "kind": "binary",
-                    "operator": "==",
-                    "left": {
-                      "kind": "getField",
-                      "path": "TASKS.view.data.number_matches"
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": true
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.confirm_view.data.number_matches"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": true
-                  }
-                }
-              }
-            },
-            {
-              "id": "mmalformed",
-              "output": "malformed",
-              "expression": {
-                "kind": "binary",
-                "operator": "or",
-                "left": {
-                  "kind": "unary",
-                  "operator": "not",
-                  "operand": {
-                    "kind": "binary",
-                    "operator": "and",
-                    "left": {
-                      "kind": "binary",
-                      "operator": "and",
-                      "left": {
-                        "kind": "binary",
-                        "operator": "and",
-                        "left": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        },
-                        "right": {
-                          "kind": "binary",
-                          "operator": "==",
-                          "left": {
-                            "kind": "getField",
-                            "path": "TASKS.confirm_view.data.pr_facts_valid"
-                          },
-                          "right": {
-                            "kind": "literal",
-                            "value": true
-                          }
-                        }
-                      },
-                      "right": {
-                        "kind": "binary",
-                        "operator": "==",
-                        "left": {
-                          "kind": "getField",
-                          "path": "TASKS.view.data.number_matches"
-                        },
-                        "right": {
-                          "kind": "literal",
-                          "value": true
-                        }
-                      }
-                    },
-                    "right": {
-                      "kind": "binary",
-                      "operator": "==",
-                      "left": {
-                        "kind": "getField",
-                        "path": "TASKS.confirm_view.data.number_matches"
-                      },
-                      "right": {
-                        "kind": "literal",
-                        "value": true
-                      }
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "TASKS.checks.data.checks_state"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": "malformed"
-                  }
-                }
-              }
-            },
-            {
               "id": "mrequested_number",
               "output": "requested_number",
               "expression": {
@@ -696,9 +548,9 @@
               "label": "malformed",
               "rules": [
                 {
-                  "path": "malformed",
+                  "path": "checks_state",
                   "op": "equals",
-                  "value": true
+                  "value": "malformed"
                 }
               ]
             },
@@ -1315,6 +1167,134 @@
         "config": {
           "stopOnFirst": true
         }
+      },
+      {
+        "id": "status_policy_fact_validity_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Closed normalized PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "status_policy_fact_validity_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "first_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "confirm_facts_valid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.confirm_view.data.pr_facts_valid"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "first_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.view.data.number_matches"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "confirm_number_matches",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.confirm_view.data.number_matches"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_status_policy_fact_validity",
+        "type": "logic.switch",
+        "label": "Strict PR fact validity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "valid",
+              "rules": [
+                {
+                  "path": "first_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_facts_valid",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "first_number_matches",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "confirm_number_matches",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "malformed"
+          }
+        }
+      },
+      {
+        "id": "status_reason_malformed_identity",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed identity",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "status_reason_malformed_identity",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.status_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
       }
     ],
     "edges": [
@@ -1371,7 +1351,7 @@
         "id": "s_pr4_labels",
         "source": "confirm_view",
         "sourceHandle": "success",
-        "target": "status_label_names",
+        "target": "status_policy_fact_validity_snap",
         "targetHandle": "in"
       },
       {
@@ -1505,6 +1485,27 @@
         "source": "switch_status_policy",
         "sourceHandle": "default",
         "target": "status_reason_malformed_default",
+        "targetHandle": "in"
+      },
+      {
+        "id": "status_fact_validity_switch",
+        "source": "status_policy_fact_validity_snap",
+        "sourceHandle": "out",
+        "target": "switch_status_policy_fact_validity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "status_fact_validity_pass",
+        "source": "switch_status_policy_fact_validity",
+        "sourceHandle": "case-0",
+        "target": "status_label_names",
+        "targetHandle": "in"
+      },
+      {
+        "id": "status_fact_validity_fail",
+        "source": "switch_status_policy_fact_validity",
+        "sourceHandle": "default",
+        "target": "status_reason_malformed_identity",
         "targetHandle": "in"
       }
     ]

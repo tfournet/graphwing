@@ -5091,7 +5091,7 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     experiment_pair = (data.get("codeoff_experiment_id") not in (None, ""), data.get("final_verification_hash") not in (None, ""))
     if experiment_pair[0] != experiment_pair[1]:
         return 400, {"error": "both code-off evidence fields are required", "code": "codeoff_gate_incomplete"}
-    auto_merge = data.get("auto_merge") is True or str(data.get("auto_merge") or "").lower() == "true"
+    auto_merge = data.get("auto_merge") is True
     allowed, why = pr_merge_allowed({}, auto_merge=auto_merge, run_id=str(data.get("run_id") or ""))
     if not allowed and why and why["code"] in {"auto_merge_not_requested", "no_run_id"}:
         return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number, **why}
