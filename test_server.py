@@ -25338,6 +25338,26 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
             return {"success", "failure"}
         return None
 
+    def test_initialize_v2_switch_reads_input_state_version_from_a_snap(self):
+        spec = json.loads(
+            (Path(server.__file__).parent / "graphs" / "run-control-initialize.json").read_text()
+        )["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn("v2_state_version_snap", nodes)
+        snap = nodes["v2_state_version_snap"]
+        self.assertEqual(snap["type"], "transforms.objectBuilder")
+        mapping = next(
+            item for item in snap["config"]["mappings"] if item["output"] == "state_version"
+        )
+        self.assertEqual(
+            mapping["expression"],
+            {"kind": "getField", "path": "CTX.INPUT.state_version"},
+        )
+        self.assertIn(("trigger", "out", "v2_state_version_snap"), edges)
+        self.assertIn(("v2_state_version_snap", "out", "v2_state_version_route"), edges)
+        self.assertNotIn(("trigger", "out", "v2_state_version_route"), edges)
+
     def test_subworkflow_children_get_enough_temporal_budget_to_start(self):
         # The engine refused to start a child under a 120 s parent timeout:
         # "required=7m12s (node maximum=1m5s + settlement margin=6m7s),
