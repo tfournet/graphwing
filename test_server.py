@@ -28902,7 +28902,10 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
             nodes["rc_decide"]["config"]["inputMapping"]["values"]["decision_only"], True,
         )
         self.assertIn(("rc_callback_hash", "out", "rc_decide"), edges)
-        self.assertIn(("rc_state_route", "default", "wait"), edges)
+        self.assertIn(("rc_state_route", "default", "rc_decision_evidence"), edges)
+        self.assertIn(("rc_decision_evidence", "out", "rc_decision_gate"), edges)
+        self.assertIn(("rc_decision_gate", "pass", "pr_head_claim_value"), edges)
+        self.assertIn(("pr_head_claim_gate", "pass", "wait"), edges)
         self.assertNotIn(("rc_callback_hash", "out", "wait"), edges)
         for decision in ("terminal", "terminal_nonretryable", "exhausted", "park",
                          "verified", "restructure"):
