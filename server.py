@@ -5119,6 +5119,8 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
         "mergeable": vd.get("mergeable"),
         "is_draft": vd.get("isDraft"), "holds": view.get("holds"),
         "pr_state": vd.get("state"), "merge_state": vd.get("mergeStateStatus"),
+        "pr_facts_valid": view.get("pr_facts_valid"),
+        "number_matches": view.get("number_matches"),
         "checks_state": checks.get("checks_state"), "review_decision": view.get("review_decision"),
         "head_ref": vd.get("headRefName"), "head": vd.get("headRefOid"),
     }
@@ -5161,6 +5163,9 @@ def pr_merge_allowed(
         # riftwing#3523 got merged from a shell. Merge belongs to a run.
         return False, {"error": "merge is only reachable from inside a run; run_id is required",
                        "code": "no_run_id"}
+    if state.get("pr_facts_valid") is not True or state.get("number_matches") is not True:
+        return False, {"error": "fresh pull request facts are malformed or mismatched",
+                       "code": "pr_state_mismatch"}
     if state.get("pr_state") != "OPEN":
         return False, {"error": "pull request is not open", "code": "not_open"}
     if state.get("is_draft") is not False:
@@ -6334,7 +6339,13 @@ PR_VIEW_FIELDS = "number,title,state,url,headRefName,headRefOid,baseRefName,merg
 
 
 def fresh_pr_view(path: Path, number: str) -> dict[str, Any]:
-    return annotate_pr_view(gh_json(path, ["pr", "view", number, "--json", PR_VIEW_FIELDS]))
+    out = annotate_pr_view(gh_json(path, ["pr", "view", number, "--json", PR_VIEW_FIELDS]))
+    if out.get("ok"):
+        raw_data = out.get("data")
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+        out["requested_number"] = str(number)
+        out["number_matches"] = str(data.get("number")) == str(number)
+    return out
 
 
 GH_CHECK_PASS = frozenset({"pass", "passing", "skipping", "skipped", "skip", "success", "neutral"})
@@ -6363,6 +6374,11 @@ def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
     out["reviews_ok"] = review_decision in {"", "APPROVED"}
     labels = data.get("labels")
     label_rows = labels if isinstance(labels, list) else []
+    labels_valid = isinstance(labels, list) and all(
+        isinstance(label, dict) and isinstance(label.get("name"), str)
+        for label in label_rows
+    )
+    label_names = sorted(label["name"] for label in label_rows) if labels_valid else []
     well_formed = (
         isinstance(out.get("data"), dict) and str(data.get("number") or "").isdigit()
         and data.get("state") in {"OPEN", "CLOSED", "MERGED"}
@@ -6371,9 +6387,9 @@ def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
         and data.get("mergeable") in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}
         and data.get("mergeStateStatus") in {"CLEAN", "BLOCKED", "BEHIND", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}
         and review_decision in {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
-        and isinstance(labels, list) and all(isinstance(label, dict) and isinstance(label.get("name"), str) for label in labels)
+        and labels_valid
     )
-    holds = sorted(label["name"] for label in label_rows if isinstance(label, dict) and label.get("name", "").startswith("hold:"))
+    holds = [name for name in label_names if name.startswith("hold:")]
     if review_decision not in {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}: state = "unknown"
     elif not well_formed: state = "malformed"
     elif data["state"] != "OPEN": state = "closed"
@@ -6384,7 +6400,11 @@ def annotate_pr_view(out: dict[str, Any]) -> dict[str, Any]:
     elif data["mergeable"] == "CONFLICTING" and data["mergeStateStatus"] == "DIRTY": state = "conflicting"
     elif data["mergeable"] == "MERGEABLE" and data["mergeStateStatus"] == "CLEAN": state = "ready"
     else: state = "inconsistent_merge_state"
-    out.update({"holds": holds, "remote_state": state, "remote_reason": state, "remote_ready": state == "ready"})
+    out.update({
+        "pr_facts_valid": well_formed, "label_names": label_names,
+        "holds": holds, "remote_state": state, "remote_reason": state,
+        "remote_ready": state == "ready",
+    })
     return out
 
 
@@ -10760,10 +10780,11 @@ def run_script_job(job_id: str) -> None:
     job["status"] = "completed" if receipt["status"] == "ok" else "failed"
     if receipt["status"] != "ok":
         job["error"] = receipt.get("summary")
+    write_job(job)
     hook = deliver_webhook(job, receipt)
     if hook is not None:
         job["webhook"] = hook
-    write_job(job)
+        write_job(job)
     herdr_job_done(job)
 
 

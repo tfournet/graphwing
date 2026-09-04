@@ -112,7 +112,7 @@
       },
       {
         "id": "status_label_names",
-        "type": "transforms.transformArray",
+        "type": "transforms.objectBuilder",
         "label": "Normalize label names",
         "position": {
           "x": 0,
@@ -120,18 +120,17 @@
         },
         "config": {
           "alias": "status_label_names",
-          "operation": "map",
-          "array": {
-            "inputKind": "ast",
-            "ast": {
-              "kind": "getField",
-              "path": "TASKS.confirm_view.data.data.labels"
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "names",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.confirm_view.data.label_names"
+              }
             }
-          },
-          "mapConfig": {
-            "mode": "field",
-            "fieldPath": "name"
-          }
+          ]
         }
       },
       {
@@ -149,7 +148,7 @@
             "inputKind": "ast",
             "ast": {
               "kind": "getField",
-              "path": "CTX.status_label_names"
+              "path": "CTX.status_label_names.names"
             }
           },
           "filterCondition": {
@@ -232,7 +231,7 @@
               "output": "labels",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.status_label_names"
+                "path": "CTX.status_label_names.names"
               }
             },
             {
@@ -522,6 +521,162 @@
                   }
                 }
               }
+            },
+            {
+              "id": "mfacts_valid",
+              "output": "facts_valid",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.confirm_view.data.pr_facts_valid"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.view.data.number_matches"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.confirm_view.data.number_matches"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                }
+              }
+            },
+            {
+              "id": "mmalformed",
+              "output": "malformed",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "unary",
+                  "operator": "not",
+                  "operand": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "and",
+                        "left": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        },
+                        "right": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.confirm_view.data.pr_facts_valid"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.view.data.number_matches"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": true
+                        }
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "TASKS.confirm_view.data.number_matches"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": true
+                      }
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.checks.data.checks_state"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "malformed"
+                  }
+                }
+              }
+            },
+            {
+              "id": "mrequested_number",
+              "output": "requested_number",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.confirm_view.data.requested_number"
+              }
             }
           ]
         }
@@ -537,6 +692,16 @@
         "config": {
           "mode": "rules",
           "cases": [
+            {
+              "label": "malformed",
+              "rules": [
+                {
+                  "path": "malformed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
             {
               "label": "closed",
               "rules": [
@@ -1079,6 +1244,55 @@
         }
       },
       {
+        "id": "herdr_confirm_http",
+        "type": "action.noop",
+        "label": "Herdr: malformed confirming PR response",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {}
+      },
+      {
+        "id": "status_reason_malformed_default",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed fallback",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "alias": "status_reason_malformed_default",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.status_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "status_join_unknown",
         "type": "logic.join.any",
         "label": "Join unknown reasons",
@@ -1101,16 +1315,6 @@
         "config": {
           "stopOnFirst": true
         }
-      },
-      {
-        "id": "herdr_confirm_http",
-        "type": "action.noop",
-        "label": "Herdr: malformed confirming PR response",
-        "position": {
-          "x": 0,
-          "y": 0
-        },
-        "config": {}
       }
     ],
     "edges": [
@@ -1202,84 +1406,84 @@
         "id": "status_policy_case_0",
         "source": "switch_status_policy",
         "sourceHandle": "case-0",
-        "target": "status_reason_closed",
+        "target": "status_reason_malformed",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_1",
         "source": "switch_status_policy",
         "sourceHandle": "case-1",
-        "target": "status_reason_held",
+        "target": "status_reason_closed",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_2",
         "source": "switch_status_policy",
         "sourceHandle": "case-2",
-        "target": "status_reason_review_red",
+        "target": "status_reason_held",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_3",
         "source": "switch_status_policy",
         "sourceHandle": "case-3",
-        "target": "status_reason_ci_red",
+        "target": "status_reason_review_red",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_4",
         "source": "switch_status_policy",
         "sourceHandle": "case-4",
-        "target": "status_reason_pending",
+        "target": "status_reason_ci_red",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_5",
         "source": "switch_status_policy",
         "sourceHandle": "case-5",
-        "target": "status_reason_no_checks",
+        "target": "status_reason_pending",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_6",
         "source": "switch_status_policy",
         "sourceHandle": "case-6",
-        "target": "status_join_unknown",
+        "target": "status_reason_no_checks",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_7",
         "source": "switch_status_policy",
         "sourceHandle": "case-7",
-        "target": "status_join_conflicting",
+        "target": "status_join_unknown",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_8",
         "source": "switch_status_policy",
         "sourceHandle": "case-8",
-        "target": "status_join_unknown",
+        "target": "status_join_conflicting",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_9",
         "source": "switch_status_policy",
         "sourceHandle": "case-9",
-        "target": "status_join_conflicting",
+        "target": "status_join_unknown",
         "targetHandle": "in"
       },
       {
         "id": "status_policy_case_10",
         "source": "switch_status_policy",
         "sourceHandle": "case-10",
-        "target": "status_reason_ready",
+        "target": "status_join_conflicting",
         "targetHandle": "in"
       },
       {
-        "id": "status_policy_default",
+        "id": "status_policy_case_11",
         "source": "switch_status_policy",
-        "sourceHandle": "default",
-        "target": "status_reason_malformed",
+        "sourceHandle": "case-11",
+        "target": "status_reason_ready",
         "targetHandle": "in"
       },
       {
@@ -1294,6 +1498,13 @@
         "source": "status_join_conflicting",
         "sourceHandle": "out",
         "target": "status_reason_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "status_policy_default",
+        "source": "switch_status_policy",
+        "sourceHandle": "default",
+        "target": "status_reason_malformed_default",
         "targetHandle": "in"
       }
     ]

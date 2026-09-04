@@ -7027,6 +7027,7 @@ while True:
         # The graph deciding "green" is what let a queue receipt pass as a test
         # pass. Re-check here rather than trusting the caller's word.
         base = {"all_green": True, "checks_state": "green", "pr_state": "OPEN",
+                "pr_facts_valid": True, "number_matches": True,
                 "mergeable": "MERGEABLE", "merge_state": "CLEAN", "is_draft": False,
                 "holds": [], "review_decision": "APPROVED"}
         for state, code in (
@@ -7044,6 +7045,7 @@ while True:
     def test_pr_merge_allows_a_green_unheld_pr_when_asked(self):
         ok, err = server.pr_merge_allowed(
             {"all_green": True, "checks_state": "green", "pr_state": "OPEN",
+             "pr_facts_valid": True, "number_matches": True,
              "mergeable": "MERGEABLE", "merge_state": "CLEAN", "is_draft": False,
              "holds": [], "review_decision": "APPROVED"},
             auto_merge=True, run_id="r1",
@@ -7211,6 +7213,13 @@ while True:
         out = server.annotate_pr_view(self._strict_pr_view(head, reviewDecision=None))
         self.assertEqual(out["review_decision"], "")
         self.assertTrue(out["remote_ready"])
+
+        for labels in (["hold:pm-review"], [{}], [{"name": 17}]):
+            with self.subTest(labels=labels):
+                malformed = server.annotate_pr_view(self._strict_pr_view(head, labels=labels))
+                self.assertFalse(malformed["pr_facts_valid"])
+                self.assertEqual(malformed["label_names"], [])
+                self.assertEqual(malformed["remote_state"], "malformed")
 
     def test_prepare_merge_evidence_does_not_apply_hold_review_or_check_policy(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7409,6 +7418,37 @@ while True:
                 self.assertIsNotNone(stored["merge_evidence"]["final"])
                 self.assertNotEqual(stored["merge_evidence"]["final"], stored["merge_evidence"]["start"])
 
+    def test_merge_evidence_terminal_state_is_persisted_before_callback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            jobs = root / "jobs"
+            job_id = "b" * 32
+            job = {
+                "job_id": job_id, "kind": "test", "status": "queued",
+                "script": "catalog-compile", "argv": [sys.executable, "-c", "pass"],
+                "cwd": str(repo), "timeout_seconds": 30,
+                "log_ref": str(jobs / job_id / "stdout.log"),
+                "response_webhook_url": "https://example.invalid/resume",
+                "response_webhook_token": "fixture", "merge_evidence": None,
+            }
+            path = jobs / job_id / "job.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(job) + "\n")
+            observed = {}
+            def callback(_job, _receipt):
+                persisted = json.loads(path.read_text())
+                observed["status"] = persisted["status"]
+                observed["returncode"] = persisted["returncode"]
+                observed["receipt"] = persisted["receipt"]["status"]
+                return {"ok": True}
+            with mock.patch.object(server, "JOBS_DIR", jobs), \
+                 mock.patch.object(server, "deliver_webhook", side_effect=callback), \
+                 mock.patch.object(server, "herdr_job_done", return_value=None):
+                server.run_script_job(job_id)
+            self.assertEqual(observed, {"status": "completed", "returncode": 0,
+                                        "receipt": "ok"})
+
     def test_merge_rejects_every_unbound_or_nonterminal_test_evidence_fixture(self):
         head = "1" * 40
         with tempfile.TemporaryDirectory() as td:
@@ -7472,6 +7512,8 @@ while True:
                 ("conflicting", self._strict_pr_view(head, mergeable="CONFLICTING", mergeStateStatus="DIRTY"), self._strict_checks()),
                 ("unknown_merge", self._strict_pr_view(head, mergeable="UNKNOWN", mergeStateStatus="UNKNOWN"), self._strict_checks()),
                 ("inconsistent", self._strict_pr_view(head, mergeStateStatus="BLOCKED"), self._strict_checks()),
+                ("malformed_label_row", self._strict_pr_view(head, labels=["hold:pm-review"]), self._strict_checks()),
+                ("malformed_label_name", self._strict_pr_view(head, labels=[{"name": 17}]), self._strict_checks()),
             )
             for label, view, checks in fixtures:
                 with self.subTest(label=label):
@@ -18419,7 +18461,7 @@ func main() {
         self.assertEqual(json.loads(spec_bytes), pr_status["spec"])
         self.assertEqual(
             hashlib.sha256(spec_bytes).hexdigest(),
-            "2a99564f146e4d444f7da5ebaa265c4ebca1d3dfc297fa0f6bd1db50b2217b45",
+            "32831ebc4f37dc85880fcf0fc1405aa0a9ed274507220d92067aa6c5133873b8",
         )
 
     def test_pr_status_graph_is_read_only_and_webhook_disabled(self):
@@ -26453,6 +26495,11 @@ class PrDriveGraphTests(unittest.TestCase):
 
     def test_final_policy_uses_normalized_raw_facts_not_remote_ready_or_remote_state(self):
         root = Path(server.__file__).parent / "graphs"
+        openapi = json.loads((root.parent / "openapi.json").read_text())
+        gh_data = openapi["components"]["schemas"]["GhData"]["properties"]
+        self.assertEqual(gh_data["pr_facts_valid"], {"type": "boolean"})
+        self.assertEqual(gh_data["number_matches"], {"type": "boolean"})
+        self.assertEqual(gh_data["label_names"]["items"], {"type": "string"})
         for filename in ("pr-drive.json", "pr-status.json"):
             graph = json.loads((root / filename).read_text())
             nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
@@ -26509,12 +26556,18 @@ class PrDriveGraphTests(unittest.TestCase):
             ("ci_red", {}, "red"), ("pending", {}, "pending"),
             ("no_checks", {}, "no_checks"), ("malformed", {}, "malformed"),
             ("unknown", {}, "unknown"), ("conflicting", {}, "inconsistent"),
+            ("malformed", {"labels": ["hold:pm-review"]}, "green"),
+            ("malformed", {"number": 8}, "green"),
+            ("malformed", {"headRefOid": "not-a-sha"}, "green"),
         )
         for expected, changes, checks_state in fixtures:
             view = {**base, **changes}
+            first = server.annotate_pr_view({"ok": True, "data": deepcopy(view)})
+            first["number_matches"] = str(view.get("number")) == "7"
+            confirmed = deepcopy(first)
             context = {"CTX": {"INPUT": {}}, "TASKS": {
-                "final_view": {"data": {"data": deepcopy(view)}},
-                "final_confirm_view": {"data": {"data": deepcopy(view)}},
+                "final_view": {"data": first},
+                "final_confirm_view": {"data": confirmed},
                 "final_checks": {"data": {"checks_state": checks_state}},
             }}
             runner = NativeGraphRunner(
