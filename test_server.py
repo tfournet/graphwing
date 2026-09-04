@@ -26011,6 +26011,25 @@ class PrDriveGraphTests(unittest.TestCase):
     def load():
         return json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
 
+    def test_rc_verified_route_reads_decision_via_snap(self):
+        spec = self.load()["spec"]
+        nodes = {n["id"]: n for n in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn("rc_verified_route_snap", nodes)
+        snap = nodes["rc_verified_route_snap"]
+        self.assertEqual(snap["type"], "transforms.objectBuilder")
+        mapping = next(item for item in snap["config"]["mappings"] if item["output"] == "v2_policy")
+        self.assertEqual(mapping["expression"], {
+            "kind": "coalesce",
+            "primary": {"kind": "getField", "path": "TASKS.rc_verified_state.result.v2_policy"},
+            "fallback": {"kind": "getField", "path": "TASKS.rc_verified_state.v2_policy"},
+        })
+        self.assertIn(("rc_verified_state", "success", "rc_verified_route_snap"), edges)
+        self.assertIn(("rc_verified_route_snap", "out", "rc_verified_route"), edges)
+        self.assertNotIn(("rc_verified_state", "success", "rc_verified_route"), edges)
+        self.assertEqual(nodes["rc_verified_route"]["config"]["cases"][0]["rules"][0]["path"],
+                         "v2_policy.decision")
+
     def test_pr_drive_attempt_admission_uses_rewst_run_control_history_not_literal_three_slots(self):
         spec = self.load()["spec"]
         nodes = {n["id"]: n for n in spec["nodes"]}
