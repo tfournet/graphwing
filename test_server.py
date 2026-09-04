@@ -26672,6 +26672,15 @@ class PrDriveGraphTests(unittest.TestCase):
                       json.dumps(callback["callback_job_id"]))
         rules = nodes["switch_final_test"]["config"]["cases"][0]["rules"]
         self.assertIn({"path": "job_bound", "op": "equals", "value": True}, rules)
+        self.assertIn({"path": "accepted_job_id", "op": "matches",
+                       "value": "^[0-9a-f]{32}$"}, rules)
+        self.assertIn({"path": "callback_job_id", "op": "matches",
+                       "value": "^[0-9a-f]{32}$"}, rules)
+        accepted = json.loads((Path(server.__file__).parent / "openapi.json").read_text())[
+            "components"]["schemas"]["ScriptRunAccepted"]
+        self.assertIn("job_id", accepted["required"])
+        self.assertEqual(accepted["properties"]["job_id"]["pattern"],
+                         "^[0-9a-f]{32}$")
         run_input = {m["output"]: m["expression"]
                      for m in nodes["run_input"]["config"]["mappings"]}
         self.assertIn("auto_merge_requested", run_input)
@@ -26683,6 +26692,22 @@ class PrDriveGraphTests(unittest.TestCase):
                                       "value": True}])
         self.assertEqual(nodes["form"]["config"]["inputs"]["auto_merge"]["type"],
                          "boolean")
+        valid_job = "a" * 32
+        for accepted_id, callback_id, advances in (
+            (valid_job, valid_job, True), (None, None, False), ("", "", False),
+            (1, True, False), ("1", 1, False), (valid_job, "b" * 32, False),
+        ):
+            context = {"CTX": {"INPUT": {}}, "TASKS": {
+                "final_test": {"data": {"job_id": accepted_id}},
+                "final_wait": {"request": {"body": {
+                    "status": "ok", "job_id": callback_id,
+                }}},
+            }}
+            runner = NativeGraphRunner(self.load(), RunControlDatastoreFixture(),
+                                       lambda node, payload, ctx: ("halt", {}))
+            runner.run({}, start="final_callback_snap", context=context)
+            self.assertEqual("post_test_view" in runner.executed, advances,
+                             (accepted_id, callback_id, runner.executed))
 
     def test_final_and_merge_policy_contains_no_code_expression_or_procedural_nunjucks(self):
         graph = self.load()
@@ -28078,9 +28103,15 @@ class NativeGraphRunner:
     def rules_pass(cls, config, payload):
         payload = payload if isinstance(payload, dict) else {}
         for rule in config.get("rules", []):
-            cls.assertion(rule["op"] == "equals", rule)
             actual, expected = cls.path(payload, rule["path"]), rule["value"]
-            if type(actual) is not type(expected) or actual != expected:
+            matched = False
+            if rule["op"] == "equals":
+                matched = type(actual) is type(expected) and actual == expected
+            elif rule["op"] == "matches":
+                matched = isinstance(actual, str) and re.fullmatch(expected, actual) is not None
+            else:
+                cls.assertion(False, rule)
+            if not matched:
                 return False
         return True
 
