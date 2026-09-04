@@ -7621,10 +7621,12 @@ while True:
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
         triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
-        # Every in-run attempt ends in the loop; the final evidence leg only
-        # runs once, after the loop's `done` handle, regardless of how many
-        # slots ran or whether any of them did anything.
-        self.assertIn(("attempts", "done", "final_view"), triples)
+        # Verification is a lifecycle state reached only when normalized facts
+        # contain no correction work. A successful correction terminates after
+        # reconciliation and cannot fall through to final evidence on stale audit data.
+        self.assertIn(("switch_needs_fix", "default", "final_view"), triples)
+        self.assertIn(("rc_reconcile", "success", "post_correction_lifecycle"), triples)
+        self.assertFalse(any(e["source"] == "post_correction_lifecycle" for e in edges))
         self.assertIn(("final_view", "success", "final_state_snap"), triples)
         self.assertIn(("final_state_snap", "out", "switch_final_state"), triples)
         self.assertIn(("switch_final_state", "case-0", "final_checkout"), triples)
@@ -8017,9 +8019,11 @@ while True:
         self.assertIn(("iter_review_transport_checks", "out", "iter_root_cause_checks"), triples)
         self.assertIn(("iter_policy_snap", "out", "switch_needs_fix"), triples)
         self.assertIn(("switch_needs_fix", "case-1", "review_infrastructure_hold"), triples)
-        self.assertIn(("switch_needs_fix", "case-2", "exact_head_audit_hold"), triples)
+        self.assertIn(("switch_needs_fix", "case-2", "await_exact_head_audit"), triples)
         self.assertIn(("switch_needs_fix", "case-3", "iter_checkout"), triples)
-        self.assertIn(("switch_needs_fix", "default", "iter_skip"), triples)
+        self.assertIn(("rc_decision_gate", "pass", "pr_head_claim_value"), triples)
+        self.assertIn(("pr_head_claim_gate", "pass", "wait"), triples)
+        self.assertIn(("switch_needs_fix", "default", "final_view"), triples)
         self.assertIn(("fix_push", "success", "correction_head"), triples)
         self.assertIn(("correction_head", "success", "correction_view"), triples)
         self.assertIn(("correction_view", "success", "correction_push_receipt"), triples)
@@ -8040,13 +8044,14 @@ while True:
         self.assertEqual(reachable, {
             "rc_evidence_join", "rc_diff", "rc_diff_hash", "rc_constraint_candidates",
             "rc_constraint_signals", "rc_progress", "rc_reconcile",
+            "post_correction_lifecycle",
             "rc_failure_join", "rc_failure",
         })
         self.assertTrue({"iter_writer_task", "rc_state", "rc_consume", "agent", "wait_fix"}
                         .isdisjoint(reachable))
         self.assertFalse(any(edge[0] == "review_infrastructure_hold" for edge in triples))
-        self.assertFalse(any(edge[0] == "exact_head_audit_hold" for edge in triples))
-        for node_id in ("review_infrastructure_hold", "exact_head_audit_hold",
+        self.assertFalse(any(edge[0] == "await_exact_head_audit" for edge in triples))
+        for node_id in ("review_infrastructure_hold", "await_exact_head_audit",
                         "correction_head", "correction_view",
                         "correction_push_receipt"):
             self.assertIn("position", nodes[node_id], node_id)
@@ -8055,16 +8060,22 @@ while True:
             mapping["output"]: mapping["expression"]
             for mapping in nodes["iter_policy_snap"]["config"]["mappings"]
         }
-        self.assertEqual(mappings["exact_head_audit"], {
-            "kind": "getField", "path": "CTX.iter_selected_review_facts.exact_head_audit",
+        self.assertEqual(mappings["fresh_exact_head_audit"], {
+            "kind": "binary", "operator": "==",
+            "left": {"kind": "getField", "path": "CTX.iter_selected_review_facts.exact_head_audit"},
+            "right": {"kind": "literal", "value": True},
         })
         hold_dump = json.dumps(mappings["review_infrastructure_failed"])
         self.assertIn("CTX.iter_review_transport_checks", hold_dump)
-        pending_dump = json.dumps(mappings["exact_head_audit_pending"])
-        self.assertIn("CTX.correction_push_receipt.ok", pending_dump)
-        self.assertIn("CTX.correction_push_receipt.head_sha", pending_dump)
-        self.assertIn("CTX.iter_selected_review_facts.exact_head_sha", pending_dump)
-        self.assertIn("exact_head_audit", pending_dump)
+        state_dump = json.dumps(mappings["state"])
+        self.assertIn("await_exact_head_audit", state_dump)
+        self.assertIn("TASKS.rc_history_state.result.v2_projection.attempts_completed",
+                      state_dump)
+        self.assertIn("CTX.iter_selected_review_facts.exact_head_sha", state_dump)
+        await_mappings = {m["output"]: m["expression"]
+                          for m in nodes["await_exact_head_audit"]["config"]["mappings"]}
+        self.assertEqual(await_mappings["attempt_consumed"],
+                         {"kind": "literal", "value": False})
         self.assertEqual(
             nodes["review_infrastructure_hold"]["config"]["alias"],
             "review_infrastructure_hold",
@@ -11486,23 +11497,22 @@ while True:
         self.assertNotIn("session_identity", nodes["agent"]["config"])
         self.assertNotIn("resume_job_id", nodes["agent"]["config"])
 
-        # One route call, reused by every in-run attempt: `route` sits outside
-        # the loop body, not inside it, so effort/profile cannot drift between
-        # slots. Only `switch_needs_fix`'s `case-0` (red) handle reaches `agent`;
-        # a same-session correction or a second route call would show up here.
+        # One route call feeds the one-writer bounded DAG. No second route call
+        # or same-invocation correction can redraw the execution profile.
         adjacency = {}
         for edge in graph["edges"]:
             adjacency.setdefault(edge["source"], []).append((edge.get("sourceHandle"), edge["target"]))
-        loop_body = set()
-        stack = [target for h, target in adjacency.get("attempts", []) if h == "each"]
+        writer_path = set()
+        stack = [target for h, target in adjacency.get("switch_needs_fix", []) if h == "case-3"]
         while stack:
             current = stack.pop()
-            if current in loop_body or current == "attempts":
+            if current in writer_path:
                 continue
-            loop_body.add(current)
+            writer_path.add(current)
             stack.extend(target for _h, target in adjacency.get(current, []))
-        self.assertNotIn("route", loop_body)
-        self.assertIn("agent", loop_body)
+        self.assertNotIn("route", writer_path)
+        self.assertIn("agent", writer_path)
+        self.assertFalse(any(node["type"] == "logic.loop" for node in graph["nodes"]))
         self.assertEqual(
             {edge["source"] for edge in graph["edges"] if edge["target"] == "route"},
             {"view"},
@@ -14061,16 +14071,14 @@ func main() {
     def test_pr_drive_reads_findings_instead_of_a_human_prompt(self):
         # The agent prompt came from CTX.INPUT.prompt, so driving a PR green
         # started with a person reading the review and writing the brief.
-        # Each in-run attempt re-reads findings itself (iter_findings, fed
-        # straight from the loop's `each` handle) rather than a single
-        # pre-loop node, since a later slot must see what the earlier slot's
-        # push changed.
+        # Each bounded invocation reads current findings after immutable
+        # run-control history and budget state, before lifecycle policy.
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
         self.assertIn("iter_findings", nodes)
         self.assertTrue(nodes["iter_findings"]["type"].endswith("/v1/gh/pr/findings"))
-        self.assertTrue(any(e["source"] == "attempts" and e.get("sourceHandle") == "each"
+        self.assertTrue(any(e["source"] == "pr_rc_history_gate" and e.get("sourceHandle") == "pass"
                             and e["target"] == "iter_findings" for e in edges))
         self.assertEqual(nodes["agent"]["config"]["prompt"],
                          "{{ CTX.rc_launch_request.prompt }}")
@@ -25713,13 +25721,13 @@ class DrivePrScriptTests(unittest.TestCase):
         self.assertEqual(m.failed_node(trace), ("b", "boom"))
         self.assertIsNone(m.failed_node({"trace": [{"id": "a", "status": "completed"}]}))
 
-    def test_worst_case_run_seconds_multiplies_body_waits_by_max_iterations(self):
-        # graphs/pr-drive.json's `attempts` loop caps at 3 iterations; its
-        # body reaches `wait` and `wait_fix_test` (960s each) through the
-        # `each` handle, and the tail reaches `final_wait` (960s) through
-        # `done`. (960+960)*3 + 960 + 300s margin = 7020.
+    def test_worst_case_run_seconds_is_derived_from_the_graph(self):
         m = self.module
-        self.assertEqual(m.worst_case_run_seconds(), 7020)
+        graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())["spec"]
+        waits = [node["config"]["timeoutSeconds"] for node in graph["nodes"]
+                 if node["type"] == "action.wait.webhook"]
+        self.assertGreater(m.worst_case_run_seconds(), max(waits))
+        self.assertNotEqual(m.worst_case_run_seconds(), 2700)
 
     def test_load_repos_and_resolve_repo_path(self):
         m = self.module
@@ -25806,26 +25814,22 @@ class DrivePrScriptTests(unittest.TestCase):
         mock_findings.assert_not_called()
         self.assertEqual(rc, 1)
 
-    def test_settled_grade_plus_sticky_hold_is_not_an_in_flight_audit(self):
-        # GRAPHWING_REVIEW_WAIT used to treat any holds as "audit still
-        # looking". After a settled A/A-, hold:pm-review is merge policy.
-        m = self.module
-        self.assertTrue(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": None}))
-        self.assertFalse(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": "A-"}))
-        self.assertFalse(m.audit_is_in_flight({"holds": ["hold:pm-review"], "grade": "B"}))
-        self.assertFalse(m.audit_is_in_flight({"holds": [], "grade": None}))
+    def test_drive_pr_preflights_pinned_exact_pr_head_before_rewst_access(self):
+        source = (Path(server.__file__).parent / "scripts" / "drive-pr.py").read_text()
+        self.assertLess(source.index("branch, head_sha = gh_pr_view("),
+                        source.index("install = pg.load_install()"))
+        self.assertLess(source.index("install = pg.load_install()"),
+                        source.index("pg.run_slug("))
+        self.assertIn('"--run-control-id", required=True', source)
+        self.assertNotIn("run-control-initialize", source)
 
-        sticky = {"holds": ["hold:pm-review"], "grade": "A-", "findings": [], "blocking": True}
-        with mock.patch.object(m, "findings") as mock_findings, mock.patch.object(m.time, "sleep") as mock_sleep:
-            self.assertTrue(m.wait_for_fresh_review("riftwing", "3914", sticky, tries=3, gap=1))
-        mock_sleep.assert_not_called()
-        mock_findings.assert_not_called()
-
-        in_flight = {"holds": ["hold:pm-review"], "grade": None, "findings": [], "blocking": True}
-        with mock.patch.object(m, "findings") as mock_findings, mock.patch.object(m.time, "sleep"):
-            mock_findings.return_value = sticky
-            self.assertTrue(m.wait_for_fresh_review("riftwing", "3914", in_flight, tries=3, gap=1))
-        self.assertEqual(mock_findings.call_count, 1)
+    def test_drive_pr_has_no_review_polling_policy_or_fixed_2700_second_wait(self):
+        source = (Path(server.__file__).parent / "scripts" / "drive-pr.py").read_text()
+        for forbidden in ("audit_is_in_flight", "wait_for_fresh_review",
+                          "REVIEW_WAIT_SECONDS", "REVIEW_POLL_SECONDS", "2700",
+                          "GRAPHWING_REVIEW_WAIT"):
+            self.assertNotIn(forbidden, source)
+        self.assertNotIn("time.sleep", source)
 
 
 class PrDriveGraphTests(unittest.TestCase):
@@ -25843,73 +25847,65 @@ class PrDriveGraphTests(unittest.TestCase):
     def load():
         return json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
 
-    def test_loop_is_capped_and_body_never_re_enters_it(self):
+    def test_pr_drive_attempt_admission_uses_rewst_run_control_history_not_literal_three_slots(self):
         spec = self.load()["spec"]
         nodes = {n["id"]: n for n in spec["nodes"]}
-        loop = nodes["attempts"]
-        self.assertEqual(loop["type"], "logic.loop")
-        self.assertEqual(loop["config"]["maxIterations"], 3)
-        self.assertEqual(loop["config"]["arraySource"], "{{ CTX.attempt_slots.slots }}")
-        self.assertEqual(next(m for m in nodes["attempt_slots"]["config"]["mappings"] if m["output"] == "slots")["expression"], {"kind": "literal", "value": [1, 2, 3]})
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
-        self.assertIn(("attempts", "each", "iter_findings"), edges)
-        self.assertIn(("attempts", "done", "final_view"), edges)
-        # body reachability from each; nothing in it targets the loop node
-        adjacency = {}
-        for s, h, t in edges:
-            adjacency.setdefault(s, []).append(t)
-        seen, stack = set(), ["iter_findings"]
-        while stack:
-            cur = stack.pop()
-            if cur in seen: continue
-            seen.add(cur); stack.extend(adjacency.get(cur, []))
-        self.assertNotIn("attempts", seen)
-        self.assertNotIn("final_view", seen)
-        self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume",
-                         "rc_authority_facts", "rc_reconcile", "fix_push"} <= seen)
-        self.assertNotIn("rc_settle", seen)
-        self.assertEqual(sum(1 for s, h, t in edges if t == "attempts"), 1)
+        self.assertNotIn("attempt_slots", nodes)
+        self.assertNotIn("attempts", nodes)
+        self.assertFalse(any(node["type"] == "logic.loop" for node in spec["nodes"]))
+        dump = json.dumps(spec)
+        self.assertNotIn('"value": [1, 2, 3]', dump)
+        self.assertNotIn('"maxIterations": 3', dump)
+        history = nodes["rc_history_state"]["config"]
+        self.assertTrue(history["inputMapping"]["values"]["decision_only"])
+        self.assertIn("v2_projection", history["outputMapping"]["keys"])
+        self.assertEqual(nodes["pr_rc_pointer_get"]["config"]["namespace"],
+                         "graphwing_run_control_pointer_v2")
+        self.assertEqual(nodes["pr_rc_current_get"]["config"]["collection"],
+                         "graphwing_run_control_history_v2")
+        self.assertIn(("pr_rc_history_gate", "pass", "iter_findings"), edges)
+        self.assertNotIn("CTX.INPUT.history", dump)
+        self.assertNotIn("CTX.INPUT.attempt", dump)
+        snap = {m["output"]: m["expression"]
+                for m in nodes["iter_policy_snap"]["config"]["mappings"]}
+        self.assertEqual(snap["attempt_ordinal"], {
+            "kind": "getField",
+            "path": "TASKS.rc_history_state.result.v2_projection.projected_attempts",
+        })
+        self.assertEqual([(s, h) for s, h, t in edges if t == "agent"],
+                         [("rc_consumed_identity", "out")])
+        self.assertIn(("rc_consume", "success", "rc_consumed_identity"), edges)
 
-    def test_each_slot_skips_when_green_and_reserves_its_own_attempt(self):
+    def test_lifecycle_state_gates_one_exact_authorized_writer(self):
         spec = self.load()["spec"]
         nodes = {n["id"]: n for n in spec["nodes"]}
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
-        # Inside a loop a logic.filter judges the loop item only (the engine
-        # rebuilds its input from ITEM and LOOP, filter.go
-        # buildFilterEffectiveItem); logic.switch reads the raw payload. Live
-        # run d19ba7d2 skipped every slot on a filter that compared all_green.
-        #
-        # all_green itself is the wrong field to gate on: /v1/gh/pr/findings's
-        # all_green is GitHub check status only (server.py folds it in
-        # separately because the checks node's own output is artifact-
-        # stubbed), not the review-findings verdict. A PR with a passing CI
-        # check and an unresolved blocking finding reads all_green=true, so
-        # every slot skipped it in live proof run bdc72f98 on PR #172: three
-        # attempts, zero fixes, on a PR with one open blocker. needs_fix
-        # (actionable review findings or folded red checks) is the field that
-        # means "this needs a writer"; merge blocking stays on holds/grade.
         self.assertEqual(nodes["switch_needs_fix"]["type"], "logic.switch")
         self.assertEqual(nodes["switch_needs_fix"]["config"]["cases"], [
-            {"label": "policy_inputs_incomplete", "rules": [
-                {"path": "policy_inputs_incomplete", "op": "equals", "value": True},
+            {"label": "park", "rules": [
+                {"path": "state", "op": "equals", "value": "park"},
             ]},
             {"label": "review_infrastructure_hold", "rules": [
-                {"path": "review_infrastructure_failed", "op": "equals", "value": True},
+                {"path": "state", "op": "equals", "value": "review_infrastructure_hold"},
             ]},
-            {"label": "exact_head_audit_pending", "rules": [
-                {"path": "exact_head_audit_pending", "op": "equals", "value": True},
+            {"label": "await_exact_head_audit", "rules": [
+                {"path": "state", "op": "equals", "value": "await_exact_head_audit"},
             ]},
-            {"label": "red", "rules": [
-                {"path": "actionable", "op": "equals", "value": True},
+            {"label": "correct", "rules": [
+                {"path": "state", "op": "equals", "value": "correct"},
             ]},
         ])
-        self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
+        self.assertIn(("switch_needs_fix", "default", "final_view"), edges)
         self.assertIn(("switch_needs_fix", "case-3", "iter_checkout"), edges)
-        self.assertFalse(any(n["type"] == "logic.filter" for n in spec["nodes"]))
+        self.assertIn(("rc_decision_gate", "pass", "pr_head_claim_value"), edges)
+        self.assertIn(("pr_head_claim_gate", "pass", "wait"), edges)
         snap = {m["output"]: m["expression"] for m in nodes["iter_policy_snap"]["config"]["mappings"]}
-        self.assertEqual(snap["attempt"], {"kind": "getField", "path": "ITEM"})
+        self.assertEqual(snap["attempt_ordinal"], {"kind": "getField",
+            "path": "TASKS.rc_history_state.result.v2_projection.projected_attempts"})
         task = next(m for m in nodes["rc_task_material"]["config"]["mappings"] if m["output"] == "task")["expression"]["properties"]
-        self.assertEqual(task["attempt"], {"kind": "getField", "path": "ITEM"})
+        self.assertEqual(task["attempt"], {"kind": "getField",
+                                           "path": "CTX.iter_policy_snap.attempt_ordinal"})
         state = nodes["rc_state"]["config"]["inputMapping"]["values"]
         self.assertEqual(state["endpoint"], "/v1/agent/run")
         self.assertEqual(
@@ -25958,11 +25954,47 @@ class PrDriveGraphTests(unittest.TestCase):
         }
 
     @staticmethod
-    def _run_native_pr_policy(spec, facts):
-        """Execute the closed PR2 native transform subset used by pr-drive."""
+    def _run_native_pr_policy(spec, facts, *, history=None, decision="continue_same_model"):
+        """Execute the native PR actionability and lifecycle policy subset."""
         nodes = {node["id"]: node for node in spec["nodes"]}
         ctx = {}
-        tasks = {"iter_findings": {"data": {"pr_policy_inputs_v1": facts}}}
+        history = history or {
+            "history_ordinal": 0, "attempts_completed": 0, "projected_attempts": 1,
+            "completed": {"attempts": 0}, "projected": {"attempts": 1},
+            "budgets": {"attempts": 25}, "fits": True,
+            "current_record_key": "rch2-anchor", "current_record_sha256": "a" * 64,
+            "anchor_record_key": "rch2-anchor", "anchor_record_sha256": "a" * 64,
+            "latest_attempt": {"kind": "initialize", "ordinal": 0,
+                               "input_head_sha": None, "output_head_sha": None,
+                               "checkpoint": None},
+        }
+        latest = history["latest_attempt"]
+        current_record = {
+            **latest,
+            "effect_descriptor": {"head_sha": latest.get("input_head_sha")},
+            "progress": {
+                "head_sha": latest.get("output_head_sha"),
+                "checkpoint": latest.get("checkpoint"),
+                "focused_tests_green": latest.get("focused_tests_green"),
+            },
+        }
+        tasks = {
+            "iter_findings": {"data": {"pr_policy_inputs_v1": facts}},
+            "rc_history_state": {"result": {
+                "v2_projection": history, "v2_policy": {"decision": decision},
+            }},
+            "pr_rc_pointer_get": {"value": {
+                "schema": "graphwing-run-control-pointer-v2",
+                "run_control_id": "rc1-fixture",
+                "ordinal": history["history_ordinal"],
+                "attempts_completed": history["attempts_completed"],
+                "record_key": history["current_record_key"],
+                "record_sha256": history["current_record_sha256"],
+                "anchor_record_key": history["anchor_record_key"],
+                "anchor_record_sha256": history["anchor_record_sha256"],
+            }},
+            "pr_rc_current_get": {"data": current_record},
+        }
 
         def get_path(path, item=None):
             root = {"CTX": ctx, "TASKS": tasks, "ITEM": item}
@@ -25996,6 +26028,13 @@ class PrDriveGraphTests(unittest.TestCase):
                 raise AssertionError(f"unsupported binary operator {operator}")
             if kind == "conditional":
                 return evaluate(expr["then"] if evaluate(expr["condition"], item) else expr["else"], item)
+            if kind == "unary":
+                if expr["operator"] == "not":
+                    return not evaluate(expr["operand"], item)
+                raise AssertionError(f"unsupported unary operator {expr['operator']}")
+            if kind == "coalesce":
+                primary = evaluate(expr["primary"], item)
+                return primary if primary is not None else evaluate(expr["fallback"], item)
             if kind == "function":
                 args = [evaluate(arg, item) for arg in expr.get("args", [])]
                 if expr["name"] == "count":
@@ -26060,18 +26099,7 @@ class PrDriveGraphTests(unittest.TestCase):
                 else:
                     raise AssertionError(f"unsupported operation {operation}")
                 ctx[alias] = values
-        snap = ctx["iter_policy_snap"]
-        if snap["policy_inputs_incomplete"]:
-            route = "policy_inputs_incomplete"
-        elif snap["review_infrastructure_failed"]:
-            route = "review_infrastructure_hold"
-        elif snap["exact_head_audit_pending"]:
-            route = "exact_head_audit_pending"
-        elif snap["actionable"]:
-            route = "red"
-        else:
-            route = "not_red"
-        return ctx, route
+        return ctx, ctx["iter_policy_snap"]["state"]
 
     def test_pr_drive_actionability_reads_only_pr_policy_inputs_v1(self):
         graph = self.load()
@@ -26092,22 +26120,22 @@ class PrDriveGraphTests(unittest.TestCase):
     def test_pr_drive_hold_only_grade_a_minus_never_reaches_writer(self):
         spec = self.load()["spec"]
         ctx, route = self._run_native_pr_policy(spec, self._policy_fixture())
-        self.assertEqual(route, "not_red")
+        self.assertEqual(route, "verify")
         self.assertFalse(ctx["iter_policy_snap"]["actionable"])
         self.assertEqual(ctx["iter_writer_task"]["task"]["actionable_findings"], [])
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
-        self.assertIn(("switch_needs_fix", "default", "iter_skip"), edges)
+        self.assertIn(("switch_needs_fix", "default", "final_view"), edges)
 
     def test_pr_drive_policy_and_aggregate_checks_never_enter_writer_task(self):
         spec = self.load()["spec"]
         policy = [{"name": "pm-review", "observed_state": "fail"},
                   {"name": "ci-status", "observed_state": "fail"}]
         ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(checks=policy))
-        self.assertEqual(route, "not_red")
+        self.assertEqual(route, "verify")
         self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"], [])
         mixed = policy + [{"name": "Go Unit Tests / 1/2", "observed_state": "fail"}]
         ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(checks=mixed))
-        self.assertEqual(route, "red")
+        self.assertEqual(route, "correct")
         self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"],
                          ["Go Unit Tests / 1/2"])
 
@@ -26116,7 +26144,7 @@ class PrDriveGraphTests(unittest.TestCase):
         ctx, route = self._run_native_pr_policy(spec, self._policy_fixture(
             checks=[{"name": "Python tests", "observed_state": "fail"}],
         ))
-        self.assertEqual(route, "red")
+        self.assertEqual(route, "correct")
         task = ctx["iter_writer_task"]["task"]
         self.assertEqual(set(task), {"version", "instruction", "exact_head_sha",
                                      "actionable_findings", "root_cause_checks"})
@@ -26135,7 +26163,7 @@ class PrDriveGraphTests(unittest.TestCase):
         ctx, route = self._run_native_pr_policy(
             spec, self._policy_fixture(grade="B", audit_findings=audit, clean_findings=clean),
         )
-        self.assertEqual(route, "red")
+        self.assertEqual(route, "correct")
         selected = ctx["iter_writer_task"]["task"]["actionable_findings"]
         self.assertEqual([(item["id"], item["severity"]) for item in selected],
                          [("A", "critical"), ("Z", "minor")])
@@ -26152,7 +26180,7 @@ class PrDriveGraphTests(unittest.TestCase):
         facts = self._policy_fixture(grade="B", audit_findings=[], clean_findings=[finding],
                                      exact_audit=False)
         ctx, route = self._run_native_pr_policy(spec, facts)
-        self.assertEqual(route, "red")
+        self.assertEqual(route, "correct")
         self.assertEqual([item["id"] for item in
                           ctx["iter_writer_task"]["task"]["actionable_findings"]],
                          ["legacy"])
@@ -26165,6 +26193,186 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertEqual(route, "review_infrastructure_hold")
         self.assertEqual(ctx["iter_writer_task"]["task"]["root_cause_checks"], [])
         self.assertFalse(ctx["iter_policy_snap"]["actionable"])
+
+    def test_pr_drive_never_launches_two_writers_for_the_same_head(self):
+        spec = self.load()["spec"]
+        facts = self._policy_fixture(
+            grade="B", checks=[{"name": "Python tests", "observed_state": "fail"}],
+        )
+        head = facts["observed_head_sha"]
+        history = {
+            "history_ordinal": 1, "attempts_completed": 1, "projected_attempts": 2,
+            "completed": {"attempts": 1}, "projected": {"attempts": 2},
+            "budgets": {"attempts": 25}, "fits": True,
+            "current_record_key": "rch2-1", "current_record_sha256": "b" * 64,
+            "anchor_record_key": "rch2-0", "anchor_record_sha256": "a" * 64,
+            "latest_attempt": {"kind": "attempt", "ordinal": 1,
+                               "input_head_sha": head, "output_head_sha": None,
+                               "checkpoint": 0},
+        }
+        ctx, state = self._run_native_pr_policy(spec, facts, history=history)
+        self.assertEqual(state, "park")
+        self.assertEqual(ctx["iter_policy_snap"]["reason"],
+                         "writer_already_launched_for_exact_head")
+        self.assertEqual(ctx["iter_policy_snap"]["attempt_ordinal"], 2)
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        claim = nodes["pr_head_claim"]
+        self.assertEqual(claim["type"], "action.datastore.kv.compareAndSwap")
+        self.assertEqual(claim["config"]["namespace"],
+                         "graphwing_pr_correction_heads_v1")
+        self.assertEqual(claim["config"]["expectedVersion"], 0)
+        self.assertEqual(claim["config"]["ttlSeconds"], 0)
+        self.assertIn("CTX.iter_policy_snap.exact_head_sha", claim["config"]["key"])
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                 for edge in spec["edges"]}
+        self.assertIn(("pr_head_claim_gate", "fail", "duplicate_head_park"), edges)
+        self.assertIn(("pr_head_claim_gate", "pass", "wait"), edges)
+
+        store = RunControlDatastoreFixture()
+        base_context = {
+            "WORKFLOW": {"runId": "workflow-run-a"},
+            "CTX": {
+                "run_input": {"run_control_id": "rc1-fixture", "repo": "graphwing",
+                              "pr_number": "185"},
+                "iter_policy_snap": {"exact_head_sha": head, "attempt_ordinal": 2,
+                                     "run_control_evidence": {}},
+            },
+            "TASKS": {},
+        }
+        first = NativeGraphRunner(
+            self.load(), store,
+            lambda node, payload, context: ("halt", {}) if node["id"] == "wait"
+            else (_ for _ in ()).throw(AssertionError(node["id"])),
+        )
+        first.run({}, start="pr_head_claim_value", context=base_context)
+        self.assertIn("wait", first.executed)
+        self.assertNotIn("duplicate_head_park", first.executed)
+
+        second = NativeGraphRunner(self.load(), store)
+        second.run({}, start="pr_head_claim_value", context=base_context)
+        self.assertIn("duplicate_head_park", second.executed)
+        self.assertNotIn("wait", second.executed)
+        self.assertEqual(len(store.writes), 1)
+
+    def test_pr_drive_after_push_requires_a_new_exact_head_audit_before_retry(self):
+        spec = self.load()["spec"]
+        facts = self._policy_fixture(
+            grade="B", exact_audit=False,
+            checks=[{"name": "Python tests", "observed_state": "fail"}],
+        )
+        head = facts["observed_head_sha"]
+        history = {
+            "history_ordinal": 4, "attempts_completed": 4, "projected_attempts": 5,
+            "completed": {"attempts": 4}, "projected": {"attempts": 5},
+            "budgets": {"attempts": 25}, "fits": True,
+            "current_record_key": "rch2-4", "current_record_sha256": "d" * 64,
+            "anchor_record_key": "rch2-0", "anchor_record_sha256": "a" * 64,
+            "latest_attempt": {"kind": "attempt", "ordinal": 4,
+                               "input_head_sha": "1" * 40, "output_head_sha": head,
+                               "checkpoint": 1, "focused_tests_green": True},
+        }
+        ctx, state = self._run_native_pr_policy(spec, facts, history=history)
+        self.assertEqual(state, "await_exact_head_audit")
+        self.assertEqual(ctx["iter_policy_snap"]["reason"],
+                         "fresh_exact_head_audit_required")
+        self.assertFalse(ctx["iter_policy_snap"]["fresh_exact_head_audit"])
+
+        audited = self._policy_fixture(
+            grade="B", exact_audit=True,
+            checks=[{"name": "Python tests", "observed_state": "fail"}],
+        )
+        ctx, state = self._run_native_pr_policy(spec, audited, history=history)
+        self.assertEqual(state, "correct")
+        self.assertTrue(ctx["iter_policy_snap"]["fresh_exact_head_audit"])
+
+    def test_pr_drive_review_transport_failure_parks_without_consuming_a_writer_attempt(self):
+        spec = self.load()["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        _ctx, state = self._run_native_pr_policy(spec, self._policy_fixture(checks=[{
+            "name": "Forward event to pr-audit daemon", "observed_state": "fail",
+        }]))
+        self.assertEqual(state, "review_infrastructure_hold")
+        receipt = {m["output"]: m["expression"]
+                   for m in nodes["review_infrastructure_hold"]["config"]["mappings"]}
+        self.assertEqual(receipt["attempt_consumed"], {"kind": "literal", "value": False})
+        edges = {(e["source"], e.get("sourceHandle"), e["target"])
+                 for e in spec["edges"]}
+        self.assertIn(("switch_needs_fix", "case-1", "review_infrastructure_hold"), edges)
+        self.assertFalse(any(source == "review_infrastructure_hold"
+                             for source, _handle, _target in edges))
+
+    def test_pr_drive_budget_exhaustion_parks_with_complete_attempt_evidence(self):
+        spec = self.load()["spec"]
+        history = {
+            "history_ordinal": 7, "attempts_completed": 7, "projected_attempts": 8,
+            "completed": {"attempts": 7, "turns": 350},
+            "projected": {"attempts": 8, "turns": 400},
+            "budgets": {"attempts": 7, "turns": 350}, "fits": False,
+            "current_record_key": "rch2-7", "current_record_sha256": "7" * 64,
+            "anchor_record_key": "rch2-0", "anchor_record_sha256": "0" * 64,
+            "latest_attempt": {"kind": "attempt", "ordinal": 7,
+                               "input_head_sha": "1" * 40, "output_head_sha": "2" * 40,
+                               "checkpoint": 1, "previous_record_sha256": "6" * 64},
+        }
+        facts = self._policy_fixture(
+            grade="B", checks=[{"name": "Python tests", "observed_state": "fail"}],
+        )
+        ctx, state = self._run_native_pr_policy(
+            spec, facts, history=history, decision="exhausted",
+        )
+        self.assertEqual(state, "park")
+        self.assertEqual(ctx["iter_policy_snap"]["reason"], "exhausted")
+        evidence = ctx["iter_policy_snap"]["run_control_evidence"]
+        self.assertEqual(evidence["history_ordinal"], 7)
+        self.assertEqual(evidence["attempts_completed"], 7)
+        self.assertEqual(evidence["projected_attempts"], 8)
+        self.assertEqual(evidence["budgets"], history["budgets"])
+        self.assertEqual(evidence["current_record_sha256"], "7" * 64)
+        self.assertEqual(evidence["anchor_record_sha256"], "0" * 64)
+        self.assertEqual(evidence["latest_attempt"]["ordinal"], 7)
+        self.assertEqual(evidence["latest_attempt"]["input_head_sha"],
+                         history["latest_attempt"]["input_head_sha"])
+        self.assertEqual(evidence["latest_attempt"]["output_head_sha"],
+                         history["latest_attempt"]["output_head_sha"])
+        self.assertNotIn("authorization_evidence", evidence["latest_attempt"])
+        self.assertNotIn("normalized_facts", evidence["latest_attempt"])
+
+    def test_pr_drive_correction_lifecycle_uses_native_nodes_and_rewst_state_only(self):
+        spec = self.load()["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        lifecycle_ids = {
+            "rc_history_state", "iter_policy_snap", "switch_needs_fix", "lifecycle_park",
+            "review_infrastructure_hold", "await_exact_head_audit",
+            "post_correction_lifecycle", "run_control_park", "pr_head_claim_value",
+            "pr_head_claim", "pr_head_claim_readback", "pr_head_claim_check",
+            "pr_head_claim_gate", "duplicate_head_park", "rc_decision_evidence",
+            "rc_decision_gate",
+        }
+        self.assertTrue(lifecycle_ids <= set(nodes))
+        self.assertEqual(nodes["rc_history_state"]["type"], "action.subworkflow")
+        self.assertEqual(nodes["rc_history_state"]["config"]["workflowId"],
+                         "$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID")
+        dump = json.dumps([nodes[node_id] for node_id in lifecycle_ids])
+        for forbidden in ("codeExpression", "sqlite", "state.db", "local_file",
+                          "sleep", "poll", "max_attempts", "maxIterations"):
+            self.assertNotIn(forbidden, dump)
+        self.assertNotRegex(dump, r"{%-?\\s*(?:for|set|if|while)\\b")
+        self.assertFalse(any(node["type"] == "logic.loop" for node in spec["nodes"]))
+
+    def test_pr_drive_successful_push_terminates_for_audit_after_reconcile(self):
+        spec = self.load()["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"])
+                 for e in spec["edges"]}
+        self.assertIn(("fix_push", "success", "correction_head"), edges)
+        self.assertIn(("correction_head", "success", "correction_view"), edges)
+        self.assertIn(("correction_view", "success", "correction_push_receipt"), edges)
+        self.assertIn(("rc_reconcile", "success", "post_correction_lifecycle"), edges)
+        post = {m["output"]: m["expression"]
+                for m in nodes["post_correction_lifecycle"]["config"]["mappings"]}
+        self.assertIn("await_exact_head_audit", json.dumps(post["state"]))
+        self.assertFalse(any(source == "post_correction_lifecycle"
+                             for source, _handle, _target in edges))
 
     def test_pr_drive_writer_task_has_no_code_expression_or_procedural_nunjucks(self):
         spec = self.load()["spec"]
@@ -27544,8 +27752,12 @@ class NativeGraphRunner:
             (config["algorithm"], config["inputKind"], config["outputFormat"], config["mode"])
             == ("sha256", "json_stringify", "hex", "hash"), node["id"])
         digest = _native_sha256(self.render(config["input"]))
-        self.context["TASKS"][node["id"]] = {"value": digest}
-        return "out", {"value": digest}
+        value = {"value": digest}
+        self.context["CTX"][config["alias"]] = value
+        # Preserve the historical fixture namespace while catalogs migrate to
+        # the authoritative Riftwing transform namespace.
+        self.context["TASKS"][node["id"]] = value
+        return "out", value
 
     @classmethod
     def rules_pass(cls, config, payload):
@@ -28895,16 +29107,18 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
         self.assertNotIn("initial_route", source)
         self.assertNotIn("budgets", source)
 
-    def test_pr_drive_loop_window_can_continue_the_same_durable_run_in_a_later_rewst_execution(self):
+    def test_pr_drive_bounded_invocation_can_continue_the_same_durable_run_later(self):
         nodes = self.nodes("pr-drive")
-        loop = nodes["attempts"]["config"]
-        self.assertGreaterEqual(loop["maxIterations"], 1)
+        self.assertNotIn("attempts", nodes)
+        self.assertFalse(any(node["type"] == "logic.loop"
+                             for node in self.graph("pr-drive")["spec"]["nodes"]))
         self.assertEqual(nodes["run_input"]["config"]["mappings"][-1]["output"],
                          "run_control_id")
         dump = json.dumps(self.graph("pr-drive"))
         self.assertNotIn("product_attempt_limit", dump)
         self.assertIn("continuation_required", dump)
         self.assertNotIn("/v1/run/control/evaluate", dump)
+        self.assertIn("await_exact_head_audit", dump)
 
 
 if __name__ == "__main__":

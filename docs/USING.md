@@ -189,23 +189,26 @@ python3 scripts/drive-pr.py 3526 --run-control-id rc1-... \
 
 The owning Rewst lifecycle creates and retains the v2 run. The script accepts that
 durable `run_control_id`, starts `graphwing-pr-drive`, and reads back its trace; it has
-no route, aggregate-budget, evaluator-contract, or local JSONL authority. One Graph
-execution carries a bounded three-slot window, but the durable run may continue in a
-later execution. Each launched slot gets fresh daemon descriptor-preparation facts,
-one read-back consumed authorization, and an exact request body signed by the
-request-aware credential. Callback loss first polls and waits for the canonical job;
-only confirmed authority loss records a full-envelope charge before native Rewst
-policy decides again. `--wait` defaults to
-the loop's own worst case (`worst_case_run_seconds`, derived from the graph's wait
-timeouts and `maxIterations`, not guessed), and refuses a smaller value rather than
-abandon a run that is still working. The script prints each run's node trace, which is
-the only per-node visibility available; the run status endpoint returns nothing but
-`completed`.
+no route, aggregate-budget, evaluator-contract, review-polling, or local JSONL
+authority. One Graph execution is a bounded DAG and can launch at most one writer;
+the durable run may continue in a later execution. Correction admission and ordinal
+come from immutable v2 history and budgets. A permanent tenant-scoped exact-head CAS
+claim prevents concurrent or later duplicate writers for the same run and commit;
+the claim is workflow state, not a local counter or attempt ledger. Every writer gets
+fresh daemon descriptor-preparation facts, one read-back consumed authorization, and an exact
+request body signed by the request-aware credential. Callback loss first polls and
+waits for the canonical job; only confirmed authority loss records a full-envelope
+charge. `--wait` defaults to the graph's longest reachable wait path
+(`worst_case_run_seconds`) and refuses a smaller value. The script prints each run's
+node trace; the run status endpoint returns only `completed`.
 
-One gap this does not close: between one slot's push and the next slot's findings
-read, nothing waits for the external reviewer to react to the new commit, so a slot can
-read a still-stale blocking finding right after a push. The script still runs its own
-pre-run audit-settle check before starting the graph at all.
+Native workflow policy owns `correct`, `await_exact_head_audit`,
+`review_infrastructure_hold`, `verify`, and `park`. After commit and push, exact
+local/remote head equality is recorded and the attempt is reconciled into Rewst v2
+history. The invocation then ends at `await_exact_head_audit`; it never sleeps or
+polls for review. A later invocation may correct again only with audit evidence for
+that pushed head. Failed audit transport ends at `review_infrastructure_hold` without
+consuming another writer attempt.
 
 **Do not fire this workflow by webhook.** A webhook-triggered run never creates
 `CTX.INPUT` at all, so `run_input` (which reads every field from `{{ CTX.INPUT.* }}`

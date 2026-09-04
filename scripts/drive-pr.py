@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Drive a PR to green through graphwing-pr-drive, and print the node trace.
 
-Every attempt is now run-control reservation-backed and the retry loop lives
-inside the graph (graphs/pr-drive.json's capped `attempts` logic.loop), not
-here. This script submits operator intent for an existing Rewst-owned durable run and
-reads back the bounded graph result. It does not select routes or create aggregate limits.
+Every writer is run-control reservation-backed. One bounded graph invocation
+can launch at most one writer; later invocations resume the same Rewst-owned
+durable run. This script submits operator intent and reads back the bounded
+graph result. It does not select routes, create aggregate limits, or poll for
+review policy.
 
 Why REST and not the webhook: a webhook-triggered run leaves CTX.INPUT empty,
 so every {{ CTX.INPUT.* }} in the graph resolves to nothing and pr-drive dies at
@@ -16,18 +17,11 @@ passes inputs properly; it is how implement-slice has always been fired.
   python3 scripts/drive-pr.py 3526 [--repo riftwing] [--test riftwing-local-gates]
                                    [--auto-merge] [--wait 900]
 
-Budget it end to end before wrapping this in anything with its own timeout: the
-whole retry chain is now one Graph run, up to three in-graph attempts plus one
-final test. --wait defaults to that run's own worst case, derived from the
-graph rather than guessed (see worst_case_run_seconds).
-
-Known gap, not built here: between one in-graph attempt's push and the next
-attempt's findings read, nothing waits for the external reviewer to react to
-the new commit (the old cross-run driver had a wait_for_fresh_review step
-between separate Python-level attempts; an in-graph loop has no equivalent
-poll-until-changed primitive without its own bounded sub-loop). A slot can
-therefore read a still-stale blocking finding right after a push. Only the
-run's own entry point waits for a settled audit, below.
+Budget it end to end before wrapping this in anything with its own timeout.
+--wait defaults to the graph's longest reachable wait path, derived from the
+graph rather than guessed (see worst_case_run_seconds). After a successful
+push the workflow returns `await_exact_head_audit`; a later invocation resumes
+from durable history after exact-head audit evidence exists.
 
 Needs the Rewst MCP token: GRAPHWING_REWST_MCP_TOKEN, or mcp_bws_key in
 rewst-install.json plus BWS_ACCESS_TOKEN.
@@ -37,10 +31,8 @@ import json
 import os
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,9 +54,7 @@ DAEMON_BASE = "http://127.0.0.1:8645"
 def build_pr_drive_input(repo: str, pr: str, test: str, auto_merge: bool,
                           klass: str, size: str, work_kind: str, prompt: str,
                           commit_message: str, run_control_id: str) -> dict[str, Any]:
-    """graphwing-pr-drive's `input`. The loop reserves, launches, settles, and
-    reconciles up to three attempts against run_control_id; there is no
-    attempt/max_attempts/kick_url/kick_token here because nothing crosses runs."""
+    """graphwing-pr-drive input for an existing durable v2 run."""
     return {
         "repo": repo,
         "pr_number": str(pr),
@@ -130,40 +120,34 @@ def worst_case_run_seconds() -> int:
 
     Derived from the graph rather than guessed, because every hardcoded timeout
     in this chain has already drifted behind the work it wraps at least once.
-    Body waits (reached from the loop's "each" handle) run once per attempt
-    slot; the tail's final_wait runs once after the loop's "done" handle.
+    The source graph is a DAG, so the longest reachable path is finite. Node
+    weights are webhook wait timeouts; all other local and GitHub work shares
+    a fixed orchestration margin.
     """
     graph = json.loads((ROOT / "graphs" / "pr-drive.json").read_text())["spec"]
     nodes = {n["id"]: n for n in graph["nodes"]}
-    adjacency: dict[str, list[tuple[str | None, str]]] = {}
+    adjacency: dict[str, list[str]] = {}
     for edge in graph["edges"]:
-        adjacency.setdefault(edge["source"], []).append((edge.get("sourceHandle"), edge["target"]))
+        adjacency.setdefault(edge["source"], []).append(edge["target"])
 
-    def reachable(source_id: str, handle: str) -> set[str]:
-        seen: set[str] = set()
-        stack = [target for h, target in adjacency.get(source_id, []) if h == handle]
-        while stack:
-            current = stack.pop()
-            if current in seen or current == source_id:
-                continue
-            seen.add(current)
-            stack.extend(target for _h, target in adjacency.get(current, []))
-        return seen
+    memo: dict[str, int] = {}
+    active: set[str] = set()
 
-    total = 300  # margin for the non-waiting nodes and gh calls
-    for loop_node in graph["nodes"]:
-        if loop_node["type"] != "logic.loop":
-            continue
-        max_iterations = int(loop_node["config"].get("maxIterations") or 1)
-        body = reachable(loop_node["id"], "each")
-        total += max_iterations * sum(
-            nodes[n]["config"]["timeoutSeconds"] for n in body if nodes[n]["type"] == "action.wait.webhook"
-        )
-        tail = reachable(loop_node["id"], "done")
-        total += sum(
-            nodes[n]["config"]["timeoutSeconds"] for n in tail if nodes[n]["type"] == "action.wait.webhook"
-        )
-    return total
+    def longest(node_id: str) -> int:
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in active:
+            raise ValueError("pr-drive must remain acyclic")
+        active.add(node_id)
+        node = nodes[node_id]
+        own = (int(node["config"]["timeoutSeconds"])
+               if node["type"] == "action.wait.webhook" else 0)
+        downstream = max((longest(target) for target in adjacency.get(node_id, [])), default=0)
+        active.remove(node_id)
+        memo[node_id] = own + downstream
+        return memo[node_id]
+
+    return 300 + longest("join_start")
 
 
 # --------------------------------------------------------------------------
@@ -228,49 +212,6 @@ def findings(repo: str, pr: str):
         return None
 
 
-# A full review can take 30 minutes. Starting the run before the audit has
-# settled on the current commit means the first in-graph attempt reads
-# whatever verdict was already there and can burn an iteration fixing work
-# that a still-running review would have cleared on its own.
-REVIEW_WAIT_SECONDS = int(os.environ.get("GRAPHWING_REVIEW_WAIT", "2700"))
-REVIEW_POLL_SECONDS = 30
-
-
-def audit_is_in_flight(opening: dict) -> bool:
-    """True only while hold:* is present and no grade has settled.
-
-    A returning hold:pm-review after A/A- is merge policy, not an unfinished
-    audit. Waiting GRAPHWING_REVIEW_WAIT for it never clears. #177.
-    """
-    if not opening.get("holds"):
-        return False
-    grade = opening.get("grade")
-    return grade in (None, "")
-
-
-def wait_for_fresh_review(repo, pr, previous, tries: int = 0, gap: int = 0) -> bool:
-    if not audit_is_in_flight(previous):
-        return True
-    gap = gap or REVIEW_POLL_SECONDS
-    tries = tries or max(1, REVIEW_WAIT_SECONDS // gap)
-    before = {f.get("fingerprint") for f in (previous.get("findings") or [])}
-    for _ in range(tries):
-        time.sleep(gap)
-        now = findings(repo, pr)
-        if now is None:
-            return False
-        if audit_is_in_flight(now):
-            continue
-        after = {f.get("fingerprint") for f in (now.get("findings") or [])}
-        if after != before or not now.get("blocking") or now.get("grade"):
-            print("review re-ran: grade=%s blocking=%s" % (now.get("grade"), now.get("blocking")))
-            return True
-    print("review did not settle within %ds; stopping rather than acting on a stale read"
-          % REVIEW_WAIT_SECONDS)
-    return False
-
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pr")
@@ -303,26 +244,15 @@ def main() -> int:
         return 1
     print("run budget: up to %ds (%.1f h)" % (args.wait, args.wait / 3600))
 
-    install = pg.load_install()
-    pg.TENANT = pg.tenant_id(install)
-    mcp = pg.rewst_mcp(install)
-
-    print("=== checking the audit is settled ===")
-    opening = findings(args.repo, args.pr)
-    if opening is None:
-        return 1
-    if audit_is_in_flight(opening):
-        print("audit is still running on this commit (%s); waiting for a verdict "
-              "before starting, or the first attempt works from a stale brief"
-              % ", ".join(opening["holds"]))
-        if not wait_for_fresh_review(args.repo, args.pr, opening):
-            return 1
-
     print("=== reading the PR head ===")
     repos = load_repos()
     repo_path = resolve_repo_path(args.repo, repos)
     branch, head_sha = gh_pr_view(repo_path, args.pr)
     print("branch", branch, "head_sha", head_sha)
+
+    install = pg.load_install()
+    pg.TENANT = pg.tenant_id(install)
+    mcp = pg.rewst_mcp(install)
 
     run_control_id = args.run_control_id
     print("run_control_id", run_control_id)

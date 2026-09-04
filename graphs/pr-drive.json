@@ -277,44 +277,394 @@
         }
       },
       {
-        "id": "attempt_slots",
+        "id": "rc_envelope",
         "type": "transforms.objectBuilder",
+        "label": "Bound one invocation envelope",
         "config": {
-          "alias": "attempt_slots",
+          "alias": "rc_envelope",
           "version": 1,
           "mappings": [
             {
               "id": "m1",
-              "output": "slots",
+              "output": "next_envelope",
               "expression": {
-                "kind": "literal",
-                "value": [
-                  1,
-                  2,
-                  3
-                ]
-              }
-            },
-            {
-              "id": "m_continuation_required",
-              "output": "continuation_required",
-              "expression": {
-                "kind": "literal",
-                "value": true
+                "kind": "object",
+                "properties": {
+                  "turns": {
+                    "kind": "literal",
+                    "value": 50
+                  },
+                  "wall_seconds": {
+                    "kind": "literal",
+                    "value": 660
+                  },
+                  "tokens": {
+                    "kind": "literal",
+                    "value": 2000000
+                  },
+                  "cost_microusd": {
+                    "kind": "literal",
+                    "value": 25000000
+                  }
+                }
               }
             }
           ]
         }
       },
       {
-        "id": "attempts",
-        "type": "logic.loop",
+        "id": "rc_history_state",
+        "type": "action.subworkflow",
+        "label": "Read immutable v2 history and budgets",
         "config": {
-          "alias": "attempts",
-          "arraySource": "{{ CTX.attempt_slots.slots }}",
-          "batchSize": 1,
-          "concurrency": 1,
-          "maxIterations": 3
+          "alias": "rc_history_state",
+          "workflowId": "$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID",
+          "workflowVersionId": "$GRAPHWING_RUN_CONTROL_STATE_VERSION_ID",
+          "inputMapping": {
+            "mode": "select",
+            "values": {
+              "run_control_id": "{{ CTX.run_input.run_control_id }}",
+              "candidate_route": {
+                "route_version": "{{ TASKS.route.result.compatibility_behavior }}",
+                "launcher": "{{ TASKS.route.result.launcher }}",
+                "provider": "{{ TASKS.route.result.provider }}",
+                "model": "{{ TASKS.route.result.model }}"
+              },
+              "next_envelope": "{{ CTX.rc_envelope.next_envelope }}",
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}",
+              "verified": false,
+              "state_version": "v2",
+              "decision_only": true
+            }
+          },
+          "outputMapping": {
+            "mode": "select",
+            "keys": [
+              "v2_policy",
+              "v2_projection",
+              "v2_decision_result",
+              "v2_terminal_result",
+              "v2_existing_terminal_result",
+              "v2_restructure"
+            ]
+          },
+          "timeout": 2400
+        }
+      },
+      {
+        "id": "pr_rc_pointer_get",
+        "type": "action.datastore.kv.get",
+        "label": "Read v2 history pointer",
+        "config": {
+          "alias": "pr_rc_pointer_get",
+          "scope": "tenant",
+          "namespace": "graphwing_run_control_pointer_v2",
+          "key": "{{ CTX.run_input.run_control_id }}"
+        }
+      },
+      {
+        "id": "pr_rc_current_get",
+        "type": "action.datastore.records.get",
+        "label": "Read immutable latest attempt",
+        "config": {
+          "alias": "pr_rc_current_get",
+          "scope": "tenant",
+          "collection": "graphwing_run_control_history_v2",
+          "recordKey": "{{ TASKS.pr_rc_pointer_get.value.record_key }}"
+        }
+      },
+      {
+        "id": "pr_rc_current_hash",
+        "type": "transforms.hash",
+        "label": "Hash immutable latest attempt",
+        "config": {
+          "alias": "pr_rc_current_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ TASKS.pr_rc_current_get.data }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "pr_rc_pointer_charges_hash",
+        "type": "transforms.hash",
+        "label": "Hash pointer charges",
+        "config": {
+          "alias": "pr_rc_pointer_charges_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ TASKS.pr_rc_pointer_get.value.charges }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "pr_rc_projection_charges_hash",
+        "type": "transforms.hash",
+        "label": "Hash state projection charges",
+        "config": {
+          "alias": "pr_rc_projection_charges_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ TASKS.rc_history_state.result.v2_projection.completed }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "pr_rc_history_check",
+        "type": "transforms.objectBuilder",
+        "label": "Validate immutable history readback",
+        "config": {
+          "alias": "pr_rc_history_check",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "pointer_found",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.found"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "pointer_schema",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.schema"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "graphwing-run-control-pointer-v2"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "pointer_run",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.run_control_id"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.run_input.run_control_id"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "current_found",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_current_get.found"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "current_key",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_current_get.recordKey"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.record_key"
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "current_hash",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.pr_rc_current_hash.value"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.record_sha256"
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "current_schema",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_current_get.data.schema"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "graphwing-run-control-history-v2"
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "current_run",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_current_get.data.run_control_id"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.run_input.run_control_id"
+                }
+              }
+            },
+            {
+              "id": "m9",
+              "output": "current_ordinal",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_current_get.data.ordinal"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.ordinal"
+                }
+              }
+            },
+            {
+              "id": "m10",
+              "output": "projection_ordinal",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_rc_pointer_get.value.ordinal"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_history_state.result.v2_projection.attempts_completed"
+                }
+              }
+            },
+            {
+              "id": "m11",
+              "output": "projection_charges",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.pr_rc_pointer_charges_hash.value"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.pr_rc_projection_charges_hash.value"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "pr_rc_history_gate",
+        "type": "logic.filter",
+        "label": "Require exact immutable history",
+        "config": {
+          "mode": "all",
+          "rules": [
+            {
+              "path": "pointer_found",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "pointer_schema",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "pointer_run",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_found",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_key",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_hash",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_schema",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_run",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "current_ordinal",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "projection_ordinal",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "projection_charges",
+              "op": "equals",
+              "value": true
+            }
+          ]
         }
       },
       {
@@ -351,53 +701,6 @@
         }
       },
       {
-        "id": "policy_inputs_hold",
-        "type": "transforms.objectBuilder",
-        "label": "Incomplete PR policy inputs",
-        "position": {
-          "x": 2500,
-          "y": 500
-        },
-        "config": {
-          "alias": "policy_inputs_hold",
-          "version": 1,
-          "mappings": [
-            {
-              "id": "m1",
-              "output": "status",
-              "expression": {
-                "kind": "literal",
-                "value": "blocked"
-              }
-            },
-            {
-              "id": "m2",
-              "output": "reason",
-              "expression": {
-                "kind": "literal",
-                "value": "pr_policy_inputs_incomplete"
-              }
-            },
-            {
-              "id": "m3",
-              "output": "head_sha",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.iter_findings.data.pr_policy_inputs_v1.observed_head_sha"
-              }
-            },
-            {
-              "id": "m4",
-              "output": "incomplete_reasons",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.iter_findings.data.pr_policy_inputs_v1.incomplete_reasons"
-              }
-            }
-          ]
-        }
-      },
-      {
         "id": "review_infrastructure_hold",
         "type": "transforms.objectBuilder",
         "label": "Review infrastructure hold",
@@ -411,73 +714,137 @@
           "mappings": [
             {
               "id": "m1",
-              "output": "status",
+              "output": "version",
               "expression": {
                 "kind": "literal",
-                "value": "blocked"
+                "value": "pr-correction-lifecycle-v1"
               }
             },
             {
               "id": "m2",
-              "output": "reason",
+              "output": "state",
               "expression": {
                 "kind": "literal",
-                "value": "review_infrastructure_failed"
+                "value": "review_infrastructure_hold"
               }
             },
             {
               "id": "m3",
-              "output": "head_sha",
+              "output": "reason",
               "expression": {
-                "kind": "getField",
-                "path": "CTX.iter_selected_review_facts.exact_head_sha"
+                "kind": "literal",
+                "value": "review_transport_failed"
               }
             },
             {
               "id": "m4",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.exact_head_sha"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            },
+            {
+              "id": "m7",
               "output": "failing",
               "expression": {
                 "kind": "getField",
                 "path": "CTX.iter_review_transport_checks"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.run_control_evidence"
               }
             }
           ]
         }
       },
       {
-        "id": "exact_head_audit_hold",
+        "id": "await_exact_head_audit",
         "type": "transforms.objectBuilder",
-        "label": "Exact-head audit still pending",
+        "label": "Await fresh exact-head audit",
         "position": {
           "x": 1420,
           "y": 440
         },
         "config": {
-          "alias": "exact_head_audit_hold",
+          "alias": "await_exact_head_audit",
           "version": 1,
           "mappings": [
             {
               "id": "m1",
-              "output": "status",
+              "output": "version",
               "expression": {
                 "kind": "literal",
-                "value": "blocked"
+                "value": "pr-correction-lifecycle-v1"
               }
             },
             {
               "id": "m2",
-              "output": "reason",
+              "output": "state",
               "expression": {
                 "kind": "literal",
-                "value": "exact_head_audit_pending"
+                "value": "await_exact_head_audit"
               }
             },
             {
               "id": "m3",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "fresh_exact_head_audit_required"
+              }
+            },
+            {
+              "id": "m4",
               "output": "expected_head_sha",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.correction_push_receipt.head_sha"
+                "path": "CTX.iter_policy_snap.exact_head_sha"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            },
+            {
+              "id": "m7",
+              "output": "evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.run_control_evidence"
               }
             }
           ]
@@ -1513,7 +1880,7 @@
       {
         "id": "iter_policy_snap",
         "type": "transforms.objectBuilder",
-        "label": "Materialize native PR actionability policy",
+        "label": "Materialize native PR correction lifecycle policy",
         "position": {
           "x": 2440,
           "y": 300
@@ -1523,14 +1890,416 @@
           "version": 1,
           "mappings": [
             {
-              "id": "m1",
-              "output": "policy_inputs_incomplete",
+              "id": "m_version",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-lifecycle-v1"
+              }
+            },
+            {
+              "id": "m_state",
+              "output": "state",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_review_transport_checks"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "review_infrastructure_hold"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "!=",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.iter_selected_review_facts.complete"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "park"
+                  },
+                  "else": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": ">",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.rc_history_state.result.v2_projection.attempts_completed"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": 0
+                        }
+                      },
+                      "right": {
+                        "kind": "unary",
+                        "operator": "not",
+                        "operand": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.iter_selected_review_facts.exact_head_audit"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        }
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "await_exact_head_audit"
+                    },
+                    "else": {
+                      "kind": "conditional",
+                      "condition": {
+                        "kind": "unary",
+                        "operator": "not",
+                        "operand": {
+                          "kind": "binary",
+                          "operator": "in",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.rc_history_state.result.v2_policy.decision"
+                          },
+                          "right": {
+                            "kind": "array",
+                            "elements": [
+                              {
+                                "kind": "literal",
+                                "value": "continue_same_model"
+                              },
+                              {
+                                "kind": "literal",
+                                "value": "handoff_cross_model"
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "then": {
+                        "kind": "literal",
+                        "value": "park"
+                      },
+                      "else": {
+                        "kind": "conditional",
+                        "condition": {
+                          "kind": "binary",
+                          "operator": "or",
+                          "left": {
+                            "kind": "binary",
+                            "operator": ">",
+                            "left": {
+                              "kind": "function",
+                              "name": "count",
+                              "args": [
+                                {
+                                  "kind": "getField",
+                                  "path": "CTX.iter_actionable_review_findings"
+                                }
+                              ]
+                            },
+                            "right": {
+                              "kind": "literal",
+                              "value": 0
+                            }
+                          },
+                          "right": {
+                            "kind": "binary",
+                            "operator": ">",
+                            "left": {
+                              "kind": "function",
+                              "name": "count",
+                              "args": [
+                                {
+                                  "kind": "getField",
+                                  "path": "CTX.iter_ordered_root_cause_check_names"
+                                }
+                              ]
+                            },
+                            "right": {
+                              "kind": "literal",
+                              "value": 0
+                            }
+                          }
+                        },
+                        "then": {
+                          "kind": "conditional",
+                          "condition": {
+                            "kind": "binary",
+                            "operator": "==",
+                            "left": {
+                              "kind": "getField",
+                              "path": "TASKS.pr_rc_current_get.data.effect_descriptor.head_sha"
+                            },
+                            "right": {
+                              "kind": "getField",
+                              "path": "CTX.iter_selected_review_facts.exact_head_sha"
+                            }
+                          },
+                          "then": {
+                            "kind": "literal",
+                            "value": "park"
+                          },
+                          "else": {
+                            "kind": "literal",
+                            "value": "correct"
+                          }
+                        },
+                        "else": {
+                          "kind": "literal",
+                          "value": "verify"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m_reason",
+              "output": "reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_review_transport_checks"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "review_transport_failed"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "!=",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.iter_selected_review_facts.complete"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": true
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "policy_inputs_incomplete"
+                  },
+                  "else": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": ">",
+                        "left": {
+                          "kind": "getField",
+                          "path": "TASKS.rc_history_state.result.v2_projection.attempts_completed"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": 0
+                        }
+                      },
+                      "right": {
+                        "kind": "unary",
+                        "operator": "not",
+                        "operand": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.iter_selected_review_facts.exact_head_audit"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": true
+                          }
+                        }
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "fresh_exact_head_audit_required"
+                    },
+                    "else": {
+                      "kind": "conditional",
+                      "condition": {
+                        "kind": "unary",
+                        "operator": "not",
+                        "operand": {
+                          "kind": "binary",
+                          "operator": "in",
+                          "left": {
+                            "kind": "getField",
+                            "path": "TASKS.rc_history_state.result.v2_policy.decision"
+                          },
+                          "right": {
+                            "kind": "array",
+                            "elements": [
+                              {
+                                "kind": "literal",
+                                "value": "continue_same_model"
+                              },
+                              {
+                                "kind": "literal",
+                                "value": "handoff_cross_model"
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "then": {
+                        "kind": "getField",
+                        "path": "TASKS.rc_history_state.result.v2_policy.decision"
+                      },
+                      "else": {
+                        "kind": "conditional",
+                        "condition": {
+                          "kind": "binary",
+                          "operator": "or",
+                          "left": {
+                            "kind": "binary",
+                            "operator": ">",
+                            "left": {
+                              "kind": "function",
+                              "name": "count",
+                              "args": [
+                                {
+                                  "kind": "getField",
+                                  "path": "CTX.iter_actionable_review_findings"
+                                }
+                              ]
+                            },
+                            "right": {
+                              "kind": "literal",
+                              "value": 0
+                            }
+                          },
+                          "right": {
+                            "kind": "binary",
+                            "operator": ">",
+                            "left": {
+                              "kind": "function",
+                              "name": "count",
+                              "args": [
+                                {
+                                  "kind": "getField",
+                                  "path": "CTX.iter_ordered_root_cause_check_names"
+                                }
+                              ]
+                            },
+                            "right": {
+                              "kind": "literal",
+                              "value": 0
+                            }
+                          }
+                        },
+                        "then": {
+                          "kind": "conditional",
+                          "condition": {
+                            "kind": "binary",
+                            "operator": "==",
+                            "left": {
+                              "kind": "getField",
+                              "path": "TASKS.pr_rc_current_get.data.effect_descriptor.head_sha"
+                            },
+                            "right": {
+                              "kind": "getField",
+                              "path": "CTX.iter_selected_review_facts.exact_head_sha"
+                            }
+                          },
+                          "then": {
+                            "kind": "literal",
+                            "value": "writer_already_launched_for_exact_head"
+                          },
+                          "else": {
+                            "kind": "literal",
+                            "value": "actionable_pr_evidence"
+                          }
+                        },
+                        "else": {
+                          "kind": "literal",
+                          "value": "no_actionable_pr_evidence"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m_attempt",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.rc_history_state.result.v2_projection.projected_attempts"
+              }
+            },
+            {
+              "id": "m_head",
+              "output": "exact_head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_selected_review_facts.exact_head_sha"
+              }
+            },
+            {
+              "id": "m_fresh_audit",
+              "output": "fresh_exact_head_audit",
               "expression": {
                 "kind": "binary",
-                "operator": "!=",
+                "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.iter_selected_review_facts.complete"
+                  "path": "CTX.iter_selected_review_facts.exact_head_audit"
                 },
                 "right": {
                   "kind": "literal",
@@ -1539,23 +2308,51 @@
               }
             },
             {
-              "id": "m2",
-              "output": "attempt",
+              "id": "m_actionable",
+              "output": "actionable",
               "expression": {
-                "kind": "getField",
-                "path": "ITEM"
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_actionable_review_findings"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.iter_ordered_root_cause_check_names"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                }
               }
             },
             {
-              "id": "m3",
-              "output": "exact_head_audit",
-              "expression": {
-                "kind": "getField",
-                "path": "CTX.iter_selected_review_facts.exact_head_audit"
-              }
-            },
-            {
-              "id": "m4",
+              "id": "m_transport",
               "output": "review_infrastructure_failed",
               "expression": {
                 "kind": "binary",
@@ -1577,130 +2374,126 @@
               }
             },
             {
-              "id": "m5",
-              "output": "exact_head_audit_pending",
+              "id": "m_complete",
+              "output": "policy_inputs_complete",
               "expression": {
-                "kind": "binary",
-                "operator": "and",
-                "left": {
-                  "kind": "binary",
-                  "operator": "==",
-                  "left": {
-                    "kind": "getField",
-                    "path": "CTX.correction_push_receipt.ok"
-                  },
-                  "right": {
-                    "kind": "literal",
-                    "value": true
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "or",
-                  "left": {
-                    "kind": "binary",
-                    "operator": "!=",
-                    "left": {
-                      "kind": "getField",
-                      "path": "CTX.iter_selected_review_facts.exact_head_audit"
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": true
-                    }
-                  },
-                  "right": {
-                    "kind": "binary",
-                    "operator": "!=",
-                    "left": {
-                      "kind": "getField",
-                      "path": "CTX.iter_selected_review_facts.exact_head_sha"
-                    },
-                    "right": {
-                      "kind": "getField",
-                      "path": "CTX.correction_push_receipt.head_sha"
-                    }
-                  }
-                }
+                "kind": "getField",
+                "path": "CTX.iter_selected_review_facts.complete"
               }
             },
             {
-              "id": "m6",
-              "output": "actionable",
+              "id": "m_prior_writer",
+              "output": "prior_writer_head_sha",
               "expression": {
-                "kind": "binary",
-                "operator": "and",
-                "left": {
-                  "kind": "binary",
-                  "operator": "and",
-                  "left": {
-                    "kind": "binary",
-                    "operator": "==",
-                    "left": {
-                      "kind": "getField",
-                      "path": "CTX.iter_selected_review_facts.complete"
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": true
-                    }
+                "kind": "getField",
+                "path": "TASKS.pr_rc_current_get.data.effect_descriptor.head_sha"
+              }
+            },
+            {
+              "id": "m_prior_correction",
+              "output": "prior_correction_head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.pr_rc_current_get.data.progress.head_sha"
+              }
+            },
+            {
+              "id": "m_run_decision",
+              "output": "run_control_decision",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.rc_history_state.result.v2_policy.decision"
+              }
+            },
+            {
+              "id": "m_evidence",
+              "output": "run_control_evidence",
+              "expression": {
+                "kind": "object",
+                "properties": {
+                  "history_ordinal": {
+                    "kind": "getField",
+                    "path": "TASKS.pr_rc_pointer_get.value.ordinal"
                   },
-                  "right": {
-                    "kind": "binary",
-                    "operator": "==",
-                    "left": {
-                      "kind": "function",
-                      "name": "count",
-                      "args": [
-                        {
-                          "kind": "getField",
-                          "path": "CTX.iter_review_transport_checks"
-                        }
-                      ]
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": 0
-                    }
-                  }
-                },
-                "right": {
-                  "kind": "binary",
-                  "operator": "or",
-                  "left": {
-                    "kind": "binary",
-                    "operator": ">",
-                    "left": {
-                      "kind": "function",
-                      "name": "count",
-                      "args": [
-                        {
-                          "kind": "getField",
-                          "path": "CTX.iter_actionable_review_findings"
-                        }
-                      ]
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": 0
-                    }
+                  "attempts_completed": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.attempts_completed"
                   },
-                  "right": {
-                    "kind": "binary",
-                    "operator": ">",
-                    "left": {
-                      "kind": "function",
-                      "name": "count",
-                      "args": [
-                        {
-                          "kind": "getField",
-                          "path": "CTX.iter_ordered_root_cause_check_names"
-                        }
-                      ]
-                    },
-                    "right": {
-                      "kind": "literal",
-                      "value": 0
+                  "projected_attempts": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.projected_attempts"
+                  },
+                  "charges": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.completed"
+                  },
+                  "projected_charges": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.projected"
+                  },
+                  "budgets": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.budgets"
+                  },
+                  "fits": {
+                    "kind": "getField",
+                    "path": "TASKS.rc_history_state.result.v2_projection.fits"
+                  },
+                  "current_record_key": {
+                    "kind": "getField",
+                    "path": "TASKS.pr_rc_pointer_get.value.record_key"
+                  },
+                  "current_record_sha256": {
+                    "kind": "getField",
+                    "path": "TASKS.pr_rc_pointer_get.value.record_sha256"
+                  },
+                  "anchor_record_key": {
+                    "kind": "getField",
+                    "path": "TASKS.pr_rc_pointer_get.value.anchor_record_key"
+                  },
+                  "anchor_record_sha256": {
+                    "kind": "getField",
+                    "path": "TASKS.pr_rc_pointer_get.value.anchor_record_sha256"
+                  },
+                  "latest_attempt": {
+                    "kind": "object",
+                    "properties": {
+                      "kind": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.kind"
+                      },
+                      "ordinal": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.ordinal"
+                      },
+                      "attempt_id": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.attempt_id"
+                      },
+                      "owner_workflow_run_id": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.owner_workflow_run_id"
+                      },
+                      "input_head_sha": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.effect_descriptor.head_sha"
+                      },
+                      "output_head_sha": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.progress.head_sha"
+                      },
+                      "checkpoint": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.progress.checkpoint"
+                      },
+                      "focused_tests_green": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.progress.focused_tests_green"
+                      },
+                      "previous_record_sha256": {
+                        "kind": "getField",
+                        "path": "TASKS.pr_rc_current_get.data.previous_record_sha256"
+                      }
                     }
                   }
                 }
@@ -1716,12 +2509,12 @@
           "mode": "rules",
           "cases": [
             {
-              "label": "policy_inputs_incomplete",
+              "label": "park",
               "rules": [
                 {
-                  "path": "policy_inputs_incomplete",
+                  "path": "state",
                   "op": "equals",
-                  "value": true
+                  "value": "park"
                 }
               ]
             },
@@ -1729,44 +2522,38 @@
               "label": "review_infrastructure_hold",
               "rules": [
                 {
-                  "path": "review_infrastructure_failed",
+                  "path": "state",
                   "op": "equals",
-                  "value": true
+                  "value": "review_infrastructure_hold"
                 }
               ]
             },
             {
-              "label": "exact_head_audit_pending",
+              "label": "await_exact_head_audit",
               "rules": [
                 {
-                  "path": "exact_head_audit_pending",
+                  "path": "state",
                   "op": "equals",
-                  "value": true
+                  "value": "await_exact_head_audit"
                 }
               ]
             },
             {
-              "label": "red",
+              "label": "correct",
               "rules": [
                 {
-                  "path": "actionable",
+                  "path": "state",
                   "op": "equals",
-                  "value": true
+                  "value": "correct"
                 }
               ]
             }
           ],
           "default": {
-            "label": "not_red"
+            "label": "verify"
           }
-        }
-      },
-      {
-        "id": "iter_skip",
-        "type": "logic.join.any",
-        "config": {
-          "stopOnFirst": true
-        }
+        },
+        "label": "Choose PR correction lifecycle state"
       },
       {
         "id": "iter_checkout",
@@ -1882,7 +2669,7 @@
                   },
                   "attempt": {
                     "kind": "getField",
-                    "path": "ITEM"
+                    "path": "CTX.iter_policy_snap.attempt_ordinal"
                   }
                 }
               }
@@ -1929,25 +2716,8 @@
               "id": "m4",
               "output": "next_envelope",
               "expression": {
-                "kind": "object",
-                "properties": {
-                  "turns": {
-                    "kind": "literal",
-                    "value": 50
-                  },
-                  "wall_seconds": {
-                    "kind": "literal",
-                    "value": 660
-                  },
-                  "tokens": {
-                    "kind": "literal",
-                    "value": 2000000
-                  },
-                  "cost_microusd": {
-                    "kind": "literal",
-                    "value": 25000000
-                  }
-                }
+                "kind": "getField",
+                "path": "CTX.rc_envelope.next_envelope"
               }
             },
             {
@@ -2019,7 +2789,7 @@
               "repository": "{{ CTX.run_input.repo }}",
               "branch": "{{ TASKS.view.data.data.headRefName }}",
               "head_sha": "{{ CTX.iter_selected_review_facts.exact_head_sha }}",
-              "task_sha256": "{{ TASKS.rc_task_hash.value }}",
+              "task_sha256": "{{ CTX.rc_task_hash.value }}",
               "permission_profile": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.permission_profile }}",
               "callback_binding_sha256": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.callback_sha256 }}",
               "handoff": "{{ CTX.rc_task_material.handoff }}",
@@ -2033,6 +2803,7 @@
             "mode": "select",
             "keys": [
               "v2_policy",
+              "v2_projection",
               "v2_decision_result",
               "v2_terminal_result",
               "v2_existing_terminal_result",
@@ -2914,7 +3685,7 @@
               "output": "diff_fingerprint",
               "expression": {
                 "kind": "getField",
-                "path": "TASKS.rc_diff_hash.value"
+                "path": "CTX.rc_diff_hash.value"
               }
             },
             {
@@ -3666,6 +4437,7 @@
             "mode": "select",
             "keys": [
               "v2_policy",
+              "v2_projection",
               "v2_decision_result",
               "v2_terminal_result",
               "v2_existing_terminal_result",
@@ -3700,6 +4472,7 @@
             "mode": "select",
             "keys": [
               "v2_policy",
+              "v2_projection",
               "v2_decision_result",
               "v2_terminal_result",
               "v2_existing_terminal_result",
@@ -3795,6 +4568,675 @@
         "config": {
           "stopOnFirst": true
         }
+      },
+      {
+        "id": "lifecycle_park",
+        "type": "transforms.objectBuilder",
+        "label": "Park PR correction lifecycle",
+        "config": {
+          "alias": "lifecycle_park",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-lifecycle-v1"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "state",
+              "expression": {
+                "kind": "literal",
+                "value": "park"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reason",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.reason"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            },
+            {
+              "id": "m6",
+              "output": "evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.run_control_evidence"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_reservation_evidence",
+        "type": "transforms.objectBuilder",
+        "label": "Bind reservation to lifecycle admission",
+        "config": {
+          "alias": "rc_reservation_evidence",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "matches",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_state.result.v2_projection.projected_attempts"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.iter_policy_snap.attempt_ordinal"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_reservation_gate",
+        "type": "logic.filter",
+        "label": "Require exact admitted ordinal",
+        "config": {
+          "mode": "all",
+          "rules": [
+            {
+              "path": "matches",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
+      },
+      {
+        "id": "run_control_park_join",
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "run_control_park",
+        "type": "transforms.objectBuilder",
+        "label": "Park on durable run-control decision",
+        "config": {
+          "alias": "run_control_park",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-lifecycle-v1"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "state",
+              "expression": {
+                "kind": "literal",
+                "value": "park"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reason",
+              "expression": {
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_state.result.v2_policy.decision"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_nonlaunch_state.result.v2_policy.decision"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            },
+            {
+              "id": "m6",
+              "output": "evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.run_control_evidence"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_correction_lifecycle",
+        "type": "transforms.objectBuilder",
+        "label": "Persist correction and await exact-head audit",
+        "config": {
+          "alias": "post_correction_lifecycle",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-lifecycle-v1"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "state",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.correction_push_receipt.ok"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "await_exact_head_audit"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "park"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.correction_push_receipt.ok"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "fresh_exact_head_audit_required"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "correction_attempt_incomplete"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "expected_head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.correction_push_receipt.head_sha"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            },
+            {
+              "id": "m7",
+              "output": "reconciliation",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.rc_reconcile.result.v2_commit"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "pr_head_claim_value",
+        "type": "transforms.objectBuilder",
+        "label": "Build exact-head writer claim",
+        "config": {
+          "alias": "pr_head_claim_value",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-head-claim-v1"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "run_control_id",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.run_input.run_control_id"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "repo",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.run_input.repo"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "pr_number",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.run_input.pr_number"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.exact_head_sha"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m7",
+              "output": "owner_workflow_run_id",
+              "expression": {
+                "kind": "getField",
+                "path": "WORKFLOW.runId"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "pr_head_claim",
+        "type": "action.datastore.kv.compareAndSwap",
+        "label": "Claim exact head once",
+        "config": {
+          "alias": "pr_head_claim",
+          "scope": "tenant",
+          "namespace": "graphwing_pr_correction_heads_v1",
+          "key": "{{ CTX.run_input.run_control_id }}:{{ CTX.iter_policy_snap.exact_head_sha }}",
+          "expectedVersion": 0,
+          "value": "{{ CTX.pr_head_claim_value }}",
+          "ttlSeconds": 0
+        }
+      },
+      {
+        "id": "pr_head_claim_readback",
+        "type": "action.datastore.kv.get",
+        "label": "Read exact-head writer claim",
+        "config": {
+          "alias": "pr_head_claim_readback",
+          "scope": "tenant",
+          "namespace": "graphwing_pr_correction_heads_v1",
+          "key": "{{ CTX.run_input.run_control_id }}:{{ CTX.iter_policy_snap.exact_head_sha }}"
+        }
+      },
+      {
+        "id": "pr_head_claim_check",
+        "type": "transforms.objectBuilder",
+        "label": "Validate exact-head writer claim",
+        "config": {
+          "alias": "pr_head_claim_check",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "swapped",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim.swapped"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "found",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.found"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "version",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.version"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim.version"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "claim_version",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.value.version"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "pr-correction-head-claim-v1"
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "run",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.value.run_control_id"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.run_input.run_control_id"
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "head",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.value.head_sha"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.iter_policy_snap.exact_head_sha"
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "ordinal",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.value.attempt_ordinal"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.iter_policy_snap.attempt_ordinal"
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "owner",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.pr_head_claim_readback.value.owner_workflow_run_id"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "WORKFLOW.runId"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "pr_head_claim_gate",
+        "type": "logic.filter",
+        "label": "Admit one writer for exact head",
+        "config": {
+          "mode": "all",
+          "rules": [
+            {
+              "path": "swapped",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "found",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "version",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "claim_version",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "run",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "head",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "ordinal",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "owner",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
+      },
+      {
+        "id": "duplicate_head_park",
+        "type": "transforms.objectBuilder",
+        "label": "Park duplicate exact-head writer",
+        "config": {
+          "alias": "duplicate_head_park",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "version",
+              "expression": {
+                "kind": "literal",
+                "value": "pr-correction-lifecycle-v1"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "state",
+              "expression": {
+                "kind": "literal",
+                "value": "park"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "writer_already_claimed_for_exact_head"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "head_sha",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.exact_head_sha"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "attempt_ordinal",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.attempt_ordinal"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "attempt_consumed",
+              "expression": {
+                "kind": "literal",
+                "value": false
+              }
+            },
+            {
+              "id": "m7",
+              "output": "evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.iter_policy_snap.run_control_evidence"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_decision_evidence",
+        "type": "transforms.objectBuilder",
+        "label": "Bind lifecycle to fresh run-control decision",
+        "config": {
+          "alias": "rc_decision_evidence",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "matches",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_decide.result.v2_projection.projected_attempts"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.iter_policy_snap.attempt_ordinal"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_decision_gate",
+        "type": "logic.filter",
+        "label": "Require fresh immutable admission",
+        "config": {
+          "mode": "all",
+          "rules": [
+            {
+              "path": "matches",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
       }
     ],
     "edges": [
@@ -3848,20 +5290,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "e5",
-        "source": "route",
-        "sourceHandle": "success",
-        "target": "attempt_slots",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e6",
-        "source": "attempt_slots",
-        "sourceHandle": "out",
-        "target": "attempts",
-        "targetHandle": "in"
-      },
-      {
         "id": "e7",
         "source": "git",
         "sourceHandle": "failure",
@@ -3873,20 +5301,6 @@
         "source": "view",
         "sourceHandle": "failure",
         "target": "herdr_no_pr",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e9",
-        "source": "route",
-        "sourceHandle": "failure",
-        "target": "herdr_route",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e10",
-        "source": "attempts",
-        "sourceHandle": "each",
-        "target": "iter_findings",
         "targetHandle": "in"
       },
       {
@@ -4037,41 +5451,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "e13a",
-        "source": "switch_needs_fix",
-        "sourceHandle": "case-0",
-        "target": "policy_inputs_hold",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e13b",
-        "source": "switch_needs_fix",
-        "sourceHandle": "case-1",
-        "target": "review_infrastructure_hold",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e13c",
-        "source": "switch_needs_fix",
-        "sourceHandle": "case-2",
-        "target": "exact_head_audit_hold",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e14",
-        "source": "switch_needs_fix",
-        "sourceHandle": "default",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e15",
-        "source": "switch_needs_fix",
-        "sourceHandle": "case-3",
-        "target": "iter_checkout",
-        "targetHandle": "in"
-      },
-      {
         "id": "e12",
         "source": "iter_findings",
         "sourceHandle": "failure",
@@ -4107,13 +5486,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "e22",
-        "source": "rc_state",
-        "sourceHandle": "failure",
-        "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
         "id": "e24",
         "source": "rc_consume",
         "sourceHandle": "failure",
@@ -4130,13 +5502,6 @@
       {
         "id": "e26b",
         "source": "agent",
-        "sourceHandle": "failure",
-        "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e33",
-        "source": "rc_reconcile",
         "sourceHandle": "failure",
         "target": "rc_failure_join",
         "targetHandle": "in"
@@ -4279,13 +5644,6 @@
         "source": "rc_failure_join",
         "sourceHandle": "out",
         "target": "rc_failure",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e49",
-        "source": "attempts",
-        "sourceHandle": "done",
-        "target": "final_view",
         "targetHandle": "in"
       },
       {
@@ -4688,139 +6046,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "e187_decide_ok",
-        "source": "rc_decide",
-        "sourceHandle": "success",
-        "target": "rc_state_route",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_fail",
-        "source": "rc_decide",
-        "sourceHandle": "failure",
-        "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_launch",
-        "source": "rc_state_route",
-        "sourceHandle": "default",
-        "target": "wait",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_0",
-        "source": "rc_state_route",
-        "sourceHandle": "case-0",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_1",
-        "source": "rc_state_route",
-        "sourceHandle": "case-1",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_2",
-        "source": "rc_state_route",
-        "sourceHandle": "case-2",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_3",
-        "source": "rc_state_route",
-        "sourceHandle": "case-3",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_4",
-        "source": "rc_state_route",
-        "sourceHandle": "case-4",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_decide_nonlaunch_5",
-        "source": "rc_state_route",
-        "sourceHandle": "case-5",
-        "target": "rc_nonlaunch_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_nonlaunch_ok",
-        "source": "rc_nonlaunch_state",
-        "sourceHandle": "success",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_nonlaunch_fail",
-        "source": "rc_nonlaunch_state",
-        "sourceHandle": "failure",
-        "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_ok",
-        "source": "rc_state",
-        "sourceHandle": "success",
-        "target": "rc_reserve_route",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_launch",
-        "source": "rc_reserve_route",
-        "sourceHandle": "default",
-        "target": "rc_consume",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_0",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-0",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_1",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-1",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_2",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-2",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_3",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-3",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_4",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-4",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e187_reserve_nonlaunch_5",
-        "source": "rc_reserve_route",
-        "sourceHandle": "case-5",
-        "target": "iter_skip",
-        "targetHandle": "in"
-      },
-      {
         "id": "e187_wait_timeout_poll",
         "source": "wait",
         "sourceHandle": "timeout",
@@ -4854,6 +6079,348 @@
         "sourceHandle": "out",
         "target": "rc_nonlaunch_state",
         "targetHandle": "in"
+      },
+      {
+        "source": "route",
+        "target": "rc_envelope",
+        "sourceHandle": "success",
+        "id": "edge-route-success-rc_envelope"
+      },
+      {
+        "source": "rc_envelope",
+        "target": "rc_history_state",
+        "sourceHandle": "out",
+        "id": "edge-rc_envelope-out-rc_history_state"
+      },
+      {
+        "source": "rc_history_state",
+        "target": "rc_failure_join",
+        "sourceHandle": "failure",
+        "id": "edge-rc_history_state-failure-rc_failure_join"
+      },
+      {
+        "source": "switch_needs_fix",
+        "target": "lifecycle_park",
+        "sourceHandle": "case-0",
+        "id": "edge-switch_needs_fix-case-0-lifecycle_park"
+      },
+      {
+        "source": "switch_needs_fix",
+        "target": "review_infrastructure_hold",
+        "sourceHandle": "case-1",
+        "id": "edge-switch_needs_fix-case-1-review_infrastructure_hold"
+      },
+      {
+        "source": "switch_needs_fix",
+        "target": "await_exact_head_audit",
+        "sourceHandle": "case-2",
+        "id": "edge-switch_needs_fix-case-2-await_exact_head_audit"
+      },
+      {
+        "source": "switch_needs_fix",
+        "target": "final_view",
+        "sourceHandle": "default",
+        "id": "edge-switch_needs_fix-default-final_view"
+      },
+      {
+        "source": "rc_decide",
+        "target": "rc_state_route",
+        "sourceHandle": "success",
+        "id": "edge-rc_decide-success-rc_state_route"
+      },
+      {
+        "source": "rc_decide",
+        "target": "rc_failure_join",
+        "sourceHandle": "failure",
+        "id": "edge-rc_decide-failure-rc_failure_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-0",
+        "id": "edge-rc_state_route-case-0-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-1",
+        "id": "edge-rc_state_route-case-1-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-2",
+        "id": "edge-rc_state_route-case-2-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-3",
+        "id": "edge-rc_state_route-case-3-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-4",
+        "id": "edge-rc_state_route-case-4-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_state_route",
+        "target": "rc_nonlaunch_join",
+        "sourceHandle": "case-5",
+        "id": "edge-rc_state_route-case-5-rc_nonlaunch_join"
+      },
+      {
+        "source": "rc_nonlaunch_state",
+        "target": "run_control_park_join",
+        "sourceHandle": "success",
+        "id": "edge-rc_nonlaunch_state-success-run_control_park_join"
+      },
+      {
+        "source": "rc_nonlaunch_state",
+        "target": "rc_failure_join",
+        "sourceHandle": "failure",
+        "id": "edge-rc_nonlaunch_state-failure-rc_failure_join"
+      },
+      {
+        "source": "rc_state",
+        "target": "rc_reserve_route",
+        "sourceHandle": "success",
+        "id": "edge-rc_state-success-rc_reserve_route"
+      },
+      {
+        "source": "rc_state",
+        "target": "rc_failure_join",
+        "sourceHandle": "failure",
+        "id": "edge-rc_state-failure-rc_failure_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "rc_reservation_evidence",
+        "sourceHandle": "default",
+        "id": "edge-rc_reserve_route-default-rc_reservation_evidence"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-0",
+        "id": "edge-rc_reserve_route-case-0-run_control_park_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-1",
+        "id": "edge-rc_reserve_route-case-1-run_control_park_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-2",
+        "id": "edge-rc_reserve_route-case-2-run_control_park_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-3",
+        "id": "edge-rc_reserve_route-case-3-run_control_park_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-4",
+        "id": "edge-rc_reserve_route-case-4-run_control_park_join"
+      },
+      {
+        "source": "rc_reserve_route",
+        "target": "run_control_park_join",
+        "sourceHandle": "case-5",
+        "id": "edge-rc_reserve_route-case-5-run_control_park_join"
+      },
+      {
+        "source": "rc_reservation_evidence",
+        "target": "rc_reservation_gate",
+        "sourceHandle": "out",
+        "id": "edge-rc_reservation_evidence-out-rc_reservation_gate"
+      },
+      {
+        "source": "rc_reservation_gate",
+        "target": "rc_consume",
+        "sourceHandle": "pass",
+        "id": "edge-rc_reservation_gate-pass-rc_consume"
+      },
+      {
+        "source": "rc_reservation_gate",
+        "target": "rc_failure_join",
+        "sourceHandle": "fail",
+        "id": "edge-rc_reservation_gate-fail-rc_failure_join"
+      },
+      {
+        "source": "run_control_park_join",
+        "target": "run_control_park",
+        "sourceHandle": "out",
+        "id": "edge-run_control_park_join-out-run_control_park"
+      },
+      {
+        "source": "rc_reconcile",
+        "target": "post_correction_lifecycle",
+        "sourceHandle": "success",
+        "id": "edge-rc_reconcile-success-post_correction_lifecycle"
+      },
+      {
+        "source": "rc_reconcile",
+        "target": "rc_failure_join",
+        "sourceHandle": "failure",
+        "id": "edge-rc_reconcile-failure-rc_failure_join"
+      },
+      {
+        "source": "route",
+        "sourceHandle": "failure",
+        "target": "herdr_route",
+        "id": "edge-route-failure-herdr_route"
+      },
+      {
+        "id": "edge-rc-history-pointer",
+        "source": "rc_history_state",
+        "sourceHandle": "success",
+        "target": "pr_rc_pointer_get"
+      },
+      {
+        "id": "edge-rc-pointer-current",
+        "source": "pr_rc_pointer_get",
+        "sourceHandle": "success",
+        "target": "pr_rc_current_get"
+      },
+      {
+        "id": "edge-rc-pointer-fail",
+        "source": "pr_rc_pointer_get",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-rc-current-hash",
+        "source": "pr_rc_current_get",
+        "sourceHandle": "success",
+        "target": "pr_rc_current_hash"
+      },
+      {
+        "id": "edge-rc-current-fail",
+        "source": "pr_rc_current_get",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-rc-current-charges",
+        "source": "pr_rc_current_hash",
+        "sourceHandle": "out",
+        "target": "pr_rc_pointer_charges_hash"
+      },
+      {
+        "id": "edge-rc-pointer-projection",
+        "source": "pr_rc_pointer_charges_hash",
+        "sourceHandle": "out",
+        "target": "pr_rc_projection_charges_hash"
+      },
+      {
+        "id": "edge-rc-projection-check",
+        "source": "pr_rc_projection_charges_hash",
+        "sourceHandle": "out",
+        "target": "pr_rc_history_check"
+      },
+      {
+        "id": "edge-rc-history-gate",
+        "source": "pr_rc_history_check",
+        "sourceHandle": "out",
+        "target": "pr_rc_history_gate"
+      },
+      {
+        "id": "edge-rc-history-pass",
+        "source": "pr_rc_history_gate",
+        "sourceHandle": "pass",
+        "target": "iter_findings"
+      },
+      {
+        "id": "edge-rc-history-fail",
+        "source": "pr_rc_history_gate",
+        "sourceHandle": "fail",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-head-claim-value-cas",
+        "source": "pr_head_claim_value",
+        "sourceHandle": "out",
+        "target": "pr_head_claim"
+      },
+      {
+        "id": "edge-head-claim-readback",
+        "source": "pr_head_claim",
+        "sourceHandle": "success",
+        "target": "pr_head_claim_readback"
+      },
+      {
+        "id": "edge-head-claim-failure",
+        "source": "pr_head_claim",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-head-claim-readback-check",
+        "source": "pr_head_claim_readback",
+        "sourceHandle": "success",
+        "target": "pr_head_claim_check"
+      },
+      {
+        "id": "edge-head-claim-readback-failure",
+        "source": "pr_head_claim_readback",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-head-claim-check-gate",
+        "source": "pr_head_claim_check",
+        "sourceHandle": "out",
+        "target": "pr_head_claim_gate"
+      },
+      {
+        "id": "edge-head-claim-duplicate",
+        "source": "pr_head_claim_gate",
+        "sourceHandle": "fail",
+        "target": "duplicate_head_park"
+      },
+      {
+        "id": "edge-lifecycle-correct-checkout",
+        "source": "switch_needs_fix",
+        "sourceHandle": "case-3",
+        "target": "iter_checkout"
+      },
+      {
+        "id": "edge-fresh-decision-evidence",
+        "source": "rc_state_route",
+        "sourceHandle": "default",
+        "target": "rc_decision_evidence"
+      },
+      {
+        "id": "edge-fresh-decision-gate",
+        "source": "rc_decision_evidence",
+        "sourceHandle": "out",
+        "target": "rc_decision_gate"
+      },
+      {
+        "id": "edge-fresh-decision-pass",
+        "source": "rc_decision_gate",
+        "sourceHandle": "pass",
+        "target": "pr_head_claim_value"
+      },
+      {
+        "id": "edge-fresh-decision-fail",
+        "source": "rc_decision_gate",
+        "sourceHandle": "fail",
+        "target": "rc_failure_join"
+      },
+      {
+        "id": "edge-head-claim-pass-wait",
+        "source": "pr_head_claim_gate",
+        "sourceHandle": "pass",
+        "target": "wait"
       }
     ]
   }
