@@ -27985,8 +27985,10 @@ class NativeGraphRunner:
 
     @staticmethod
     def tonumber(value):
-        if value is None or isinstance(value, bool):
+        if value is None:
             return 0.0
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, str):
