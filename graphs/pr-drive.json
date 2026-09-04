@@ -3852,6 +3852,16 @@
                   "value": "ok"
                 },
                 {
+                  "path": "accepted_job_id",
+                  "op": "matches",
+                  "value": "^[0-9a-f]{32}$"
+                },
+                {
+                  "path": "callback_job_id",
+                  "op": "matches",
+                  "value": "^[0-9a-f]{32}$"
+                },
+                {
                   "path": "job_bound",
                   "op": "equals",
                   "value": true

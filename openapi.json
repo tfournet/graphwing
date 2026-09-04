@@ -1405,10 +1405,13 @@
       },
       "ScriptRunAccepted": {
         "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "job_id", "status", "kind", "name", "poll"],
         "properties": {
           "ok": { "type": "boolean" },
-          "job_id": { "type": "string" },
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
           "status": { "type": "string" },
+          "kind": { "type": "string" },
           "name": { "type": "string" },
           "poll": { "type": "string" }
         }
