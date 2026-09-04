@@ -242,11 +242,11 @@ artifact stub: `TASKS.checks.data.all_green` is unreadable because that node ret
 ~21KB, which is why the findings endpoint runs `gh pr checks` itself and returns a small
 flat result.
 
-`auto_merge` is per-run and defaults false. Initial-green and after-fix routes both checkout the freshly read PR head and run one final named test. The earlier after-fix test remains advisory.
+`auto_merge` is per-run, defaults false, and is normalized once as explicit boolean human authorization. Native nodes classify raw PR state, draft, label names, review decision, mergeability/state, stable exact head, and normalized checks. `held`, `review-red`, `CI-red`, `pending`, `no-checks`, `malformed`, `unknown`, `conflicting`, and `closed` all terminate before the final callback wait; only `ready` checks out the confirmed head and runs one final named test. The earlier after-fix test remains advisory.
 Only the final async job carries persisted `pr-merge-evidence-v1` repo/recipe/PR/run/head and clean start/end provenance. Its server-stamped `writer_evidence_mode` is `writer` after a fix and `initial_green` only when no writer ran; after-fix pins the successful writer/session job while initial-green has no writer reference.
 For named scripts, tests, and RR recipes, supplying `response_webhook_url` forces async execution even when the catalog recipe defaults to sync, so a Graph wait always receives a terminal callback.
-Merge accepts that final persisted job ID only when its repo/recipe/PR/run/head and clean start/end provenance match. It then freshly requires an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
-Code-off receipts remain independent issue-67 commit/push gates and cannot waive this final test. `graphwing-pr-status` reports remote readiness only; `remote_ready` means `named_test_required`, not merge-safe.
+After the exact-head callback succeeds, the workflow rereads and confirms the same normalized facts before reporting ready and selecting `human_merge` or `request_merge`. Merge accepts that final persisted job ID only when its repo/recipe/PR/run/head and clean start/end provenance match. It then independently requires explicit authorization, an open non-draft PR, a stable head, `MERGEABLE`/`CLEAN`, no holds or blocking review, and nonempty terminal-passing GitHub checks. It invokes `gh pr merge --match-head-commit <sha>` once and never retries a moved head.
+Code-off receipts remain independent issue-67 commit/push gates and cannot waive this final test. `graphwing-pr-status` applies the same remote-only native classification and performs no test or write effect. Legacy daemon readiness fields remain available for compatibility but neither active graph reads them.
 
 ## Other graphs
 

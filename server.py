@@ -5117,18 +5117,18 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
     state = {
         "all_green": bool(checks.get("all_green")),
         "mergeable": vd.get("mergeable"),
-        "is_draft": vd.get("isDraft"), "holds": view.get("holds"), "remote_state": view.get("remote_state"),
+        "is_draft": vd.get("isDraft"), "holds": view.get("holds"),
+        "pr_state": vd.get("state"), "merge_state": vd.get("mergeStateStatus"),
         "checks_state": checks.get("checks_state"), "review_decision": view.get("review_decision"),
         "head_ref": vd.get("headRefName"), "head": vd.get("headRefOid"),
     }
     if str(vd.get("number")) != number:
         why = {"error": "fresh PR number is inconsistent", "code": "pr_state_mismatch"}
-    elif view.get("remote_state") != "ready":
-        why = {"error": "fresh PR state is not remotely ready", "code": str(view.get("remote_state") or "malformed")}
-    elif checks.get("checks_state") != "green":
-        why = {"error": "declared GitHub checks are not terminal passing", "code": str(checks.get("checks_state") or "malformed_checks")}
     else:
-        why = validate_merge_test(data, repo_name, repo, number, vd)
+        _allowed, why = pr_merge_allowed(state, auto_merge=auto_merge,
+                                         run_id=str(data.get("run_id") or ""))
+        if not why:
+            why = validate_merge_test(data, repo_name, repo, number, vd)
     if why:
         return 409, {"ok": False, "merged": False, "repo": repo_name, "number": number,
                      "state": state, **why}
@@ -5146,15 +5146,11 @@ def gh_pr_merge(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]
 def pr_merge_allowed(
     state: dict[str, Any], auto_merge: bool, run_id: str = ""
 ) -> tuple[bool, dict[str, Any] | None]:
-    """Decide whether a run may merge this PR.
+    """Return non-bypassable merge-safety rejection facts.
 
-    Off unless the run explicitly asked. The operator lock puts merge on the
-    engineer; this exists only for the runs where they said auto-merge, and
-    absence of that flag is a refusal rather than a default.
-
-    Every condition is re-checked here against freshly read PR state instead
-    of trusting whatever the graph concluded upstream. A node deciding "green"
-    on its own is exactly what let a queue receipt pass as a test result.
+    The workflow owns eligibility and intent. This validator never chooses a
+    workflow state; it independently refuses an unauthorized or unsafe effect
+    from freshly read facts.
     """
     if not auto_merge:
         return False, {"error": "auto_merge was not requested for this run",
@@ -5165,15 +5161,26 @@ def pr_merge_allowed(
         # riftwing#3523 got merged from a shell. Merge belongs to a run.
         return False, {"error": "merge is only reachable from inside a run; run_id is required",
                        "code": "no_run_id"}
-    if state.get("is_draft"):
+    if state.get("pr_state") != "OPEN":
+        return False, {"error": "pull request is not open", "code": "not_open"}
+    if state.get("is_draft") is not False:
         return False, {"error": "pull request is a draft", "code": "is_draft"}
-    if not state.get("all_green"):
-        return False, {"error": "checks are not all green", "code": "not_green"}
+    checks_state = state.get("checks_state")
+    if checks_state != "green" or state.get("all_green") is not True:
+        return False, {"error": "checks are not a nonempty terminal passing set",
+                       "code": str(checks_state or "malformed_checks")}
     if str(state.get("mergeable") or "").upper() != "MERGEABLE":
         return False, {"error": f"pull request is {state.get('mergeable')}", "code": "not_mergeable"}
+    if state.get("merge_state") != "CLEAN":
+        return False, {"error": f"pull request merge state is {state.get('merge_state')}",
+                       "code": "unsafe_merge_state"}
     holds = state.get("holds") or []
     if holds:
         return False, {"error": f"blocking labels present: {', '.join(holds)}", "code": "held"}
+    review = state.get("review_decision")
+    if review not in {"", "APPROVED"}:
+        return False, {"error": f"pull request review decision is {review}",
+                       "code": "review_blocked"}
     return True, None
 
 
@@ -10689,8 +10696,12 @@ def prepare_merge_evidence(data: dict[str, Any], spec: dict[str, Any], repos: di
     if not view.get("ok"):
         return None, {**view, "status": int(view.get("status", 502))}
     vd = view.get("data") or {}
-    if str(vd.get("number")) != number or not view.get("remote_ready"):
-        return None, {"error": "PR is not remotely ready for final evidence", "code": str(view.get("remote_state") or "pr_state_invalid"), "status": 409}
+    if (str(vd.get("number")) != number
+            or not isinstance(vd.get("headRefName"), str)
+            or not valid_branch(vd["headRefName"])
+            or not GIT_SHA_RE.fullmatch(str(vd.get("headRefOid") or ""))):
+        return None, {"error": "fresh PR identity is malformed",
+                      "code": "pr_identity_invalid", "status": 409}
     if vd.get("headRefOid") != expected:
         return None, {"error": "declared PR head is stale", "code": "head_moved", "status": 409}
     if writer not in (None, ""):

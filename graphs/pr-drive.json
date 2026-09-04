@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-pr-drive",
   "name": "graphwing-pr-drive",
-  "description": "Hard-coded PR driver using the declared trigger inputs documented in the catalog: one bounded run reserves and settles each attempt through a capped in-run retry loop (up to three slots; a slot re-reads normalized pr-policy-inputs-v1 facts, applies native review/check actionability, holds failed PR Audit transport as review infrastructure, and after a correction waits for exact-head audit evidence before another writer), then a fresh remote-state gate terminates policy-held or otherwise non-ready PRs before any callback wait; ready PRs run one final head-bound named test and persisted evidence gate before optional merge. Every attempt is run-control reservation-backed; start after graphwing-run-control-initialize with run_control_id. The webhook/doorbell start is a known-disabled operator path because current webhook runs do not create CTX.INPUT.",
+  "description": "Hard-coded PR driver using the declared trigger inputs: one bounded native workflow policy owns final PR readiness, one final head-bound named test, fresh post-test eligibility, an evidence gate, and explicit human versus requested optional merge intent. Every non-ready state terminates before callback wait; Graphwing retains exact merge safety enforcement. The webhook start is a known-disabled operator path.",
   "spec": {
     "meta": {
       "useSearchAttributes": true
@@ -34,8 +34,9 @@
               "description": "PR number. Named pr_number because a plain pr input never reaches the workflow input context."
             },
             "auto_merge": {
-              "type": "string",
-              "required": false
+              "type": "boolean",
+              "required": false,
+              "description": "Explicit human authorization to request automatic merge; defaults false."
             },
             "test": {
               "type": "string",
@@ -126,11 +127,19 @@
               }
             },
             {
-              "id": "m4",
-              "output": "auto_merge",
+              "id": "mauto_merge_authorized",
+              "output": "auto_merge_authorized",
               "expression": {
-                "kind": "getField",
-                "path": "CTX.INPUT.auto_merge"
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.INPUT.auto_merge"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
               }
             },
             {
@@ -3781,119 +3790,6 @@
         }
       },
       {
-        "id": "final_state_snap",
-        "type": "transforms.objectBuilder",
-        "label": "Final PR state",
-        "position": {
-          "x": 3090,
-          "y": 240
-        },
-        "config": {
-          "alias": "final_state_snap",
-          "version": 1,
-          "mappings": [
-            {
-              "id": "m1",
-              "output": "remote_ready",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.final_view.data.remote_ready"
-              }
-            },
-            {
-              "id": "m2",
-              "output": "remote_state",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.final_view.data.remote_state"
-              }
-            },
-            {
-              "id": "m3",
-              "output": "holds",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.final_view.data.holds"
-              }
-            }
-          ]
-        }
-      },
-      {
-        "id": "switch_final_state",
-        "type": "logic.switch",
-        "label": "Final PR ready?",
-        "position": {
-          "x": 3180,
-          "y": 240
-        },
-        "config": {
-          "mode": "rules",
-          "cases": [
-            {
-              "label": "ready",
-              "rules": [
-                {
-                  "path": "remote_ready",
-                  "op": "equals",
-                  "value": true
-                }
-              ]
-            }
-          ],
-          "default": {
-            "label": "blocked"
-          }
-        }
-      },
-      {
-        "id": "final_state_blocked",
-        "type": "transforms.objectBuilder",
-        "label": "Final PR blocked",
-        "position": {
-          "x": 3360,
-          "y": 80
-        },
-        "config": {
-          "alias": "final_state_blocked",
-          "version": 1,
-          "mappings": [
-            {
-              "id": "m1",
-              "output": "status",
-              "expression": {
-                "kind": "literal",
-                "value": "blocked"
-              }
-            },
-            {
-              "id": "m2",
-              "output": "reason",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.final_view.data.remote_state"
-              }
-            },
-            {
-              "id": "m3",
-              "output": "holds",
-              "expression": {
-                "kind": "getField",
-                "path": "TASKS.final_view.data.holds"
-              }
-            },
-            {
-              "id": "m_continuation_required",
-              "output": "continuation_required",
-              "expression": {
-                "kind": "literal",
-                "value": true
-              }
-            }
-          ]
-        }
-      },
-      {
         "id": "final_checkout",
         "type": "action.graphwing.POST:/v1/git/checkout",
         "label": "Checkout final PR head",
@@ -3905,7 +3801,7 @@
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
           "repo": "{{ CTX.run_input.repo }}",
-          "branch": "{{ TASKS.final_view.data.data.headRefName }}",
+          "branch": "{{ TASKS.final_confirm_view.data.data.headRefName }}",
           "create": false
         }
       },
@@ -3943,7 +3839,7 @@
           "repo": "{{ CTX.run_input.repo }}",
           "pr": "{{ CTX.run_input.pr_number }}",
           "run_id": "{{ WORKFLOW.runId }}",
-          "expected_head": "{{ TASKS.final_view.data.data.headRefOid }}",
+          "expected_head": "{{ TASKS.final_confirm_view.data.data.headRefOid }}",
           "writer_job_id": "{{ CTX.receipt.job_id | default('') }}",
           "response_webhook_url": "{{ TASKS.final_wait.pending.resumeUrl }}",
           "response_webhook_token": "{{ TASKS.final_wait.pending.resumeToken }}"
@@ -3959,65 +3855,20 @@
               "label": "ok",
               "rules": [
                 {
-                  "path": "request.body.status",
+                  "path": "status",
                   "op": "equals",
                   "value": "ok"
+                },
+                {
+                  "path": "job_bound",
+                  "op": "equals",
+                  "value": true
                 }
               ]
             }
           ],
           "default": {
             "label": "not_ok"
-          }
-        }
-      },
-      {
-        "id": "merge_snap",
-        "type": "transforms.objectBuilder",
-        "label": "Merge snapshot",
-        "position": {
-          "x": 2900,
-          "y": 240
-        },
-        "config": {
-          "alias": "merge_snap",
-          "version": 1,
-          "mappings": [
-            {
-              "id": "m1",
-              "output": "auto_merge",
-              "expression": {
-                "kind": "getField",
-                "path": "CTX.run_input.auto_merge"
-              }
-            }
-          ]
-        }
-      },
-      {
-        "id": "switch_merge",
-        "type": "logic.switch",
-        "label": "Auto-merge?",
-        "position": {
-          "x": 3000,
-          "y": 240
-        },
-        "config": {
-          "mode": "rules",
-          "cases": [
-            {
-              "label": "auto_merge",
-              "rules": [
-                {
-                  "path": "auto_merge",
-                  "op": "equals",
-                  "value": "true"
-                }
-              ]
-            }
-          ],
-          "default": {
-            "label": "engineer_merges"
           }
         }
       },
@@ -4034,23 +3885,11 @@
           "timeout": 60,
           "repo": "{{ CTX.run_input.repo }}",
           "number": "{{ CTX.run_input.pr_number }}",
-          "auto_merge": "{{ CTX.run_input.auto_merge }}",
+          "auto_merge": "{{ CTX.run_input.auto_merge_authorized }}",
           "run_id": "{{ WORKFLOW.runId }}",
           "test": "{{ CTX.run_input.test }}",
           "evidence_job_id": "{{ TASKS.final_wait.request.body.job_id }}",
           "merge_method": "squash"
-        }
-      },
-      {
-        "id": "join_done",
-        "type": "logic.join.any",
-        "label": "Join done",
-        "position": {
-          "x": 3400,
-          "y": 240
-        },
-        "config": {
-          "stopOnFirst": true
         }
       },
       {
@@ -5237,6 +5076,2432 @@
             }
           ]
         }
+      },
+      {
+        "id": "final_checks",
+        "type": "action.graphwing.GET:/v1/gh/pr/checks",
+        "label": "Fresh normalized final checks",
+        "position": {
+          "x": 3070,
+          "y": 240
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "final_confirm_view",
+        "type": "action.graphwing.GET:/v1/gh/pr/view",
+        "label": "Confirm final PR head",
+        "position": {
+          "x": 3140,
+          "y": 240
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "final_label_names",
+        "type": "transforms.transformArray",
+        "label": "Normalize label names",
+        "position": {
+          "x": 3200,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_label_names",
+          "operation": "map",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "TASKS.final_confirm_view.data.data.labels"
+            }
+          },
+          "mapConfig": {
+            "mode": "field",
+            "fieldPath": "name"
+          }
+        }
+      },
+      {
+        "id": "final_hold_labels",
+        "type": "transforms.transformArray",
+        "label": "Select hold labels",
+        "position": {
+          "x": 3280,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_hold_labels",
+          "operation": "filter",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "CTX.final_label_names"
+            }
+          },
+          "filterCondition": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "binary",
+              "operator": "==",
+              "left": {
+                "kind": "function",
+                "name": "substring",
+                "args": [
+                  {
+                    "kind": "getField",
+                    "path": "ITEM"
+                  },
+                  {
+                    "kind": "literal",
+                    "value": 0
+                  },
+                  {
+                    "kind": "literal",
+                    "value": 5
+                  }
+                ]
+              },
+              "right": {
+                "kind": "literal",
+                "value": "hold:"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "final_policy_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Native final policy facts",
+        "position": {
+          "x": 3300,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_policy_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "first_head",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.data.headRefOid"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "headRefOid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.headRefOid"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "state",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.state"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "isDraft",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.isDraft"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "labels",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_label_names"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "hold_count",
+              "expression": {
+                "kind": "function",
+                "name": "count",
+                "args": [
+                  {
+                    "kind": "getField",
+                    "path": "CTX.final_hold_labels"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "m7",
+              "output": "reviewDecision",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.reviewDecision"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "mergeable",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.mergeable"
+              }
+            },
+            {
+              "id": "m9",
+              "output": "mergeStateStatus",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_confirm_view.data.data.mergeStateStatus"
+              }
+            },
+            {
+              "id": "m10",
+              "output": "checks_state",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_checks.data.checks_state"
+              }
+            },
+            {
+              "id": "m11",
+              "output": "closed",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.final_confirm_view.data.data.state"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": "CLOSED"
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "MERGED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m12",
+              "output": "held",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.final_confirm_view.data.data.isDraft"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.final_hold_labels"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                }
+              }
+            },
+            {
+              "id": "m13",
+              "output": "review_red",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.final_confirm_view.data.data.reviewDecision"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": "CHANGES_REQUESTED"
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "REVIEW_REQUIRED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m14",
+              "output": "review_ok",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.final_confirm_view.data.data.reviewDecision"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": null
+                    },
+                    {
+                      "kind": "literal",
+                      "value": ""
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "APPROVED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m15",
+              "output": "head_consistent",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.final_view.data.data.headRefOid"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.final_confirm_view.data.data.headRefOid"
+                }
+              }
+            },
+            {
+              "id": "m16",
+              "output": "unknown_merge",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.final_confirm_view.data.data.mergeable"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "UNKNOWN"
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.final_confirm_view.data.data.mergeStateStatus"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "UNKNOWN"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m17",
+              "output": "conflicting_state",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "or",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.final_confirm_view.data.data.mergeable"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "CONFLICTING"
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "in",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.final_confirm_view.data.data.mergeStateStatus"
+                    },
+                    "right": {
+                      "kind": "array",
+                      "elements": [
+                        {
+                          "kind": "literal",
+                          "value": "BLOCKED"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "BEHIND"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "DIRTY"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "DRAFT"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "HAS_HOOKS"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "UNSTABLE"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "unary",
+                  "operator": "not",
+                  "operand": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.final_view.data.data.headRefOid"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "TASKS.final_confirm_view.data.data.headRefOid"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_final_policy",
+        "type": "logic.switch",
+        "label": "Native final readiness policy",
+        "position": {
+          "x": 3380,
+          "y": 240
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "closed",
+              "rules": [
+                {
+                  "path": "closed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "held",
+              "rules": [
+                {
+                  "path": "held",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "review-red",
+              "rules": [
+                {
+                  "path": "review_red",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "CI-red",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "red"
+                }
+              ]
+            },
+            {
+              "label": "pending",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "pending"
+                }
+              ]
+            },
+            {
+              "label": "no-checks",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "no_checks"
+                }
+              ]
+            },
+            {
+              "label": "unknown",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "unknown"
+                }
+              ]
+            },
+            {
+              "label": "conflicting",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "inconsistent"
+                }
+              ]
+            },
+            {
+              "label": "unknown",
+              "rules": [
+                {
+                  "path": "unknown_merge",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "conflicting",
+              "rules": [
+                {
+                  "path": "conflicting_state",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "ready",
+              "rules": [
+                {
+                  "path": "state",
+                  "op": "equals",
+                  "value": "OPEN"
+                },
+                {
+                  "path": "isDraft",
+                  "op": "equals",
+                  "value": false
+                },
+                {
+                  "path": "hold_count",
+                  "op": "equals",
+                  "value": 0
+                },
+                {
+                  "path": "review_ok",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "green"
+                },
+                {
+                  "path": "mergeable",
+                  "op": "equals",
+                  "value": "MERGEABLE"
+                },
+                {
+                  "path": "mergeStateStatus",
+                  "op": "equals",
+                  "value": "CLEAN"
+                },
+                {
+                  "path": "head_consistent",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "malformed"
+          }
+        }
+      },
+      {
+        "id": "final_reason_held",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: held",
+        "position": {
+          "x": 3460,
+          "y": 80
+        },
+        "config": {
+          "alias": "final_reason_held",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "held"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_review_red",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: review-red",
+        "position": {
+          "x": 3460,
+          "y": 120
+        },
+        "config": {
+          "alias": "final_reason_review_red",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "review-red"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_ci_red",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: CI-red",
+        "position": {
+          "x": 3460,
+          "y": 160
+        },
+        "config": {
+          "alias": "final_reason_ci_red",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "CI-red"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_pending",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: pending",
+        "position": {
+          "x": 3460,
+          "y": 200
+        },
+        "config": {
+          "alias": "final_reason_pending",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "pending"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_no_checks",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: no-checks",
+        "position": {
+          "x": 3460,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_reason_no_checks",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "no-checks"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_malformed",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed",
+        "position": {
+          "x": 3460,
+          "y": 280
+        },
+        "config": {
+          "alias": "final_reason_malformed",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_unknown",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: unknown",
+        "position": {
+          "x": 3460,
+          "y": 320
+        },
+        "config": {
+          "alias": "final_reason_unknown",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "unknown"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_conflicting",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: conflicting",
+        "position": {
+          "x": 3460,
+          "y": 360
+        },
+        "config": {
+          "alias": "final_reason_conflicting",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "conflicting"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_closed",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: closed",
+        "position": {
+          "x": 3460,
+          "y": 400
+        },
+        "config": {
+          "alias": "final_reason_closed",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "closed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_reason_ready",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: ready",
+        "position": {
+          "x": 3460,
+          "y": 440
+        },
+        "config": {
+          "alias": "final_reason_ready",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.final_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_view",
+        "type": "action.graphwing.GET:/v1/gh/pr/view",
+        "label": "Fresh PR after final test",
+        "position": {
+          "x": 3660,
+          "y": 240
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "post_test_checks",
+        "type": "action.graphwing.GET:/v1/gh/pr/checks",
+        "label": "Fresh checks after final test",
+        "position": {
+          "x": 3740,
+          "y": 240
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "post_test_confirm_view",
+        "type": "action.graphwing.GET:/v1/gh/pr/view",
+        "label": "Confirm post-test PR head",
+        "position": {
+          "x": 3820,
+          "y": 240
+        },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "repo": "{{ CTX.run_input.repo }}",
+          "number": "{{ CTX.run_input.pr_number }}"
+        }
+      },
+      {
+        "id": "post_test_label_names",
+        "type": "transforms.transformArray",
+        "label": "Normalize label names",
+        "position": {
+          "x": 3900,
+          "y": 240
+        },
+        "config": {
+          "alias": "post_test_label_names",
+          "operation": "map",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "TASKS.post_test_confirm_view.data.data.labels"
+            }
+          },
+          "mapConfig": {
+            "mode": "field",
+            "fieldPath": "name"
+          }
+        }
+      },
+      {
+        "id": "post_test_hold_labels",
+        "type": "transforms.transformArray",
+        "label": "Select hold labels",
+        "position": {
+          "x": 3980,
+          "y": 240
+        },
+        "config": {
+          "alias": "post_test_hold_labels",
+          "operation": "filter",
+          "array": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "getField",
+              "path": "CTX.post_test_label_names"
+            }
+          },
+          "filterCondition": {
+            "inputKind": "ast",
+            "ast": {
+              "kind": "binary",
+              "operator": "==",
+              "left": {
+                "kind": "function",
+                "name": "substring",
+                "args": [
+                  {
+                    "kind": "getField",
+                    "path": "ITEM"
+                  },
+                  {
+                    "kind": "literal",
+                    "value": 0
+                  },
+                  {
+                    "kind": "literal",
+                    "value": 5
+                  }
+                ]
+              },
+              "right": {
+                "kind": "literal",
+                "value": "hold:"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "post_test_policy_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Native final policy facts",
+        "position": {
+          "x": 4000,
+          "y": 240
+        },
+        "config": {
+          "alias": "post_test_policy_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "first_head",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_view.data.data.headRefOid"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "headRefOid",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.headRefOid"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "state",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.state"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "isDraft",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.isDraft"
+              }
+            },
+            {
+              "id": "m5",
+              "output": "labels",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_label_names"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "hold_count",
+              "expression": {
+                "kind": "function",
+                "name": "count",
+                "args": [
+                  {
+                    "kind": "getField",
+                    "path": "CTX.post_test_hold_labels"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "m7",
+              "output": "reviewDecision",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.reviewDecision"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "mergeable",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.mergeable"
+              }
+            },
+            {
+              "id": "m9",
+              "output": "mergeStateStatus",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_confirm_view.data.data.mergeStateStatus"
+              }
+            },
+            {
+              "id": "m10",
+              "output": "checks_state",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.post_test_checks.data.checks_state"
+              }
+            },
+            {
+              "id": "m11",
+              "output": "closed",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_confirm_view.data.data.state"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": "CLOSED"
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "MERGED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m12",
+              "output": "held",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.post_test_confirm_view.data.data.isDraft"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": true
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": ">",
+                  "left": {
+                    "kind": "function",
+                    "name": "count",
+                    "args": [
+                      {
+                        "kind": "getField",
+                        "path": "CTX.post_test_hold_labels"
+                      }
+                    ]
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                }
+              }
+            },
+            {
+              "id": "m13",
+              "output": "review_red",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_confirm_view.data.data.reviewDecision"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": "CHANGES_REQUESTED"
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "REVIEW_REQUIRED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m14",
+              "output": "review_ok",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_confirm_view.data.data.reviewDecision"
+                },
+                "right": {
+                  "kind": "array",
+                  "elements": [
+                    {
+                      "kind": "literal",
+                      "value": null
+                    },
+                    {
+                      "kind": "literal",
+                      "value": ""
+                    },
+                    {
+                      "kind": "literal",
+                      "value": "APPROVED"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m15",
+              "output": "head_consistent",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_view.data.data.headRefOid"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_confirm_view.data.data.headRefOid"
+                }
+              }
+            },
+            {
+              "id": "m16",
+              "output": "unknown_merge",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.post_test_confirm_view.data.data.mergeable"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "UNKNOWN"
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "TASKS.post_test_confirm_view.data.data.mergeStateStatus"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "UNKNOWN"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m17",
+              "output": "conflicting_state",
+              "expression": {
+                "kind": "binary",
+                "operator": "or",
+                "left": {
+                  "kind": "binary",
+                  "operator": "or",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.post_test_confirm_view.data.data.mergeable"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "CONFLICTING"
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "in",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.post_test_confirm_view.data.data.mergeStateStatus"
+                    },
+                    "right": {
+                      "kind": "array",
+                      "elements": [
+                        {
+                          "kind": "literal",
+                          "value": "BLOCKED"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "BEHIND"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "DIRTY"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "DRAFT"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "HAS_HOOKS"
+                        },
+                        {
+                          "kind": "literal",
+                          "value": "UNSTABLE"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "unary",
+                  "operator": "not",
+                  "operand": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "TASKS.post_test_view.data.data.headRefOid"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "TASKS.post_test_confirm_view.data.data.headRefOid"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m18",
+              "output": "tested_head",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_view.data.data.headRefOid"
+              }
+            },
+            {
+              "id": "m19",
+              "output": "tested_head_consistent",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.post_test_confirm_view.data.data.headRefOid"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.final_view.data.data.headRefOid"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_post_test_policy",
+        "type": "logic.switch",
+        "label": "Native final readiness policy",
+        "position": {
+          "x": 4080,
+          "y": 240
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "closed",
+              "rules": [
+                {
+                  "path": "closed",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "held",
+              "rules": [
+                {
+                  "path": "held",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "review-red",
+              "rules": [
+                {
+                  "path": "review_red",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "CI-red",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "red"
+                }
+              ]
+            },
+            {
+              "label": "pending",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "pending"
+                }
+              ]
+            },
+            {
+              "label": "no-checks",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "no_checks"
+                }
+              ]
+            },
+            {
+              "label": "unknown",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "unknown"
+                }
+              ]
+            },
+            {
+              "label": "conflicting",
+              "rules": [
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "inconsistent"
+                }
+              ]
+            },
+            {
+              "label": "unknown",
+              "rules": [
+                {
+                  "path": "unknown_merge",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "conflicting",
+              "rules": [
+                {
+                  "path": "conflicting_state",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            },
+            {
+              "label": "ready",
+              "rules": [
+                {
+                  "path": "state",
+                  "op": "equals",
+                  "value": "OPEN"
+                },
+                {
+                  "path": "isDraft",
+                  "op": "equals",
+                  "value": false
+                },
+                {
+                  "path": "hold_count",
+                  "op": "equals",
+                  "value": 0
+                },
+                {
+                  "path": "review_ok",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "checks_state",
+                  "op": "equals",
+                  "value": "green"
+                },
+                {
+                  "path": "mergeable",
+                  "op": "equals",
+                  "value": "MERGEABLE"
+                },
+                {
+                  "path": "mergeStateStatus",
+                  "op": "equals",
+                  "value": "CLEAN"
+                },
+                {
+                  "path": "head_consistent",
+                  "op": "equals",
+                  "value": true
+                },
+                {
+                  "path": "tested_head_consistent",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "malformed"
+          }
+        }
+      },
+      {
+        "id": "post_test_reason_held",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: held",
+        "position": {
+          "x": 4160,
+          "y": 80
+        },
+        "config": {
+          "alias": "post_test_reason_held",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "held"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_review_red",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: review-red",
+        "position": {
+          "x": 4160,
+          "y": 120
+        },
+        "config": {
+          "alias": "post_test_reason_review_red",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "review-red"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_ci_red",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: CI-red",
+        "position": {
+          "x": 4160,
+          "y": 160
+        },
+        "config": {
+          "alias": "post_test_reason_ci_red",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "CI-red"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_pending",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: pending",
+        "position": {
+          "x": 4160,
+          "y": 200
+        },
+        "config": {
+          "alias": "post_test_reason_pending",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "pending"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_no_checks",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: no-checks",
+        "position": {
+          "x": 4160,
+          "y": 240
+        },
+        "config": {
+          "alias": "post_test_reason_no_checks",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "no-checks"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_malformed",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: malformed",
+        "position": {
+          "x": 4160,
+          "y": 280
+        },
+        "config": {
+          "alias": "post_test_reason_malformed",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "malformed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_unknown",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: unknown",
+        "position": {
+          "x": 4160,
+          "y": 320
+        },
+        "config": {
+          "alias": "post_test_reason_unknown",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "unknown"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_conflicting",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: conflicting",
+        "position": {
+          "x": 4160,
+          "y": 360
+        },
+        "config": {
+          "alias": "post_test_reason_conflicting",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "conflicting"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_reason_closed",
+        "type": "transforms.objectBuilder",
+        "label": "Final policy: closed",
+        "position": {
+          "x": 4160,
+          "y": 400
+        },
+        "config": {
+          "alias": "post_test_reason_closed",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "blocked"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "closed"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "post_test_report_ready",
+        "type": "transforms.objectBuilder",
+        "label": "Report exact tested head ready",
+        "position": {
+          "x": 4160,
+          "y": 480
+        },
+        "config": {
+          "alias": "post_test_report_ready",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "intent",
+              "expression": {
+                "kind": "literal",
+                "value": "report_ready"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "human_merge",
+        "type": "transforms.objectBuilder",
+        "label": "Human merge required",
+        "position": {
+          "x": 4500,
+          "y": 420
+        },
+        "config": {
+          "alias": "human_merge",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "intent",
+              "expression": {
+                "kind": "literal",
+                "value": "human_merge"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "request_merge",
+        "type": "transforms.objectBuilder",
+        "label": "Request exact merge",
+        "position": {
+          "x": 4500,
+          "y": 520
+        },
+        "config": {
+          "alias": "request_merge",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "reason",
+              "expression": {
+                "kind": "literal",
+                "value": "ready"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "intent",
+              "expression": {
+                "kind": "literal",
+                "value": "request_merge"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "exact_head",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.post_test_policy_snap.headRefOid"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "switch_merge_intent",
+        "type": "logic.switch",
+        "label": "Explicit auto-merge authorization?",
+        "position": {
+          "x": 4420,
+          "y": 480
+        },
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "request_merge",
+              "rules": [
+                {
+                  "path": "auto_merge_authorized",
+                  "op": "equals",
+                  "value": true
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "human_merge"
+          }
+        }
+      },
+      {
+        "id": "final_join_unknown",
+        "type": "logic.join.any",
+        "label": "Join unknown reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "final_join_conflicting",
+        "type": "logic.join.any",
+        "label": "Join conflicting reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "post_test_join_unknown",
+        "type": "logic.join.any",
+        "label": "Join unknown reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "post_test_join_conflicting",
+        "type": "logic.join.any",
+        "label": "Join conflicting reasons",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "final_callback_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Bind final callback to accepted test",
+        "position": {
+          "x": 3500,
+          "y": 240
+        },
+        "config": {
+          "alias": "final_callback_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "status",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_wait.request.body.status"
+              }
+            },
+            {
+              "id": "m2",
+              "output": "accepted_job_id",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_test.data.job_id"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "callback_job_id",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.final_wait.request.body.job_id"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "job_bound",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "TASKS.final_test.data.job_id"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "TASKS.final_wait.request.body.job_id"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "final_callback_join",
+        "type": "logic.join.all",
+        "label": "Join accepted final test and callback",
+        "position": {
+          "x": 3460,
+          "y": 300
+        },
+        "config": {}
       }
     ],
     "edges": [
@@ -5647,34 +7912,6 @@
         "targetHandle": "in"
       },
       {
-        "id": "e51",
-        "source": "final_view",
-        "sourceHandle": "success",
-        "target": "final_state_snap",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e51a",
-        "source": "final_state_snap",
-        "sourceHandle": "out",
-        "target": "switch_final_state",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e51b",
-        "source": "switch_final_state",
-        "sourceHandle": "case-0",
-        "target": "final_checkout",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e51c",
-        "source": "switch_final_state",
-        "sourceHandle": "default",
-        "target": "final_state_blocked",
-        "targetHandle": "in"
-      },
-      {
         "id": "e52",
         "source": "final_checkout",
         "sourceHandle": "success",
@@ -5686,20 +7923,6 @@
         "source": "final_wait",
         "sourceHandle": "pending",
         "target": "final_test",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e54",
-        "source": "final_wait",
-        "sourceHandle": "out",
-        "target": "switch_final_test",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e55",
-        "source": "switch_final_test",
-        "sourceHandle": "case-0",
-        "target": "rc_verified_state",
         "targetHandle": "in"
       },
       {
@@ -5752,45 +7975,10 @@
         "targetHandle": "in"
       },
       {
-        "id": "e63",
-        "source": "merge_snap",
-        "sourceHandle": "out",
-        "target": "switch_merge",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e64",
-        "source": "switch_merge",
-        "sourceHandle": "case-0",
-        "target": "merge",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e65",
-        "source": "switch_merge",
-        "sourceHandle": "default",
-        "target": "join_done",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e66",
-        "source": "merge",
-        "sourceHandle": "success",
-        "target": "join_done",
-        "targetHandle": "in"
-      },
-      {
         "id": "e67",
         "source": "merge",
         "sourceHandle": "failure",
         "target": "join_final_fail",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e68",
-        "source": "join_done",
-        "sourceHandle": "out",
-        "target": "done_after_fix",
         "targetHandle": "in"
       },
       {
@@ -6015,13 +8203,6 @@
         "source": "rc_consumed_identity",
         "sourceHandle": "out",
         "target": "agent",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e_pr5_verified_route",
-        "source": "rc_verified_route",
-        "sourceHandle": "case-0",
-        "target": "merge_snap",
         "targetHandle": "in"
       },
       {
@@ -6421,6 +8602,405 @@
         "source": "pr_head_claim_gate",
         "sourceHandle": "pass",
         "target": "wait"
+      },
+      {
+        "id": "e_pr4_final_checks",
+        "source": "final_view",
+        "sourceHandle": "success",
+        "target": "final_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_confirm",
+        "source": "final_checks",
+        "sourceHandle": "success",
+        "target": "final_confirm_view",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_labels",
+        "source": "final_confirm_view",
+        "sourceHandle": "success",
+        "target": "final_label_names",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_holds",
+        "source": "final_label_names",
+        "sourceHandle": "out",
+        "target": "final_hold_labels",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_snap",
+        "source": "final_hold_labels",
+        "sourceHandle": "out",
+        "target": "final_policy_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_switch",
+        "source": "final_policy_snap",
+        "sourceHandle": "out",
+        "target": "switch_final_policy",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_fail_0",
+        "source": "final_checks",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_fail_1",
+        "source": "final_confirm_view",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_ready",
+        "source": "final_reason_ready",
+        "sourceHandle": "out",
+        "target": "final_checkout",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_view",
+        "source": "switch_final_test",
+        "sourceHandle": "case-0",
+        "target": "post_test_view",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_checks",
+        "source": "post_test_view",
+        "sourceHandle": "success",
+        "target": "post_test_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_confirm",
+        "source": "post_test_checks",
+        "sourceHandle": "success",
+        "target": "post_test_confirm_view",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_labels",
+        "source": "post_test_confirm_view",
+        "sourceHandle": "success",
+        "target": "post_test_label_names",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_holds",
+        "source": "post_test_label_names",
+        "sourceHandle": "out",
+        "target": "post_test_hold_labels",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_snap",
+        "source": "post_test_hold_labels",
+        "sourceHandle": "out",
+        "target": "post_test_policy_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_switch",
+        "source": "post_test_policy_snap",
+        "sourceHandle": "out",
+        "target": "switch_post_test_policy",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_fail_0",
+        "source": "post_test_view",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_fail_1",
+        "source": "post_test_checks",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_post_fail_2",
+        "source": "post_test_confirm_view",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_report_verified",
+        "source": "post_test_report_ready",
+        "sourceHandle": "out",
+        "target": "rc_verified_state",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_verified_intent",
+        "source": "rc_verified_route",
+        "sourceHandle": "case-0",
+        "target": "switch_merge_intent",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_request_intent",
+        "source": "switch_merge_intent",
+        "sourceHandle": "case-0",
+        "target": "request_merge",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_human_intent",
+        "source": "switch_merge_intent",
+        "sourceHandle": "default",
+        "target": "human_merge",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_request_merge",
+        "source": "request_merge",
+        "sourceHandle": "out",
+        "target": "merge",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_0",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-0",
+        "target": "final_reason_closed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_1",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-1",
+        "target": "final_reason_held",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_2",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-2",
+        "target": "final_reason_review_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_3",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-3",
+        "target": "final_reason_ci_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_4",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-4",
+        "target": "final_reason_pending",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_5",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-5",
+        "target": "final_reason_no_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_6",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-6",
+        "target": "final_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_7",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-7",
+        "target": "final_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_8",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-8",
+        "target": "final_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_9",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-9",
+        "target": "final_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_case_10",
+        "source": "switch_final_policy",
+        "sourceHandle": "case-10",
+        "target": "final_reason_ready",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_policy_default",
+        "source": "switch_final_policy",
+        "sourceHandle": "default",
+        "target": "final_reason_malformed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_joined_unknown",
+        "source": "final_join_unknown",
+        "sourceHandle": "out",
+        "target": "final_reason_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "final_joined_conflicting",
+        "source": "final_join_conflicting",
+        "sourceHandle": "out",
+        "target": "final_reason_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_0",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-0",
+        "target": "post_test_reason_closed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_1",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-1",
+        "target": "post_test_reason_held",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_2",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-2",
+        "target": "post_test_reason_review_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_3",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-3",
+        "target": "post_test_reason_ci_red",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_4",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-4",
+        "target": "post_test_reason_pending",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_5",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-5",
+        "target": "post_test_reason_no_checks",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_6",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-6",
+        "target": "post_test_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_7",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-7",
+        "target": "post_test_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_8",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-8",
+        "target": "post_test_join_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_9",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-9",
+        "target": "post_test_join_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_case_10",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "case-10",
+        "target": "post_test_report_ready",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_policy_default",
+        "source": "switch_post_test_policy",
+        "sourceHandle": "default",
+        "target": "post_test_reason_malformed",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_joined_unknown",
+        "source": "post_test_join_unknown",
+        "sourceHandle": "out",
+        "target": "post_test_reason_unknown",
+        "targetHandle": "in"
+      },
+      {
+        "id": "post_test_joined_conflicting",
+        "source": "post_test_join_conflicting",
+        "sourceHandle": "out",
+        "target": "post_test_reason_conflicting",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_merge_done",
+        "source": "merge",
+        "sourceHandle": "success",
+        "target": "done_after_fix",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_callback_snap",
+        "source": "final_wait",
+        "sourceHandle": "out",
+        "target": "final_callback_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_callback_switch",
+        "source": "final_callback_snap",
+        "sourceHandle": "out",
+        "target": "switch_final_test",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_final_test_accepted",
+        "source": "final_test",
+        "sourceHandle": "success",
+        "target": "final_callback_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr4_callback_joined",
+        "source": "final_callback_join",
+        "sourceHandle": "out",
+        "target": "final_callback_snap",
+        "targetHandle": "in"
       }
     ]
   }

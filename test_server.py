@@ -7026,12 +7026,16 @@ while True:
     def test_pr_merge_refuses_when_not_actually_green(self):
         # The graph deciding "green" is what let a queue receipt pass as a test
         # pass. Re-check here rather than trusting the caller's word.
+        base = {"all_green": True, "checks_state": "green", "pr_state": "OPEN",
+                "mergeable": "MERGEABLE", "merge_state": "CLEAN", "is_draft": False,
+                "holds": [], "review_decision": "APPROVED"}
         for state, code in (
-            ({"all_green": False, "mergeable": "MERGEABLE", "is_draft": False}, "not_green"),
-            ({"all_green": True, "mergeable": "CONFLICTING", "is_draft": False}, "not_mergeable"),
-            ({"all_green": True, "mergeable": "MERGEABLE", "is_draft": True}, "is_draft"),
-            ({"all_green": True, "mergeable": "MERGEABLE", "is_draft": False,
-              "holds": ["hold:pm-review"]}, "held"),
+            ({**base, "all_green": False, "checks_state": "red"}, "red"),
+            ({**base, "mergeable": "CONFLICTING"}, "not_mergeable"),
+            ({**base, "is_draft": True}, "is_draft"),
+            ({**base, "holds": ["hold:pm-review"]}, "held"),
+            ({**base, "review_decision": "CHANGES_REQUESTED"}, "review_blocked"),
+            ({**base, "merge_state": "BLOCKED"}, "unsafe_merge_state"),
         ):
             ok, err = server.pr_merge_allowed(state, auto_merge=True, run_id="r1")
             self.assertFalse(ok, state)
@@ -7039,7 +7043,9 @@ while True:
 
     def test_pr_merge_allows_a_green_unheld_pr_when_asked(self):
         ok, err = server.pr_merge_allowed(
-            {"all_green": True, "mergeable": "MERGEABLE", "is_draft": False, "holds": []},
+            {"all_green": True, "checks_state": "green", "pr_state": "OPEN",
+             "mergeable": "MERGEABLE", "merge_state": "CLEAN", "is_draft": False,
+             "holds": [], "review_decision": "APPROVED"},
             auto_merge=True, run_id="r1",
         )
         self.assertTrue(ok, err)
@@ -7205,6 +7211,52 @@ while True:
         out = server.annotate_pr_view(self._strict_pr_view(head, reviewDecision=None))
         self.assertEqual(out["review_decision"], "")
         self.assertTrue(out["remote_ready"])
+
+    def test_prepare_merge_evidence_does_not_apply_hold_review_or_check_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self._scratch_git(root)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature"],
+                           check=True, capture_output=True)
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            spec = {"name": "catalog-compile", "cwd": repo.resolve()}
+            request = {
+                "evidence_mode": "pr_merge", "repo": "r", "pr": "7",
+                "run_id": "run-7", "expected_head": head,
+            }
+            policy_red_views = (
+                self._strict_pr_view(head, labels=[{"name": "hold:pm-review"}]),
+                self._strict_pr_view(head, reviewDecision="CHANGES_REQUESTED"),
+                self._strict_pr_view(head, isDraft=True),
+                self._strict_pr_view(head, mergeable="CONFLICTING", mergeStateStatus="DIRTY"),
+            )
+            for view in policy_red_views:
+                with self.subTest(view=view), mock.patch.object(
+                    server, "gh_json", return_value=view,
+                ):
+                    evidence, error = server.prepare_merge_evidence(
+                        request, spec, {"r": str(repo)},
+                    )
+                self.assertIsNone(error)
+                self.assertEqual(evidence["expected_head"], head)
+            for label, changed in (
+                ("stale_head", {**request, "expected_head": "2" * 40}),
+                ("bad_recipe", request),
+                ("malformed_identity", {**request, "run_id": ""}),
+            ):
+                bad_spec = ({**spec, "cwd": root.resolve()}
+                            if label == "bad_recipe" else spec)
+                with self.subTest(label=label), mock.patch.object(
+                    server, "gh_json", return_value=self._strict_pr_view(head),
+                ):
+                    evidence, error = server.prepare_merge_evidence(
+                        changed, bad_spec, {"r": str(repo)},
+                    )
+                self.assertIsNone(evidence)
+                self.assertIsNotNone(error)
 
     def test_merge_evidence_creation_stamps_server_side_pr_and_git_provenance(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7627,26 +7679,27 @@ while True:
         self.assertIn(("switch_needs_fix", "default", "final_view"), triples)
         self.assertIn(("rc_reconcile", "success", "post_correction_lifecycle"), triples)
         self.assertFalse(any(e["source"] == "post_correction_lifecycle" for e in edges))
-        self.assertIn(("final_view", "success", "final_state_snap"), triples)
-        self.assertIn(("final_state_snap", "out", "switch_final_state"), triples)
-        self.assertIn(("switch_final_state", "case-0", "final_checkout"), triples)
-        self.assertIn(("switch_final_state", "default", "final_state_blocked"), triples)
-        self.assertFalse(any(e["source"] == "final_state_blocked" for e in edges),
-                         "a blocked final state must terminate before final_wait")
-        state_rules = nodes["switch_final_state"]["config"]["cases"][0]["rules"]
-        self.assertEqual(state_rules, [{"path": "remote_ready", "op": "equals", "value": True}])
-        state_mappings = {m["output"]: m["expression"] for m in nodes["final_state_snap"]["config"]["mappings"]}
-        self.assertEqual(state_mappings["remote_ready"],
-                         {"kind": "getField", "path": "TASKS.final_view.data.remote_ready"})
-        blocked = {m["output"]: m["expression"] for m in nodes["final_state_blocked"]["config"]["mappings"]}
-        self.assertEqual(blocked["status"], {"kind": "literal", "value": "blocked"})
-        self.assertEqual(blocked["reason"],
-                         {"kind": "getField", "path": "TASKS.final_view.data.remote_state"})
-        self.assertEqual(blocked["holds"],
-                         {"kind": "getField", "path": "TASKS.final_view.data.holds"})
+        self.assertIn(("final_view", "success", "final_checks"), triples)
+        self.assertIn(("final_checks", "success", "final_confirm_view"), triples)
+        self.assertIn(("final_confirm_view", "success", "final_label_names"), triples)
+        self.assertIn(("final_policy_snap", "out", "switch_final_policy"), triples)
+        self.assertIn(("final_reason_ready", "out", "final_checkout"), triples)
+        for node_id in nodes:
+            if node_id.startswith("final_reason_") and node_id != "final_reason_ready":
+                self.assertFalse(any(e["source"] == node_id for e in edges),
+                                 "a non-ready final state must terminate before final_wait")
+        state_mappings = {m["output"]: m["expression"]
+                          for m in nodes["final_policy_snap"]["config"]["mappings"]}
+        self.assertEqual(state_mappings["headRefOid"],
+                         {"kind": "getField", "path": "TASKS.final_confirm_view.data.data.headRefOid"})
+        self.assertNotIn("remote_ready", json.dumps(nodes["final_policy_snap"]))
+        self.assertNotIn("remote_state", json.dumps(nodes["switch_final_policy"]))
         self.assertIn(("final_checkout", "success", "final_wait"), triples)
         self.assertIn(("final_wait", "pending", "final_test"), triples)
-        self.assertIn(("final_wait", "out", "switch_final_test"), triples)
+        self.assertIn(("final_wait", "out", "final_callback_join"), triples)
+        self.assertIn(("final_test", "success", "final_callback_join"), triples)
+        self.assertIn(("final_callback_join", "out", "final_callback_snap"), triples)
+        self.assertIn(("final_callback_snap", "out", "switch_final_test"), triples)
         self.assertEqual(nodes["final_test"]["config"]["evidence_mode"], "pr_merge")
         self.assertEqual(nodes["final_test"]["config"]["response_webhook_url"], "{{ TASKS.final_wait.pending.resumeUrl }}")
         self.assertNotIn("evidence_mode", nodes["fix_test"]["config"])
@@ -7668,7 +7721,7 @@ while True:
             return any(reaches(nxt, goal, seen.copy()) for nxt in outgoing.get(start, []))
         for edge in edges:
             if edge["target"] == "merge":
-                self.assertEqual((edge["source"], edge.get("sourceHandle")), ("switch_merge", "case-0"))
+                self.assertEqual((edge["source"], edge.get("sourceHandle")), ("request_merge", "out"))
         def merge_paths(node, path=()):
             current = (*path, node)
             if node == "merge":
@@ -7690,18 +7743,20 @@ while True:
         for banned in ("/v1/test/run", "/v1/agent/run", "/v1/git/", "/v1/gh/pr/merge"):
             self.assertFalse(any(banned in node_type for node_type in types), banned)
         labels = " ".join(str(n.get("label", "")).lower() for n in nodes.values())
-        for state in ("no checks", "red", "pending", "blocking review", "malformed", "unknown", "inconsistent"):
+        for state in ("no-checks", "ci-red", "pending", "review-red", "malformed",
+                      "unknown", "conflicting", "closed", "held", "ready"):
             self.assertIn(state, labels)
-        ready = nodes["done_remote_ready"]
+        ready = nodes["status_reason_ready"]
         dumped = json.dumps(ready).lower()
-        self.assertIn("remote_ready", dumped)
-        self.assertIn("named_test_required", dumped)
+        ready_mappings = {m["output"]: m["expression"]
+                          for m in ready["config"]["mappings"]}
+        self.assertEqual(ready_mappings["reason"], {"kind": "literal", "value": "ready"})
         self.assertNotIn('"mergeable"', dumped)
-        for node_id in ("view", "checks"):
+        for node_id in ("view", "checks", "confirm_view"):
             self.assertEqual(nodes[node_id]["config"]["number"], "{{ CTX.INPUT.pr }}")
         self.assertFalse(nodes["hook"]["config"]["enabled"])
-        ready_mappings = {m["output"]: m["expression"] for m in ready["config"]["mappings"]}
-        self.assertEqual(ready_mappings["pr"], {"kind": "getField", "path": "CTX.INPUT.pr"})
+        self.assertNotIn("remote_ready", json.dumps(nodes["status_policy_snap"]))
+        self.assertNotIn("remote_state", json.dumps(nodes["switch_status_policy"]))
 
     def test_pr_graph_action_configs_match_openapi_request_shapes(self):
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
@@ -14157,14 +14212,15 @@ func main() {
                                  "artifact-stubbed and unreadable")
 
     def test_pr_drive_auto_merge_rule_matches_the_value_it_receives(self):
-        # Form inputs arrive as strings, so auto_merge is "true"/"false". The
-        # rule compared against boolean true, so the merge branch could never
-        # be taken even when a run explicitly asked for it.
+        # Automatic merge is explicit human authorization, normalized once to
+        # a boolean before policy evaluates it.
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
-        rule = nodes["switch_merge"]["config"]["cases"][0]["rules"][0]
-        self.assertIsInstance(rule["value"], str, "auto_merge arrives as a string")
-        self.assertEqual(rule["value"], "true")
+        rule = nodes["switch_merge_intent"]["config"]["cases"][0]["rules"][0]
+        self.assertEqual(rule, {"path": "auto_merge_authorized", "op": "equals",
+                                "value": True})
+        self.assertEqual(nodes["form"]["config"]["inputs"]["auto_merge"]["type"],
+                         "boolean")
 
     def test_pr_drive_switch_can_actually_match_its_input(self):
         # Inserting findings in front of a checks-reading switch once left its
@@ -18300,11 +18356,10 @@ func main() {
             'You start work and merge." width="100%">\n</p>\n\n' + topology_caption,
             readme_source,
         )
-        self.assertIn(
-            "| `graphwing-pr-status` | `pr` | Read remote-only PR state through an API "
-            "start. Webhook starts remain disabled. |",
-            readme_source,
-        )
+        self.assertIn("| `graphwing-pr-status` | `pr` | Read remote-only PR state through an API start.",
+                      readme_source)
+        self.assertIn("closed readiness reasons. Webhook starts remain disabled. |",
+                      readme_source)
 
         catalog_source = (root / "graphs" / "README.md").read_text()
         self.assertNotIn("`kick_url` starts the next", catalog_source)
@@ -18328,12 +18383,10 @@ func main() {
         pr_drive = json.loads((root / "graphs" / "pr-drive.json").read_text())
         nodes = {node["id"]: node for node in pr_drive["spec"]["nodes"]}
         self.assertEqual(nodes["view"]["config"]["number"], "{{ CTX.run_input.pr_number }}")
-        self.assertIn(
-            "| `graphwing-pr-status` | `pr` | API-started remote-only classification; "
-            "webhook starts remain disabled; performs no named-test "
-            "job or git write |",
-            catalog_source,
-        )
+        self.assertIn("| `graphwing-pr-status` | `pr` | API-started remote-only native classification",
+                      catalog_source)
+        self.assertIn("performs no named-test job or git write; webhook starts remain disabled |",
+                      catalog_source)
 
         using_source = (root / "docs" / "USING.md").read_text()
         self.assertIn("generic catalog wiring", using_source)
@@ -18353,10 +18406,10 @@ func main() {
             "remote_ready still requires final named-test evidence before merge. Payload: pr."
         )
         expected_description = (
-            "Read-only remote PR status. Start through the API with input.pr; webhook starts "
-            "are disabled because they do not create CTX.INPUT. Never "
-            "creates named-test evidence or writes git; remote_ready still requires final "
-            "named-test evidence before merge. Payload: pr."
+            "Read-only PR status. Native nodes classify normalized raw PR identity, labels, "
+            "review, mergeability, merge-state, exact stable head, and normalized checks into "
+            "closed readiness reasons. No test, git write, or merge effect. Start through API "
+            "input.pr; webhook remains disabled."
         )
         self.assertEqual(pr_status["description"], expected_description)
         self.assertNotEqual(pr_status["description"], old_description)
@@ -18366,7 +18419,7 @@ func main() {
         self.assertEqual(json.loads(spec_bytes), pr_status["spec"])
         self.assertEqual(
             hashlib.sha256(spec_bytes).hexdigest(),
-            "7d2024cae9a8897bcbb1c1ff7ba7272fd800ea1e3e1be1ddd542221099e18d1b",
+            "2a99564f146e4d444f7da5ebaa265c4ebca1d3dfc297fa0f6bd1db50b2217b45",
         )
 
     def test_pr_status_graph_is_read_only_and_webhook_disabled(self):
@@ -26398,8 +26451,160 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertNotIn("namespace(", dumped)
         self.assertNotIn("logic.loop", dumped)
 
+    def test_final_policy_uses_normalized_raw_facts_not_remote_ready_or_remote_state(self):
+        root = Path(server.__file__).parent / "graphs"
+        for filename in ("pr-drive.json", "pr-status.json"):
+            graph = json.loads((root / filename).read_text())
+            nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+            policy = [node for node_id, node in nodes.items()
+                      if "policy" in node_id or node_id in {"state_snap", "switch_state"}]
+            dumped = json.dumps(policy)
+            self.assertNotIn("remote_ready", dumped, filename)
+            self.assertNotIn("remote_state", dumped, filename)
+            for fact in ("state", "isDraft", "labels", "reviewDecision", "mergeable",
+                         "mergeStateStatus", "headRefOid", "checks_state"):
+                self.assertIn(fact, dumped, (filename, fact))
+
+    def test_every_nonready_final_state_terminates_before_final_wait(self):
+        spec = self.load()["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = spec["edges"]
+        reasons = {"held", "review-red", "CI-red", "pending", "no-checks",
+                   "malformed", "unknown", "conflicting", "closed", "ready"}
+        terminal_reasons = {}
+        for node_id, node in nodes.items():
+            if not node_id.startswith("final_reason_"):
+                continue
+            mappings = {m["output"]: m["expression"]
+                        for m in node["config"]["mappings"]}
+            terminal_reasons[node_id] = mappings["reason"].get("value")
+        self.assertEqual(set(terminal_reasons.values()), reasons)
+        outgoing = {}
+        for edge in edges:
+            outgoing.setdefault(edge["source"], []).append(edge["target"])
+        def reaches(start, goal, seen=None):
+            seen = set() if seen is None else seen
+            if start == goal: return True
+            if start in seen: return False
+            seen.add(start)
+            return any(reaches(nxt, goal, seen.copy()) for nxt in outgoing.get(start, []))
+        for node_id, reason in terminal_reasons.items():
+            if reason != "ready":
+                self.assertFalse(reaches(node_id, "final_wait"), (node_id, reason))
+        cases = nodes["switch_final_policy"]["config"]["cases"]
+        self.assertTrue(any(any(rule.get("path") == "isDraft" for rule in case["rules"])
+                            for case in cases))
+        head = "a" * 40
+        base = {
+            "number": 7, "state": "OPEN", "isDraft": False,
+            "labels": [], "reviewDecision": "APPROVED", "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN", "headRefName": "feature", "headRefOid": head,
+        }
+        fixtures = (
+            ("ready", {}, "green"),
+            ("closed", {"state": "CLOSED"}, "green"),
+            ("held", {"isDraft": True}, "green"),
+            ("held", {"labels": [{"name": "hold:pm-review"}]}, "green"),
+            ("review_red", {"reviewDecision": "CHANGES_REQUESTED"}, "green"),
+            ("ci_red", {}, "red"), ("pending", {}, "pending"),
+            ("no_checks", {}, "no_checks"), ("malformed", {}, "malformed"),
+            ("unknown", {}, "unknown"), ("conflicting", {}, "inconsistent"),
+        )
+        for expected, changes, checks_state in fixtures:
+            view = {**base, **changes}
+            context = {"CTX": {"INPUT": {}}, "TASKS": {
+                "final_view": {"data": {"data": deepcopy(view)}},
+                "final_confirm_view": {"data": {"data": deepcopy(view)}},
+                "final_checks": {"data": {"checks_state": checks_state}},
+            }}
+            runner = NativeGraphRunner(
+                self.load(), RunControlDatastoreFixture(),
+                lambda node, payload, ctx: ("halt", {}),
+            )
+            runner.run({}, start="final_label_names", context=context)
+            self.assertIn("final_reason_" + expected, runner.executed)
+            self.assertNotIn("final_wait", runner.executed)
+            self.assertEqual("final_checkout" in runner.executed, expected == "ready")
+
+    def test_synchronous_policy_rejection_never_feeds_a_callback_wait(self):
+        spec = self.load()["spec"]
+        edges = spec["edges"]
+        incoming = [edge for edge in edges if edge["target"] == "final_wait"]
+        self.assertEqual([(edge["source"], edge.get("sourceHandle")) for edge in incoming],
+                         [("final_checkout", "success")])
+        predecessors = {edge["source"] for edge in edges
+                        if edge["target"].startswith("final_reason_")}
+        self.assertTrue(predecessors <= {
+            "switch_final_policy", "final_join_unknown", "final_join_conflicting",
+        })
+        nonready = [edge for edge in edges if edge["source"] == "switch_final_policy"
+                    and edge["target"] != "final_reason_ready"]
+        self.assertTrue(nonready)
+        outgoing = {}
+        for candidate in edges:
+            outgoing.setdefault(candidate["source"], []).append(candidate["target"])
+        def reaches_wait(start, seen=None):
+            seen = set() if seen is None else seen
+            if start == "final_wait": return True
+            if start in seen: return False
+            seen.add(start)
+            return any(reaches_wait(nxt, seen.copy()) for nxt in outgoing.get(start, []))
+        self.assertTrue(all(not reaches_wait(edge["target"]) for edge in nonready))
+
+    def test_merge_is_requested_only_after_exact_final_test_and_fresh_native_policy(self):
+        spec = self.load()["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                 for edge in spec["edges"]}
+        self.assertIn(("final_wait", "out", "final_callback_join"), edges)
+        self.assertIn(("final_test", "success", "final_callback_join"), edges)
+        self.assertIn(("final_callback_join", "out", "final_callback_snap"), edges)
+        self.assertIn(("final_callback_snap", "out", "switch_final_test"), edges)
+        self.assertIn(("switch_final_test", "case-0", "post_test_view"), edges)
+        self.assertIn(("post_test_confirm_view", "success", "post_test_label_names"), edges)
+        self.assertIn(("post_test_report_ready", "out", "rc_verified_state"), edges)
+        self.assertIn(("rc_verified_route", "case-0", "switch_merge_intent"), edges)
+        self.assertIn(("switch_merge_intent", "case-0", "request_merge"), edges)
+        self.assertIn(("switch_merge_intent", "default", "human_merge"), edges)
+        self.assertIn(("request_merge", "out", "merge"), edges)
+        self.assertEqual([(s, h) for s, h, target in edges if target == "merge"],
+                         [("request_merge", "out")])
+        merge = nodes["merge"]["config"]
+        self.assertEqual(merge["auto_merge"], "{{ CTX.run_input.auto_merge_authorized }}")
+        self.assertEqual(merge["evidence_job_id"],
+                         "{{ TASKS.final_wait.request.body.job_id }}")
+        callback = {m["output"]: m["expression"]
+                    for m in nodes["final_callback_snap"]["config"]["mappings"]}
+        self.assertIn("TASKS.final_test.data.job_id", json.dumps(callback["accepted_job_id"]))
+        self.assertIn("TASKS.final_wait.request.body.job_id",
+                      json.dumps(callback["callback_job_id"]))
+        rules = nodes["switch_final_test"]["config"]["cases"][0]["rules"]
+        self.assertIn({"path": "job_bound", "op": "equals", "value": True}, rules)
+        run_input = {m["output"]: m["expression"]
+                     for m in nodes["run_input"]["config"]["mappings"]}
+        self.assertIn("auto_merge_authorized", run_input)
+        self.assertNotIn("auto_merge", run_input)
+        self.assertEqual(nodes["form"]["config"]["inputs"]["auto_merge"]["type"],
+                         "boolean")
+
+    def test_final_and_merge_policy_contains_no_code_expression_or_procedural_nunjucks(self):
+        graph = self.load()
+        nodes = [node for node in graph["spec"]["nodes"]
+                 if any(token in node["id"] for token in ("final_", "post_test_", "merge"))]
+        dumped = json.dumps(nodes)
+        self.assertNotIn("codeExpression", dumped)
+        self.assertNotRegex(dumped, r"{%-?\s*(?:for|set|if|while)\b")
+        self.assertTrue(all(node["type"] in {
+            "transforms.objectBuilder", "transforms.transformArray", "logic.switch",
+            "action.graphwing.GET:/v1/gh/pr/view", "action.graphwing.GET:/v1/gh/pr/checks",
+            "action.graphwing.POST:/v1/git/checkout", "action.wait.webhook",
+            "action.graphwing.POST:/v1/test/run", "action.graphwing.POST:/v1/gh/pr/merge",
+            "logic.join.any", "logic.join.all", "action.noop",
+        } or node["id"] in {"rc_verified_state", "rc_verified_route"} for node in nodes))
+
     def test_pr_drive_actual_riftwing_workflow_lint_when_available(self):
-        graph_path = Path(server.__file__).parent / "graphs" / "pr-drive.json"
+        graph_paths = [Path(server.__file__).parent / "graphs" / name
+                       for name in ("pr-drive.json", "pr-status.json")]
         riftwing = os.environ.get("RIFTWING_CHECKOUT")
         if not riftwing:
             self.assertNotIn("transforms.codeExpression", {
@@ -26427,11 +26632,13 @@ func main() {
         with tempfile.TemporaryDirectory() as tmp:
             checker = Path(tmp) / "graphwing_pr_drive_lint.go"
             checker.write_text(go_source)
-            result = subprocess.run(["go", "run", str(checker), str(graph_path)],
-                                    cwd=Path(riftwing) / "rewst-go", text=True,
-                                    capture_output=True, timeout=120, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), "issues=0")
+            for graph_path in graph_paths:
+                result = subprocess.run(["go", "run", str(checker), str(graph_path)],
+                                        cwd=Path(riftwing) / "rewst-go", text=True,
+                                        capture_output=True, timeout=120, check=False)
+                self.assertEqual(result.returncode, 0,
+                                 graph_path.name + "\n" + result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), "issues=0", graph_path.name)
 
     def test_agent_launch_failure_reaches_the_run_control_failure_fence(self):
         # Live proof run ba65af2a: an HTTP 502 launching the writer (a
@@ -27651,6 +27858,8 @@ class NativeGraphRunner:
                 # asteval's length() is byte length of a coerced string and
                 # errors on arrays; count() is the array primitive.
                 return len(_native_text(args[0]))
+            if name == "substring":
+                return _native_text(args[0])[int(args[1]):int(args[2])]
             raise AssertionError(name)
         if kind == "filter":
             value = self.evaluate(expression["input"], context, item)
@@ -27733,6 +27942,15 @@ class NativeGraphRunner:
         if operation == "filter":
             condition = config["filterCondition"]["ast"]
             built = [item for item in source if self.evaluate(condition, self.context, item)]
+        elif operation == "map":
+            map_config = config["mapConfig"]
+            if map_config["mode"] == "field":
+                built = [self.path({"ITEM": item}, "ITEM." + map_config["fieldPath"])
+                         for item in source]
+            else:
+                built = [{mapping["output"]: self.evaluate(
+                    mapping["expression"], self.context, item,
+                ) for mapping in map_config["mappings"]} for item in source]
         elif operation == "concat":
             built = list(source) + list(
                 self.evaluate(config["concatValue"]["ast"], self.context) or [])
@@ -29086,8 +29304,7 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
             return "success", result
 
         runner = NativeGraphRunner(graph, store, actions)
-        runner.run({"request": {"body": {"status": "ok"}}},
-                   start="switch_final_test", context={
+        runner.run({}, start="rc_verified_state", context={
             "CTX": {"run_input": {"run_control_id": durable.run_control_id()}},
             "TASKS": {"route": {"result": {
                 "compatibility_behavior": durable.ROUTE["route_version"],
@@ -29097,7 +29314,8 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
         })
         self.assertIn("rc_verified_state", runner.executed)
         self.assertIn("rc_verified_route", runner.executed)
-        self.assertIn("merge_snap", runner.executed)
+        self.assertIn("switch_merge_intent", runner.executed)
+        self.assertIn("human_merge", runner.executed)
         self.assertEqual(durable.pointer(store)["terminal"]["outcome"], "verified")
 
     def test_drive_pr_no_longer_selects_route_or_mints_aggregate_budgets(self):
