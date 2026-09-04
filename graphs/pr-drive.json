@@ -294,6 +294,14 @@
                   3
                 ]
               }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
             }
           ]
         }
@@ -1755,8 +1763,10 @@
       },
       {
         "id": "iter_skip",
-        "type": "action.noop",
-        "config": {}
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
       },
       {
         "id": "iter_checkout",
@@ -1933,9 +1943,9 @@
                     "kind": "literal",
                     "value": 2000000
                   },
-                  "provider_cost_usd": {
+                  "cost_microusd": {
                     "kind": "literal",
-                    "value": "25"
+                    "value": 25000000
                   }
                 }
               }
@@ -2003,28 +2013,106 @@
               "run_control_id": "{{ CTX.run_input.run_control_id }}",
               "candidate_route": "{{ CTX.rc_task_material.candidate_route }}",
               "next_envelope": "{{ CTX.rc_task_material.next_envelope }}",
-              "launcher_fingerprint": "graphwing-loop-attempt-v1",
+              "launcher_fingerprint": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.launcher_version }}",
               "endpoint": "/v1/agent/run",
-              "exact_request_body_sha256": "{{ CTX.rc_task_hash.value }}",
+              "exact_request_body_sha256": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.request_sha256 }}",
               "repository": "{{ CTX.run_input.repo }}",
               "branch": "{{ TASKS.view.data.data.headRefName }}",
               "head_sha": "{{ CTX.iter_selected_review_facts.exact_head_sha }}",
-              "task_sha256": "{{ CTX.rc_task_hash.value }}",
-              "permission_profile": "pr-drive-writer-v1",
-              "callback_binding_sha256": "{{ CTX.rc_callback_hash.value }}",
-              "handoff": "{{ CTX.rc_task_material.handoff }}"
+              "task_sha256": "{{ TASKS.rc_task_hash.value }}",
+              "permission_profile": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.permission_profile }}",
+              "callback_binding_sha256": "{{ TASKS.rc_authority_facts.data.descriptor_preparation.callback_sha256 }}",
+              "handoff": "{{ CTX.rc_task_material.handoff }}",
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}",
+              "verified": false,
+              "state_version": "v2",
+              "decision_only": false
             }
           },
           "outputMapping": {
             "mode": "select",
             "keys": [
-              "transition_result",
-              "attempt_identity",
-              "reservation_parts",
-              "descriptor_hash"
+              "v2_policy",
+              "v2_decision_result",
+              "v2_terminal_result",
+              "v2_existing_terminal_result",
+              "v2_restructure",
+              "v2_reserve_commit"
             ]
           },
           "timeout": 2400
+        }
+      },
+      {
+        "id": "rc_state_route",
+        "type": "logic.switch",
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "terminal",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "terminal"
+                }
+              ]
+            },
+            {
+              "label": "gaming terminal",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "terminal_nonretryable"
+                }
+              ]
+            },
+            {
+              "label": "exhausted",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "exhausted"
+                }
+              ]
+            },
+            {
+              "label": "park",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "park"
+                }
+              ]
+            },
+            {
+              "label": "verified",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "verified"
+                }
+              ]
+            },
+            {
+              "label": "restructure",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "restructure"
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "launch"
+          }
         }
       },
       {
@@ -2037,52 +2125,21 @@
           "inputMapping": {
             "mode": "select",
             "values": {
-              "run_control_id": "{{ CTX.run_input.run_control_id }}"
+              "run_control_id": "{{ CTX.run_input.run_control_id }}",
+              "state_version": "v2",
+              "descriptor_preparation": "{{ TASKS.rc_authority_facts.data.descriptor_preparation }}",
+              "issued_at": "{{ TASKS.rc_authority_facts.data.issued_at }}",
+              "expires_at": "{{ TASKS.rc_authority_facts.data.expires_at }}"
             }
           },
           "outputMapping": {
             "mode": "select",
             "keys": [
-              "transition_result",
-              "consume_result"
+              "v2_transition_result",
+              "v2_consume_result"
             ]
           },
           "timeout": 2400
-        }
-      },
-      {
-        "id": "rc_continuity",
-        "type": "transforms.objectBuilder",
-        "config": {
-          "alias": "rc_continuity",
-          "version": 1,
-          "mappings": [
-            {
-              "id": "m1",
-              "output": "run_control",
-              "expression": {
-                "kind": "object",
-                "properties": {
-                  "run_control_id": {
-                    "kind": "getField",
-                    "path": "CTX.run_input.run_control_id"
-                  },
-                  "attempt_id": {
-                    "kind": "getField",
-                    "path": "TASKS.rc_state.result.attempt_identity.attempt_id"
-                  },
-                  "authorization_id": {
-                    "kind": "getField",
-                    "path": "TASKS.rc_state.result.attempt_identity.authorization_id"
-                  },
-                  "launch_descriptor_sha256": {
-                    "kind": "getField",
-                    "path": "TASKS.rc_state.result.descriptor_hash.value"
-                  }
-                }
-              }
-            }
-          ]
         }
       },
       {
@@ -2114,29 +2171,20 @@
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 60,
-          "cwd": "{{ CTX.run_input.repo }}",
-          "prompt": "{{ CTX.iter_writer_task.task | tojson }}",
-          "launcher": "{{ TASKS.route.result.launcher }}",
-          "provider": "{{ TASKS.route.result.provider }}",
-          "model": "{{ TASKS.route.result.model }}",
-          "effort": "{{ TASKS.route.result.effort }}",
-          "route_execution_profile": "{{ TASKS.route.result.writer_execution_profile }}",
-          "_comment": "Without these the writer takes AGENT_RUN_BUDGET=300 and is SIGINTed at 300+60. Three laps ran 260s, 335s and 363s, so a fix round is L-sized work, not M. wait is 960, which clears 600+60 with room.",
-          "max_turns": "50",
-          "run_budget_seconds": "600",
-          "response_webhook_url": "{{ TASKS.wait.pending.resumeUrl }}",
-          "response_webhook_token": "{{ TASKS.wait.pending.resumeToken }}",
-          "run_control": "{{ CTX.rc_continuity.run_control }}"
-        }
-      },
-      {
-        "id": "rc_settle",
-        "type": "action.graphwing.POST:/v1/run/control/settle",
-        "config": {
-          "integrationInstanceId": "$GRAPHWING_INSTANCE",
-          "timeout": 30,
-          "run_control": "{{ CTX.rc_continuity.run_control }}",
-          "receipt": "{{ TASKS.wait.request.body }}"
+          "prompt": "{{ CTX.rc_launch_request.prompt }}",
+          "launcher": "{{ CTX.rc_launch_request.launcher }}",
+          "provider": "{{ CTX.rc_launch_request.provider }}",
+          "model": "{{ CTX.rc_launch_request.model }}",
+          "effort": "{{ CTX.rc_launch_request.effort }}",
+          "route_execution_profile": "{{ CTX.rc_launch_request.route_execution_profile }}",
+          "max_turns": "{{ CTX.rc_launch_request.max_turns }}",
+          "run_budget_seconds": "{{ CTX.rc_launch_request.run_budget_seconds }}",
+          "max_tokens": "{{ CTX.rc_launch_request.max_tokens }}",
+          "max_cost_usd": "{{ CTX.rc_launch_request.max_cost_usd }}",
+          "cwd": "{{ CTX.rc_launch_request.cwd }}",
+          "response_webhook_url": "{{ CTX.rc_launch_request.response_webhook_url }}",
+          "response_webhook_token": "{{ CTX.rc_launch_request.response_webhook_token }}",
+          "rewst_authorization": "{{ TASKS.rc_consume.result.v2_consume_result.authorization }}"
         }
       },
       {
@@ -2150,16 +2198,21 @@
             "mode": "select",
             "values": {
               "run_control_id": "{{ CTX.run_input.run_control_id }}",
-              "kind": "{{ TASKS.rc_settle.data.kind }}",
-              "receipt": "{{ TASKS.rc_settle.data.receipt }}",
-              "authority_loss_reason": "{{ TASKS.rc_settle.data.authority_loss_reason }}",
-              "progress": "{{ CTX.rc_progress }}"
+              "kind": "{{ CTX.rc_authority_loss.kind | default('terminal_receipt') }}",
+              "receipt": null,
+              "authority_loss_reason": "{{ CTX.rc_authority_loss.authority_loss_reason }}",
+              "progress": "{{ CTX.rc_progress }}",
+              "state_version": "v2",
+              "attempt_job_id": "{{ CTX.rc_agent_accepted.job_id }}",
+              "authorization_identity": "{{ CTX.rc_consumed_identity.authorization_identity }}",
+              "reserved_envelope": "{{ CTX.rc_task_material.next_envelope }}",
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}"
             }
           },
           "outputMapping": {
             "mode": "select",
             "keys": [
-              "transition_result"
+              "v2_commit"
             ]
           },
           "timeout": 2400
@@ -2181,32 +2234,60 @@
               "id": "m1",
               "output": "status",
               "expression": {
-                "kind": "getField",
-                "path": "TASKS.wait.request.body.status"
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.wait.request.body.status"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_wait_job.data.receipt.status"
+                }
               }
             },
             {
               "id": "m2",
               "output": "summary",
               "expression": {
-                "kind": "getField",
-                "path": "TASKS.wait.request.body.summary"
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.wait.request.body.summary"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_wait_job.data.receipt.summary"
+                }
               }
             },
             {
               "id": "m3",
               "output": "job_id",
               "expression": {
-                "kind": "getField",
-                "path": "TASKS.wait.request.body.job_id"
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.wait.request.body.job_id"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_wait_job.data.receipt.job_id"
+                }
               }
             },
             {
               "id": "m4",
               "output": "sha",
               "expression": {
-                "kind": "getField",
-                "path": "TASKS.wait.request.body.sha"
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.wait.request.body.sha"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_wait_job.data.receipt.sha"
+                }
               }
             },
             {
@@ -2451,18 +2532,6 @@
         "id": "herdr_pr_checkout",
         "type": "action.noop",
         "label": "Herdr: PR checkout failed",
-        "config": {}
-      },
-      {
-        "id": "herdr_wait_timeout",
-        "type": "action.noop",
-        "label": "Herdr: agent wait timeout",
-        "config": {}
-      },
-      {
-        "id": "herdr_wait_fail",
-        "type": "action.noop",
-        "label": "Herdr: agent wait failure",
         "config": {}
       },
       {
@@ -2845,7 +2914,7 @@
               "output": "diff_fingerprint",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.rc_diff_hash.value"
+                "path": "TASKS.rc_diff_hash.value"
               }
             },
             {
@@ -3040,6 +3109,14 @@
               "expression": {
                 "kind": "getField",
                 "path": "TASKS.final_view.data.holds"
+              }
+            },
+            {
+              "id": "m_continuation_required",
+              "output": "continuation_required",
+              "expression": {
+                "kind": "literal",
+                "value": true
               }
             }
           ]
@@ -3265,6 +3342,459 @@
           "y": 520
         },
         "config": {}
+      },
+      {
+        "id": "rc_launch_request",
+        "type": "transforms.objectBuilder",
+        "config": {
+          "alias": "rc_launch_request",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m_prompt",
+              "output": "prompt",
+              "expression": {
+                "kind": "filter",
+                "filter": "tojson",
+                "input": {
+                  "kind": "getField",
+                  "path": "CTX.iter_writer_task.task"
+                }
+              }
+            },
+            {
+              "id": "m_launcher",
+              "output": "launcher",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.route.result.launcher"
+              }
+            },
+            {
+              "id": "m_provider",
+              "output": "provider",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.route.result.provider"
+              }
+            },
+            {
+              "id": "m_model",
+              "output": "model",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.route.result.model"
+              }
+            },
+            {
+              "id": "m_effort",
+              "output": "effort",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.route.result.effort"
+              }
+            },
+            {
+              "id": "m_route_execution_profile",
+              "output": "route_execution_profile",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.route.result.writer_execution_profile"
+              }
+            },
+            {
+              "id": "m_max_turns",
+              "output": "max_turns",
+              "expression": {
+                "kind": "literal",
+                "value": "50"
+              }
+            },
+            {
+              "id": "m_run_budget_seconds",
+              "output": "run_budget_seconds",
+              "expression": {
+                "kind": "literal",
+                "value": "600"
+              }
+            },
+            {
+              "id": "m_max_tokens",
+              "output": "max_tokens",
+              "expression": {
+                "kind": "literal",
+                "value": "2000000"
+              }
+            },
+            {
+              "id": "m_max_cost_usd",
+              "output": "max_cost_usd",
+              "expression": {
+                "kind": "literal",
+                "value": "25"
+              }
+            },
+            {
+              "id": "m_cwd",
+              "output": "cwd",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.run_input.repo"
+              }
+            },
+            {
+              "id": "m_response_webhook_url",
+              "output": "response_webhook_url",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.wait.pending.resumeUrl"
+              }
+            },
+            {
+              "id": "m_response_webhook_token",
+              "output": "response_webhook_token",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.wait.pending.resumeToken"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_authority_facts",
+        "type": "action.graphwing.POST:/v1/rewst/launch-authority-facts",
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "operation": "agent_run",
+          "launcher": "{{ TASKS.route.result.launcher }}",
+          "request": "{{ CTX.rc_launch_request }}",
+          "alias": "rc_authority_facts"
+        }
+      },
+      {
+        "id": "rc_poll_job",
+        "type": "action.graphwing.GET:/v1/agent/jobs/{job_id}",
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 30,
+          "job_id": "{{ CTX.rc_agent_accepted.job_id }}",
+          "alias": "rc_poll_job"
+        }
+      },
+      {
+        "id": "rc_wait_job",
+        "type": "action.graphwing.POST:/v1/agent/jobs/wait",
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 60,
+          "job_id": "{{ CTX.rc_agent_accepted.job_id }}",
+          "timeout_seconds": 30,
+          "alias": "rc_wait_job"
+        }
+      },
+      {
+        "id": "rc_authority_loss",
+        "type": "transforms.objectBuilder",
+        "config": {
+          "alias": "rc_authority_loss",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m_kind",
+              "output": "kind",
+              "expression": {
+                "kind": "literal",
+                "value": "authority_loss"
+              }
+            },
+            {
+              "id": "m_authority_loss_reason",
+              "output": "authority_loss_reason",
+              "expression": {
+                "kind": "literal",
+                "value": "callback_lost_or_daemon_restarted"
+              }
+            },
+            {
+              "id": "m_reserved_envelope",
+              "output": "reserved_envelope",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.rc_task_material.next_envelope"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_verified_state",
+        "type": "action.subworkflow",
+        "config": {
+          "alias": "rc_verified_state",
+          "workflowId": "$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID",
+          "workflowVersionId": "$GRAPHWING_RUN_CONTROL_STATE_VERSION_ID",
+          "inputMapping": {
+            "mode": "select",
+            "values": {
+              "run_control_id": "{{ CTX.run_input.run_control_id }}",
+              "state_version": "v2",
+              "candidate_route": {
+                "route_version": "{{ TASKS.route.result.compatibility_behavior }}",
+                "launcher": "{{ TASKS.route.result.launcher }}",
+                "provider": "{{ TASKS.route.result.provider }}",
+                "model": "{{ TASKS.route.result.model }}"
+              },
+              "next_envelope": {
+                "turns": 50,
+                "wall_seconds": 660,
+                "tokens": 2000000,
+                "cost_microusd": 25000000
+              },
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}",
+              "verified": true,
+              "decision_only": false
+            }
+          },
+          "outputMapping": {
+            "mode": "select",
+            "keys": [
+              "v2_policy",
+              "v2_terminal_result",
+              "v2_existing_terminal_result",
+              "v2_restructure"
+            ]
+          },
+          "timeout": 2400
+        }
+      },
+      {
+        "id": "rc_verified_route",
+        "type": "logic.switch",
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "verified",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "verified"
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "not verified"
+          }
+        }
+      },
+      {
+        "id": "rc_authority_loss_join",
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "rc_receipt_join",
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "rc_consumed_identity",
+        "type": "transforms.objectBuilder",
+        "config": {
+          "alias": "rc_consumed_identity",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "authorization_identity",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.rc_consume.result.v2_consume_result.authorization_identity"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_agent_accepted",
+        "type": "transforms.objectBuilder",
+        "label": "Bind accepted exact-authorized job",
+        "config": {
+          "alias": "rc_agent_accepted",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "job_id",
+              "expression": {
+                "kind": "getField",
+                "path": "TASKS.agent.data.job_id"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "rc_decide",
+        "type": "action.subworkflow",
+        "config": {
+          "alias": "rc_decide",
+          "workflowId": "$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID",
+          "workflowVersionId": "$GRAPHWING_RUN_CONTROL_STATE_VERSION_ID",
+          "inputMapping": {
+            "mode": "select",
+            "values": {
+              "run_control_id": "{{ CTX.run_input.run_control_id }}",
+              "candidate_route": "{{ CTX.rc_task_material.candidate_route }}",
+              "next_envelope": "{{ CTX.rc_task_material.next_envelope }}",
+              "handoff": "{{ CTX.rc_task_material.handoff }}",
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}",
+              "verified": false,
+              "state_version": "v2",
+              "decision_only": true
+            }
+          },
+          "outputMapping": {
+            "mode": "select",
+            "keys": [
+              "v2_policy",
+              "v2_decision_result",
+              "v2_terminal_result",
+              "v2_existing_terminal_result",
+              "v2_restructure",
+              "v2_reserve_commit"
+            ]
+          },
+          "timeout": 2400
+        }
+      },
+      {
+        "id": "rc_nonlaunch_state",
+        "type": "action.subworkflow",
+        "config": {
+          "alias": "rc_nonlaunch_state",
+          "workflowId": "$GRAPHWING_RUN_CONTROL_STATE_WORKFLOW_ID",
+          "workflowVersionId": "$GRAPHWING_RUN_CONTROL_STATE_VERSION_ID",
+          "inputMapping": {
+            "mode": "select",
+            "values": {
+              "run_control_id": "{{ CTX.run_input.run_control_id }}",
+              "candidate_route": "{{ CTX.rc_task_material.candidate_route }}",
+              "next_envelope": "{{ CTX.rc_task_material.next_envelope }}",
+              "handoff": "{{ CTX.rc_task_material.handoff }}",
+              "owner_workflow_run_id": "{{ WORKFLOW.runId }}",
+              "verified": false,
+              "state_version": "v2",
+              "decision_only": false
+            }
+          },
+          "outputMapping": {
+            "mode": "select",
+            "keys": [
+              "v2_policy",
+              "v2_decision_result",
+              "v2_terminal_result",
+              "v2_existing_terminal_result",
+              "v2_restructure",
+              "v2_reserve_commit"
+            ]
+          },
+          "timeout": 2400
+        }
+      },
+      {
+        "id": "rc_reserve_route",
+        "type": "logic.switch",
+        "config": {
+          "mode": "rules",
+          "cases": [
+            {
+              "label": "terminal",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "terminal"
+                }
+              ]
+            },
+            {
+              "label": "gaming terminal",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "terminal_nonretryable"
+                }
+              ]
+            },
+            {
+              "label": "exhausted",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "exhausted"
+                }
+              ]
+            },
+            {
+              "label": "park",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "park"
+                }
+              ]
+            },
+            {
+              "label": "verified",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "verified"
+                }
+              ]
+            },
+            {
+              "label": "restructure",
+              "rules": [
+                {
+                  "path": "v2_policy.decision",
+                  "op": "equals",
+                  "value": "restructure"
+                }
+              ]
+            }
+          ],
+          "default": {
+            "label": "launch"
+          }
+        }
+      },
+      {
+        "id": "rc_poll_join",
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
+      },
+      {
+        "id": "rc_nonlaunch_join",
+        "type": "logic.join.any",
+        "config": {
+          "stopOnFirst": true
+        }
       }
     ],
     "edges": [
@@ -3577,31 +4107,10 @@
         "targetHandle": "in"
       },
       {
-        "id": "e20",
-        "source": "rc_callback_hash",
-        "sourceHandle": "out",
-        "target": "rc_state",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e21",
-        "source": "rc_state",
-        "sourceHandle": "success",
-        "target": "rc_consume",
-        "targetHandle": "in"
-      },
-      {
         "id": "e22",
         "source": "rc_state",
         "sourceHandle": "failure",
         "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e23",
-        "source": "rc_consume",
-        "sourceHandle": "success",
-        "target": "rc_continuity",
         "targetHandle": "in"
       },
       {
@@ -3612,57 +4121,15 @@
         "targetHandle": "in"
       },
       {
-        "id": "e25",
-        "source": "rc_continuity",
-        "sourceHandle": "out",
-        "target": "wait",
-        "targetHandle": "in"
-      },
-      {
         "id": "e26",
         "source": "wait",
         "sourceHandle": "pending",
-        "target": "agent",
+        "target": "rc_launch_request",
         "targetHandle": "in"
       },
       {
         "id": "e26b",
         "source": "agent",
-        "sourceHandle": "failure",
-        "target": "rc_failure_join",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e27",
-        "source": "wait",
-        "sourceHandle": "out",
-        "target": "rc_settle",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e28",
-        "source": "wait",
-        "sourceHandle": "timeout",
-        "target": "herdr_wait_timeout",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e29",
-        "source": "wait",
-        "sourceHandle": "failure",
-        "target": "herdr_wait_fail",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e30",
-        "source": "rc_settle",
-        "sourceHandle": "success",
-        "target": "receipt",
-        "targetHandle": "in"
-      },
-      {
-        "id": "e31",
-        "source": "rc_settle",
         "sourceHandle": "failure",
         "target": "rc_failure_join",
         "targetHandle": "in"
@@ -3874,7 +4341,7 @@
         "id": "e55",
         "source": "switch_final_test",
         "sourceHandle": "case-0",
-        "target": "merge_snap",
+        "target": "rc_verified_state",
         "targetHandle": "in"
       },
       {
@@ -4088,10 +4555,304 @@
         "targetHandle": "in"
       },
       {
-        "id": "e83",
+        "id": "e_pr5_1",
+        "source": "rc_launch_request",
+        "sourceHandle": "out",
+        "target": "rc_authority_facts",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_2",
+        "source": "rc_authority_facts",
+        "sourceHandle": "success",
+        "target": "rc_state",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_3",
+        "source": "rc_authority_facts",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_4",
+        "source": "rc_consume",
+        "sourceHandle": "success",
+        "target": "rc_consumed_identity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_7",
+        "source": "rc_poll_job",
+        "sourceHandle": "success",
+        "target": "rc_wait_job",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_8",
+        "source": "rc_poll_job",
+        "sourceHandle": "failure",
+        "target": "rc_authority_loss_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_9",
+        "source": "rc_wait_job",
+        "sourceHandle": "success",
+        "target": "rc_receipt_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_10",
+        "source": "rc_wait_job",
+        "sourceHandle": "failure",
+        "target": "rc_authority_loss_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_11",
+        "source": "rc_authority_loss",
+        "sourceHandle": "out",
+        "target": "rc_evidence_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_12",
+        "source": "wait",
+        "sourceHandle": "out",
+        "target": "rc_receipt_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_verified",
+        "source": "rc_verified_state",
+        "sourceHandle": "success",
+        "target": "rc_verified_route",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_verified_fail",
+        "source": "rc_verified_state",
+        "sourceHandle": "failure",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_loss_join",
+        "source": "rc_authority_loss_join",
+        "sourceHandle": "out",
+        "target": "rc_authority_loss",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_receipt_join",
+        "source": "rc_receipt_join",
+        "sourceHandle": "out",
+        "target": "receipt",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_consumed_identity",
+        "source": "rc_consumed_identity",
+        "sourceHandle": "out",
+        "target": "agent",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_verified_route",
+        "source": "rc_verified_route",
+        "sourceHandle": "case-0",
+        "target": "merge_snap",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_verified_blocked",
+        "source": "rc_verified_route",
+        "sourceHandle": "default",
+        "target": "join_final_fail",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_rc_agent_accepted",
+        "source": "agent",
+        "sourceHandle": "success",
+        "target": "rc_agent_accepted",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide",
+        "source": "rc_callback_hash",
+        "sourceHandle": "out",
+        "target": "rc_decide",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_ok",
+        "source": "rc_decide",
+        "sourceHandle": "success",
+        "target": "rc_state_route",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_fail",
+        "source": "rc_decide",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_launch",
+        "source": "rc_state_route",
+        "sourceHandle": "default",
+        "target": "wait",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_0",
+        "source": "rc_state_route",
+        "sourceHandle": "case-0",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_1",
+        "source": "rc_state_route",
+        "sourceHandle": "case-1",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_2",
+        "source": "rc_state_route",
+        "sourceHandle": "case-2",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_3",
+        "source": "rc_state_route",
+        "sourceHandle": "case-3",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_4",
+        "source": "rc_state_route",
+        "sourceHandle": "case-4",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_decide_nonlaunch_5",
+        "source": "rc_state_route",
+        "sourceHandle": "case-5",
+        "target": "rc_nonlaunch_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_nonlaunch_ok",
+        "source": "rc_nonlaunch_state",
+        "sourceHandle": "success",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_nonlaunch_fail",
+        "source": "rc_nonlaunch_state",
+        "sourceHandle": "failure",
+        "target": "rc_failure_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_ok",
+        "source": "rc_state",
+        "sourceHandle": "success",
+        "target": "rc_reserve_route",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_launch",
+        "source": "rc_reserve_route",
+        "sourceHandle": "default",
+        "target": "rc_consume",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_0",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-0",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_1",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-1",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_2",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-2",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_3",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-3",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_4",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-4",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_reserve_nonlaunch_5",
+        "source": "rc_reserve_route",
+        "sourceHandle": "case-5",
+        "target": "iter_skip",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_wait_timeout_poll",
+        "source": "wait",
+        "sourceHandle": "timeout",
+        "target": "rc_poll_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_wait_failure_poll",
+        "source": "wait",
+        "sourceHandle": "failure",
+        "target": "rc_poll_join",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_progress_reconcile",
         "source": "rc_progress",
         "sourceHandle": "out",
         "target": "rc_reconcile",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_poll_join",
+        "source": "rc_poll_join",
+        "sourceHandle": "out",
+        "target": "rc_poll_job",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e187_nonlaunch_join",
+        "source": "rc_nonlaunch_join",
+        "sourceHandle": "out",
+        "target": "rc_nonlaunch_state",
         "targetHandle": "in"
       }
     ]

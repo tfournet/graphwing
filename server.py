@@ -850,7 +850,9 @@ def _validate_rewst_consumed_authorization(
             or not issued_at <= timestamp <= expires_at
             or expires_at - issued_at > 900
             or not _valid_rewst_id(auth.get("authorization_id"))
-            or auth.get("collection") != "graphwing_run_control_v1"
+            or auth.get("collection") not in {
+                "graphwing_run_control_v1", "graphwing_run_control_history_v2",
+            }
             or not _valid_rewst_id(auth.get("record_key"))
             or not _valid_sha256(auth.get("payload_sha256"))
             or not isinstance(auth_challenge, str)
@@ -1004,6 +1006,135 @@ def rewst_descriptor_matches(authority: Any, expected: Any) -> bool:
     return hmac.compare_digest(actual_hash, expected_hash)
 
 
+def rewst_launch_authority_facts(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) not in ({"operation", "launcher"}, {"operation", "launcher", "request"}) \
+            or data.get("operation") != "agent_run":
+        return 400, {
+            "error": "operation and launcher must identify one agent_run launcher",
+            "code": "bad_launch_authority_facts_request",
+        }
+    launcher = data.get("launcher")
+    if not isinstance(launcher, str) or launcher not in NATIVE_LAUNCHERS:
+        return 400, {
+            "error": "launcher must be claude, codex, or grok",
+            "code": "bad_launcher",
+        }
+    fingerprint = launcher_version_fingerprint(resolve_launcher_binary_now(launcher), launcher)
+    if fingerprint in (None, "missing_companion"):
+        return 501, {
+            "error": "launcher authority facts are unavailable",
+            "code": "missing_binary" if fingerprint == "missing_companion"
+            else "launcher_version_mismatch",
+        }
+    issued_at = int(time.time())
+    out = {
+        "version": "graphwing-launch-authority-facts-v1",
+        "challenge_version": "graphwing-server-instance-challenge-v1",
+        "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
+        "descriptor_version": "graphwing-launch-descriptor-v1",
+        "operation": "agent_run",
+        "role": "writer",
+        "launcher": launcher,
+        "provider": NATIVE_LAUNCHERS[launcher]["provider"],
+        "launcher_version": fingerprint,
+        "permission_profile": AGENT_PERMISSION_PROFILE,
+        "issued_at": issued_at,
+        "expires_at": issued_at + REWST_SIGNATURE_MAX_SKEW_SECONDS,
+        "hard_ceilings": {
+            "max_turns": REWST_LAUNCH_MAX_TURNS,
+            "wall_seconds": REWST_LAUNCH_MAX_WALL_SECONDS,
+            "max_tokens": REWST_LAUNCH_MAX_TOKENS,
+            "max_cost_usd": str(REWST_LAUNCH_MAX_COST_USD),
+        },
+    }
+    request = data.get("request")
+    if request is not None:
+        prepared, prepare_err = _rewst_agent_descriptor_preparation(request, load_repos())
+        if prepare_err is not None:
+            return 400, prepare_err
+        out["descriptor_preparation"] = prepared
+    return 200, out
+
+
+def _rewst_agent_descriptor_preparation(
+    data: Any, repos: dict[str, str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    allowed = {
+        "prompt", "launcher", "provider", "model", "max_turns", "run_budget_seconds",
+        "cwd", "response_webhook_url", "response_webhook_token", "effort",
+        "route_execution_profile", "run_control", "max_tokens", "max_cost_usd",
+    }
+    if not isinstance(data, dict) or set(data) - allowed:
+        return None, {"error": "request contains unsupported fields", "code": "unexpected_fields"}
+    prompt = data.get("prompt")
+    launcher, provider, model = data.get("launcher"), data.get("provider"), data.get("model")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None, {"error": "prompt is required", "code": "missing_prompt"}
+    prompt = prompt.strip()
+    native = NATIVE_LAUNCHERS.get(launcher) if isinstance(launcher, str) else None
+    if native is None:
+        return None, {"error": "launcher must be claude, codex, or grok", "code": "bad_launcher"}
+    if provider != native["provider"] or model not in native["models"]:
+        return None, {"error": "invalid native model identity", "code": "bad_model_identity"}
+    requested_effort = data.get("effort", "default")
+    profile, profile_err = parse_route_execution_profile(
+        data.get("route_execution_profile"), expected_role="writer", launcher=launcher,
+        provider=provider, model=model, effort=requested_effort,
+    )
+    if profile_err is not None or profile is None:
+        return None, profile_err or {"error": "invalid route profile", "code": "bad_route_execution_profile"}
+    effort, effort_err = normalize_effort(launcher, provider, model, requested_effort, "route")
+    if effort_err is not None or effort is None:
+        return None, effort_err or {"error": "unsupported effort", "code": "unsupported_effort"}
+    turns, turns_err = parse_optional_int(data, "max_turns", 1, REWST_LAUNCH_MAX_TURNS)
+    wall, wall_err = parse_optional_int(data, "run_budget_seconds", 1, REWST_LAUNCH_MAX_WALL_SECONDS)
+    tokens, tokens_err = parse_optional_int(data, "max_tokens", 0, REWST_LAUNCH_MAX_TOKENS)
+    cost = data.get("max_cost_usd")
+    parsed_cost = _run_control_cost(cost)
+    if (turns_err or wall_err or tokens_err or turns is None or wall is None or tokens is None
+            or parsed_cost is None or parsed_cost > REWST_LAUNCH_MAX_COST_USD):
+        return None, {"error": "launch envelope is invalid", "code": "bad_launch_envelope"}
+    webhook_url, webhook_token, webhook_err = parse_webhook_fields(data)
+    if webhook_err:
+        return None, webhook_err
+    continuity = run_control_continuity(data.get("run_control")) if "run_control" in data else None
+    if "run_control" in data and continuity is None:
+        return None, {"error": "run_control continuity is required", "code": "bad_run_control_continuity"}
+    repo_name, resolved = resolve_run_cwd(data.get("cwd"), repos)
+    if repo_name is None:
+        assert isinstance(resolved, dict)
+        return None, resolved
+    branch, head, git_err = current_branch_head(resolved)
+    if git_err is not None or branch is None or head is None:
+        return None, git_err or {"error": "git identity unavailable", "code": "git_state_unavailable"}
+    fingerprint = launcher_version_fingerprint(resolve_launcher_binary_now(launcher), launcher)
+    if fingerprint in (None, "missing_companion"):
+        return None, {"error": "launcher identity unavailable", "code": "launcher_version_mismatch"}
+    canonical_request = _rewst_canonical_json_bytes(data)
+    assert canonical_request is not None
+    route_version = profile.get("route_version") or profile.get("policy_version")
+    effective_size = profile.get("size") or profile.get("effective_size")
+    return {
+        "descriptor_version": "graphwing-launch-descriptor-v1", "operation": "agent_run",
+        "route_version": route_version, "role": "writer", "work_kind": profile["work_kind"],
+        "work_class": profile["class"], "effective_size": effective_size,
+        "profile_version": profile["version"], "launcher": launcher, "provider": provider,
+        "model": model, **effort, "launcher_version": fingerprint, "repo": repo_name,
+        "branch": branch, "starting_head": head,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "diff_sha256": None,
+        "resume_parent_job_id": None, "max_turns": turns, "wall_seconds": wall,
+        "max_tokens": tokens, "max_cost_usd": cost,
+        "callback_sha256": _rewst_callback_sha256(webhook_url, webhook_token),
+        "permission_profile": AGENT_PERMISSION_PROFILE,
+        "request_sha256": hashlib.sha256(canonical_request).hexdigest(),
+        "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
+    }, None
+
+
 def _rewst_callback_sha256(url: str | None, token: str | None) -> str:
     canonical = _rewst_canonical_json_bytes({
         "response_webhook_token": token,
@@ -1028,11 +1159,11 @@ def _rewst_agent_launch_descriptor(
     expected = {
         "descriptor_version": "graphwing-launch-descriptor-v1",
         "operation": "agent_run",
-        "route_version": route_profile["route_version"],
+        "route_version": route_profile.get("route_version") or route_profile["policy_version"],
         "role": "writer",
         "work_kind": route_profile["work_kind"],
         "work_class": route_profile["class"],
-        "effective_size": route_profile["size"],
+        "effective_size": route_profile.get("size") or route_profile["effective_size"],
         "profile_version": route_profile["version"],
         "launcher": launcher,
         "provider": provider,
@@ -14131,6 +14262,10 @@ def dispatch_inner(
             "challenge_version": "graphwing-server-instance-challenge-v1",
             "server_instance_challenge": REWST_SERVER_INSTANCE_CHALLENGE,
         })
+
+    if method == "POST" and path == "/v1/rewst/launch-authority-facts":
+        status, payload = rewst_launch_authority_facts(body)
+        return json_out(status, payload)
 
     if method == "GET" and path == "/v1/units/status":
         out = units_status()

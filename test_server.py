@@ -7703,7 +7703,7 @@ while True:
 
     def test_pr_graph_action_configs_match_openapi_request_shapes(self):
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
-        ignored = {"integrationInstanceId", "timeout", "_comment"}
+        ignored = {"integrationInstanceId", "timeout", "_comment", "alias"}
         for filename in ("pr-drive.json", "pr-status.json"):
             graph = json.loads((Path(server.__file__).parent / "graphs" / filename).read_text())
             for node in graph["spec"]["nodes"]:
@@ -8039,8 +8039,8 @@ while True:
             pending.extend(outgoing.get(source, ()))
         self.assertEqual(reachable, {
             "rc_evidence_join", "rc_diff", "rc_diff_hash", "rc_constraint_candidates",
-            "rc_constraint_signals", "rc_progress", "rc_reconcile", "rc_failure_join",
-            "rc_failure",
+            "rc_constraint_signals", "rc_progress", "rc_reconcile",
+            "rc_failure_join", "rc_failure",
         })
         self.assertTrue({"iter_writer_task", "rc_state", "rc_consume", "agent", "wait_fix"}
                         .isdisjoint(reachable))
@@ -11472,10 +11472,11 @@ while True:
             if node["type"].endswith(("/v1/agent/run", "/v1/review/run"))
         ]
         self.assertEqual([node["id"] for node in model_nodes], ["agent"])
-        self.assertEqual(nodes["agent"]["config"].get("effort"), "{{ TASKS.route.result.effort }}")
+        self.assertEqual(nodes["agent"]["config"].get("effort"),
+                         "{{ CTX.rc_launch_request.effort }}")
         self.assertEqual(
             nodes["agent"]["config"].get("route_execution_profile"),
-            "{{ TASKS.route.result.writer_execution_profile }}",
+            "{{ CTX.rc_launch_request.route_execution_profile }}",
         )
         self.assertEqual(
             [node["id"] for node in graph["nodes"] if node["id"] == "route"
@@ -13971,8 +13972,8 @@ func main() {
             },
             "pr-drive.json": {
                 "route_nodes": {"route"},
-                "consumers": {"agent": "{{ TASKS.route.result.effort }}"},
-                "profiles": {"agent": "{{ TASKS.route.result.writer_execution_profile }}"},
+                "consumers": {"agent": "{{ CTX.rc_launch_request.effort }}"},
+                "profiles": {"agent": "{{ CTX.rc_launch_request.route_execution_profile }}"},
             },
         }
         graphs = {
@@ -14072,7 +14073,7 @@ func main() {
         self.assertTrue(any(e["source"] == "attempts" and e.get("sourceHandle") == "each"
                             and e["target"] == "iter_findings" for e in edges))
         self.assertEqual(nodes["agent"]["config"]["prompt"],
-                         "{{ CTX.iter_writer_task.task | tojson }}")
+                         "{{ CTX.rc_launch_request.prompt }}")
         task_dump = json.dumps(nodes["iter_writer_task"])
         self.assertIn("pr-correction-task-v1", task_dump)
         self.assertIn("CTX.iter_actionable_review_findings", task_dump)
@@ -14086,7 +14087,11 @@ func main() {
         graph = json.loads((Path(server.__file__).parent / "graphs" / "pr-drive.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         cfg = nodes["agent"]["config"]
-        budget = int(cfg["run_budget_seconds"])
+        budget_mapping = next(
+            mapping for mapping in nodes["rc_launch_request"]["config"]["mappings"]
+            if mapping["output"] == "run_budget_seconds"
+        )
+        budget = int(budget_mapping["expression"]["value"])
         self.assertGreater(budget, server.AGENT_RUN_BUDGET,
                            "an unset budget is what killed three writers")
         self.assertGreater(nodes["wait"]["config"]["timeoutSeconds"], budget + 60,
@@ -14117,8 +14122,11 @@ func main() {
         self.assertIn("route", nodes, "pr-drive must consult workflow routing policy")
         self.assertEqual(nodes["route"]["type"], "action.subworkflow")
         cfg = nodes["agent"]["config"]
-        self.assertIn("TASKS.route.result.model", cfg.get("model", ""))
-        self.assertIn("TASKS.route.result.launcher", cfg.get("launcher", ""))
+        self.assertEqual(cfg.get("model"), "{{ CTX.rc_launch_request.model }}")
+        self.assertEqual(cfg.get("launcher"), "{{ CTX.rc_launch_request.launcher }}")
+        launch = json.dumps(nodes["rc_launch_request"])
+        self.assertIn("TASKS.route.result.model", launch)
+        self.assertIn("TASKS.route.result.launcher", launch)
         # route has to run before the writer, not merely exist.
         order = {e["source"]: e["target"] for e in edges}
         self.assertTrue(any(e["target"] == "route" for e in edges), "route is unreachable")
@@ -25049,7 +25057,9 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
         )
         published_chain = set(self.catalog.publish_stems("pr-drive"))
         self.assertTrue((active - {"run-control-initialize"}) <= published_chain)
-        self.assertTrue((graph_stems - active).isdisjoint(published_chain))
+        self.assertTrue(
+            ((graph_stems - active) - {"run-control-initialize"}).isdisjoint(published_chain)
+        )
 
         tree = ast.parse((self.ROOT / "server.py").read_text())
         symbols = set()
@@ -25098,7 +25108,7 @@ class RunControlOwnershipBaselineTests(unittest.TestCase):
         self.assertEqual(
             self._active_run_control_graphs(),
             {
-                "run-control-initialize", "run-control-state", "run-control-consume",
+                "run-control-state", "run-control-consume",
                 "run-control-consume-authorization", "run-control-reconcile", "run-control-transition",
             },
         )
@@ -25327,7 +25337,7 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         attempt = next(m for m in nodes["attempt_entry"]["config"]["mappings"] if m["output"] == "attempt")["expression"]
         downgraded = attempt["properties"]["reconciliation"]["else"]["properties"]
         self.assertEqual(downgraded["receipt_id"], {"kind": "getField", "path": "CTX.INPUT.receipt.receipt_id"})
-        self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "CTX.receipt_hash.value"})
+        self.assertEqual(downgraded["receipt_sha256"], {"kind": "getField", "path": "TASKS.receipt_hash.value"})
 
     def test_same_model_retries_are_bounded_by_the_attempts_budget_only(self):
         # Policy decision 2026-09-01: the runaway protection is the attempts
@@ -25645,56 +25655,6 @@ class DrivePrScriptTests(unittest.TestCase):
         spec.loader.exec_module(module)
         cls.module = module
 
-    def test_canonical_json_is_sorted_and_compact(self):
-        m = self.module
-        self.assertEqual(m.canonical_json({"b": 1, "a": 2}), b'{"a":2,"b":1}')
-        self.assertEqual(m.sha256_hex({"b": 1, "a": 2}), hashlib.sha256(b'{"a":2,"b":1}').hexdigest())
-
-    def test_evaluator_contract_sha256_matches_the_schema_on_disk(self):
-        m = self.module
-        openapi_path = Path(server.__file__).parent / "openapi.json"
-        schema = json.loads(openapi_path.read_text())["components"]["schemas"]["RunControlRequest"]
-        expected = hashlib.sha256(
-            json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        self.assertEqual(m.evaluator_contract_sha256(openapi_path), expected)
-
-    def test_root_workflow_run_id_and_root_identity(self):
-        m = self.module
-        self.assertEqual(m.root_workflow_run_id("3526", "20260902T000000Z"), "rc-3526-20260902T000000Z")
-        identity = m.build_root_identity("wf-1", "wfv-1", "rc-3526-20260902T000000Z")
-        self.assertEqual(identity, {
-            "root_workflow_id": "wf-1",
-            "root_workflow_version_id": "wfv-1",
-            "root_workflow_run_id": "rc-3526-20260902T000000Z",
-            "purpose": "pr_drive",
-        })
-
-    def test_budgets_field_set_and_values(self):
-        m = self.module
-        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
-        self.assertEqual(set(budgets), {"attempts", "turns", "wall_seconds", "tokens", "provider_cost_usd"})
-        self.assertEqual(budgets, {
-            "attempts": 3, "turns": 150, "wall_seconds": 3600, "tokens": 6000000, "provider_cost_usd": "75",
-        })
-
-    def test_resolved_falls_back_only_when_none(self):
-        m = self.module
-        self.assertEqual(m.resolved(None, 3), 3)
-        self.assertEqual(m.resolved(0, 3), 0)
-        self.assertEqual(m.resolved(200, 3), 200)
-
-    def test_initialize_input_field_set(self):
-        m = self.module
-        root_identity = m.build_root_identity("wf-1", "wfv-1", "rc-1-x")
-        budgets = m.build_budgets(3, 150, 3600, 6000000, "75")
-        route = {"route_version": "normal-v1", "launcher": "claude", "provider": "anthropic",
-                 "model": "claude-opus-5"}
-        payload = m.build_initialize_input(root_identity, budgets, route, "deadbeef")
-        self.assertEqual(set(payload), {"root_identity", "budgets", "initial_route", "evaluator_contract_sha256"})
-        self.assertEqual(payload["initial_route"], route)
-        self.assertEqual(payload["evaluator_contract_sha256"], "deadbeef")
-
     def test_pr_drive_input_field_set_and_types(self):
         # No attempt/max_attempts/kick_url/kick_token: nothing crosses runs
         # any more, the loop reserves and settles every attempt in-run.
@@ -25809,65 +25769,27 @@ class DrivePrScriptTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "gh pr view 3914 returned non-JSON output"):
                     m.gh_pr_view(Path(tmp), "3914")
 
-    def test_workflow_run_title_matches_servers_pr_and_repo_fallback(self):
-        m = self.module
-        self.assertEqual(m.workflow_run_title("pr-drive", {"pr_number": "3526"}), "pr-drive PR 3526")
-        self.assertEqual(m.workflow_run_title("pr-drive", {"repo": "riftwing"}), "pr-drive riftwing")
-        self.assertEqual(m.workflow_run_title("pr-drive", {}), "pr-drive")
-
-    def test_record_workflow_run_writes_the_servers_jsonl_shape_plus_run_control_id(self):
-        m = self.module
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(m.pg, "HOME", Path(tmp)):
-                m.record_workflow_run({
-                    "workflow": "graphwing-pr-drive",
-                    "status": "completed",
-                    "source": "drive-pr",
-                    "input": {"repo": "riftwing", "pr_number": "3526", "test": "riftwing-local-gates"},
-                    "run_id": "run-1",
-                    "run_control_id": "rc1-abc",
-                    "created_at": "2026-09-02T00:00:00Z",
-                })
-                lines = (Path(tmp) / "workflow-runs.jsonl").read_text().splitlines()
-            self.assertEqual(len(lines), 1)
-            row = json.loads(lines[0])
-            self.assertEqual(row["workflow"], "graphwing-pr-drive")
-            self.assertEqual(row["status"], "completed")
-            self.assertEqual(row["source"], "drive-pr")
-            self.assertEqual(row["run_id"], "run-1")
-            self.assertEqual(row["run_control_id"], "rc1-abc")
-            self.assertEqual(row["title"], "graphwing-pr-drive PR 3526")
-
     def test_argument_parsing_defaults_and_flags(self):
         m = self.module
         parser = m.build_arg_parser()
-        args = parser.parse_args(["3526"])
+        args = parser.parse_args(["3526", "--run-control-id", "rc1-existing"])
         self.assertEqual(args.pr, "3526")
         self.assertEqual(args.repo, "riftwing")
         self.assertEqual(args.test, "riftwing-local-gates")
         self.assertEqual(args.work_kind, "go_coding")
         self.assertFalse(args.auto_merge)
-        self.assertIsNone(args.attempts)
-        self.assertIsNone(args.turns)
-        self.assertIsNone(args.wall_seconds)
-        self.assertIsNone(args.tokens)
-        self.assertIsNone(args.cost)
+        self.assertEqual(args.run_control_id, "rc1-existing")
         self.assertEqual(args.wait, 0)
 
         args2 = parser.parse_args([
             "3526", "--repo", "gw", "--test", "t1", "--work-kind", "typescript_coding", "--auto-merge",
-            "--attempts", "5", "--turns", "10", "--wall-seconds", "20", "--tokens", "30",
-            "--cost", "40", "--wait", "50",
+            "--run-control-id", "rc1-next", "--wait", "50",
         ])
         self.assertEqual(args2.repo, "gw")
         self.assertEqual(args2.test, "t1")
         self.assertEqual(args2.work_kind, "typescript_coding")
         self.assertTrue(args2.auto_merge)
-        self.assertEqual(args2.attempts, 5)
-        self.assertEqual(args2.turns, 10)
-        self.assertEqual(args2.wall_seconds, 20)
-        self.assertEqual(args2.tokens, 30)
-        self.assertEqual(args2.cost, "40")
+        self.assertEqual(args2.run_control_id, "rc1-next")
         self.assertEqual(args2.wait, 50)
 
     def test_wait_below_the_graphs_worst_case_is_rejected_by_main(self):
@@ -25876,58 +25798,13 @@ class DrivePrScriptTests(unittest.TestCase):
         # itself kept going with nothing watching it. main() must refuse
         # before starting anything rather than let that happen silently.
         m = self.module
-        with mock.patch.object(sys, "argv", ["drive-pr.py", "3526", "--wait", "10"]):
+        with mock.patch.object(sys, "argv", [
+            "drive-pr.py", "3526", "--run-control-id", "rc1-existing", "--wait", "10",
+        ]):
             with mock.patch.object(m, "findings") as mock_findings:
                 rc = m.main()
         mock_findings.assert_not_called()
         self.assertEqual(rc, 1)
-
-    def test_main_reads_pr_head_before_durable_run_control_initialize(self):
-        m = self.module
-        events = []
-
-        def fake_run_slug(_mcp, workflow, _payload, wait):
-            events.append(workflow)
-            if workflow == "graphwing-run-control-initialize":
-                return "completed", "init-run", {}, {
-                    "trace": [{"id": "identity", "output": {"run_control_id": "rc1-abc"}}],
-                }
-            return "completed", "drive-run", {}, {"trace": []}
-
-        def fake_pr_view(_repo_path, _pr):
-            events.append("gh-pr-view")
-            return "fix/pr", "a" * 40
-
-        install = {"pr_drive": {"workflow_id": "wf-1", "workflow_version_id": "wfv-1"}}
-        patches = (
-            mock.patch.object(sys, "argv", ["drive-pr.py", "3914"]),
-            mock.patch.object(m, "worst_case_run_seconds", return_value=10),
-            mock.patch.object(m.pg, "load_install", return_value=install),
-            mock.patch.object(m.pg, "tenant_id", return_value="tenant"),
-            mock.patch.object(m.pg, "rewst_mcp", return_value="mcp"),
-            mock.patch.object(m.pg, "run_slug", side_effect=fake_run_slug),
-            mock.patch.object(m, "findings", side_effect=[{"holds": [], "grade": "A"}, None]),
-            mock.patch.object(m, "resolve_route", return_value={
-                "route_version": "normal-v1", "launcher": "codex",
-                "provider": "openai", "model": "gpt-5.6-sol",
-            }),
-            mock.patch.object(m, "api_key", return_value="key"),
-            mock.patch.object(m, "load_repos", return_value={"riftwing": "/repo"}),
-            mock.patch.object(m, "resolve_repo_path", return_value=Path("/repo")),
-            mock.patch.object(m, "gh_pr_view", side_effect=fake_pr_view),
-            mock.patch.object(m, "evaluator_contract_sha256", return_value="b" * 64),
-            mock.patch.object(m, "utc_compact_timestamp", return_value="20260903T000000Z"),
-            mock.patch.object(m, "record_workflow_run"),
-            mock.patch("builtins.print"),
-        )
-        with ExitStack() as stack:
-            for patcher in patches:
-                stack.enter_context(patcher)
-            self.assertEqual(m.main(), 0)
-
-        self.assertEqual(events, [
-            "gh-pr-view", "graphwing-run-control-initialize", "graphwing-pr-drive",
-        ])
 
     def test_settled_grade_plus_sticky_hold_is_not_an_in_flight_audit(self):
         # GRAPHWING_REVIEW_WAIT used to treat any holds as "audit still
@@ -25988,7 +25865,9 @@ class PrDriveGraphTests(unittest.TestCase):
             seen.add(cur); stack.extend(adjacency.get(cur, []))
         self.assertNotIn("attempts", seen)
         self.assertNotIn("final_view", seen)
-        self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume", "rc_settle", "rc_reconcile", "fix_push"} <= seen)
+        self.assertTrue({"wait", "wait_fix_test", "rc_state", "rc_consume",
+                         "rc_authority_facts", "rc_reconcile", "fix_push"} <= seen)
+        self.assertNotIn("rc_settle", seen)
         self.assertEqual(sum(1 for s, h, t in edges if t == "attempts"), 1)
 
     def test_each_slot_skips_when_green_and_reserves_its_own_attempt(self):
@@ -26033,17 +25912,15 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertEqual(task["attempt"], {"kind": "getField", "path": "ITEM"})
         state = nodes["rc_state"]["config"]["inputMapping"]["values"]
         self.assertEqual(state["endpoint"], "/v1/agent/run")
-        self.assertEqual(state["exact_request_body_sha256"], "{{ CTX.rc_task_hash.value }}")
-        self.assertEqual(nodes["agent"]["config"]["run_control"], "{{ CTX.rc_continuity.run_control }}")
-        self.assertEqual(nodes["agent"]["config"]["prompt"], "{{ CTX.iter_writer_task.task | tojson }}")
-        continuity = nodes["rc_continuity"]["config"]["mappings"][0]["expression"]["properties"]
-        self.assertEqual({k: v["path"] for k, v in continuity.items()}, {
-            "run_control_id": "CTX.run_input.run_control_id",
-            "attempt_id": "TASKS.rc_state.result.attempt_identity.attempt_id",
-            "authorization_id": "TASKS.rc_state.result.attempt_identity.authorization_id",
-            "launch_descriptor_sha256": "TASKS.rc_state.result.descriptor_hash.value",
-        })
-        self.assertEqual(nodes["rc_settle"]["config"]["receipt"], "{{ TASKS.wait.request.body }}")
+        self.assertEqual(
+            state["exact_request_body_sha256"],
+            "{{ TASKS.rc_authority_facts.data.descriptor_preparation.request_sha256 }}",
+        )
+        self.assertNotIn("run_control", nodes["agent"]["config"])
+        self.assertEqual(nodes["agent"]["config"]["prompt"],
+                         "{{ CTX.rc_launch_request.prompt }}")
+        self.assertNotIn("rc_continuity", nodes)
+        self.assertNotIn("rc_settle", nodes)
         self.assertNotIn("kick", json.dumps(spec))
         self.assertNotIn("/v1/pr/continue", json.dumps(spec))
         dump = json.dumps(spec)
@@ -26210,7 +26087,7 @@ class PrDriveGraphTests(unittest.TestCase):
                           "TASKS.iter_findings.data.actionable_failing", "TASKS.iter_findings.data.brief"):
             self.assertNotIn(forbidden, json.dumps(graph["spec"]))
         self.assertEqual(nodes["agent"]["config"]["prompt"],
-                         "{{ CTX.iter_writer_task.task | tojson }}")
+                         "{{ CTX.rc_launch_request.prompt }}")
 
     def test_pr_drive_hold_only_grade_a_minus_never_reaches_writer(self):
         spec = self.load()["spec"]
@@ -26475,9 +26352,9 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         self.assertFalse(any("/v1/slice/route" in node["type"] for node in graph["spec"]["nodes"]))
         agent = nodes["agent"]["config"]
         for field in ("launcher", "provider", "model", "effort"):
-            self.assertEqual(agent[field], f"{{{{ TASKS.route.result.{field} }}}}")
+            self.assertEqual(agent[field], f"{{{{ CTX.rc_launch_request.{field} }}}}")
         self.assertEqual(agent["route_execution_profile"],
-                         "{{ TASKS.route.result.writer_execution_profile }}")
+                         "{{ CTX.rc_launch_request.route_execution_profile }}")
         candidate = next(
             mapping["expression"] for mapping in nodes["rc_task_material"]["config"]["mappings"]
             if mapping["output"] == "candidate_route"
@@ -26489,48 +26366,6 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             self.assertEqual(candidate[field], {
                 "kind": "getField", "path": f"TASKS.route.result.{field}",
             })
-
-    def test_drive_pr_resolves_initial_route_through_rewst_policy_and_never_posts_v1_slice_route(self):
-        spec = importlib.util.spec_from_file_location(
-            "drive_pr_consumer_test", self.ROOT / "scripts" / "drive-pr.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        profile = {
-            "version": "route-execution-profile-v2", "policy_version": "workflow-normal-v1",
-            "decision_id": "routing-normal-v1:" + "a" * 64, "decision_sha256": "a" * 64,
-            "role": "writer", "work_kind": "go_coding", "class": "mechanical",
-            "effective_size": "M", "launcher": "codex", "provider": "openai",
-            "model": "gpt-5.6-sol", "requested_effort": "high",
-        }
-        output = {
-            "compatibility_behavior": "normal-v1", "launcher": "codex", "provider": "openai",
-            "model": "gpt-5.6-sol", "effort": "high", "writer_execution_profile": profile,
-        }
-        trace = {"data": {"result": {"trace": [
-            {"nodeId": "route_output", "status": "completed", "output": output},
-        ]}}}
-        policy_ref = {
-            "workflow_id": "workflow-exact", "workflow_version_id": "version-exact",
-            "slug": "graphwing-routing-policy",
-        }
-        with mock.patch.object(module.pg, "read_back_exact_published_version", return_value="version-exact") as readback, \
-             mock.patch.object(module.pg, "run_slug", return_value=("completed", "run-1", {}, trace)) as run, \
-             mock.patch.object(module.urllib.request, "urlopen", side_effect=AssertionError("local route called")):
-            route = module.resolve_route("mcp", policy_ref, "mechanical", "M", "go_coding")
-        readback.assert_called_once_with(
-            "mcp", "workflow-exact", "version-exact", "graphwing-routing-policy",
-        )
-        run.assert_called_once_with(
-            "mcp", "graphwing-routing-policy",
-            {"input": {"class": "mechanical", "size": "M", "work_kind": "go_coding"}},
-            wait=90,
-        )
-        self.assertEqual(route, {
-            "route_version": "normal-v1", "launcher": "codex",
-            "provider": "openai", "model": "gpt-5.6-sol",
-        })
-
 
 class RewstNativeRoutingPolicyTests(unittest.TestCase):
     """Provider-free fixtures for issue #186's canonical native policy."""
@@ -27709,7 +27544,7 @@ class NativeGraphRunner:
             (config["algorithm"], config["inputKind"], config["outputFormat"], config["mode"])
             == ("sha256", "json_stringify", "hex", "hash"), node["id"])
         digest = _native_sha256(self.render(config["input"]))
-        self.context["CTX"][config["alias"]] = {"value": digest}
+        self.context["TASKS"][node["id"]] = {"value": digest}
         return "out", {"value": digest}
 
     @classmethod
@@ -27758,18 +27593,22 @@ class NativeGraphRunner:
                 if self.rules_pass(case, payload):
                     return f"case-{index}", payload
             return "default", payload
-        if kind == "logic.join.any":
+        if kind in ("logic.join.any", "logic.join.all"):
             return "out", payload
         if kind.startswith("action.datastore."):
             return self.datastore(node)
         if kind == "action.noop":
             return "success", payload
         handle, result = self.actions(node, payload, self.context)
-        self.context["TASKS"][node["config"]["alias"]] = result
+        self.context["TASKS"][node["config"].get("alias", node["id"])] = result
         return handle, result
 
-    def run(self, inputs, start="trigger"):
-        self.context = {"CTX": {"INPUT": deepcopy(inputs)}, "TASKS": {}}
+    def run(self, inputs, start="trigger", context=None):
+        self.context = deepcopy(context) if context is not None else {
+            "CTX": {"INPUT": deepcopy(inputs)}, "TASKS": {},
+        }
+        self.context.setdefault("CTX", {})["INPUT"] = deepcopy(inputs)
+        self.context.setdefault("TASKS", {})
         queue, joined, guard = [(start, deepcopy(inputs))], set(), 0
         while queue:
             node_id, payload = queue.pop(0)
@@ -27875,7 +27714,11 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
                     "evaluator_contract_sha256": None})
         return runner
 
-    def reserve(self, store, *, envelope=None, route=None, owner_run_id="run-187-a"):
+    def reserve(self, store, *, envelope=None, route=None, owner_run_id="run-187-a",
+                exact_request_body_sha256="b" * 64,
+                launcher_fingerprint="graphwing-loop-attempt-v1",
+                permission_profile="pr-drive-writer-v1",
+                callback_binding_sha256="f" * 64):
         def actions(node, payload, context):
             if node["type"].endswith("GET:/v1/rewst/server-challenge"):
                 return "success", {"server_instance_challenge": "c" * 64}
@@ -27888,10 +27731,11 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
             "run_control_id": self.run_control_id(), "state_version": "v2",
             "candidate_route": deepcopy(route or self.ROUTE),
             "next_envelope": deepcopy(envelope or self.ENVELOPE),
-            "launcher_fingerprint": "graphwing-loop-attempt-v1", "endpoint": "/v1/agent/run",
-            "exact_request_body_sha256": "b" * 64, "repository": "graphwing",
+            "launcher_fingerprint": launcher_fingerprint, "endpoint": "/v1/agent/run",
+            "exact_request_body_sha256": exact_request_body_sha256, "repository": "graphwing",
             "branch": "feature/x", "head_sha": "e" * 40, "task_sha256": "b" * 64,
-            "permission_profile": "pr-drive-writer-v1", "callback_binding_sha256": "f" * 64,
+            "permission_profile": permission_profile,
+            "callback_binding_sha256": callback_binding_sha256,
             "handoff": {"reason_code": "provider_switch"}, "owner_workflow_run_id": owner_run_id,
         })
         return runner
@@ -28184,7 +28028,9 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
         self.assertIn(("iter_checkout", "success", "rc_pre_evidence"), edges)
         self.assertIn(("rc_evidence_join", "out", "rc_diff"), edges)
         self.assertIn(("rc_diff", "success", "rc_diff_hash"), edges)
+        self.assertNotIn("rc_reconcile_join", nodes)
         self.assertIn(("rc_progress", "out", "rc_reconcile"), edges)
+        self.assertNotIn(("agent", "success", "rc_reconcile"), edges)
         self.assertNotIn(("rc_settle", "success", "rc_reconcile"), edges)
         for terminal in ("correction_push_receipt", "herdr_receipt", "herdr_test_fail",
                          "herdr_test_http", "herdr_commit", "herdr_push",
@@ -28249,7 +28095,10 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
         store = RunControlDatastoreFixture()
         self.initialize(store)
         for ordinal in range(1, 13):
-            self.append_attempt(store, owner_run_id=f"run-187-{ordinal % 3}")
+            self.append_attempt(
+                store, progress=self.progress(checkpoint=ordinal),
+                owner_run_id=f"run-187-{ordinal % 3}",
+            )
         self.assertEqual(self.pointer(store)["ordinal"], 12)
         self.assertEqual(self.pointer(store)["attempts_completed"], 12)
         self.assertGreater(12, server.RUN_CONTROL_MAX_ATTEMPTS)
@@ -28361,7 +28210,7 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
         native = {
             "trigger.manual", "trigger.form", "trigger.webhook", "transforms.objectBuilder",
             "transforms.hash", "transforms.transformArray", "transforms.aggregate",
-            "transforms.regexReplace", "logic.filter", "logic.switch", "logic.join.any",
+            "transforms.regexReplace", "logic.filter", "logic.switch", "logic.join.any", "logic.join.all",
             "logic.loop", "action.noop", "action.wait.webhook", "action.datastore.kv.get",
             "action.datastore.kv.compareAndSwap", "action.datastore.records.get",
             "action.datastore.records.upsert", "action.subworkflow",
@@ -28451,6 +28300,612 @@ func main() {
                                     "action.datastore.kv.compareAndSwap"):
                     target = node["config"].get("collection") or node["config"]["namespace"]
                     self.assertTrue(target.endswith("_v2"), (stem, node["id"], target))
+
+class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
+    """Issue #187 PR5: native policy and exact launch authorization cutover."""
+
+    ROOT = Path(server.__file__).parent
+
+    @classmethod
+    def graph(cls, stem):
+        return json.loads((cls.ROOT / "graphs" / f"{stem}.json").read_text())
+
+    def nodes(self, stem):
+        return {node["id"]: node for node in self.graph(stem)["spec"]["nodes"]}
+
+    def edges(self, stem):
+        return {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                for edge in self.graph(stem)["spec"]["edges"]}
+
+    def policy_run(self, *, signals=(), no_progress_streak=0, route=None):
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        durable.initialize(store)
+        pointer_entry = store.kv[(durable.POINTER_NAMESPACE, durable.run_control_id())]
+        pointer_entry["value"]["progress"]["last"] = {
+            **durable.progress(), "constraint_signals": list(signals),
+        }
+        pointer_entry["value"]["checkpoint"]["no_progress_streak"] = no_progress_streak
+        runner = durable.reserve(store, route=route)
+        return durable, store, runner
+
+    def test_launch_authority_facts_expose_current_closed_descriptor_prerequisites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _write_fake_codex(
+                Path(tmp) / "codex", b"native launcher artifact\n"
+            )
+            with mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server.time, "time", return_value=1_788_400_000):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/rewst/launch-authority-facts", {}, True,
+                    _native_json({"operation": "agent_run", "launcher": "codex"}).encode(),
+                )
+                expected_launcher_version = server.launcher_version_fingerprint(
+                    launcher, "codex"
+                )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(set(payload), {
+            "version", "challenge_version", "server_instance_challenge",
+            "descriptor_version", "operation", "role", "launcher", "provider",
+            "launcher_version", "permission_profile", "issued_at", "expires_at",
+            "hard_ceilings",
+        })
+        self.assertEqual(payload["version"], "graphwing-launch-authority-facts-v1")
+        self.assertEqual(payload["launcher_version"], expected_launcher_version)
+        self.assertEqual(payload["permission_profile"], server.AGENT_PERMISSION_PROFILE)
+        self.assertEqual((payload["issued_at"], payload["expires_at"]),
+                         (1_788_400_000, 1_788_400_300))
+        self.assertEqual(payload["hard_ceilings"], {
+            "max_turns": server.REWST_LAUNCH_MAX_TURNS,
+            "wall_seconds": server.REWST_LAUNCH_MAX_WALL_SECONDS,
+            "max_tokens": server.REWST_LAUNCH_MAX_TOKENS,
+            "max_cost_usd": str(server.REWST_LAUNCH_MAX_COST_USD),
+        })
+        spec = json.loads(server.openapi_bytes())
+        response = spec["components"]["schemas"]["RewstLaunchAuthorityFacts"]
+        self.assertFalse(response["additionalProperties"])
+        self.assertEqual(set(response["required"]), set(payload))
+
+        route_profile = {
+            "version": "route-execution-profile-v2", "policy_version": "routing-v2",
+            "decision_id": "decision-187", "decision_sha256": "d" * 64,
+            "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+            "effective_size": "M", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "requested_effort": "high",
+        }
+        unsigned = {
+            "prompt": "fix issue 187", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "effort": "high",
+            "route_execution_profile": route_profile, "max_turns": 50,
+            "run_budget_seconds": 600, "max_tokens": 2_000_000,
+            "max_cost_usd": "25", "cwd": "graphwing",
+            "response_webhook_url": "https://example.invalid/resume",
+            "response_webhook_token": "secret",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared_launcher = _write_fake_codex(
+                Path(tmp) / "codex", b"native launcher artifact\n"
+            )
+            with mock.patch.object(
+                    server, "resolve_launcher_binary_now", return_value=prepared_launcher), \
+                 mock.patch.object(server, "load_repos", return_value={
+                     "graphwing": str(self.ROOT),
+                 }), mock.patch.object(server.time, "time", return_value=1_788_400_000):
+                status, prepared, _ = server.dispatch(
+                    "POST", "/v1/rewst/launch-authority-facts", {}, True,
+                    _native_json({
+                        "operation": "agent_run", "launcher": "codex", "request": unsigned,
+                    }).encode(),
+                )
+        self.assertEqual(status, 200, prepared)
+        descriptor = prepared["descriptor_preparation"]
+        self.assertEqual(descriptor["launcher_version"], expected_launcher_version)
+        self.assertEqual(descriptor["request_sha256"],
+                         hashlib.sha256(_native_json(unsigned).encode()).hexdigest())
+        self.assertEqual(descriptor["prompt_sha256"],
+                         hashlib.sha256(b"fix issue 187").hexdigest())
+        self.assertEqual(descriptor["route_version"], "routing-v2")
+        self.assertEqual(descriptor["effective_size"], "M")
+        self.assertEqual(set(descriptor), set(json.loads(server.openapi_bytes())[
+            "components"]["schemas"]["RewstLaunchDescriptorPreparation"]["required"]))
+
+    def test_run_control_state_has_no_graphwing_evaluate_action_and_computes_policy_with_native_nodes(self):
+        nodes = self.nodes("run-control-state")
+        v2_reachable = set()
+        stack = ["v2_state_version_route"]
+        edges = self.edges("run-control-state")
+        while stack:
+            current = stack.pop()
+            if current in v2_reachable:
+                continue
+            v2_reachable.add(current)
+            stack.extend(target for source, handle, target in edges
+                         if source == current and not (
+                             current == "v2_state_version_route" and handle == "default"))
+        self.assertFalse(any("/v1/run/control/evaluate" in nodes[node_id]["type"]
+                             for node_id in v2_reachable))
+        self.assertEqual(nodes["v2_policy"]["type"], "transforms.objectBuilder")
+        self.assertEqual(nodes["v2_policy_route"]["type"], "logic.switch")
+        self.assertNotRegex(json.dumps(nodes["v2_policy"]), r"\{%-?\s*(?:set|for|if)\b")
+        outputs = {m["output"] for m in nodes["v2_policy"]["config"]["mappings"]}
+        self.assertTrue({"decision", "terminal", "retryable", "route_changed",
+                         "same_route_continuations", "route_efficiency"} <= outputs)
+
+    def test_constraint_gaming_precedes_restructure_and_is_terminal_nonretryable(self):
+        policy = self.nodes("run-control-state")["v2_policy"]["config"]
+        rendered = json.dumps(policy)
+        self.assertLess(rendered.index("constraint_gaming"), rendered.index("size_limit_conflict"))
+        self.assertIn("terminal_nonretryable", rendered)
+        self.assertIn("retryable", rendered)
+        durable, store, runner = self.policy_run(
+            signals=("size_limit_conflict", "constraint_gaming_detected"),
+        )
+        self.assertEqual(runner.context["CTX"]["v2_policy"]["decision"],
+                         "terminal_nonretryable")
+        self.assertEqual(durable.pointer(store)["terminal"]["outcome"],
+                         "terminal_nonretryable")
+        self.assertFalse(durable.pointer(store)["terminal"]["retryable"])
+
+    def test_size_limit_conflict_restructures_only_without_a_gaming_signal(self):
+        nodes, edges = self.nodes("run-control-state"), self.edges("run-control-state")
+        self.assertEqual(nodes["v2_restructure"]["type"], "transforms.objectBuilder")
+        self.assertIn(("v2_policy_route", "case-1", "v2_restructure"), edges)
+        config = json.dumps(nodes["v2_restructure"]["config"])
+        self.assertIn("restructure", config)
+        self.assertIn("size_limit_conflict", config)
+        durable, store, runner = self.policy_run(signals=("size_limit_conflict",))
+        self.assertEqual(runner.context["CTX"]["v2_policy"]["decision"], "restructure")
+        self.assertIsNone(durable.pointer(store)["terminal"])
+        self.assertIsNone(durable.pointer(store)["outstanding_authorization"])
+
+    def test_no_progress_checkpoint_history_selects_workflow_handoff_or_park_without_daemon_advice(self):
+        config = json.dumps(self.nodes("run-control-state")["v2_policy"]["config"])
+        self.assertIn("no_progress_streak", config)
+        self.assertIn("handoff_cross_model", config)
+        self.assertIn("park", config)
+        self.assertNotIn("TASKS.evaluate", config)
+        self.assertNotIn("daemon_decision", config)
+        durable, store, parked = self.policy_run(no_progress_streak=2)
+        self.assertEqual(parked.context["CTX"]["v2_policy"]["decision"], "park")
+        self.assertEqual(durable.pointer(store)["terminal"]["outcome"], "park")
+        handoff = {"route_version": "workflow-handoff-v1", "launcher": "codex",
+                   "provider": "openai", "model": "gpt-5.6-sol"}
+        durable, store, switched = self.policy_run(
+            no_progress_streak=2, route=handoff,
+        )
+        self.assertEqual(switched.context["CTX"]["v2_policy"]["decision"],
+                         "handoff_cross_model")
+        self.assertEqual(durable.pointer(store)["outstanding_authorization"]["route"],
+                         handoff)
+
+    def test_exhausted_and_existing_terminal_paths_persist_the_original_outcome(self):
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        budgets = {**durable.BUDGETS, "attempts": 0}
+        durable.initialize(store, budgets=budgets)
+        exhausted = durable.reserve(store)
+        self.assertEqual(exhausted.context["CTX"]["v2_policy"]["decision"],
+                         "exhausted")
+        self.assertEqual(durable.pointer(store)["terminal"]["outcome"], "exhausted")
+        self.assertIsNone(durable.pointer(store)["outstanding_authorization"])
+
+        before = deepcopy(durable.pointer(store))
+        writes = len(store.writes)
+        replay = durable.reserve(store)
+        self.assertEqual(replay.context["CTX"]["v2_policy"]["decision"], "terminal")
+        self.assertIn("v2_existing_terminal_result", replay.executed)
+        self.assertNotIn("v2_terminal_commit", replay.executed)
+        self.assertEqual(durable.pointer(store), before)
+        self.assertEqual(len(store.writes), writes)
+
+    def test_same_model_continuation_count_spans_all_attempt_records_and_is_not_caller_reanchorable(self):
+        initialize = json.dumps(self.nodes("run-control-initialize")["v2_initial_pointer"]["config"])
+        reconcile = json.dumps(self.nodes("run-control-reconcile")["v2_target_pointer"]["config"])
+        state = json.dumps(self.nodes("run-control-state")["v2_policy"]["config"])
+        self.assertIn("same_route_continuations", initialize)
+        self.assertIn("same_route_continuations", reconcile)
+        self.assertIn("TASKS.v2_pointer_get.value.same_route_continuations", state)
+        self.assertNotIn("CTX.INPUT.same_route_continuations", state + reconcile)
+
+    def test_efficiency_eligibility_never_cross_contaminates_routes(self):
+        reconcile = json.dumps(self.nodes("run-control-reconcile")["v2_target_pointer"]["config"])
+        state = json.dumps(self.nodes("run-control-state")["v2_policy"]["config"])
+        self.assertIn("route_efficiency", reconcile)
+        self.assertIn("route_sha256", reconcile)
+        self.assertIn("candidate_route_sha256", state)
+        self.assertIn("route_sha256", state)
+
+    def test_pr_drive_agent_receives_the_exact_consumed_authorization_and_signed_body(self):
+        nodes, edges = self.nodes("pr-drive"), self.edges("pr-drive")
+        agent = nodes["agent"]["config"]
+        self.assertEqual(agent["rewst_authorization"],
+                         "{{ TASKS.rc_consume.result.v2_consume_result.authorization }}")
+        self.assertEqual(agent["max_tokens"], "{{ CTX.rc_launch_request.max_tokens }}")
+        self.assertEqual(agent["max_cost_usd"], "{{ CTX.rc_launch_request.max_cost_usd }}")
+        self.assertIn(("rc_consume", "success", "rc_consumed_identity"), edges)
+        self.assertIn(("rc_consumed_identity", "out", "agent"), edges)
+        self.assertNotIn(("rc_consume", "success", "rc_continuity"), edges)
+        consume = nodes["rc_consume"]["config"]["outputMapping"]["keys"]
+        self.assertEqual(consume.count("v2_consume_result"), 1)
+        self.assertIn("authorization", json.dumps(self.nodes("run-control-consume")[
+            "v2_authorization"]["config"]))
+
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        durable.initialize(store)
+        request = {
+            "prompt": "task", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-opus-5", "effort": "default", "max_turns": 50,
+            "run_budget_seconds": 600, "max_tokens": 2_000_000,
+            "max_cost_usd": "25", "cwd": "graphwing",
+            "response_webhook_url": "https://example.invalid/resume",
+            "response_webhook_token": "token",
+            "route_execution_profile": {"version": "route-execution-profile-v1"},
+        }
+        request_sha256 = hashlib.sha256(_native_json(request).encode()).hexdigest()
+        durable.reserve(
+            store, exact_request_body_sha256=request_sha256,
+            launcher_fingerprint="sha256:" + "1" * 64,
+            permission_profile=server.AGENT_PERMISSION_PROFILE,
+        )
+        preparation = {
+            "descriptor_version": "graphwing-launch-descriptor-v1",
+            "operation": "agent_run", "route_version": "workflow-normal-v1",
+            "role": "writer", "work_kind": "go_coding", "work_class": "mechanical",
+            "effective_size": "M", "profile_version": "route-execution-profile-v1",
+            "launcher": "claude", "provider": "anthropic", "model": "claude-opus-5",
+            "requested_effort": "default", "effective_effort": "default",
+            "effort_source": "route", "launcher_version": "sha256:" + "1" * 64,
+            "repo": "graphwing", "branch": "feature/x", "starting_head": "e" * 40,
+            "prompt_sha256": hashlib.sha256(b"task").hexdigest(), "diff_sha256": None,
+            "resume_parent_job_id": None, "max_turns": 50, "wall_seconds": 600,
+            "max_tokens": 2_000_000, "max_cost_usd": "25",
+            "callback_sha256": "f" * 64,
+            "permission_profile": server.AGENT_PERMISSION_PROFILE,
+            "request_sha256": request_sha256,
+            "server_instance_challenge": "c" * 64,
+        }
+
+        def actions(node, payload, context):
+            if node["type"].endswith("GET:/v1/rewst/server-challenge"):
+                return "success", {"server_instance_challenge": "c" * 64}
+            raise AssertionError(node["id"])
+
+        bad_preparation = {**preparation, "request_sha256": "0" * 64}
+        with self.assertRaises(NativeGraphFenced):
+            NativeGraphRunner(
+                self.graph("run-control-consume"), deepcopy(store), actions,
+            ).run({
+                "run_control_id": durable.run_control_id(), "state_version": "v2",
+                "descriptor_preparation": bad_preparation,
+                "issued_at": 1_788_400_000, "expires_at": 1_788_400_300,
+            })
+
+        runner = NativeGraphRunner(self.graph("run-control-consume"), store, actions)
+        runner.run({
+            "run_control_id": durable.run_control_id(), "state_version": "v2",
+            "descriptor_preparation": preparation,
+            "issued_at": 1_788_400_000, "expires_at": 1_788_400_300,
+        })
+        authorization = runner.context["CTX"]["v2_authorization"]
+        exact_body = _native_json({**request, "rewst_authorization": authorization}).encode()
+        with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", "c" * 64):
+            accepted = server._validate_rewst_consumed_authorization(
+                "/v1/agent/run", exact_body, 1_788_400_000,
+            )
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted["authorization"], authorization)
+        self.assertEqual(set(authorization), server.REWST_AUTHORIZATION_FIELDS)
+        self.assertEqual(set(authorization["descriptor"]), server.REWST_DESCRIPTOR_FIELDS)
+
+        launched = []
+
+        def launch_action(node, payload, context):
+            self.assertEqual(node["id"], "agent")
+            rendered = launch_runner.render(node["config"])
+            launch_body = {key: rendered[key] for key in request}
+            launch_body["rewst_authorization"] = rendered["rewst_authorization"]
+            with mock.patch.object(server, "REWST_SERVER_INSTANCE_CHALLENGE", "c" * 64):
+                launched.append(server._validate_rewst_consumed_authorization(
+                    "/v1/agent/run", _native_json(launch_body).encode(), 1_788_400_000,
+                ))
+            return "halt", {}
+
+        launch_runner = NativeGraphRunner(self.graph("pr-drive"), store, launch_action)
+        launch_runner.run({}, start="rc_consumed_identity", context={
+            "CTX": {"rc_launch_request": request},
+            "TASKS": {"rc_consume": {"result": {"v2_consume_result": {
+                "authorization": authorization,
+                "authorization_identity": runner.context["CTX"][
+                    "v2_consume_result"]["authorization_identity"],
+            }}}},
+        })
+        self.assertEqual(launch_runner.executed, ["rc_consumed_identity", "agent"])
+        self.assertEqual(len(launched), 1)
+        self.assertIsNotNone(launched[0])
+        with self.assertRaises(NativeGraphFenced):
+            NativeGraphRunner(self.graph("run-control-consume"), store, actions).run({
+                "run_control_id": durable.run_control_id(), "state_version": "v2",
+                "descriptor_preparation": preparation,
+                "issued_at": 1_788_400_000, "expires_at": 1_788_400_300,
+            })
+
+    def test_pr_drive_prepared_request_hash_matches_the_actual_rendered_agent_body(self):
+        graph = self.graph("pr-drive")
+        nodes = self.nodes("pr-drive")
+        route_profile = {
+            "version": "route-execution-profile-v2", "policy_version": "workflow-normal-v1",
+            "decision_id": "decision-187", "decision_sha256": "d" * 64,
+            "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+            "effective_size": "M", "launcher": "codex", "provider": "openai",
+            "model": "gpt-5.6-sol", "requested_effort": "high",
+        }
+        runner = NativeGraphRunner(graph, RunControlDatastoreFixture())
+        runner.context = {
+            "CTX": {
+                "INPUT": {}, "iter_writer_task": {"task": {"kind": "fix", "issue": 187}},
+                "run_input": {"repo": "graphwing"},
+            },
+            "TASKS": {
+                "route": {"result": {
+                    "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+                    "effort": "high", "writer_execution_profile": route_profile,
+                }},
+                "wait": {"pending": {
+                    "resumeUrl": "https://example.invalid/resume", "resumeToken": "secret",
+                }},
+            },
+        }
+        runner.execute(nodes["rc_launch_request"], None)
+        rendered_agent = runner.render(nodes["agent"]["config"])
+        unsigned_body = {
+            key: value for key, value in rendered_agent.items()
+            if key not in {"integrationInstanceId", "timeout", "rewst_authorization"}
+        }
+        for field in ("max_turns", "run_budget_seconds", "max_tokens", "max_cost_usd"):
+            self.assertIsInstance(unsigned_body[field], str, field)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _write_fake_codex(Path(tmp) / "codex", b"native launcher artifact\n")
+            with mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server, "load_repos", return_value={
+                     "graphwing": str(self.ROOT),
+                 }), mock.patch.object(server.time, "time", return_value=1_788_400_000):
+                status, prepared, _ = server.dispatch(
+                    "POST", "/v1/rewst/launch-authority-facts", {}, True,
+                    _native_json({
+                        "operation": "agent_run", "launcher": "codex", "request": unsigned_body,
+                    }).encode(),
+                )
+        self.assertEqual(status, 200, prepared)
+        self.assertEqual(
+            prepared["descriptor_preparation"]["request_sha256"],
+            hashlib.sha256(_native_json(unsigned_body).encode()).hexdigest(),
+        )
+
+    def test_pr_drive_decides_before_wait_and_nonlaunch_paths_never_arm_or_charge(self):
+        graph, nodes, edges = self.graph("pr-drive"), self.nodes("pr-drive"), self.edges("pr-drive")
+        self.assertIn("rc_decide", nodes)
+        self.assertEqual(
+            nodes["rc_decide"]["config"]["inputMapping"]["values"]["decision_only"], True,
+        )
+        self.assertIn(("rc_callback_hash", "out", "rc_decide"), edges)
+        self.assertIn(("rc_state_route", "default", "wait"), edges)
+        self.assertNotIn(("rc_callback_hash", "out", "wait"), edges)
+        for decision in ("terminal", "terminal_nonretryable", "exhausted", "park",
+                         "verified", "restructure"):
+            runner = NativeGraphRunner(graph, RunControlDatastoreFixture(),
+                                       lambda node, payload, context: ("halt", {}))
+            runner.run({"v2_policy": {"decision": decision}}, start="rc_state_route")
+            self.assertEqual(runner.executed, ["rc_state_route", "rc_nonlaunch_join", "rc_nonlaunch_state"], decision)
+            self.assertNotIn("wait", runner.executed, decision)
+            self.assertNotIn("rc_reconcile", runner.executed, decision)
+
+        durable, store = RunControlDurableStateV2Tests(), RunControlDatastoreFixture()
+        durable.initialize(store)
+        before, writes = deepcopy(durable.pointer(store)), len(store.writes)
+        runner = NativeGraphRunner(self.graph("run-control-state"), store)
+        runner.run({
+            "run_control_id": durable.run_control_id(), "state_version": "v2",
+            "candidate_route": deepcopy(durable.ROUTE),
+            "next_envelope": deepcopy(durable.ENVELOPE), "verified": False,
+            "decision_only": True,
+        })
+        self.assertIn(runner.context["CTX"]["v2_policy"]["decision"],
+                      {"continue_same_model", "handoff_cross_model"})
+        self.assertEqual(durable.pointer(store), before)
+        self.assertEqual(len(store.writes), writes)
+        self.assertNotIn("v2_reserve_commit", runner.executed)
+
+    def test_pr_drive_recovery_branches_reconcile_once_without_all_joins(self):
+        nodes, edges = self.nodes("pr-drive"), self.edges("pr-drive")
+        self.assertEqual(nodes["rc_poll_join"]["type"], "logic.join.any")
+        self.assertNotIn("rc_reconcile_join", nodes)
+        self.assertIn(("wait", "timeout", "rc_poll_join"), edges)
+        self.assertIn(("wait", "failure", "rc_poll_join"), edges)
+        self.assertIn(("rc_poll_join", "out", "rc_poll_job"), edges)
+        self.assertIn(("rc_progress", "out", "rc_reconcile"), edges)
+        self.assertNotIn(("agent", "success", "rc_reconcile"), edges)
+
+    def test_lost_callback_restart_replay_exhaustion_handoff_restructure_and_terminal_paths_are_all_fenced(self):
+        nodes, edges = self.nodes("pr-drive"), self.edges("pr-drive")
+        self.assertEqual(nodes["rc_poll_job"]["type"], "action.graphwing.GET:/v1/agent/jobs/{job_id}")
+        self.assertEqual(nodes["rc_wait_job"]["type"], "action.graphwing.POST:/v1/agent/jobs/wait")
+        self.assertEqual(nodes["rc_poll_join"]["type"], "logic.join.any")
+        self.assertIn(("wait", "timeout", "rc_poll_join"), edges)
+        self.assertIn(("wait", "failure", "rc_poll_join"), edges)
+        self.assertIn(("rc_poll_join", "out", "rc_poll_job"), edges)
+        self.assertIn(("rc_poll_job", "success", "rc_wait_job"), edges)
+        state_dump = json.dumps(self.graph("run-control-state"))
+        for outcome in ("exhausted", "handoff_cross_model", "restructure", "park",
+                        "verified", "terminal_nonretryable"):
+            self.assertIn(outcome, state_dump)
+        consume_dump = json.dumps(self.graph("run-control-consume"))
+        self.assertIn("server_instance_challenge", consume_dump)
+        self.assertIn("expectedVersion", consume_dump)
+
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        durable.initialize(store)
+        durable.reserve(store)
+        outstanding = durable.pointer(store)["outstanding_authorization"]
+
+        def actions(node, payload, context):
+            if node["type"] == "action.subworkflow":
+                return durable.child_transition(store, runner, node)
+            raise AssertionError(node["id"])
+
+        runner = NativeGraphRunner(self.graph("run-control-reconcile"), store, actions)
+        runner.run({
+            "run_control_id": durable.run_control_id(), "state_version": "v2",
+            "kind": "authority_loss", "receipt": None,
+            "authority_loss_reason": "daemon_restarted", "attempt_job_id": "j" * 32,
+            "authorization_identity": {
+                "version": "graphwing-rewst-authorization-identity-v1",
+                "authorization_id": outstanding["authorization_id"],
+                "descriptor_sha256": outstanding["effect_descriptor_sha256"],
+            },
+            "reserved_envelope": durable.ENVELOPE, "progress": durable.progress(),
+            "owner_workflow_run_id": "run-187-a",
+        })
+        lost = durable.history(store, 1)
+        self.assertFalse(lost["authority_available"])
+        self.assertEqual(lost["charged"], durable.ENVELOPE)
+        self.assertEqual(set(lost["observed"].values()), {None})
+        self.assertNotIn("v2_attempt_facts", runner.executed)
+
+    def test_pr_drive_callback_poll_and_authority_loss_edges_reach_reconcile(self):
+        graph = self.graph("pr-drive")
+
+        def traverse(wait_handle, poll_handle="success"):
+            captured = []
+
+            def actions(node, payload, context):
+                if node["id"] == "wait":
+                    return wait_handle, {"request": {"body": {
+                        "status": "not_ok", "job_id": "j" * 32,
+                    }}}
+                if node["id"] == "rc_poll_job":
+                    return poll_handle, {"ok": poll_handle == "success"}
+                if node["id"] == "rc_wait_job":
+                    return "success", {"receipt": {
+                        "status": "not_ok", "job_id": "j" * 32,
+                    }}
+                if node["id"] == "rc_diff":
+                    return "success", {"diff": "diff --git a/a b/a\n+x\n"}
+                if node["id"] == "rc_reconcile":
+                    captured.append(runner.render(node["config"]["inputMapping"]["values"]))
+                    return "halt", {}
+                raise AssertionError(node["id"])
+
+            runner = NativeGraphRunner(graph, RunControlDatastoreFixture(), actions)
+            context = {
+                "CTX": {
+                    "run_input": {"run_control_id": "rc1-" + "a" * 64},
+                    "rc_pre_evidence": {"pre_attempt_red": True},
+                    "rc_task_material": {"next_envelope": deepcopy(
+                        RunControlDurableStateV2Tests.ENVELOPE)},
+                },
+                "TASKS": {
+                    "agent": {"data": {"job_id": "j" * 32}},
+                    "rc_consume": {"result": {"v2_consume_result": {
+                        "authorization_identity": {
+                            "version": "graphwing-rewst-authorization-identity-v1",
+                            "authorization_id": "rca2-" + "b" * 64,
+                            "descriptor_sha256": "c" * 64,
+                        },
+                    }}},
+                },
+            }
+            runner.run({}, start="wait", context=context)
+            self.assertEqual(len(captured), 1)
+            return runner.executed, captured[0]
+
+        callback, callback_input = traverse("out")
+        self.assertEqual(callback[:4], ["wait", "rc_receipt_join", "receipt",
+                                        "switch_receipt_ok"])
+        self.assertEqual(callback_input["kind"], "terminal_receipt")
+        self.assertIn("rc_reconcile", callback)
+
+        polled, polled_input = traverse("timeout")
+        for node_id in ("rc_poll_join", "rc_poll_job", "rc_wait_job",
+                        "rc_receipt_join", "receipt", "rc_reconcile"):
+            self.assertIn(node_id, polled)
+        self.assertEqual(polled_input["kind"], "terminal_receipt")
+
+        lost, lost_input = traverse("timeout", poll_handle="failure")
+        for node_id in ("rc_poll_join", "rc_poll_job", "rc_authority_loss_join",
+                        "rc_authority_loss", "rc_reconcile"):
+            self.assertIn(node_id, lost)
+        self.assertEqual(lost_input["kind"], "authority_loss")
+        self.assertEqual(lost_input["authority_loss_reason"],
+                         "callback_lost_or_daemon_restarted")
+
+    def test_pr_drive_routes_real_state_results_and_persists_verified(self):
+        graph = self.graph("pr-drive")
+        for decision in ("terminal", "terminal_nonretryable", "exhausted", "park",
+                         "verified", "restructure"):
+            runner = NativeGraphRunner(graph, RunControlDatastoreFixture(),
+                                       lambda node, payload, context: ("halt", {}))
+            runner.run({"v2_policy": {"decision": decision}},
+                       start="rc_state_route")
+            self.assertEqual(runner.executed, ["rc_state_route", "rc_nonlaunch_join", "rc_nonlaunch_state"])
+
+        durable = RunControlDurableStateV2Tests()
+        store = RunControlDatastoreFixture()
+        durable.initialize(store)
+
+        def actions(node, payload, context):
+            self.assertEqual(node["id"], "rc_verified_state")
+            child = NativeGraphRunner(self.graph("run-control-state"), store)
+
+            def child_actions(child_node, child_payload, child_context):
+                if child_node["type"] == "action.subworkflow":
+                    return durable.child_transition(store, child, child_node)
+                raise AssertionError(child_node["id"])
+
+            child.actions = child_actions
+            child.run(runner.render(node["config"]["inputMapping"]["values"]))
+            result = {key: child.context["CTX"].get(key)
+                      for key in node["config"]["outputMapping"]["keys"]}
+            return "success", result
+
+        runner = NativeGraphRunner(graph, store, actions)
+        runner.run({"request": {"body": {"status": "ok"}}},
+                   start="switch_final_test", context={
+            "CTX": {"run_input": {"run_control_id": durable.run_control_id()}},
+            "TASKS": {"route": {"result": {
+                "compatibility_behavior": durable.ROUTE["route_version"],
+                "launcher": durable.ROUTE["launcher"],
+                "provider": durable.ROUTE["provider"], "model": durable.ROUTE["model"],
+            }}},
+        })
+        self.assertIn("rc_verified_state", runner.executed)
+        self.assertIn("rc_verified_route", runner.executed)
+        self.assertIn("merge_snap", runner.executed)
+        self.assertEqual(durable.pointer(store)["terminal"]["outcome"], "verified")
+
+    def test_drive_pr_no_longer_selects_route_or_mints_aggregate_budgets(self):
+        source = (self.ROOT / "scripts" / "drive-pr.py").read_text()
+        for forbidden in ("def resolve_route(", "def evaluator_contract_sha256(",
+                          "def build_budgets(", "--attempts", "--turns",
+                          "--wall-seconds", "--tokens", "--cost",
+                          "workflow-runs.jsonl", "def record_workflow_run("):
+            self.assertNotIn(forbidden, source)
+        self.assertNotIn("initial_route", source)
+        self.assertNotIn("budgets", source)
+
+    def test_pr_drive_loop_window_can_continue_the_same_durable_run_in_a_later_rewst_execution(self):
+        nodes = self.nodes("pr-drive")
+        loop = nodes["attempts"]["config"]
+        self.assertGreaterEqual(loop["maxIterations"], 1)
+        self.assertEqual(nodes["run_input"]["config"]["mappings"][-1]["output"],
+                         "run_control_id")
+        dump = json.dumps(self.graph("pr-drive"))
+        self.assertNotIn("product_attempt_limit", dump)
+        self.assertIn("continuation_required", dump)
+        self.assertNotIn("/v1/run/control/evaluate", dump)
+
 
 if __name__ == "__main__":
     unittest.main()

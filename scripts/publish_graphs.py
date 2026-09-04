@@ -36,7 +36,7 @@ RUN_CONTROL_GRAPH_CLASSIFICATION = {
     "run-control-authorize": "compatibility-only",
     "run-control-consume": "active",
     "run-control-consume-authorization": "active",
-    "run-control-initialize": "active",
+    "run-control-initialize": "compatibility-only",
     "run-control-reconcile": "active",
     "run-control-state": "active",
     "run-control-transition": "active",
