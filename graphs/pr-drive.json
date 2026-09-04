@@ -4182,6 +4182,32 @@
         }
       },
       {
+        "id": "rc_verified_route_snap",
+        "type": "transforms.objectBuilder",
+        "label": "Snap verified policy decision",
+        "config": {
+          "alias": "rc_verified_route_snap",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "v2_policy",
+              "expression": {
+                "kind": "coalesce",
+                "primary": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_verified_state.result.v2_policy"
+                },
+                "fallback": {
+                  "kind": "getField",
+                  "path": "TASKS.rc_verified_state.v2_policy"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "rc_verified_route",
         "type": "logic.switch",
         "config": {
@@ -8707,7 +8733,7 @@
         "id": "e_pr5_verified",
         "source": "rc_verified_state",
         "sourceHandle": "success",
-        "target": "rc_verified_route",
+        "target": "rc_verified_route_snap",
         "targetHandle": "in"
       },
       {
@@ -9645,6 +9671,13 @@
         "source": "switch_post_test_policy_fact_validity",
         "sourceHandle": "default",
         "target": "post_test_reason_malformed_identity",
+        "targetHandle": "in"
+      },
+      {
+        "id": "e_pr5_verified_snap",
+        "source": "rc_verified_route_snap",
+        "sourceHandle": "out",
+        "target": "rc_verified_route",
         "targetHandle": "in"
       }
     ]
