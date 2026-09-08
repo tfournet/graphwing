@@ -14592,10 +14592,9 @@ func main() {
                 "alias": "fallback_route_choice_pick",
                 "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
                 "entries": [
-                    {"key": route_version, "value": {
+                    {"key": "availability-fallback-v1", "value": {
                         "kind": "getField", "path": "CTX.recovery_selection.route",
                     }}
-                    for route_version in ("normal-v1", "availability-fallback-v1")
                 ],
                 "defaultValue": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route"},
                 "caseSensitive": True,
@@ -22516,7 +22515,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "3b554a18136185611e1ba010abd500bf9772cf144c7a64ca9e93b8240b4996f3")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "5e48f5e70a93dddc64aff315f0c76a556cd19f32e51a7d6722dab73c27329c3e")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -27160,6 +27159,46 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
                 "INPUT": {},
                 "normal_fallback_candidate": {"route": policy},
                 "recovery_selection": {},
+            },
+            "TASKS": {},
+        }
+        for node_id in ("fallback_route_choice_pick", "fallback_route_choice"):
+            node = runner.nodes[node_id]
+            built = {
+                mapping["output"]: runner.evaluate(mapping["expression"], runner.context)
+                for mapping in node["config"]["mappings"]
+            }
+            runner.context["CTX"][node["config"]["alias"]] = built
+        choice = runner.context["CTX"]["fallback_route_choice"]["value"]
+        self.assertEqual(choice, policy)
+        self.assertEqual(
+            choice["writer_execution_profile"],
+            policy["writer_execution_profile"],
+        )
+
+    def test_fallback_route_choice_ignores_leftover_normal_v1_recovery_selection(self):
+        base = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0,
+        }
+        primary = RewstNativeRoutingPolicyTests.route(base)
+        policy = RewstNativeRoutingPolicyTests.route({
+            **base,
+            "agent_evidence": RewstNativeRoutingPolicyTests.fallback_evidence(primary),
+        })
+        leftover = {
+            "route_version": "normal-v1",
+            "launcher": "codex",
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "writer_execution_profile": {"role": "stale-primary"},
+        }
+        runner = NativeGraphRunner(self.graph("implement-slice"), None)
+        runner.context = {
+            "CTX": {
+                "INPUT": {},
+                "normal_fallback_candidate": {"route": policy},
+                "recovery_selection": {"route": leftover},
             },
             "TASKS": {},
         }
