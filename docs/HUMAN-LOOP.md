@@ -11,6 +11,33 @@ Use your normal editor or terminal. Do not reconstruct operating rules from an o
 - Native `codex`, `claude`, and `grok` launchers must already be installed. Graphwing never installs or wraps them.
 - Herdr is optional. Session `graphwing`, tab `graph`, is a deterministic job dashboard. Do not use it as a planner or chat seat.
 
+## Claude skill lock
+
+The Graphwing loop requires `graphwing-loop@graphwing` and its exact plugin-qualified skills:
+
+```text
+/graphwing-loop:grilling
+/graphwing-loop:to-spec
+/graphwing-loop:to-tickets
+```
+
+Install the plugin with `install.py`, or run:
+
+```bash
+claude plugin marketplace add <graphwing-checkout>
+claude plugin install graphwing-loop@graphwing
+```
+
+Do not use the bare `/grilling`, `/to-spec`, or `/to-tickets` names. Claude Code gives plugin skills qualified names and offers a bare alias only when no other command has that name. `mattpocock-skills@claude-plugins-official` supplies the same three names. With both plugins enabled on the inspected Claude Code 2.1.263 installation, autocomplete exposed both qualified implementations and no unique bare owner; menu order is not an operator contract. Matt's `/grill-with-docs` also calls `grilling` unqualified, so it does not bind the Graphwing implementation.
+
+Fail closed before starting a Graphwing loop: disable Matt's conflicting skills by disabling its plugin at user scope, then restart Claude Code or run `/reload-plugins`:
+
+```bash
+claude plugin disable mattpocock-skills@claude-plugins-official --scope user
+```
+
+Claude Code manages plugin skills as a unit, so the current client cannot disable only Matt's `grilling`, `to-spec`, and `to-tickets`; the command also disables `/mattpocock-skills:grill-with-docs`. Start with `/graphwing-loop:grilling` instead. `claude plugin list` must show `graphwing-loop@graphwing` enabled and `mattpocock-skills@claude-plugins-official` disabled. Stop if it does not. Do not rename Graphwing's skills or shadow the collision in `~/.claude/skills/`.
+
 ## Hard architecture boundary
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is authoritative. Rewst workflows own business policy and durable workflow state, including routing, retries, review actionability, lifecycle transitions, winner selection, merge eligibility, and terminal outcomes.
@@ -41,9 +68,9 @@ decision. Replacement-daemon authority loss produces closed null facts with
 
 ## Flow
 
-1. Grill the idea and record the accepted behavior on its GitHub issue.
+1. Run `/graphwing-loop:grilling`, grill the idea, and record the accepted behavior on its GitHub issue.
 2. Stamp class (`mechanical`, `visual`, or `sensitive`), work kind (`go_coding`, `typescript_coding`, or `research_ops`), and size floor (`S`, `M`, or `L`).
-3. Structure the approved work into a slice map in the app worktree. Graph does not invent slices.
+3. Run `/graphwing-loop:to-spec`, then `/graphwing-loop:to-tickets` to structure the approved work into a slice map in the app worktree. Graph does not invent slices.
 4. Start `graphwing-implement-slice` manually/form-side or through `/workflows/{slug}/run` with `{ "input": {...} }`; the current webhook input path is known broken.
 5. Run named local tests from `tests.json`. On red, files stay on disk and the run parks.
 6. After the map is empty, run the named smoke or e2e recipe before opening a PR.
