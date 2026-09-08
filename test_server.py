@@ -11564,7 +11564,7 @@ while True:
         self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
         self.assertEqual(
             _lookup_view(nodes["fallback_route_choice_pick"])["defaultValue"],
-            {"kind": "getField", "path": "CTX.recovery_selection.route"},
+            {"kind": "getField", "path": "CTX.normal_fallback_candidate.route"},
         )
         for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
             self.assertNotIn("TASKS.route", nodes[node_id]["config"]["effort"], node_id)
@@ -14590,14 +14590,14 @@ func main() {
             _lookup_view(nodes["fallback_route_choice_pick"]),
             {
                 "alias": "fallback_route_choice_pick",
-                "input": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route.route_version"},
+                "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
                 "entries": [
                     {"key": route_version, "value": {
-                        "kind": "getField", "path": "CTX.normal_fallback_candidate.route",
+                        "kind": "getField", "path": "CTX.recovery_selection.route",
                     }}
                     for route_version in ("normal-v1", "availability-fallback-v1")
                 ],
-                "defaultValue": {"kind": "getField", "path": "CTX.recovery_selection.route"},
+                "defaultValue": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route"},
                 "caseSensitive": True,
             },
         )
@@ -22516,7 +22516,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "b07f33616c01b0d9ae1ade350f87b51f17c1d03d7eb85b82c934a38a2d740c28")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "3b554a18136185611e1ba010abd500bf9772cf144c7a64ca9e93b8240b4996f3")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -27138,6 +27138,44 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
                 self.assertIsNone(RewstNativeRoutingPolicyTests.route({
                     **base, "agent_evidence": changed,
                 }))
+
+    def test_fallback_route_choice_binds_policy_result_without_route_version(self):
+        base = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0,
+        }
+        primary = RewstNativeRoutingPolicyTests.route(base)
+        policy = RewstNativeRoutingPolicyTests.route({
+            **base,
+            "agent_evidence": RewstNativeRoutingPolicyTests.fallback_evidence(primary),
+        })
+        self.assertIsNotNone(policy)
+        self.assertNotIn("route_version", policy)
+        self.assertEqual(policy["compatibility_behavior"], "availability-fallback-v1")
+        self.assertIn("writer_execution_profile", policy)
+
+        runner = NativeGraphRunner(self.graph("implement-slice"), None)
+        runner.context = {
+            "CTX": {
+                "INPUT": {},
+                "normal_fallback_candidate": {"route": policy},
+                "recovery_selection": {},
+            },
+            "TASKS": {},
+        }
+        for node_id in ("fallback_route_choice_pick", "fallback_route_choice"):
+            node = runner.nodes[node_id]
+            built = {
+                mapping["output"]: runner.evaluate(mapping["expression"], runner.context)
+                for mapping in node["config"]["mappings"]
+            }
+            runner.context["CTX"][node["config"]["alias"]] = built
+        choice = runner.context["CTX"]["fallback_route_choice"]["value"]
+        self.assertEqual(choice, policy)
+        self.assertEqual(
+            choice["writer_execution_profile"],
+            policy["writer_execution_profile"],
+        )
 
     def test_fallback_profile_is_rejected_before_spawn_when_unsupported_forged_or_mismatched(self):
         policy = self.graph("routing-policy")
