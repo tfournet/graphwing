@@ -560,6 +560,8 @@ ROUTING_POLICY_V2_VERSION = "routing-policy-v2"
 ROUTING_POLICY_V2_ROUTE_VERSION = "routing-policy-v2-candidate"
 ROUTE_EXECUTION_PROFILE_VERSION = "route-execution-profile-v1"
 ROUTE_EXECUTION_PROFILE_V2_VERSION = "route-execution-profile-v2"
+AGENT_EVIDENCE_VERSION = "agent-evidence-v1"
+AGENT_EVIDENCE_VERIFY_FIELDS = frozenset({"job_id", "session_identity"})
 ROUTE_EXECUTION_ROLES = frozenset({"writer", "reviewer1", "reviewer2"})
 ROUTE_EXECUTION_PROFILE_FIELDS = frozenset({
     "version", "route_version", "role", "work_kind", "class", "size",
@@ -7448,36 +7450,37 @@ def sanitized_review_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def valid_server_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value
+    ):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
 def valid_review_timestamps(job: Any) -> bool:
     """Accept only exact server-authored second-resolution UTC lifecycle stamps."""
     if not isinstance(job, dict):
         return False
 
-    def valid(value: Any) -> bool:
-        if not isinstance(value, str) or not re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value
-        ):
-            return False
-        try:
-            datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            return False
-        return True
-
     status = job.get("status")
     created = job.get("created_at")
     started = job.get("started_at")
     finished = job.get("finished_at")
-    if not valid(created):
+    if not valid_server_timestamp(created):
         return False
     if status == "queued":
         return started is None and finished is None
     if status == "running":
-        return valid(started) and finished is None
+        return valid_server_timestamp(started) and finished is None
     if status == "completed":
-        return valid(started) and valid(finished)
+        return valid_server_timestamp(started) and valid_server_timestamp(finished)
     if status == "failed":
-        return (started is None or valid(started)) and valid(finished)
+        return (started is None or valid_server_timestamp(started)) and valid_server_timestamp(finished)
     return False
 
 
@@ -7799,7 +7802,11 @@ def sanitized_agent_receipt(job: dict[str, Any]) -> dict[str, Any] | None:
     code = stored.get("failure_code")
     if status == "ok" and code == "none" and profile["session_identity"].get("native_session_id"):
         classified = classify_agent_failure("success")
-    elif isinstance(code, str) and code in FAILURE_CLASS_BY_CODE and code != "success":
+    elif (
+        isinstance(code, str)
+        and code != "success"
+        and (code in FAILURE_CLASS_BY_CODE or code in PROVIDER_AVAILABILITY_CODES)
+    ):
         classified = classify_agent_failure(code)
     else:
         status = "error"
@@ -8063,6 +8070,142 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "session_identity": identity,
         **{key: job.get(key) for key in ("created_at", "started_at", "finished_at")},
         "receipt": sanitized_agent_receipt(job),
+    }
+
+
+def valid_agent_terminal_timestamps(job: Any) -> bool:
+    if not isinstance(job, dict) or job.get("status") not in {"completed", "failed"}:
+        return False
+    created, started, finished = (
+        job.get("created_at"), job.get("started_at"), job.get("finished_at")
+    )
+    if not valid_server_timestamp(created) or not valid_server_timestamp(finished):
+        return False
+    if started is not None and not valid_server_timestamp(started):
+        return False
+    if job.get("status") == "completed" and started is None:
+        return False
+    assert isinstance(created, str) and isinstance(finished, str)
+    assert started is None or isinstance(started, str)
+    return bool(created <= finished and (started is None or created <= started <= finished))
+
+
+def agent_evidence_verify(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != AGENT_EVIDENCE_VERIFY_FIELDS:
+        return 400, {
+            "error": "agent evidence verification requires only job_id and session_identity",
+            "code": "unexpected_fields",
+        }
+    job_id = data.get("job_id")
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        return 400, {"error": "invalid job_id", "code": "bad_job_id"}
+    expected_identity, identity_err = parse_session_identity(data.get("session_identity"))
+    expected_profile = (
+        expected_identity.get("route_execution_profile")
+        if isinstance(expected_identity, dict) else None
+    )
+    if (
+        identity_err is not None or expected_identity != data.get("session_identity")
+        or not isinstance(expected_profile, dict)
+        or expected_profile.get("version") != ROUTE_EXECUTION_PROFILE_V2_VERSION
+        or expected_profile.get("role") != "writer"
+        or expected_identity.get("effort_source") != "route"
+    ):
+        return 400, {
+            "error": "session_identity must contain one exact pinned v2 writer profile",
+            "code": "bad_session_identity",
+        }
+    assert isinstance(expected_identity, dict)
+    assert isinstance(expected_profile, dict)
+
+    job = read_job(job_id)
+    if (
+        not isinstance(job, dict) or job.get("kind") != "agent"
+        or job.get("job_id") != job_id
+    ):
+        return 404, {"error": "agent evidence not found", "code": "not_found"}
+    if job.get("status") not in {"completed", "failed"}:
+        return 409, {
+            "error": "agent evidence is not terminal", "code": "agent_evidence_not_terminal",
+        }
+    profile = trusted_agent_profile(job)
+    stored_receipt = job.get("receipt")
+    receipt_fields = {
+        "status", "job_id", "launcher", "provider", "model", "session_identity",
+        "requested_effort", "effective_effort", "effort_source", "launcher_version",
+        "summary", "failure_class", "failure_code", "failover_eligible", "diagnostic",
+        "usage", "usage_diagnostic",
+    }
+    if (
+        not is_agent_job_record(job) or profile is None
+        or profile.get("session_identity") != expected_identity
+        or not valid_agent_terminal_timestamps(job)
+        or not isinstance(stored_receipt, dict) or set(stored_receipt) != receipt_fields
+        or not receipt_profile_matches_job(job, stored_receipt)
+    ):
+        return 409, {
+            "error": "agent evidence does not match the server-authored terminal job",
+            "code": "agent_evidence_mismatch",
+        }
+    receipt = stored_receipt
+    receipt_status = receipt.get("status")
+    expected_job_status = "completed" if receipt_status == "ok" else "failed"
+    failure_class = receipt.get("failure_class")
+    failure_code = receipt.get("failure_code")
+    failover_eligible = receipt.get("failover_eligible")
+    classified = classify_agent_failure(
+        "success" if receipt_status == "ok" else str(failure_code or "unknown_failure")
+    )
+    usage = receipt.get("usage")
+    usage_diagnostic = receipt.get("usage_diagnostic")
+    usage_valid = (
+        valid_normalized_usage(usage) and usage_diagnostic is None
+    ) or (
+        usage is None and usage_diagnostic in {
+            "usage_not_reported", "usage_incomplete", "usage_malformed",
+            "usage_authority_unavailable", "usage_authority_mismatch",
+        }
+    )
+    if (
+        job.get("status") != expected_job_status
+        or receipt_status not in {"ok", "error", "timeout"}
+        or (receipt_status == "ok" and not expected_identity.get("native_session_id"))
+        or not isinstance(failure_class, str) or not isinstance(failure_code, str)
+        or type(failover_eligible) is not bool or not usage_valid
+        or any(receipt.get(key) != classified[key] for key in (
+            "failure_class", "failure_code", "failover_eligible", "diagnostic",
+        ))
+        or receipt.get("summary") != classified["diagnostic"]["summary"]
+        or failover_eligible != (
+            failure_class == "provider_availability"
+            and failure_code in PROVIDER_AVAILABILITY_CODES
+        )
+    ):
+        return 409, {
+            "error": "agent evidence does not match the server-authored terminal job",
+            "code": "agent_evidence_mismatch",
+        }
+    identity = profile["session_identity"]
+    route_profile = identity["route_execution_profile"]
+    return 200, {
+        "evidence_version": AGENT_EVIDENCE_VERSION,
+        "kind": "agent",
+        "job_id": job_id,
+        "role": route_profile["role"],
+        "terminal_status": receipt_status,
+        "failure_class": failure_class,
+        "failure_code": failure_code,
+        "failover_eligible": failover_eligible,
+        "route_execution_profile": json.loads(json.dumps(route_profile)),
+        "session_identity": json.loads(json.dumps(identity)),
+        "repo": identity["repo"],
+        "branch": identity["branch"],
+        "created_at": job["created_at"],
+        "finished_at": job["finished_at"],
     }
 
 
@@ -9591,7 +9734,9 @@ def structured_provider_failure(text: str) -> str | None:
 def classify_agent_failure(evidence_code: str, structured_output: str = "") -> dict[str, Any]:
     failure_class = FAILURE_CLASS_BY_CODE.get(evidence_code)
     provider_code = None
-    if failure_class in (None, "model_execution", "unknown"):
+    if evidence_code in PROVIDER_AVAILABILITY_CODES:
+        provider_code = evidence_code
+    elif failure_class in (None, "model_execution", "unknown"):
         provider_code = structured_provider_failure(structured_output)
     if provider_code:
         failure_class, failure_code = "provider_availability", provider_code
@@ -14391,6 +14536,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/attempt-facts":
         status, payload = run_control_attempt_facts(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/agent/evidence/verify":
+        status, payload = agent_evidence_verify(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/run/control/validate-initialize":
         status, payload = run_control_validate_initialize(body)

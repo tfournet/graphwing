@@ -68,6 +68,7 @@
         "python3",
         "-m",
         "unittest",
+        "test_server.AgentEvidenceVerifyTests",
         "test_server.WorkflowRoutingConsumerTests",
         "test_server.RewstNativeRoutingPolicyTests",
         "test_server.WorkflowRouteProfileV2Tests",
