@@ -339,7 +339,7 @@ Two more findings on the way:
     token under both headers (run ccf0dd9e).
 12. **Seat named tests.** Named tests run in the daemon's home, where only
     `server.py`, `test_server.py`, and `setup_tunnel.py` exist;
-    `graphwing-compile` fails there on `install.py`. `graphwing-seat-compile`
+    `catalog-compile` fails there on `install.py`. `graphwing-seat-compile`
     compiles what the seat actually has. Writer commits also need a git
     identity in the allowlisted checkout, because the daemon's `HOME` carries
     none.

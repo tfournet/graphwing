@@ -18122,9 +18122,31 @@ func main() {
         self.assertEqual(not_configured[0], 501)
         self.assertFalse(hasattr(server, "port_listening"))
 
+    def test_catalog_test_recipes_have_unique_execution_identities(self):
+        recipes = json.loads(
+            (Path(server.__file__).parent / "tests.json").read_text()
+        )["tests"]
+        names = {recipe["name"] for recipe in recipes}
+        identities = {}
+        duplicates = []
+        for recipe in recipes:
+            identity = (
+                tuple(recipe["argv"]),
+                recipe["cwd"],
+                recipe["timeout_seconds"],
+            )
+            if identity in identities:
+                duplicates.append((identities[identity], recipe["name"]))
+            else:
+                identities[identity] = recipe["name"]
+
+        self.assertEqual(duplicates, [])
+        self.assertNotIn("graphwing-compile", names)
+        self.assertIn("catalog-compile", names)
+
     def test_test_run_compile(self):
         status, payload, _ = server.dispatch(
-            "POST", "/v1/test/run", {}, True, b'{"name":"graphwing-compile"}'
+            "POST", "/v1/test/run", {}, True, b'{"name":"catalog-compile"}'
         )
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["ok"])
@@ -18177,7 +18199,7 @@ func main() {
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "unknown_test")
         status, payload, _ = server.dispatch(
-            "POST", "/v1/test/run", {}, True, b'{"name":"graphwing-compile","argv":["id"]}'
+            "POST", "/v1/test/run", {}, True, b'{"name":"catalog-compile","argv":["id"]}'
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "argv_forbidden")
