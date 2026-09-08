@@ -24121,6 +24121,34 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_graphwing_loop_catalog_pins_operator_skill_names(self):
+        root = Path(__file__).resolve().parent
+        expected = {"grilling", "to-spec", "to-tickets"}
+        plugin_root = root / "plugins" / "graphwing-loop"
+        manifest = json.loads((plugin_root / ".claude-plugin" / "plugin.json").read_text())
+        marketplace = json.loads((root / ".claude-plugin" / "marketplace.json").read_text())
+        entry = next(item for item in marketplace["plugins"] if item["name"] == "graphwing-loop")
+
+        for catalog in (manifest, entry):
+            self.assertEqual(
+                {Path(skill).name for skill in catalog["skills"]},
+                expected,
+            )
+        for name in expected:
+            skill = plugin_root / "skills" / name / "SKILL.md"
+            self.assertTrue(skill.is_file(), str(skill))
+            self.assertRegex(skill.read_text(), rf"(?m)^name: {re.escape(name)}$")
+
+        for rel in ("docs/HUMAN-LOOP.md", "docs/USING.md"):
+            text = (root / rel).read_text()
+            for name in expected:
+                self.assertIn(f"/graphwing-loop:{name}", text, rel)
+        human_loop = (root / "docs/HUMAN-LOOP.md").read_text()
+        self.assertIn(
+            "claude plugin disable mattpocock-skills@claude-plugins-official --scope user",
+            human_loop,
+        )
+
     def test_runtime_and_templates_have_no_hardcoded_home(self):
         root = Path(__file__).resolve().parent
         for rel in (

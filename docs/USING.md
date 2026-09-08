@@ -10,9 +10,21 @@ Use your normal editor or terminal; optional Herdr session `graphwing`, tab `gra
 
 Allowlisted short names are `$GRAPHWING_HOME/repos.json`. Graph `cwd` / `repo` fields use those names, not paths.
 
+## Claude skills preflight
+
+Use only Graphwing's qualified operator-loop names:
+
+```text
+/graphwing-loop:grilling
+/graphwing-loop:to-spec
+/graphwing-loop:to-tickets
+```
+
+Bare `/grilling`, `/to-spec`, and `/to-tickets` do not have a proven Graphwing owner when `mattpocock-skills` is also enabled. Matt's `/grill-with-docs` calls `grilling` unqualified and is not a safe Graphwing entry point. Before starting, follow the [Claude skill lock](HUMAN-LOOP.md#claude-skill-lock): `claude plugin list` must show `graphwing-loop@graphwing` enabled and `mattpocock-skills@claude-plugins-official` disabled. Stop rather than structure with the wrong skill.
+
 ## Structure a slice map
 
-After Shortcut Ready, same tab, `/to-tickets` (from the `graphwing-loop` plugin; see [HUMAN-LOOP.md](HUMAN-LOOP.md) step 1 to install it). Graph does not Structure.
+After Shortcut Ready, same tab, `/graphwing-loop:to-tickets`. Graph does not Structure.
 
 Index JSON in the app worktree (example: [`examples/slices.example.json`](../examples/slices.example.json)):
 
