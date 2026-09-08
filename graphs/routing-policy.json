@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-routing-policy",
   "name": "graphwing-routing-policy",
-  "description": "Deterministic Rewst-native routing policy. Payload: class, work_kind, size, ac_count, seams. Preserves normal-v1 compatibility behavior and emits closed route-execution-profile-v2 decisions; malformed inputs fail closed.",
+  "description": "Deterministic Rewst-native routing policy. Preserves normal-v1 primary/reviewer behavior and the characterized one-hop availability fallback, emitting closed route-execution-profile-v2 decisions from verified facts; malformed inputs fail closed.",
   "spec": {
     "meta": {
       "useSearchAttributes": true,
@@ -107,6 +107,14 @@
                 "kind": "getField",
                 "path": "CTX.INPUT.seams"
               }
+            },
+            {
+              "id": "m6",
+              "output": "agent_evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.agent_evidence"
+              }
             }
           ]
         }
@@ -174,7 +182,23 @@
                       "class|size|work_kind",
                       "class|seams|size|work_kind",
                       "ac_count|class|size|work_kind",
-                      "ac_count|class|seams|size|work_kind"
+                      "ac_count|class|seams|size|work_kind",
+                      "agent_evidence|work_kind",
+                      "agent_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|work_kind",
+                      "ac_count|agent_evidence|seams|work_kind",
+                      "agent_evidence|size|work_kind",
+                      "agent_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|size|work_kind",
+                      "ac_count|agent_evidence|seams|size|work_kind",
+                      "agent_evidence|class|work_kind",
+                      "agent_evidence|class|seams|work_kind",
+                      "ac_count|agent_evidence|class|work_kind",
+                      "ac_count|agent_evidence|class|seams|work_kind",
+                      "agent_evidence|class|size|work_kind",
+                      "agent_evidence|class|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|size|work_kind",
+                      "ac_count|agent_evidence|class|seams|size|work_kind"
                     ]
                   }
                 },
@@ -1616,6 +1640,2254 @@
         }
       },
       {
+        "id": "fallback_mode",
+        "type": "transforms.objectBuilder",
+        "label": "Snap fallback request mode",
+        "position": {
+          "x": 1520,
+          "y": 0
+        },
+        "config": {
+          "alias": "routing_fallback_mode",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "requested",
+              "expression": {
+                "kind": "binary",
+                "operator": "!=",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_requested",
+        "type": "logic.filter",
+        "label": "Fallback evidence supplied?",
+        "position": {
+          "x": 1600,
+          "y": 0
+        },
+        "config": {
+          "group": "AND",
+          "rules": [
+            {
+              "path": "requested",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_facts",
+        "type": "transforms.objectBuilder",
+        "label": "Validate verified primary facts",
+        "position": {
+          "x": 1680,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_facts",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "evidence_closed",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "filter",
+                  "filter": "join",
+                  "input": {
+                    "kind": "filter",
+                    "filter": "sort",
+                    "input": {
+                      "kind": "filter",
+                      "filter": "keys",
+                      "input": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.agent_evidence"
+                      },
+                      "filterArgs": []
+                    },
+                    "filterArgs": []
+                  },
+                  "filterArgs": [
+                    {
+                      "kind": "literal",
+                      "value": "|"
+                    }
+                  ]
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "branch|created_at|evidence_version|failover_eligible|failure_class|failure_code|finished_at|job_id|kind|repo|role|route_execution_profile|session_identity|terminal_status"
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "evidence_version",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.evidence_version"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "agent-evidence-v1"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "canonical_agent",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.kind"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "agent"
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "job_identity",
+              "expression": {
+                "kind": "binary",
+                "operator": "!=",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.job_id"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "writer_role",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.role"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "writer"
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "terminal_error",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.terminal_status"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "error"
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "provider_availability",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.failure_class"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "provider_availability"
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "failure_code_allowed",
+              "expression": {
+                "kind": "binary",
+                "operator": "in",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": [
+                    "missing_binary",
+                    "provider_authentication",
+                    "provider_quota",
+                    "provider_rate_limit",
+                    "provider_network",
+                    "provider_overloaded",
+                    "provider_http_5xx"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "m9",
+              "output": "failover_eligible",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.failover_eligible"
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": true
+                }
+              }
+            },
+            {
+              "id": "m10",
+              "output": "profile_closed",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "filter",
+                  "filter": "join",
+                  "input": {
+                    "kind": "filter",
+                    "filter": "sort",
+                    "input": {
+                      "kind": "filter",
+                      "filter": "keys",
+                      "input": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                      },
+                      "filterArgs": []
+                    },
+                    "filterArgs": []
+                  },
+                  "filterArgs": [
+                    {
+                      "kind": "literal",
+                      "value": "|"
+                    }
+                  ]
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "class|decision_id|decision_sha256|effective_size|launcher|model|policy_version|provider|requested_effort|role|version|work_kind"
+                }
+              }
+            },
+            {
+              "id": "m11",
+              "output": "profile_exact",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                },
+                "right": {
+                  "kind": "object",
+                  "properties": {
+                    "version": {
+                      "kind": "literal",
+                      "value": "route-execution-profile-v2"
+                    },
+                    "policy_version": {
+                      "kind": "literal",
+                      "value": "workflow-normal-v1"
+                    },
+                    "decision_id": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "literal",
+                        "value": "routing-normal-v1:"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_decision_hash.value"
+                      }
+                    },
+                    "decision_sha256": {
+                      "kind": "getField",
+                      "path": "CTX.routing_decision_hash.value"
+                    },
+                    "role": {
+                      "kind": "literal",
+                      "value": "writer"
+                    },
+                    "work_kind": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "class": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.class"
+                    },
+                    "effective_size": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "launcher": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.launcher"
+                    },
+                    "provider": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.provider"
+                    },
+                    "model": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.model"
+                    },
+                    "requested_effort": {
+                      "kind": "getField",
+                      "path": "CTX.routing_writer_profile.effort"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m12",
+              "output": "session_closed",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "filter",
+                  "filter": "join",
+                  "input": {
+                    "kind": "filter",
+                    "filter": "sort",
+                    "input": {
+                      "kind": "filter",
+                      "filter": "keys",
+                      "input": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.agent_evidence.session_identity"
+                      },
+                      "filterArgs": []
+                    },
+                    "filterArgs": []
+                  },
+                  "filterArgs": [
+                    {
+                      "kind": "literal",
+                      "value": "|"
+                    }
+                  ]
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": "branch|effective_effort|effort_source|launcher|launcher_version|model|native_session_id|provider|repo|requested_effort|route_execution_profile|starting_head"
+                }
+              }
+            },
+            {
+              "id": "m13",
+              "output": "session_profile_exact",
+              "expression": {
+                "kind": "binary",
+                "operator": "==",
+                "left": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.session_identity.route_execution_profile"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                }
+              }
+            },
+            {
+              "id": "m14",
+              "output": "session_route_exact",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "and",
+                  "left": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "and",
+                      "left": {
+                        "kind": "binary",
+                        "operator": "and",
+                        "left": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.agent_evidence.session_identity.launcher"
+                          },
+                          "right": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.launcher"
+                          }
+                        },
+                        "right": {
+                          "kind": "binary",
+                          "operator": "==",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.agent_evidence.session_identity.provider"
+                          },
+                          "right": {
+                            "kind": "getField",
+                            "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.provider"
+                          }
+                        }
+                      },
+                      "right": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input.agent_evidence.session_identity.model"
+                        },
+                        "right": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.model"
+                        }
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.agent_evidence.session_identity.requested_effort"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.requested_effort"
+                      }
+                    }
+                  },
+                  "right": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.agent_evidence.session_identity.effort_source"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "route"
+                    }
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.effective_effort"
+                  },
+                  "right": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.work_kind"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "go_coding"
+                      }
+                    },
+                    "then": {
+                      "kind": "literal",
+                      "value": "high"
+                    },
+                    "else": {
+                      "kind": "conditional",
+                      "condition": {
+                        "kind": "binary",
+                        "operator": "==",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_policy_input.work_kind"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": "typescript_coding"
+                        }
+                      },
+                      "then": {
+                        "kind": "literal",
+                        "value": "default"
+                      },
+                      "else": {
+                        "kind": "literal",
+                        "value": "high"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m15",
+              "output": "provenance_exact",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.repo"
+                  },
+                  "right": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.repo"
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.branch"
+                  },
+                  "right": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.branch"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m16",
+              "output": "timestamps_present",
+              "expression": {
+                "kind": "binary",
+                "operator": "and",
+                "left": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.created_at"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                },
+                "right": {
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.finished_at"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_eligible",
+        "type": "logic.filter",
+        "label": "Verified primary availability failure?",
+        "position": {
+          "x": 1760,
+          "y": -120
+        },
+        "config": {
+          "group": "AND",
+          "rules": [
+            {
+              "path": "evidence_closed",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "evidence_version",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "canonical_agent",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "job_identity",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "writer_role",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "terminal_error",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "provider_availability",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "failure_code_allowed",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "failover_eligible",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "profile_closed",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "profile_exact",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "session_closed",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "session_profile_exact",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "session_route_exact",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "provenance_exact",
+              "op": "equals",
+              "value": true
+            },
+            {
+              "path": "timestamps_present",
+              "op": "equals",
+              "value": true
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_rejected",
+        "type": "transforms.regexReplace",
+        "label": "Reject invalid fallback evidence",
+        "position": {
+          "x": 1840,
+          "y": -240
+        },
+        "config": {
+          "input": "graphwing_routing_fallback_evidence_rejected",
+          "pattern": "(?=graphwing)",
+          "replacement": ""
+        }
+      },
+      {
+        "id": "fallback_writer_profile",
+        "type": "transforms.objectBuilder",
+        "label": "Select one-hop availability alternate",
+        "position": {
+          "x": 1840,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_writer_profile",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "codex"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "anthropic"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "openai"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "anthropic"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude-opus-5"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "gpt-5.6-sol"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude-sonnet-5"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "go_coding"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "default"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "typescript_coding"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "high"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "default"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_reviewer_policy",
+        "type": "transforms.objectBuilder",
+        "label": "Select fallback opposing reviewers",
+        "position": {
+          "x": 1920,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_reviewer_policy",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "count",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "sensitive"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": 2
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "and",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_policy_input.class"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "mechanical"
+                      }
+                    },
+                    "right": {
+                      "kind": "binary",
+                      "operator": "==",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_effective_size.value"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "S"
+                      }
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": 0
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                }
+              }
+            },
+            {
+              "id": "m2",
+              "output": "effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "sensitive"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "high"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "medium"
+                }
+              }
+            },
+            {
+              "id": "m3",
+              "output": "reviewer1_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "codex"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "codex"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m4",
+              "output": "reviewer1_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "anthropic"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "openai"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "reviewer1_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "claude-sonnet-5"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "gpt-5.6-sol"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "gpt-5.6-sol"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m6",
+              "output": "reviewer2_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "grok"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "grok"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m7",
+              "output": "reviewer2_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "xai"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "xai"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "anthropic"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m8",
+              "output": "reviewer2_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": "openai"
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "grok-4.6"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_writer_profile.provider"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": "anthropic"
+                    }
+                  },
+                  "then": {
+                    "kind": "literal",
+                    "value": "grok-4.6"
+                  },
+                  "else": {
+                    "kind": "literal",
+                    "value": "claude-opus-5"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_decision_material",
+        "type": "transforms.objectBuilder",
+        "label": "Build canonical fallback decision",
+        "position": {
+          "x": 2000,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_decision_material",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "value",
+              "expression": {
+                "kind": "object",
+                "properties": {
+                  "policy_version": {
+                    "kind": "literal",
+                    "value": "workflow-normal-v1"
+                  },
+                  "compatibility_behavior": {
+                    "kind": "literal",
+                    "value": "availability-fallback-v1"
+                  },
+                  "primary_decision_sha256": {
+                    "kind": "getField",
+                    "path": "CTX.routing_decision_hash.value"
+                  },
+                  "primary_job_id": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.job_id"
+                  },
+                  "failure_code": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                  },
+                  "class": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "work_kind": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "size_floor": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.size"
+                  },
+                  "effective_size": {
+                    "kind": "getField",
+                    "path": "CTX.routing_effective_size.value"
+                  },
+                  "ac_count": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input_normalized.ac_count"
+                  },
+                  "seams": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input_normalized.seams"
+                  },
+                  "writer": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile"
+                  },
+                  "budget": {
+                    "kind": "getField",
+                    "path": "CTX.routing_execution_budget"
+                  },
+                  "reviewers": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "fallback_decision_hash",
+        "type": "transforms.hash",
+        "label": "Hash canonical fallback decision",
+        "position": {
+          "x": 2080,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_decision_hash",
+          "mode": "hash",
+          "algorithm": "sha256",
+          "inputKind": "json_stringify",
+          "input": "{{ CTX.routing_fallback_decision_material.value }}",
+          "outputFormat": "hex",
+          "hexCase": "lower"
+        }
+      },
+      {
+        "id": "fallback_route_output",
+        "type": "transforms.objectBuilder",
+        "label": "Emit one-hop fallback profiles v2",
+        "position": {
+          "x": 2160,
+          "y": -120
+        },
+        "config": {
+          "alias": "routing_fallback_policy_output",
+          "version": 1,
+          "mappings": [
+            {
+              "id": "m1",
+              "output": "ok",
+              "expression": {
+                "kind": "literal",
+                "value": true
+              }
+            },
+            {
+              "id": "m2",
+              "output": "policy_version",
+              "expression": {
+                "kind": "literal",
+                "value": "workflow-normal-v1"
+              }
+            },
+            {
+              "id": "m3",
+              "output": "compatibility_behavior",
+              "expression": {
+                "kind": "literal",
+                "value": "availability-fallback-v1"
+              }
+            },
+            {
+              "id": "m4",
+              "output": "decision_id",
+              "expression": {
+                "kind": "binary",
+                "operator": "+",
+                "left": {
+                  "kind": "literal",
+                  "value": "routing-fallback-v1:"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_decision_hash.value"
+                }
+              }
+            },
+            {
+              "id": "m5",
+              "output": "decision_sha256",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_decision_hash.value"
+              }
+            },
+            {
+              "id": "m6",
+              "output": "class",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.class"
+              }
+            },
+            {
+              "id": "m7",
+              "output": "work_kind",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.work_kind"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "size_floor",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.size"
+              }
+            },
+            {
+              "id": "m9",
+              "output": "size",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_effective_size.value"
+              }
+            },
+            {
+              "id": "m10",
+              "output": "ac_count",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input_normalized.ac_count"
+              }
+            },
+            {
+              "id": "m11",
+              "output": "seams",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input_normalized.seams"
+              }
+            },
+            {
+              "id": "m12",
+              "output": "launcher",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_writer_profile.launcher"
+              }
+            },
+            {
+              "id": "m13",
+              "output": "provider",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_writer_profile.provider"
+              }
+            },
+            {
+              "id": "m14",
+              "output": "model",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_writer_profile.model"
+              }
+            },
+            {
+              "id": "m15",
+              "output": "effort",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_writer_profile.effort"
+              }
+            },
+            {
+              "id": "m16",
+              "output": "reason",
+              "expression": {
+                "kind": "binary",
+                "operator": "+",
+                "left": {
+                  "kind": "literal",
+                  "value": "availability_fallback:"
+                },
+                "right": {
+                  "kind": "getField",
+                  "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                }
+              }
+            },
+            {
+              "id": "m17",
+              "output": "max_turns",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_execution_budget.max_turns"
+              }
+            },
+            {
+              "id": "m18",
+              "output": "run_budget_seconds",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_execution_budget.run_budget_seconds"
+              }
+            },
+            {
+              "id": "m19",
+              "output": "reviewer_count",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_fallback_reviewer_policy.count"
+              }
+            },
+            {
+              "id": "m20",
+              "output": "reviewer1",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer1_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m21",
+              "output": "reviewer1_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer1_launcher"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m22",
+              "output": "reviewer1_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer1_provider"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m23",
+              "output": "reviewer1_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer1_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m24",
+              "output": "reviewer1_effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.effort"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m25",
+              "output": "reviewer1_reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "different_provider_from_writer"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "not_required_by_review_policy"
+                }
+              }
+            },
+            {
+              "id": "m26",
+              "output": "reviewer2",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer2_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m27",
+              "output": "reviewer2_launcher",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer2_launcher"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m28",
+              "output": "reviewer2_provider",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer2_provider"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m29",
+              "output": "reviewer2_model",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.reviewer2_model"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m30",
+              "output": "reviewer2_effort",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "getField",
+                  "path": "CTX.routing_fallback_reviewer_policy.effort"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "none"
+                }
+              }
+            },
+            {
+              "id": "m31",
+              "output": "reviewer2_reason",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "different_provider_from_writer_and_reviewer1"
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": "not_required_by_review_policy"
+                }
+              }
+            },
+            {
+              "id": "m32",
+              "output": "review",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": "==",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 0
+                  }
+                },
+                "then": {
+                  "kind": "literal",
+                  "value": "none"
+                },
+                "else": {
+                  "kind": "conditional",
+                  "condition": {
+                    "kind": "binary",
+                    "operator": "==",
+                    "left": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.count"
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": 1
+                    }
+                  },
+                  "then": {
+                    "kind": "conditional",
+                    "condition": {
+                      "kind": "binary",
+                      "operator": ">=",
+                      "left": {
+                        "kind": "getField",
+                        "path": "CTX.routing_fallback_reviewer_policy.count"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": 1
+                      }
+                    },
+                    "then": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer1_model"
+                    },
+                    "else": {
+                      "kind": "literal",
+                      "value": "none"
+                    }
+                  },
+                  "else": {
+                    "kind": "binary",
+                    "operator": "+",
+                    "left": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "conditional",
+                        "condition": {
+                          "kind": "binary",
+                          "operator": ">=",
+                          "left": {
+                            "kind": "getField",
+                            "path": "CTX.routing_fallback_reviewer_policy.count"
+                          },
+                          "right": {
+                            "kind": "literal",
+                            "value": 1
+                          }
+                        },
+                        "then": {
+                          "kind": "getField",
+                          "path": "CTX.routing_fallback_reviewer_policy.reviewer1_model"
+                        },
+                        "else": {
+                          "kind": "literal",
+                          "value": "none"
+                        }
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": "_"
+                      }
+                    },
+                    "right": {
+                      "kind": "conditional",
+                      "condition": {
+                        "kind": "binary",
+                        "operator": ">=",
+                        "left": {
+                          "kind": "getField",
+                          "path": "CTX.routing_fallback_reviewer_policy.count"
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": 2
+                        }
+                      },
+                      "then": {
+                        "kind": "getField",
+                        "path": "CTX.routing_fallback_reviewer_policy.reviewer2_model"
+                      },
+                      "else": {
+                        "kind": "literal",
+                        "value": "none"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "id": "m33",
+              "output": "writer_execution_profile",
+              "expression": {
+                "kind": "object",
+                "properties": {
+                  "version": {
+                    "kind": "literal",
+                    "value": "route-execution-profile-v2"
+                  },
+                  "policy_version": {
+                    "kind": "literal",
+                    "value": "workflow-normal-v1"
+                  },
+                  "decision_id": {
+                    "kind": "binary",
+                    "operator": "+",
+                    "left": {
+                      "kind": "literal",
+                      "value": "routing-fallback-v1:"
+                    },
+                    "right": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_decision_hash.value"
+                    }
+                  },
+                  "decision_sha256": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_decision_hash.value"
+                  },
+                  "role": {
+                    "kind": "literal",
+                    "value": "writer"
+                  },
+                  "work_kind": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.work_kind"
+                  },
+                  "class": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.class"
+                  },
+                  "effective_size": {
+                    "kind": "getField",
+                    "path": "CTX.routing_effective_size.value"
+                  },
+                  "launcher": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.launcher"
+                  },
+                  "provider": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.provider"
+                  },
+                  "model": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.model"
+                  },
+                  "requested_effort": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_writer_profile.effort"
+                  }
+                }
+              }
+            },
+            {
+              "id": "m34",
+              "output": "reviewer1_execution_profile",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 1
+                  }
+                },
+                "then": {
+                  "kind": "object",
+                  "properties": {
+                    "version": {
+                      "kind": "literal",
+                      "value": "route-execution-profile-v2"
+                    },
+                    "policy_version": {
+                      "kind": "literal",
+                      "value": "workflow-normal-v1"
+                    },
+                    "decision_id": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "literal",
+                        "value": "routing-fallback-v1:"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_fallback_decision_hash.value"
+                      }
+                    },
+                    "decision_sha256": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_decision_hash.value"
+                    },
+                    "role": {
+                      "kind": "literal",
+                      "value": "reviewer1"
+                    },
+                    "work_kind": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "class": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.class"
+                    },
+                    "effective_size": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "launcher": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer1_launcher"
+                    },
+                    "provider": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer1_provider"
+                    },
+                    "model": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer1_model"
+                    },
+                    "requested_effort": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.effort"
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            },
+            {
+              "id": "m35",
+              "output": "reviewer2_execution_profile",
+              "expression": {
+                "kind": "conditional",
+                "condition": {
+                  "kind": "binary",
+                  "operator": ">=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_fallback_reviewer_policy.count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": 2
+                  }
+                },
+                "then": {
+                  "kind": "object",
+                  "properties": {
+                    "version": {
+                      "kind": "literal",
+                      "value": "route-execution-profile-v2"
+                    },
+                    "policy_version": {
+                      "kind": "literal",
+                      "value": "workflow-normal-v1"
+                    },
+                    "decision_id": {
+                      "kind": "binary",
+                      "operator": "+",
+                      "left": {
+                        "kind": "literal",
+                        "value": "routing-fallback-v1:"
+                      },
+                      "right": {
+                        "kind": "getField",
+                        "path": "CTX.routing_fallback_decision_hash.value"
+                      }
+                    },
+                    "decision_sha256": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_decision_hash.value"
+                    },
+                    "role": {
+                      "kind": "literal",
+                      "value": "reviewer2"
+                    },
+                    "work_kind": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.work_kind"
+                    },
+                    "class": {
+                      "kind": "getField",
+                      "path": "CTX.routing_policy_input.class"
+                    },
+                    "effective_size": {
+                      "kind": "getField",
+                      "path": "CTX.routing_effective_size.value"
+                    },
+                    "launcher": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer2_launcher"
+                    },
+                    "provider": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer2_provider"
+                    },
+                    "model": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.reviewer2_model"
+                    },
+                    "requested_effort": {
+                      "kind": "getField",
+                      "path": "CTX.routing_fallback_reviewer_policy.effort"
+                    }
+                  }
+                },
+                "else": {
+                  "kind": "literal",
+                  "value": null
+                }
+              }
+            },
+            {
+              "id": "m36",
+              "output": "fallback_code",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+              }
+            }
+          ]
+        }
+      },
+      {
         "id": "route_output",
         "type": "transforms.objectBuilder",
         "label": "Emit route execution profiles v2",
@@ -2534,7 +4806,67 @@
         "id": "e10",
         "source": "decision_hash",
         "sourceHandle": "out",
+        "target": "fallback_mode"
+      },
+      {
+        "id": "e-fallback-mode",
+        "source": "fallback_mode",
+        "sourceHandle": "out",
+        "target": "fallback_requested"
+      },
+      {
+        "id": "e-normal-output",
+        "source": "fallback_requested",
+        "sourceHandle": "fail",
         "target": "route_output"
+      },
+      {
+        "id": "e-fallback-facts",
+        "source": "fallback_requested",
+        "sourceHandle": "pass",
+        "target": "fallback_facts"
+      },
+      {
+        "id": "e-fallback-eligible",
+        "source": "fallback_facts",
+        "sourceHandle": "out",
+        "target": "fallback_eligible"
+      },
+      {
+        "id": "e-fallback-policy",
+        "source": "fallback_eligible",
+        "sourceHandle": "pass",
+        "target": "fallback_writer_profile"
+      },
+      {
+        "id": "e-fallback-rejected",
+        "source": "fallback_eligible",
+        "sourceHandle": "fail",
+        "target": "fallback_rejected"
+      },
+      {
+        "id": "e-fallback-reviewers",
+        "source": "fallback_writer_profile",
+        "sourceHandle": "out",
+        "target": "fallback_reviewer_policy"
+      },
+      {
+        "id": "e-fallback-material",
+        "source": "fallback_reviewer_policy",
+        "sourceHandle": "out",
+        "target": "fallback_decision_material"
+      },
+      {
+        "id": "e-fallback-hash",
+        "source": "fallback_decision_material",
+        "sourceHandle": "out",
+        "target": "fallback_decision_hash"
+      },
+      {
+        "id": "e-fallback-output",
+        "source": "fallback_decision_hash",
+        "sourceHandle": "out",
+        "target": "fallback_route_output"
       },
       {
         "id": "e-reject",

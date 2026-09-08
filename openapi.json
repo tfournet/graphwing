@@ -459,6 +459,24 @@
         }
       }
     },
+    "/v1/agent/evidence/verify": {
+      "post": {
+        "operationId": "agentEvidenceVerify",
+        "tags": ["agent"],
+        "summary": "Re-read one terminal server-authored agent job and return closed normalized execution facts without selecting a route.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentEvidenceVerifyRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "closed terminal agent facts", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentEvidenceFacts" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/slice/route/fallback": {
       "post": {
         "operationId": "sliceRouteFallback",
@@ -1805,6 +1823,48 @@
           "receipt": {"anyOf": [{"$ref": "#/components/schemas/RunControlSettledReceipt"}, {"type": "null"}]},
           "authority_loss_reason": {"type": ["string", "null"], "enum": ["receipt_authority_unavailable", "receipt_route_unresolvable", "continuation_kick_failed", "kicked_run_never_settled", "launched_run_never_settled", null]},
           "replay": {"type": "boolean"}
+        }
+      },
+      "AgentEvidenceVerifyRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "session_identity"],
+        "properties": {
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "session_identity": { "$ref": "#/components/schemas/AgentEvidenceSessionIdentity", "description": "Exact callback identity containing a pinned route-execution-profile-v2 writer decision." }
+        }
+      },
+      "AgentEvidenceSessionIdentity": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SessionIdentity" },
+          {
+            "type": "object",
+            "required": ["route_execution_profile"],
+            "properties": {
+              "route_execution_profile": { "$ref": "#/components/schemas/RouteExecutionProfileV2" }
+            }
+          }
+        ]
+      },
+      "AgentEvidenceFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_version", "kind", "job_id", "role", "terminal_status", "failure_class", "failure_code", "failover_eligible", "route_execution_profile", "session_identity", "repo", "branch", "created_at", "finished_at"],
+        "properties": {
+          "evidence_version": { "type": "string", "const": "agent-evidence-v1" },
+          "kind": { "type": "string", "const": "agent" },
+          "job_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "role": { "type": "string", "const": "writer" },
+          "terminal_status": { "type": "string", "enum": ["ok", "error", "timeout"] },
+          "failure_class": { "type": "string", "enum": ["none", "provider_availability", "timeout_budget", "model_execution", "malformed_contract", "session_provenance", "repository_state", "cancelled", "unknown"] },
+          "failure_code": { "type": "string", "enum": ["none", "missing_binary", "provider_authentication", "provider_quota", "provider_rate_limit", "provider_network", "provider_overloaded", "provider_http_5xx", "run_budget_exceeded", "reported_timeout", "process_exit", "spawn_failed", "model_stopped", "model_reported_error", "invalid_receipt", "adapter_contract_invalid", "missing_prompt", "session_identity_missing", "session_identity_mismatch", "session_provenance_invalid", "launcher_version_mismatch", "repository_mismatch", "branch_mismatch", "head_mismatch", "cancelled", "unknown_failure"] },
+          "failover_eligible": { "type": "boolean" },
+          "route_execution_profile": { "$ref": "#/components/schemas/RouteExecutionProfileV2" },
+          "session_identity": { "$ref": "#/components/schemas/AgentEvidenceSessionIdentity" },
+          "repo": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "branch": { "$ref": "#/components/schemas/BranchName" },
+          "created_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+          "finished_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
         }
       },
       "RouteExecutionProfileV1": {

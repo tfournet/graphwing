@@ -11559,7 +11559,7 @@ while True:
         )
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
-            "TASKS.fallback_route.data",
+            "TASKS.fallback_policy.result",
         )
         self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
         self.assertEqual(
@@ -14068,7 +14068,7 @@ func main() {
         # expected consumers from whichever fields the graph happens to have.
         expected = {
             "implement-slice.json": {
-                "route_nodes": {"route", "fallback_route", "recovery_route"},
+                "route_nodes": {"route", "fallback_policy", "recovery_route"},
                 "consumers": {
                     "agent": "{{ CTX.selected_route.value.effort }}",
                     "agent_fallback": "{{ CTX.fallback_route_choice.value.effort }}",
@@ -14116,7 +14116,8 @@ func main() {
             self.assertEqual(
                 {node_id for node_id, node in nodes.items()
                  if "/v1/slice/route" in node["type"]
-                 or (node_id == "route" and node["type"] == "action.subworkflow")},
+                 or (node_id in {"route", "fallback_policy"}
+                     and node["type"] == "action.subworkflow")},
                 contract["route_nodes"],
                 graph_name,
             )
@@ -14500,16 +14501,20 @@ func main() {
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
         triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in graph["spec"]["edges"]}
-        self.assertIn(("if_initial_fallback_eligible", "pass", "fallback_route"), triples)
-        self.assertIn(("if_receipt_ok", "fail", "fallback_eligibility"), triples)
-        self.assertIn(("fallback_eligibility", "out", "if_initial_fallback_eligible"), triples)
-        self.assertIn(("if_initial_fallback_eligible", "fail", "join_receipt_fail"), triples)
+        self.assertIn(("if_receipt_ok", "fail", "agent_evidence_verify"), triples)
+        self.assertIn(("agent_evidence_verify", "success", "fallback_policy"), triples)
+        self.assertIn(("agent_evidence_verify", "failure", "join_receipt_fail"), triples)
+        self.assertIn(("fallback_policy", "success", "normal_fallback_candidate"), triples)
+        self.assertIn(("fallback_policy", "failure", "fallback_route_fail"), triples)
+        self.assertNotIn("if_initial_fallback_eligible", nodes)
+        self.assertNotIn("fallback_eligibility", nodes)
+        self.assertNotIn("fallback_route", nodes)
+        self.assertEqual(nodes["agent_evidence_verify"]["type"],
+                         "action.graphwing.POST:/v1/agent/evidence/verify")
+        self.assertEqual(nodes["fallback_policy"]["type"], "action.subworkflow")
+        self.assertEqual(nodes["fallback_policy"]["config"]["inputMapping"]["values"]["agent_evidence"],
+                         "{{ TASKS.agent_evidence_verify.data }}")
         edges = graph["spec"]["edges"]
-        self.assertEqual([(e["source"], e.get("sourceHandle")) for e in edges if e["target"] == "fallback_route"], [("if_initial_fallback_eligible", "pass")])
-        self.assertEqual({e["source"] for e in edges if e["target"] == "if_initial_fallback_eligible"}, {"fallback_eligibility"})
-        self.assertEqual(nodes["fallback_eligibility"]["type"], "transforms.objectBuilder")
-        self.assertEqual({m["output"] for m in nodes["fallback_eligibility"]["config"]["mappings"]},
-                          {"status", "role", "failure_class", "failover_eligible"})
         def reaches(start, target):
             seen, pending = set(), [start]
             while pending:
@@ -14521,18 +14526,8 @@ func main() {
                     pending.extend(e["target"] for e in edges if e["source"] == current)
             return False
         for source in ("if_receipt_ok2", "if_receipt_ok3", "if_receipt_ok_rn1", "if_receipt_ok_rn2", "if_review1", "if_review1b", "if_review2", "if_review2b", "if_test_ok", "if_test_ok2", "if_test_rn1", "if_test_rn2"):
-            self.assertFalse(reaches(source, "fallback_route"), source)
+            self.assertFalse(reaches(source, "fallback_policy"), source)
             self.assertFalse(reaches(source, "agent_fallback"), source)
-        self.assertEqual(nodes["if_initial_fallback_eligible"]["config"], {
-            "group": "AND",
-            "rules": [
-                {"path": "status", "op": "equals", "value": "error"},
-                {"path": "role", "op": "equals", "value": "primary"},
-                {"path": "failure_class", "op": "equals", "value": "provider_availability"},
-                {"path": "failover_eligible", "op": "equals", "value": True},
-            ],
-        })
-        self.assertIn(("fallback_route", "success", "normal_fallback_candidate"), triples)
         self.assertIn(("normal_fallback_candidate", "out", "join_fallback_start"), triples)
         self.assertIn(("join_fallback_start", "out", "fallback_route_choice_pick"), triples)
         self.assertIn(("fallback_route_choice_pick", "out", "fallback_route_choice"), triples)
@@ -14878,10 +14873,10 @@ func main() {
 
         route_decisions = {
             node_id for node_id, node in nodes.items()
-            if "/v1/slice/route" in node["type"]
+            if "/v1/slice/route" in node["type"] or node_id == "fallback_policy"
         }
         downstream_starts = {
-            "fallback_route", "wait_fallback", "agent_fallback", "record_fallback",
+            "fallback_policy", "wait_fallback", "agent_fallback", "record_fallback",
             "if_fallback_receipt_ok", "wait2", "agent2", "record2", "if_receipt_ok2",
             "wait3", "agent3", "if_receipt_ok3", "wait_rn1", "agent_rn1",
             "if_receipt_ok_rn1", "wait_rn2", "agent_rn2", "if_receipt_ok_rn2",
@@ -14910,7 +14905,7 @@ func main() {
         )
         self.assertEqual(
             [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
-            ["fallback_route"],
+            [],
         )
 
     def test_implement_slice_active_resumes_are_pinned_to_successful_receipt(self):
@@ -15002,7 +14997,10 @@ func main() {
                 self.assertIn(f"CTX.{receipt}.resume_job_id", cfg["resume_job_id"])
         self.assertEqual(nodes["agent3"]["config"]["session_identity"], "{{ CTX.receipt2.session_identity }}")
         self.assertEqual(nodes["agent3"]["config"]["resume_job_id"], "{{ CTX.receipt2.resume_job_id }}")
-        self.assertEqual(nodes["fallback_route"]["config"]["primary_receipt"], "{{ CTX.receipt }}")
+        self.assertEqual(nodes["agent_evidence_verify"]["config"]["job_id"],
+                         "{{ CTX.receipt.job_id }}")
+        self.assertEqual(nodes["agent_evidence_verify"]["config"]["session_identity"],
+                         "{{ CTX.receipt.session_identity }}")
 
     def test_implement_slice_correction_failures_end_in_canned_leaf_receipts(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -15086,7 +15084,7 @@ func main() {
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
         terminals = {
-            ("fallback_route", "failure"): ("fallback_route_fail", "fallback_route"),
+            ("fallback_policy", "failure"): ("fallback_route_fail", "fallback_route"),
             ("wait_fallback", "timeout"): ("fallback_wait_timeout", "fallback_wait_timeout"),
             ("wait_fallback", "failure"): ("fallback_wait_fail", "fallback_wait_failure"),
             ("agent_fallback", "failure"): ("fallback_action_fail", "fallback_action"),
@@ -15205,7 +15203,7 @@ func main() {
             )
         self.assertEqual(
             [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
-            ["fallback_route"],
+            [],
         )
         dumped_graph = json.dumps(graph)
         for wrong_transform_path in ("TASKS.record", "TASKS.record_fallback", "TASKS.record2"):
@@ -22518,7 +22516,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "865462e9c3f54d9ad7f047a869ada2f1a043aa76a714800b65ae59936aedb9af")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "b07f33616c01b0d9ae1ade350f87b51f17c1d03d7eb85b82c934a38a2d740c28")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -25764,14 +25762,6 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                         self.assertFalse(isinstance(value, dict) and "kind" in value, value)
 
     def test_no_filter_is_fed_by_another_filter(self):
-        # A filter's output is its own verdict object ({input, passed, result,
-        # ruleCount}), never the payload it judged. Live consume run 488f13fa
-        # died because precheck_gate read consume_replay_gate's verdict.
-        # implement-slice's if_receipt_ok -> if_initial_fallback_eligible had
-        # the same defect in the shipped graph (the provider-availability
-        # fallback could never fire). Fixed by routing through
-        # fallback_eligibility, a transforms.objectBuilder that re-emits the
-        # four fields if_initial_fallback_eligible tests from the receipt.
         for path in sorted((Path(server.__file__).parent / "graphs").glob("*.json")):
             spec = json.loads(path.read_text())["spec"]
             types = {node["id"]: node["type"] for node in spec["nodes"]}
@@ -25781,24 +25771,23 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                                      (edge["source"], edge["target"]))
 
     def test_implement_slice_fallback_eligibility_re_emits_the_gated_fields(self):
-        # if_initial_fallback_eligible tests status, role, failure_class, and
-        # failover_eligible. Those must come from a re-emitting objectBuilder
-        # sitting between if_receipt_ok's fail branch and the gate, not from
-        # if_receipt_ok's own verdict object (see test_no_filter_is_fed_by_
-        # another_filter and issue #141).
         spec = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())["spec"]
         nodes = {node["id"]: node for node in spec["nodes"]}
-        node = nodes["fallback_eligibility"]
-        self.assertEqual(node["type"], "transforms.objectBuilder")
-        self.assertEqual(node["config"]["alias"], "fallback_eligibility")
-        emitted = {m["output"]: m["expression"] for m in node["config"]["mappings"]}
-        self.assertEqual(set(emitted), {"status", "role", "failure_class", "failover_eligible"})
-        for field in ("status", "role", "failure_class", "failover_eligible"):
-            self.assertEqual(emitted[field], {"kind": "getField", "path": f"CTX.receipt.{field}"})
+        self.assertNotIn("fallback_eligibility", nodes)
+        self.assertNotIn("if_initial_fallback_eligible", nodes)
+        verify = nodes["agent_evidence_verify"]
+        self.assertEqual(verify["type"], "action.graphwing.POST:/v1/agent/evidence/verify")
+        self.assertEqual(verify["config"]["job_id"], "{{ CTX.receipt.job_id }}")
+        self.assertEqual(verify["config"]["session_identity"],
+                         "{{ CTX.receipt.session_identity }}")
+        policy = nodes["fallback_policy"]
+        self.assertEqual(policy["type"], "action.subworkflow")
+        self.assertEqual(policy["config"]["inputMapping"]["values"]["agent_evidence"],
+                         "{{ TASKS.agent_evidence_verify.data }}")
         edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
-        self.assertIn(("if_receipt_ok", "fail", "fallback_eligibility"), edges)
-        self.assertIn(("fallback_eligibility", "out", "if_initial_fallback_eligible"), edges)
-        self.assertNotIn(("if_receipt_ok", "fail", "if_initial_fallback_eligible"), edges)
+        self.assertIn(("if_receipt_ok", "fail", "agent_evidence_verify"), edges)
+        self.assertIn(("agent_evidence_verify", "success", "fallback_policy"), edges)
+        self.assertNotIn(("if_receipt_ok", "fail", "fallback_policy"), edges)
 
     def test_filters_fed_by_object_builders_test_fields_that_builder_emits(self):
         # Live runs c1697499 (state) and the reconcile design shared one bug:
@@ -26894,8 +26883,127 @@ func main() {
         self.assertIn(("agent", "failure", "rc_failure_join"), edges)
 
 
+class AgentEvidenceVerifyTests(unittest.TestCase):
+    """Issue #186 slice 4 closed agent evidence fixtures."""
+
+    @staticmethod
+    def _failed_v2_job(job_id="a" * 32):
+        route_profile = {
+            "version": "route-execution-profile-v2",
+            "policy_version": "workflow-normal-v1",
+            "decision_id": "routing-normal-v1:" + "b" * 64,
+            "decision_sha256": "b" * 64,
+            "role": "writer",
+            "work_kind": "go_coding",
+            "class": "mechanical",
+            "effective_size": "M",
+            "launcher": "codex",
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "requested_effort": "high",
+        }
+        identity = {
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "requested_effort": "high", "effective_effort": "high",
+            "effort_source": "route", "route_execution_profile": route_profile,
+            "launcher_version": "sha256:" + "c" * 64,
+            "repo": "scratch", "branch": "feat/issue-186",
+            "starting_head": "d" * 40, "native_session_id": None,
+        }
+        job = {
+            "job_id": job_id, "kind": "agent", "status": "failed",
+            "repo": "scratch", "branch": "feat/issue-186", "starting_head": "d" * 40,
+            "launcher": "codex", "provider": "openai", "model": "gpt-5.6-sol",
+            "requested_effort": "high", "effective_effort": "high",
+            "effort_source": "route", "launcher_version": "sha256:" + "c" * 64,
+            "session_identity": identity,
+            "created_at": "2026-09-08T12:00:00Z",
+            "started_at": "2026-09-08T12:00:01Z",
+            "finished_at": "2026-09-08T12:00:02Z",
+        }
+        job["receipt"] = server.normalize_receipt(
+            job, {"status": "error"}, 1, False,
+            evidence_code="provider_rate_limit",
+        )
+        return job
+
+    @staticmethod
+    def _verify(job):
+        return server.dispatch(
+            "POST", "/v1/agent/evidence/verify", {}, True,
+            json.dumps({
+                "job_id": job["job_id"],
+                "session_identity": job["session_identity"],
+            }).encode(),
+        )[:2]
+
+    def test_agent_evidence_verify_returns_closed_normalized_facts_without_selecting_a_route(self):
+        job = self._failed_v2_job()
+        with mock.patch.object(server, "read_job", return_value=deepcopy(job)):
+            status, facts = self._verify(job)
+        self.assertEqual(status, 200, facts)
+        self.assertEqual(set(facts), {
+            "evidence_version", "kind", "job_id", "role", "terminal_status",
+            "failure_class", "failure_code", "failover_eligible",
+            "route_execution_profile", "session_identity", "repo", "branch",
+            "created_at", "finished_at",
+        })
+        self.assertEqual(facts["evidence_version"], "agent-evidence-v1")
+        self.assertEqual((facts["kind"], facts["job_id"], facts["role"]),
+                         ("agent", job["job_id"], "writer"))
+        self.assertEqual(
+            (facts["terminal_status"], facts["failure_class"], facts["failure_code"],
+             facts["failover_eligible"]),
+            ("error", "provider_availability", "provider_rate_limit", True),
+        )
+        self.assertEqual(facts["route_execution_profile"],
+                         job["session_identity"]["route_execution_profile"])
+        self.assertEqual(facts["session_identity"], job["session_identity"])
+        self.assertEqual((facts["repo"], facts["branch"]),
+                         ("scratch", "feat/issue-186"))
+        self.assertNotIn("alternate", json.dumps(facts).lower())
+        self.assertNotIn("selected", json.dumps(facts).lower())
+        spec = json.loads((Path(__file__).parent / "openapi.json").read_text())
+        operation = spec["paths"]["/v1/agent/evidence/verify"]["post"]
+        self.assertEqual(operation["operationId"], "agentEvidenceVerify")
+        schema = spec["components"]["schemas"]["AgentEvidenceFacts"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), set(schema["properties"]))
+        self.assertNotIn("selected_alternate_route", schema["properties"])
+        self.assertEqual(
+            schema["properties"]["session_identity"]["$ref"],
+            "#/components/schemas/AgentEvidenceSessionIdentity",
+        )
+        identity_schema = spec["components"]["schemas"]["AgentEvidenceSessionIdentity"]
+        self.assertEqual(
+            identity_schema["allOf"][1]["properties"]["route_execution_profile"]["$ref"],
+            "#/components/schemas/RouteExecutionProfileV2",
+        )
+
+    def test_agent_evidence_verify_rejects_missing_alien_nonterminal_replaced_or_profile_drifted_jobs(self):
+        self.assertTrue(hasattr(server, "agent_evidence_verify"))
+        expected = self._failed_v2_job()
+        cases = {
+            "missing": None,
+            "alien": {**deepcopy(expected), "kind": "review"},
+            "nonterminal": {**deepcopy(expected), "status": "running", "receipt": None,
+                            "finished_at": None},
+            "replaced": {**deepcopy(expected), "job_id": "e" * 32},
+            "profile_drifted": deepcopy(expected),
+            "bad_timestamp": {**deepcopy(expected), "finished_at": "TOKEN_SECRET"},
+        }
+        cases["profile_drifted"]["session_identity"] = {
+            **cases["profile_drifted"]["session_identity"], "model": "grok-4.6",
+        }
+        for name, stored in cases.items():
+            with self.subTest(name=name), mock.patch.object(server, "read_job", return_value=stored):
+                status, payload = self._verify(expected)
+            self.assertIn(status, {404, 409}, payload)
+            self.assertNotIn("TOKEN_SECRET", json.dumps(payload))
+
+
 class WorkflowRoutingConsumerTests(unittest.TestCase):
-    """Issue #186 PR3 consumer cutover fixtures."""
+    """Issue #186 workflow routing consumer fixtures."""
 
     ROOT = Path(__file__).resolve().parent
 
@@ -26932,7 +27040,6 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             for node in graph["spec"]["nodes"]
         ))
         self.assertNotIn("TASKS.route.data", json.dumps(graph))
-        self.assertEqual(nodes["fallback_route"]["config"]["primary_route"], "{{ TASKS.route.result }}")
         primary = nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]
         self.assertEqual(primary, {"kind": "getField", "path": "TASKS.route.result"})
         self.assertEqual(nodes["agent"]["config"]["route_execution_profile"],
@@ -26962,6 +27069,150 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             nodes["map_switch_rev2"]["config"]["mappings"][0]["expression"],
             {"kind": "getField", "path": "CTX.active_route.value.reviewer_count"},
         )
+
+    def test_implement_slice_fallback_has_no_call_to_v1_slice_route_fallback(self):
+        graph = self.graph("implement-slice")
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertNotIn("if_initial_fallback_eligible", nodes)
+        self.assertNotIn("fallback_route", nodes)
+        self.assertFalse(any(
+            node["type"] == "action.graphwing.POST:/v1/slice/route/fallback"
+            for node in graph["spec"]["nodes"]
+        ))
+        self.assertEqual(nodes["agent_evidence_verify"]["type"],
+                         "action.graphwing.POST:/v1/agent/evidence/verify")
+        self.assertEqual(nodes["fallback_policy"]["type"], "action.subworkflow")
+
+    def test_fallback_requires_verified_primary_provider_availability_facts_and_one_exact_policy_alternate(self):
+        graph = self.graph("implement-slice")["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        verify = nodes["agent_evidence_verify"]["config"]
+        self.assertEqual(verify["job_id"], "{{ CTX.receipt.job_id }}")
+        self.assertEqual(verify["session_identity"], "{{ CTX.receipt.session_identity }}")
+        fallback_policy = nodes["fallback_policy"]["config"]
+        self.assertEqual(fallback_policy["workflowId"],
+                         "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID")
+        self.assertEqual(fallback_policy["workflowVersionId"],
+                         "$GRAPHWING_ROUTING_POLICY_VERSION_ID")
+        self.assertEqual(
+            fallback_policy["inputMapping"]["values"]["agent_evidence"],
+            "{{ TASKS.agent_evidence_verify.data }}",
+        )
+        self.assertEqual(fallback_policy["outputMapping"], {
+            "mode": "select", "keys": self.policy_output_keys(),
+        })
+        edges = {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                 for edge in graph["edges"]}
+        self.assertIn(("if_receipt_ok", "fail", "agent_evidence_verify"), edges)
+        self.assertIn(("agent_evidence_verify", "success", "fallback_policy"), edges)
+        self.assertIn(("agent_evidence_verify", "failure", "join_receipt_fail"), edges)
+        self.assertIn(("fallback_policy", "success", "normal_fallback_candidate"), edges)
+        self.assertIn(("fallback_policy", "failure", "fallback_route_fail"), edges)
+        self.assertEqual(
+            nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"],
+            {"kind": "getField", "path": "TASKS.fallback_policy.result"},
+        )
+        self.assertEqual(
+            nodes["agent_fallback"]["config"]["route_execution_profile"],
+            "{{ CTX.fallback_route_choice.value.writer_execution_profile }}",
+        )
+        base = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0,
+        }
+        primary = RewstNativeRoutingPolicyTests.route(base)
+        evidence = RewstNativeRoutingPolicyTests.fallback_evidence(primary)
+        self.assertIsNotNone(RewstNativeRoutingPolicyTests.route({
+            **base, "agent_evidence": evidence,
+        }))
+        mutations = (
+            {**evidence, "failure_class": "model_execution"},
+            {**evidence, "failover_eligible": False},
+            {**evidence, "extra": "forged"},
+            {**evidence, "route_execution_profile": {
+                **evidence["route_execution_profile"], "decision_sha256": "e" * 64,
+            }},
+        )
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                self.assertIsNone(RewstNativeRoutingPolicyTests.route({
+                    **base, "agent_evidence": changed,
+                }))
+
+    def test_fallback_profile_is_rejected_before_spawn_when_unsupported_forged_or_mismatched(self):
+        policy = self.graph("routing-policy")
+        self.assertIn("fallback_writer_profile",
+                      {node["id"] for node in policy["spec"]["nodes"]})
+        profile = {
+            "version": "route-execution-profile-v2",
+            "policy_version": "workflow-normal-v1",
+            "decision_id": "routing-fallback-v1:" + "a" * 64,
+            "decision_sha256": "a" * 64,
+            "role": "writer", "work_kind": "go_coding", "class": "mechanical",
+            "effective_size": "M", "launcher": "claude", "provider": "anthropic",
+            "model": "claude-opus-5", "requested_effort": "default",
+        }
+        mutations = (
+            ({**profile, "model": "claude-fable-5"}, "claude", "anthropic", "claude-fable-5"),
+            ({**profile, "forged": True}, "claude", "anthropic", "claude-opus-5"),
+            ({**profile, "launcher": "codex"}, "claude", "anthropic", "claude-opus-5"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for changed, launcher, provider, model in mutations:
+                request = {
+                    "prompt": "provider-free fallback fixture", "cwd": "scratch",
+                    "launcher": launcher, "provider": provider, "model": model,
+                    "effort": changed.get("requested_effort"),
+                    "route_execution_profile": changed,
+                }
+                with self.subTest(changed=changed), \
+                     mock.patch.object(server, "resolve_launcher_binary_now") as resolve, \
+                     mock.patch.object(server, "enqueue_agent") as spawn:
+                    status, payload = server.agent_run(
+                        json.dumps(request).encode(), {"scratch": td},
+                    )
+                self.assertEqual(status, 400, payload)
+                resolve.assert_not_called()
+                spawn.assert_not_called()
+
+    def test_fallback_failure_parks_and_never_attempts_an_unlisted_second_provider(self):
+        graph = self.graph("implement-slice")["spec"]
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        self.assertIn("agent_evidence_verify", nodes)
+        self.assertEqual(
+            [node["id"] for node in graph["nodes"]
+             if node["type"] == "action.graphwing.POST:/v1/agent/run"
+             and "fallback" in node["id"]],
+            ["agent_fallback"],
+        )
+        adjacency = {}
+        for edge in graph["edges"]:
+            adjacency.setdefault(edge["source"], []).append(edge["target"])
+        fallback_failures = {
+            edge["target"] for edge in graph["edges"]
+            if (edge["source"], edge.get("sourceHandle")) in {
+                ("fallback_policy", "failure"),
+                ("agent_fallback", "failure"),
+                ("if_fallback_receipt_ok", "fail"),
+            }
+        }
+        launchers = {
+            node["id"] for node in graph["nodes"]
+            if node["type"] in {
+                "action.graphwing.POST:/v1/agent/run",
+                "action.graphwing.POST:/v1/review/run",
+            }
+        }
+        seen, pending = set(), list(fallback_failures)
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(adjacency.get(current, []))
+        self.assertTrue(seen.isdisjoint(launchers), seen & launchers)
+        self.assertNotIn("action.graphwing.POST:/v1/slice/route/fallback",
+                         {node["type"] for node in graph["nodes"]})
 
     def test_implement_slice_all_test_red_and_review_nack_corrections_reuse_the_exact_successful_session_profile(self):
         graph = self.graph("implement-slice")
@@ -27155,8 +27406,51 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
             json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         ).hexdigest()
         context["CTX"]["routing_decision_hash"] = {"value": digest}
+        if "agent_evidence" in payload:
+            facts = cls._object_builder(nodes["fallback_facts"], context)
+            context["CTX"][nodes["fallback_facts"]["config"]["alias"]] = facts
+            if not all(value is True for value in facts.values()):
+                return None
+            for node_id in (
+                "fallback_writer_profile", "fallback_reviewer_policy",
+                "fallback_decision_material",
+            ):
+                node = nodes[node_id]
+                value = cls._object_builder(node, context)
+                context["CTX"][node["config"]["alias"]] = value
+            material = context["CTX"]["routing_fallback_decision_material"]["value"]
+            digest = hashlib.sha256(
+                json.dumps(material, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode()
+            ).hexdigest()
+            context["CTX"]["routing_fallback_decision_hash"] = {"value": digest}
+            return cls._object_builder(nodes["fallback_route_output"], context)
         output = cls._object_builder(nodes["route_output"], context)
         return output
+
+    @classmethod
+    def fallback_evidence(cls, route, job_id="a" * 32):
+        profile = route["writer_execution_profile"]
+        identity = {
+            "launcher": profile["launcher"], "provider": profile["provider"],
+            "model": profile["model"], "requested_effort": profile["requested_effort"],
+            "effective_effort": "high" if profile["launcher"] in {"codex", "grok"}
+                                else profile["requested_effort"],
+            "effort_source": "route", "route_execution_profile": profile,
+            "launcher_version": "sha256:" + "c" * 64,
+            "repo": "scratch", "branch": "feat/issue-186",
+            "starting_head": "d" * 40, "native_session_id": None,
+        }
+        return {
+            "evidence_version": "agent-evidence-v1", "kind": "agent",
+            "job_id": job_id, "role": "writer", "terminal_status": "error",
+            "failure_class": "provider_availability",
+            "failure_code": "provider_rate_limit", "failover_eligible": True,
+            "route_execution_profile": profile, "session_identity": identity,
+            "repo": "scratch", "branch": "feat/issue-186",
+            "created_at": "2026-09-08T12:00:00Z",
+            "finished_at": "2026-09-08T12:00:02Z",
+        }
 
     def test_routing_policy_graph_uses_only_native_policy_nodes_and_has_no_graphwing_route_action(self):
         graph, nodes = self.load()
@@ -27173,13 +27467,23 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
             "reviewer_policy": "transforms.objectBuilder",
             "decision_material": "transforms.objectBuilder",
             "decision_hash": "transforms.hash",
+            "fallback_mode": "transforms.objectBuilder",
+            "fallback_requested": "logic.filter",
+            "fallback_facts": "transforms.objectBuilder",
+            "fallback_eligible": "logic.filter",
+            "fallback_rejected": "transforms.regexReplace",
+            "fallback_writer_profile": "transforms.objectBuilder",
+            "fallback_reviewer_policy": "transforms.objectBuilder",
+            "fallback_decision_material": "transforms.objectBuilder",
+            "fallback_decision_hash": "transforms.hash",
+            "fallback_route_output": "transforms.objectBuilder",
             "route_output": "transforms.objectBuilder",
         }
         for node_id, node_type in expected.items():
             self.assertEqual(nodes[node_id]["type"], node_type)
         self.assertEqual(
             {mapping["output"] for mapping in nodes["policy_input"]["config"]["mappings"]},
-            {"class", "work_kind", "size", "ac_count", "seams"},
+            {"class", "work_kind", "size", "ac_count", "seams", "agent_evidence"},
         )
         node_types = {node["type"] for node in graph["spec"]["nodes"]}
         self.assertNotIn("transforms.codeExpression", node_types)
@@ -27226,6 +27530,58 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
                             self.BUDGETS[(class_name, size)],
                         )
         self.assertEqual(len(seen), 27)
+
+    def test_routing_policy_native_fallback_matrix_matches_the_hard_coded_availability_fallback_v1_ledger(self):
+        fallbacks = {
+            "go_coding": ("claude", "anthropic", "claude-opus-5", "default"),
+            "typescript_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
+            "research_ops": ("claude", "anthropic", "claude-sonnet-5", "default"),
+        }
+        for work_kind, expected in fallbacks.items():
+            for class_name in ("mechanical", "visual", "sensitive"):
+                for size in ("S", "M", "L"):
+                    base = {
+                        "class": class_name, "work_kind": work_kind, "size": size,
+                        "ac_count": 0, "seams": 0,
+                    }
+                    primary = self.route(base)
+                    fallback = self.route({
+                        **base, "agent_evidence": self.fallback_evidence(primary),
+                    })
+                    with self.subTest(work_kind=work_kind, class_name=class_name, size=size):
+                        self.assertIsNotNone(fallback)
+                        self.assertEqual(fallback["compatibility_behavior"],
+                                         "availability-fallback-v1")
+                        self.assertEqual(
+                            tuple(fallback[key] for key in
+                                  ("launcher", "provider", "model", "effort")),
+                            expected,
+                        )
+                        self.assertNotEqual(fallback["provider"], primary["provider"])
+                        self.assertEqual(
+                            (fallback["max_turns"], fallback["run_budget_seconds"]),
+                            self.BUDGETS[(class_name, size)],
+                        )
+                        self.assertEqual(fallback["fallback_code"],
+                                         "provider_rate_limit")
+                        profile = fallback["writer_execution_profile"]
+                        self.assertEqual(set(profile), self.PROFILE_FIELDS)
+                        self.assertEqual(profile["version"],
+                                         "route-execution-profile-v2")
+                        self.assertEqual(profile["role"], "writer")
+                        self.assertEqual(profile["decision_sha256"],
+                                         fallback["decision_sha256"])
+                        count = 2 if class_name == "sensitive" else (
+                            0 if class_name == "mechanical" and size == "S" else 1
+                        )
+                        self.assertEqual(fallback["reviewer_count"], count)
+                        expected_reviewers = self.REVIEWERS[expected[1]][:count]
+                        for index, reviewer in enumerate(expected_reviewers, 1):
+                            self.assertEqual(
+                                tuple(fallback[f"reviewer{index}_{key}"]
+                                      for key in ("launcher", "provider", "model")),
+                                reviewer,
+                            )
 
     def test_routing_policy_graph_preserves_ac_count_seam_effective_size_and_budget_boundaries(self):
         cases = (
