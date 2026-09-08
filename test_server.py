@@ -14601,18 +14601,25 @@ func main() {
             },
         )
         self.assertEqual(
-            _lookup_view(nodes["active_route_pick"]),
+            nodes["active_route_pick"]["config"]["mappings"][0]["expression"],
             {
-                "alias": "active_route_pick",
-                "input": {"kind": "getField", "path": "CTX.fallback_receipt.route.route_version"},
-                "entries": [
-                    {"key": route_version, "value": {
-                        "kind": "getField", "path": "CTX.fallback_receipt.route",
-                    }}
-                    for route_version in ("normal-v1", "availability-fallback-v1")
-                ],
-                "defaultValue": {"kind": "getField", "path": "CTX.receipt.route"},
-                "caseSensitive": True,
+                "kind": "conditional",
+                "condition": {
+                    "kind": "binary", "operator": "==",
+                    "left": {"kind": "getField", "path": "CTX.fallback_receipt.route.compatibility_behavior"},
+                    "right": {"kind": "literal", "value": "availability-fallback-v1"},
+                },
+                "then": {"kind": "getField", "path": "CTX.fallback_receipt.route"},
+                "else": {
+                    "kind": "conditional",
+                    "condition": {
+                        "kind": "binary", "operator": "==",
+                        "left": {"kind": "getField", "path": "CTX.fallback_receipt.route.route_version"},
+                        "right": {"kind": "literal", "value": "availability-fallback-v1"},
+                    },
+                    "then": {"kind": "getField", "path": "CTX.fallback_receipt.route"},
+                    "else": {"kind": "getField", "path": "CTX.receipt.route"},
+                },
             },
         )
         self.assertEqual(
@@ -22515,7 +22522,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "5e48f5e70a93dddc64aff315f0c76a556cd19f32e51a7d6722dab73c27329c3e")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "86425b5833380f36f30a93a872185f9ec57c50436454fed854f8851d19c006ff")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -27215,6 +27222,45 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             choice["writer_execution_profile"],
             policy["writer_execution_profile"],
         )
+
+    def test_active_route_pick_binds_policy_fallback_without_route_version(self):
+        base = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0,
+        }
+        primary = RewstNativeRoutingPolicyTests.route(base)
+        policy = RewstNativeRoutingPolicyTests.route({
+            **base,
+            "agent_evidence": RewstNativeRoutingPolicyTests.fallback_evidence(primary),
+        })
+        self.assertNotIn("route_version", policy)
+        runner = NativeGraphRunner(self.graph("implement-slice"), None)
+        runner.context = {
+            "CTX": {
+                "INPUT": {},
+                "receipt": {"route": primary, "status": "error"},
+                "fallback_receipt": {
+                    "status": "ok",
+                    "role": "availability_fallback",
+                    "route": policy,
+                },
+            },
+            "TASKS": {},
+        }
+        for node_id in ("active_route_pick", "active_route"):
+            node = runner.nodes[node_id]
+            built = {
+                mapping["output"]: runner.evaluate(mapping["expression"], runner.context)
+                for mapping in node["config"]["mappings"]
+            }
+            runner.context["CTX"][node["config"]["alias"]] = built
+        active = runner.context["CTX"]["active_route"]["value"]
+        self.assertEqual(active, policy)
+        self.assertEqual(
+            active["writer_execution_profile"],
+            policy["writer_execution_profile"],
+        )
+        self.assertNotEqual(active.get("launcher"), primary.get("launcher"))
 
     def test_fallback_profile_is_rejected_before_spawn_when_unsupported_forged_or_mismatched(self):
         policy = self.graph("routing-policy")
