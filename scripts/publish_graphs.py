@@ -64,6 +64,8 @@ ROUTING_POLICY_WORKFLOW_PIN_SOURCES = {
     "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID": "routing-policy",
     "$GRAPHWING_ROUTING_POLICY_VERSION_ID": "routing-policy",
 }
+ROUTING_RECOVERY_VERSION = "provider-recovery-v1"
+ROUTING_STATE_COLLECTION = "graphwing_routing_state_v1"
 RUN_CONTROL_PIN_ERROR_MESSAGES = {
     "run-control-consume-authorization": "run-control authorization publication returned no exact IDs",
     "run-control-transition": "run-control transition publication returned no exact IDs",

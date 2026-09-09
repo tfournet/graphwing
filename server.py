@@ -576,6 +576,8 @@ ROUTE_EXECUTION_PROFILE_V2_FIELDS = frozenset({
 })
 WORKFLOW_POLICY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 RECOVERY_VERSION = "provider-recovery-v1"
+LAUNCHER_CAPABILITY_VERSION = "launcher-capability-v1"
+LAUNCHER_CAPABILITY_FIELDS = frozenset({"launcher"})
 NORMAL_WRITER_ROUTES = {
     "go_coding": ("codex", "openai", "gpt-5.6-sol", "high"),
     "typescript_coding": ("claude", "anthropic", "claude-opus-5", "default"),
@@ -2710,6 +2712,15 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "path": nxt.get("path"),
         "kicked": False,
     }
+    routing_run_id = data.get("routing_run_id")
+    if routing_run_id not in (None, "") and (
+        not isinstance(routing_run_id, str)
+        or WORKFLOW_POLICY_ID_RE.fullmatch(routing_run_id) is None
+    ):
+        return 400, {
+            "error": "routing_run_id is invalid",
+            "code": "bad_routing_run_id",
+        }
     recovery_fields = (
         "prior_primary_route", "prior_primary_receipt", "prior_fallback_route",
         "prior_fallback_receipt",
@@ -2761,6 +2772,8 @@ def slice_continue(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, A
         "kick_url": kick_url,
         "kick_token": token,
     }
+    if isinstance(routing_run_id, str) and routing_run_id:
+        payload["routing_run_id"] = routing_run_id
     if recovery_version == RECOVERY_VERSION:
         payload["recovery_version"] = RECOVERY_VERSION
         payload.update(recovery_values)
@@ -4796,6 +4809,42 @@ def launcher_version_fingerprint(binary: Path, launcher: str | None = None) -> s
         return "missing"
     except OSError:
         return None
+
+
+def launcher_capability(body: bytes) -> tuple[int, dict[str, Any]]:
+    """Report current launcher facts without selecting or invoking a provider."""
+    data, err = parse_json_object(body)
+    if err:
+        return 400, err
+    assert data is not None
+    if set(data) != LAUNCHER_CAPABILITY_FIELDS:
+        return 400, {
+            "error": "launcher capability requires only launcher",
+            "code": "unexpected_fields",
+        }
+    launcher = data.get("launcher")
+    if launcher not in NATIVE_LAUNCHERS:
+        return 400, {
+            "error": "launcher must be claude, codex, or grok",
+            "code": "bad_launcher",
+        }
+    assert isinstance(launcher, str)
+    fingerprint = launcher_version_fingerprint(
+        resolve_launcher_binary_now(launcher), launcher,
+    )
+    available = isinstance(fingerprint, str) and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", fingerprint,
+    ) is not None
+    diagnostic_code = "missing_binary" if fingerprint in {
+        "missing", "missing_companion",
+    } else "launcher_version_mismatch"
+    return 200, {
+        "capability_version": LAUNCHER_CAPABILITY_VERSION,
+        "launcher": launcher,
+        "state": "available" if available else "unavailable",
+        "launcher_version": fingerprint if available else None,
+        "diagnostic": None if available else compact_diagnostic(diagnostic_code),
+    }
 
 
 RECOVERY_RECEIPT_FIELDS = (
@@ -14557,6 +14606,9 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route/fallback":
         status, payload = slice_route_fallback(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/launcher/capability":
+        status, payload = launcher_capability(body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/slice/route/recovery":
         status, payload = slice_route_recovery(body)

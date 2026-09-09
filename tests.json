@@ -72,6 +72,7 @@
         "test_server.WorkflowRoutingConsumerTests",
         "test_server.RewstNativeRoutingPolicyTests",
         "test_server.WorkflowRouteProfileV2Tests",
+        "test_server.DurableRoutingRecoveryTests",
         "test_run_control_native.NativeRunControlContracts"
       ],
       "cwd": ".",
