@@ -21754,12 +21754,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "814ee48002a1433f9339f2024b5fd3b5e668ff5e794632f9cce03a4181b56392",
+            "36a1048733abeb21b089a1451f5200b0ee9e9b4bfb38d5eb975e141c15ebc596",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 348)
-        self.assertEqual(len(graph["spec"]["edges"]), 411)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 348)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 411)
+        self.assertEqual(len(graph["spec"]["nodes"]), 428)
+        self.assertEqual(len(graph["spec"]["edges"]), 517)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 428)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 517)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21882,11 +21882,14 @@ class CodeOffTests(unittest.TestCase):
             "v2_candidates_ready", "v2_candidate_parked",
         )
         expected_v2_leaves |= {
-            "v2_candidate_contract_disabled", "v2_blind_ready",
-            "v2_candidate_parked",
+            "v2_candidate_contract_disabled", "v2_candidate_parked",
+            "v2_judgments_ready", "v2_judgment_parked",
         } | {
             f"{prefix}_{suffix}"
-            for prefix in pr3_transition_prefixes
+            for prefix in pr3_transition_prefixes + (
+                "v2_judgment_0", "v2_judgment_1", "v2_judgment_2",
+                "v2_judgment_parked",
+            )
             for suffix in ("write_failed", "readback_failed", "readback_mismatch")
         }
         self.assertEqual(leaves, {
@@ -22030,6 +22033,13 @@ class CodeOffTests(unittest.TestCase):
                 "v2_freeze_2": "v2_candidate_park_join",
                 "v2_test_1": "v2_candidate_park_join",
                 "v2_test_2": "v2_candidate_park_join",
+                "v2_blind": "v2_judgment_park_join",
+                "v2_judge_0_launch": "v2_judgment_park_join",
+                "v2_judge_1_launch": "v2_judgment_park_join",
+                "v2_judge_2_launch": "v2_judgment_park_join",
+                "v2_read_judgment_0": "v2_judgment_park_join",
+                "v2_read_judgment_1": "v2_judgment_park_join",
+                "v2_read_judgment_2": "v2_judgment_park_join",
             }.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
@@ -22093,7 +22103,9 @@ class CodeOffTests(unittest.TestCase):
                     "v2_frozen_1", "v2_test_1", "v2_test_1_result",
                     "v2_author_2_launch", "v2_author_2_callback", "v2_freeze_2",
                     "v2_frozen_2", "v2_test_2", "v2_test_2_result",
-                    "v2_candidates_ready", "v2_candidate_parked",
+                    "v2_candidates_ready", "v2_judgment_0", "v2_judgment_1",
+                    "v2_judgment_2", "v2_judgment_parked",
+                    "v2_candidate_parked",
                 )
              ],
         )
@@ -22161,14 +22173,22 @@ class CodeOffTests(unittest.TestCase):
         v2_runs = [node for node in graph["nodes"]
                    if node["type"] == "action.graphwing.POST:/v1/agent/run"
                    and node["id"].startswith("v2_")]
-        self.assertEqual([node["id"] for node in v2_runs], ["v2_author_1", "v2_author_2"])
+        self.assertEqual([node["id"] for node in v2_runs], [
+            "v2_author_1", "v2_author_2", "v2_judge_0_launch",
+            "v2_judge_1_launch", "v2_judge_2_launch",
+        ])
         for node in v2_runs:
-            index = node["id"].rsplit("_", 1)[1]
+            if node["id"].startswith("v2_author_"):
+                index = node["id"].rsplit("_", 1)[1]
+                projection_id = f"v2_author_{index}_slot"
+            else:
+                index = node["id"].split("_")[2]
+                projection_id = f"v2_judge_{index}_slot"
             slot = node["config"]["codeoff_workspace"]["slot"]
             projection = next(candidate for candidate in graph["nodes"]
-                              if candidate["id"] == f"v2_author_{index}_slot")
+                              if candidate["id"] == projection_id)
             self.assertEqual(projection["type"], "transforms.objectBuilder")
-            self.assertEqual(projection["config"]["alias"], f"v2_author_{index}_slot")
+            self.assertEqual(projection["config"]["alias"], projection_id)
             fields = {mapping["output"]: mapping["expression"]
                       for mapping in projection["config"]["mappings"]}
             self.assertEqual(fields, {
@@ -22182,13 +22202,13 @@ class CodeOffTests(unittest.TestCase):
                                      "path": f"TASKS.initialize_v2.data.slots.{slot}.requested_effort"},
             })
             self.assertEqual(node["config"]["launcher"],
-                             f"{{{{ CTX.v2_author_{index}_slot.launcher }}}}")
+                             f"{{{{ CTX.{projection_id}.launcher }}}}")
             self.assertEqual(node["config"]["provider"],
-                             f"{{{{ CTX.v2_author_{index}_slot.provider }}}}")
+                             f"{{{{ CTX.{projection_id}.provider }}}}")
             self.assertEqual(node["config"]["model"],
-                             f"{{{{ CTX.v2_author_{index}_slot.exact_model }}}}")
+                             f"{{{{ CTX.{projection_id}.exact_model }}}}")
             self.assertEqual(node["config"]["effort"],
-                             f"{{{{ CTX.v2_author_{index}_slot.requested_effort }}}}")
+                             f"{{{{ CTX.{projection_id}.requested_effort }}}}")
 
     def test_codeoff_graph_converges_every_terminal_into_the_durable_record(self):
         graph = json.loads(
@@ -22200,7 +22220,7 @@ class CodeOffTests(unittest.TestCase):
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
             "policy_v2_parked", "v2_candidate_contract_disabled",
-            "v2_blind_ready", "v2_candidate_parked",
+            "v2_judgments_ready", "v2_candidate_parked", "v2_judgment_parked",
         } | {
             f"{prefix}_{suffix}"
             for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
@@ -22214,6 +22234,8 @@ class CodeOffTests(unittest.TestCase):
                 "v2_author_2_launch", "v2_author_2_callback", "v2_freeze_2",
                 "v2_frozen_2", "v2_test_2", "v2_test_2_result",
                 "v2_candidates_ready", "v2_candidate_parked",
+                "v2_judgment_0", "v2_judgment_1", "v2_judgment_2",
+                "v2_judgment_parked",
             )
             for suffix in ("write_failed", "readback_failed", "readback_mismatch")
         }
@@ -22508,6 +22530,15 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "claude": "claude-result-v1", "codex": "codex-rollout-v1",
             "grok": "grok-acp-v1",
         }[identity["launcher"]]
+        if slot.startswith("author-"):
+            prompt_hash = manifest["prompt_hash"]
+            budget = manifest["policy"]["budgets"]["author_seconds"]
+        else:
+            private = json.loads((root / "private" / "blinding.json").read_text())
+            prompt_hash = hashlib.sha256(
+                server._codeoff_judge_prompt(manifest, private, slot)
+            ).hexdigest()
+            budget = manifest["policy"]["budgets"]["judge_seconds"]
         execution_identity = {
             "version": "code-off-execution-identity-v1", "source": source,
             **{key: session_identity[key] for key in (
@@ -22527,9 +22558,9 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             **profile, "session_identity": session_identity,
             "launch_native_session_id": None,
             "codeoff_workspace": {"experiment_id": experiment_id, "slot": slot},
-            "prompt_hash": manifest["prompt_hash"],
+            "prompt_hash": prompt_hash,
             "max_turns": manifest["policy"]["budgets"]["max_turns"],
-            "run_budget_seconds": manifest["policy"]["budgets"]["author_seconds"],
+            "run_budget_seconds": budget,
             "started_at": "2026-09-03T12:00:00Z",
             "finished_at": "2026-09-03T12:00:01Z",
             "execution_identity": execution_identity, "receipt": receipt,
@@ -23568,6 +23599,353 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             status, payload = self._post(self._body("policy-v2-over-budget", over_budget))
         self.assertEqual((status, payload["code"]), (400, "bad_budgets"))
 
+    def test_v2_graph_launches_all_exact_judges_before_reading_any_judgment_and_has_no_replacement_edge(self):
+        nodes, edges = self._v2_durable_graph()
+        edge_set = set(edges)
+        judge_slots = ("judge-fable", "judge-1", "judge-2")
+
+        self.assertEqual(
+            nodes["v2_blind"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/blind",
+        )
+        self.assertEqual(nodes["v2_judge_launches_join"]["type"], "logic.join.all")
+        self.assertEqual(nodes["v2_judge_callbacks_join"]["type"], "logic.join.all")
+        self.assertIn(("v2_blind_ready", "success", "v2_blind"), edge_set)
+        self.assertIn(("v2_judge_launches_join", "out", "v2_judge_callbacks_join"), edge_set)
+
+        for index, slot in enumerate(judge_slots):
+            launch = f"v2_judge_{index}_launch"
+            wait = f"v2_wait_judge_{index}"
+            callback = f"v2_judge_{index}_callback_gate"
+            read = f"v2_read_judgment_{index}"
+            self.assertEqual(nodes[launch]["type"], "action.graphwing.POST:/v1/agent/run")
+            self.assertEqual(nodes[launch]["config"]["codeoff_workspace"]["slot"], slot)
+            self.assertEqual(nodes[read]["type"],
+                             "action.graphwing.POST:/v1/code-off/v2/read-judgment")
+            self.assertIn((wait, "pending", launch), edge_set)
+            self.assertIn((launch, "success", "v2_judge_launches_join"), edge_set)
+            self.assertIn((callback, "pass", "v2_judge_callbacks_join"), edge_set)
+            self.assertEqual(
+                {(source, handle) for source, handle, target in edges if target == read},
+                {("v2_judge_callbacks_join", "out")},
+            )
+
+        judgment_surface = json.dumps([
+            node for node_id, node in nodes.items()
+            if node_id.startswith("v2_") and "judge" in node_id
+        ]).lower()
+        for forbidden in ("replacement", "redraw", "fallback", "resume_job_id"):
+            self.assertNotIn(forbidden, judgment_surface)
+
+    def _ready_v2_for_judgment(self, experiment_id):
+        self._initialize(experiment_id)
+        for index, slot in enumerate(("author-1", "author-2"), 1):
+            workspace = server.codeoff_workspace_path(experiment_id, slot)
+            (workspace / f"candidate-{index}.py").write_text(f"VALUE = {index}\n")
+            job_id = str(index) * 32
+            with mock.patch.object(
+                server, "_codeoff_validate_job",
+                return_value=(self._v2_job(job_id), None),
+            ):
+                freeze_status, frozen = self._post_v2(
+                    "freeze-candidate", self._v2_freeze_body(experiment_id, slot, job_id),
+                )
+            self.assertEqual(freeze_status, 200, frozen)
+            test_status, tested = self._post_v2(
+                "test-candidate", self._v2_test_body(experiment_id, frozen, slot),
+            )
+            self.assertEqual(test_status, 200, tested)
+        status, blinded = self._post_v2("blind", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, blinded)
+        return blinded
+
+    def test_v2_judgment_fact_translates_to_sorted_author_slots_without_exposing_blind_labels_or_ordering(self):
+        experiment_id = "judgment-fact-v2"
+        blinded = self._ready_v2_for_judgment(experiment_id)
+        self.assertEqual([item["slot"] for item in blinded["bundles"]],
+                         ["judge-fable", "judge-1", "judge-2"])
+        for bundle in blinded["bundles"]:
+            self.assertEqual(set(bundle), {"slot", "judge_snapshot_hash", "leakage_count"})
+        root = self.records / experiment_id
+        internal_state = json.loads((root / "state.json").read_text())
+        blinded_wire = json.dumps(blinded)
+        for digest in internal_state["blind_bundle_hashes"].values():
+            self.assertNotIn(digest, blinded_wire)
+        judge_slot = "judge-fable"
+        job = self._bind_v2_terminal_job(experiment_id, judge_slot, "f" * 32)
+        private = json.loads((root / "private" / "blinding.json").read_text())
+        labels = private["judges"][judge_slot]["labels"]
+        dimensions = self._policy()["rubric"]["dimensions"]
+        candidates = {}
+        for label, author_slot in labels.items():
+            scores = {
+                name: maximum - (0 if author_slot == "author-1" else 1)
+                for name, maximum in dimensions.items()
+            }
+            candidates[label] = {
+                "scores": scores, "pass": author_slot == "author-1",
+                "rationale": f"{label} has bounded evidence for {author_slot}",
+            }
+        preferred_label = next(
+            label for label, slot in labels.items() if slot == "author-1"
+        )
+        raw = {
+            "rubric_version": "code-off-rubric-v2",
+            "judge_snapshot_hash": private["judges"][judge_slot]["judge_snapshot_hash"],
+            "candidates": candidates,
+            "preference": preferred_label,
+            "rationale": f"{preferred_label} is stronger",
+        }
+        workspace = server.codeoff_workspace_path(experiment_id, judge_slot)
+        (workspace / "judge-result.json").write_text(json.dumps(raw) + "\n")
+
+        status, fact = self._post_v2("read-judgment", {
+            "experiment_id": experiment_id, "slot": judge_slot,
+            "job_id": job["job_id"],
+        })
+        self.assertEqual(status, 200, fact)
+        self.assertEqual(list(fact), [
+            "ok", "protocol_version", "policy_version", "experiment_id", "status",
+            "judge_slot", "judgment_receipt_hash", "rubric_version",
+            "preferred_author_slot", "authors", "rationale",
+        ])
+        self.assertEqual(list(fact["authors"]), ["author-1", "author-2"])
+        self.assertEqual(fact["preferred_author_slot"], "author-1")
+        self.assertGreater(fact["authors"]["author-1"]["total"],
+                           fact["authors"]["author-2"]["total"])
+        for author_slot, judgment in fact["authors"].items():
+            self.assertEqual(list(judgment), ["total", "dimensions", "pass", "rationale"])
+            self.assertEqual(judgment["dimensions"], candidates[
+                next(label for label, slot in labels.items() if slot == author_slot)
+            ]["scores"])
+            self.assertEqual(
+                list(judgment["dimensions"]), sorted(judgment["dimensions"])
+            )
+        rendered = json.dumps(fact)
+        for forbidden in (
+            "candidate-1", "candidate-2", '"labels"', '"ordering"',
+            "judge_snapshot_hash", "prompt", "workspace", str(workspace),
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertRegex(fact["judgment_receipt_hash"], r"^[0-9a-f]{64}$")
+        openapi = json.loads(server.openapi_bytes())
+        for operation, request_schema, result_schema in (
+            ("blind", "CodeOffV2BlindRequest", "CodeOffV2BlindResult"),
+            ("read-judgment", "CodeOffV2ReadJudgmentRequest", "CodeOffV2JudgmentFact"),
+        ):
+            endpoint = openapi["paths"][f"/v1/code-off/v2/{operation}"]["post"]
+            self.assertEqual(
+                endpoint["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                f"#/components/schemas/{request_schema}",
+            )
+            self.assertEqual(
+                endpoint["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                f"#/components/schemas/{result_schema}",
+            )
+        judgment_schema = openapi["components"]["schemas"]["CodeOffV2JudgmentFact"]
+        self.assertFalse(judgment_schema["additionalProperties"])
+        self.assertEqual(set(judgment_schema["properties"]), set(fact))
+        self.assertNotIn("judge_snapshot_hash", judgment_schema["properties"])
+        hostile = deepcopy(raw)
+        hostile["rationale"] = "\ud800"
+        parsed, parse_error = server._codeoff_v2_parse_judgment(
+            hostile, private["judges"][judge_slot]["judge_snapshot_hash"],
+        )
+        self.assertIsNone(parsed)
+        self.assertEqual(parse_error, "invalid_judge_result")
+
+        replay_status, replay = self._post_v2("read-judgment", {
+            "experiment_id": experiment_id, "slot": judge_slot,
+            "job_id": job["job_id"],
+        })
+        self.assertEqual((replay_status, replay), (200, fact))
+        state_path = root / "state.json"
+        state = json.loads(state_path.read_text())
+        state["judges"][judge_slot]["authors"]["author-1"]["total"] += 1
+        state_path.write_text(json.dumps(state))
+        tampered_status, tampered = self._post_v2("read-judgment", {
+            "experiment_id": experiment_id, "slot": judge_slot,
+            "job_id": job["job_id"],
+        })
+        self.assertEqual(
+            (tampered_status, tampered["code"]),
+            (409, "judgment_authority_tampered"),
+        )
+
+    def test_v2_native_nodes_reject_missing_duplicate_abstaining_malformed_out_of_range_and_wrong_rubric_judgments_per_policy(self):
+        nodes, edges = self._v2_durable_graph()
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )
+        runner = NativeGraphRunner(graph, None)
+        policy = self._policy()
+        slots = ("judge-fable", "judge-1", "judge-2")
+
+        def fact(slot, receipt):
+            dimensions = dict(policy["rubric"]["dimensions"])
+            return {
+                "ok": True, "protocol_version": "code-off-v2",
+                "policy_version": "code-off-policy-v2",
+                "experiment_id": "native-judgment-v2", "status": "judgment-read",
+                "judge_slot": slot, "judgment_receipt_hash": receipt,
+                "rubric_version": policy["rubric"]["version"],
+                "preferred_author_slot": "author-1",
+                "authors": {
+                    author: {
+                        "total": sum(dimensions.values()),
+                        "dimensions": dict(dimensions), "pass": True,
+                        "rationale": f"bounded {author}",
+                    }
+                    for author in ("author-1", "author-2")
+                },
+                "rationale": "bounded judgment",
+            }
+
+        def evaluate(index, value):
+            context = {
+                "CTX": {
+                    "INPUT": {"experiment_id": "native-judgment-v2"},
+                    "codeoff_policy_v2": {"value": policy},
+                },
+                "TASKS": {f"v2_read_judgment_{index}": {"data": value}},
+            }
+            mapped = {
+                key: runner.evaluate(expression, context)
+                for key, expression in self._v2_mappings(
+                    nodes[f"v2_judgment_{index}_actionability"]
+                ).items()
+            }
+            return NativeGraphRunner.rules_pass(
+                nodes[f"v2_judgment_{index}_actionable"]["config"], mapped
+            )
+
+        judgments = [fact(slot, str(index + 3) * 64) for index, slot in enumerate(slots)]
+        for index, value in enumerate(judgments):
+            self.assertTrue(evaluate(index, value), (index, value))
+            self.assertIn(
+                (f"v2_judgment_{index}_actionable", "fail", "v2_judgment_park_join"),
+                edges,
+            )
+
+        cases = {}
+        cases["missing"] = {}
+        cases["abstaining"] = deepcopy(judgments[0])
+        cases["abstaining"]["preferred_author_slot"] = "abstain"
+        cases["malformed"] = deepcopy(judgments[0])
+        cases["malformed"]["authors"]["author-1"]["pass"] = 1
+        cases["out_of_range"] = deepcopy(judgments[0])
+        cases["out_of_range"]["authors"]["author-1"]["dimensions"]["correctness"] = 41
+        cases["wrong_dimensions"] = deepcopy(judgments[0])
+        wrong_dimensions = cases["wrong_dimensions"]["authors"]["author-1"]
+        del wrong_dimensions["dimensions"]["correctness"]
+        wrong_dimensions["dimensions"]["unexpected"] = 0
+        wrong_dimensions["total"] = sum(wrong_dimensions["dimensions"].values())
+        cases["wrong_rubric"] = deepcopy(judgments[0])
+        cases["wrong_rubric"]["rubric_version"] = "code-off-rubric-v1"
+        cases["wrong_status"] = deepcopy(judgments[0])
+        cases["wrong_status"]["status"] = "error"
+        cases["wrong_experiment"] = deepcopy(judgments[0])
+        cases["wrong_experiment"]["experiment_id"] = "different-experiment-v2"
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(evaluate(0, value))
+
+        census = self._v2_mappings(nodes["v2_judgment_census"])
+
+        def census_pass(values, census_policy=None):
+            context = {
+                "CTX": {
+                    "codeoff_policy_v2": {
+                        "value": census_policy or policy,
+                    },
+                },
+                "TASKS": {
+                    f"v2_read_judgment_{index}": {"data": value}
+                    for index, value in enumerate(values)
+                },
+            }
+            mapped = {
+                key: runner.evaluate(expression, context)
+                for key, expression in census.items()
+            }
+            return NativeGraphRunner.rules_pass(
+                nodes["v2_judgment_census_gate"]["config"], mapped
+            )
+
+        self.assertTrue(census_pass(judgments))
+        self.assertFalse(census_pass(judgments[:2] + [{}]))
+        duplicate = deepcopy(judgments)
+        duplicate[2]["judgment_receipt_hash"] = duplicate[1]["judgment_receipt_hash"]
+        self.assertFalse(census_pass(duplicate))
+        wrong_census = deepcopy(policy)
+        wrong_census["random_judge_count"] = 1
+        self.assertFalse(census_pass(judgments, wrong_census))
+        self.assertIn(
+            ("v2_judgment_census_gate", "fail", "v2_judgment_park_join"), edges,
+        )
+        judgment_nodes = [
+            node for node_id, node in nodes.items()
+            if node_id.startswith("v2_judgment_")
+        ]
+        self.assertFalse(any(
+            node["type"] == "transforms.codeExpression" for node in judgment_nodes
+        ))
+        self.assertNotIn("{%", json.dumps(judgment_nodes))
+
+    def test_v2_judgments_are_durably_written_and_read_back_before_winner_selection(self):
+        nodes, edges = self._v2_durable_graph()
+        inbound = {}
+        for source, handle, target in edges:
+            inbound.setdefault(target, set()).add((source, handle))
+        for index, slot in enumerate(("judge-fable", "judge-1", "judge-2")):
+            prefix = f"v2_judgment_{index}"
+            record = self._v2_mappings(nodes[f"{prefix}_record"])
+            self.assertEqual(list(record), [
+                "schema_version", "policy_version", "policy_hash", "experiment_id",
+                "judge_slot", "judgment_receipt_hash", "rubric_version",
+                "preferred_author_slot", "authors", "rationale",
+            ])
+            self.assertEqual(record["judge_slot"], {
+                "kind": "literal", "value": slot,
+            })
+            self.assertEqual(nodes[f"{prefix}_upsert"]["type"],
+                             "action.datastore.records.upsert")
+            self.assertEqual(nodes[f"{prefix}_upsert"]["config"]["scope"], "tenant")
+            self.assertEqual(
+                nodes[f"{prefix}_upsert"]["config"]["collection"],
+                "graphwing_codeoff_judgment_v2",
+            )
+            self.assertNotIn("ttl", nodes[f"{prefix}_upsert"]["config"])
+            self.assertEqual(nodes[f"{prefix}_readback"]["type"],
+                             "action.datastore.records.get")
+            self.assertIn((f"{prefix}_actionable", "pass", f"{prefix}_record"), edges)
+            self.assertIn((f"{prefix}_upsert", "success", f"{prefix}_readback"), edges)
+            self.assertIn((f"{prefix}_readback_gate", "pass",
+                           "v2_judgments_persisted_join"), edges)
+            check = self._v2_mappings(nodes[f"{prefix}_readback_check"])
+            self.assertEqual(check["data_matches"]["left"], {
+                "kind": "getField", "path": f"CTX.{prefix}_readback_hash.value",
+            })
+            self.assertEqual(inbound[f"{prefix}_record"], {
+                (f"{prefix}_actionable", "pass"),
+            })
+
+        self.assertEqual(nodes["v2_judgments_persisted_join"]["type"], "logic.join.all")
+        self.assertIn(("v2_judgments_persisted_join", "out", "v2_judgment_census"), edges)
+        self.assertIn(("v2_judgment_census", "out", "v2_judgment_census_gate"), edges)
+        self.assertIn(("v2_judgment_census_gate", "pass", "v2_judgments_ready"), edges)
+        self.assertEqual(nodes["v2_judgments_ready"]["type"], "action.noop")
+        self.assertEqual(
+            {source for source, _handle in inbound["v2_judgments_ready"]},
+            {"v2_judgment_census_gate"},
+        )
+        self.assertFalse(any(
+            node_id.startswith("v2_") and any(
+                word in node_id for word in ("winner", "aggregate", "promotion")
+            )
+            for node_id in nodes
+        ))
+
 
     V2_STAGES = (
         ("v2_initialization", "initialization", 0, False),
@@ -23719,6 +24097,9 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(effects, {
             "initialize_v2", "v2_author_1", "v2_author_2",
             "v2_freeze_1", "v2_freeze_2", "v2_test_1", "v2_test_2",
+            "v2_blind", "v2_judge_0_launch", "v2_judge_1_launch",
+            "v2_judge_2_launch", "v2_read_judgment_0",
+            "v2_read_judgment_1", "v2_read_judgment_2",
         })
         self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
         self.assertEqual(forward.get("v2_continuation_disabled"), {"v2_candidate_stage_contract"})
