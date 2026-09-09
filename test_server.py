@@ -21754,12 +21754,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "36a1048733abeb21b089a1451f5200b0ee9e9b4bfb38d5eb975e141c15ebc596",
+            "20e11066b2575e20d5e1761c45b53d340dbc4c98e0951df4fb0eaa3c61187105",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 428)
-        self.assertEqual(len(graph["spec"]["edges"]), 517)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 428)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 517)
+        self.assertEqual(len(graph["spec"]["nodes"]), 460)
+        self.assertEqual(len(graph["spec"]["edges"]), 549)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 460)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 549)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21776,6 +21776,9 @@ class CodeOffTests(unittest.TestCase):
             "logic.join.all": {"out"},
             "action.wait.webhook": {"pending", "out", "timeout", "failure"},
             "transforms.objectBuilder": {"out"},
+            "transforms.transformArray": {"out"},
+            "transforms.aggregate": {"out"},
+            "transforms.groupByAggregate": {"out"},
             "transforms.hash": {"out"},
             "action.datastore.records.upsert": {"success", "failure"},
             "action.datastore.records.get": {"success", "failure"},
@@ -21883,7 +21886,9 @@ class CodeOffTests(unittest.TestCase):
         )
         expected_v2_leaves |= {
             "v2_candidate_contract_disabled", "v2_candidate_parked",
-            "v2_judgments_ready", "v2_judgment_parked",
+            "v2_judgment_parked", "v2_final_verification_pending", "v2_no_winner",
+            "v2_winner_decision_write_failed", "v2_winner_decision_readback_failed",
+            "v2_winner_decision_readback_mismatch",
         } | {
             f"{prefix}_{suffix}"
             for prefix in pr3_transition_prefixes + (
@@ -22107,7 +22112,7 @@ class CodeOffTests(unittest.TestCase):
                     "v2_judgment_2", "v2_judgment_parked",
                     "v2_candidate_parked",
                 )
-             ],
+             ] + ["v2_winner_decision_upsert"],
         )
         key_expression = json.dumps(
             nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
@@ -22220,7 +22225,10 @@ class CodeOffTests(unittest.TestCase):
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
             "policy_v2_parked", "v2_candidate_contract_disabled",
-            "v2_judgments_ready", "v2_candidate_parked", "v2_judgment_parked",
+            "v2_candidate_parked", "v2_judgment_parked",
+            "v2_final_verification_pending", "v2_no_winner",
+            "v2_winner_decision_write_failed", "v2_winner_decision_readback_failed",
+            "v2_winner_decision_readback_mismatch",
         } | {
             f"{prefix}_{suffix}"
             for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
@@ -23829,8 +23837,9 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
 
         cases = {}
         cases["missing"] = {}
-        cases["abstaining"] = deepcopy(judgments[0])
-        cases["abstaining"]["preferred_author_slot"] = "abstain"
+        abstaining = deepcopy(judgments[0])
+        abstaining["preferred_author_slot"] = "abstain"
+        self.assertTrue(evaluate(0, abstaining))
         cases["malformed"] = deepcopy(judgments[0])
         cases["malformed"]["authors"]["author-1"]["pass"] = 1
         cases["out_of_range"] = deepcopy(judgments[0])
@@ -23939,13 +23948,257 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             {source for source, _handle in inbound["v2_judgments_ready"]},
             {"v2_judgment_census_gate"},
         )
-        self.assertFalse(any(
-            node_id.startswith("v2_") and any(
-                word in node_id for word in ("winner", "aggregate", "promotion")
-            )
-            for node_id in nodes
-        ))
+        self.assertIn(
+            ("v2_judgments_ready", "success", "v2_aggregation_inputs"), edges,
+        )
 
+    @staticmethod
+    def _v2_judgment_record(slot, preference, author_1_score, author_2_score, receipt):
+        return {
+            "schema_version": "code-off-judgment-v2",
+            "policy_version": "code-off-policy-v2",
+            "policy_hash": "a" * 64,
+            "experiment_id": "winner-policy-v2",
+            "judge_slot": slot,
+            "judgment_receipt_hash": receipt,
+            "rubric_version": "code-off-rubric-v2",
+            "preferred_author_slot": preference,
+            "authors": {
+                "author-1": {
+                    "total": author_1_score, "dimensions": {}, "pass": True,
+                    "rationale": "bounded author-1 evidence",
+                },
+                "author-2": {
+                    "total": author_2_score, "dimensions": {}, "pass": True,
+                    "rationale": "bounded author-2 evidence",
+                },
+            },
+            "rationale": "bounded judgment",
+        }
+
+    @staticmethod
+    def _v2_candidate_test_record(slot, passed, receipt):
+        return {
+            "schema_version": "code-off-transition-payload-v2",
+            "policy_version": "code-off-policy-v2",
+            "routing_version": "code-off-candidate-routing-v2",
+            "experiment_id": "winner-policy-v2",
+            "stage": f"candidate-tested-{slot}",
+            "ordinal": 13 if slot == "author-1" else 23,
+            "reason": "candidate_test_finished",
+            "attempt_ids": [slot], "terminal": False, "slot": slot,
+            "tests_pass": passed, "no_mutation": True,
+            "test_receipt_hash": receipt,
+            "transition_id": f"graphwing-codeoff-v2:winner-policy-v2:transition:candidate-tested-{slot}:"
+                             f"{13 if slot == 'author-1' else 23}",
+            "payload_hash": ("8" if slot == "author-1" else "9") * 64,
+        }
+
+    def _evaluate_v2_winner(self, preferences, scores, candidate_tests=(True, True)):
+        graph = json.loads(
+            (Path(server.__file__).parent / "graphs" / "code-off.json").read_text()
+        )
+        runner = NativeGraphRunner(graph, None)
+        slots = ("judge-fable", "judge-1", "judge-2")
+        runner.context = {
+            "CTX": {
+                "INPUT": {"experiment_id": "winner-policy-v2"},
+                "codeoff_policy_v2": {"value": self._policy()},
+                "policy_v2_hash": {"value": "a" * 64},
+            },
+            "TASKS": {
+                **{
+                    f"v2_judgment_{index}_readback": {"data": self._v2_judgment_record(
+                        slot, preferences[index], scores[index][0], scores[index][1],
+                        str(index + 3) * 64,
+                    )}
+                    for index, slot in enumerate(slots)
+                },
+                "v2_test_1_result_readback": {"data": self._v2_candidate_test_record(
+                    "author-1", candidate_tests[0], "6" * 64,
+                )},
+                "v2_test_2_result_readback": {"data": self._v2_candidate_test_record(
+                    "author-2", candidate_tests[1], "7" * 64,
+                )},
+            },
+        }
+        order = (
+            "v2_aggregation_inputs", "v2_aggregation_inputs_hash",
+            "v2_aggregation_rows", "v2_aggregation_totals",
+            "v2_author_1_totals_rows", "v2_author_1_totals",
+            "v2_author_2_totals_rows", "v2_author_2_totals",
+            "v2_candidate_test_facts", "v2_author_1_test_rows", "v2_author_1_test",
+            "v2_author_2_test_rows", "v2_author_2_test",
+            "v2_selection_comparison", "v2_provisional_decision", "v2_winner_test",
+            "v2_winner_decision",
+        )
+        for node_id in order:
+            runner.execute(runner.nodes[node_id], {})
+        return runner.context["CTX"]["v2_winner_decision"]
+
+    def test_v2_native_aggregation_matches_hard_coded_majority_score_fallback_tie_and_failed_test_vectors(self):
+        majority = self._evaluate_v2_winner(
+            ("author-1", "author-1", "author-2"),
+            ((10, 90), (10, 90), (10, 90)),
+        )
+        self.assertEqual(
+            (majority["winner"], majority["basis"], majority["vote_totals"],
+             majority["score_totals"]),
+            ("author-1", "preference-majority", {"author-1": 2, "author-2": 1},
+             {"author-1": 30, "author-2": 270}),
+        )
+        score = self._evaluate_v2_winner(
+            ("author-1", "author-2", "abstain"),
+            ((20, 80), (20, 80), (20, 80)),
+        )
+        self.assertEqual((score["winner"], score["basis"]),
+                         ("author-2", "summed-scores"))
+        tied = self._evaluate_v2_winner(
+            ("abstain", "abstain", "abstain"),
+            ((50, 50), (50, 50), (50, 50)),
+        )
+        self.assertEqual((tied["decision"], tied["winner"], tied["basis"]),
+                         ("no-winner", None, "exact-score-tie"))
+        failed = self._evaluate_v2_winner(
+            ("author-1", "author-1", "author-2"),
+            ((90, 10), (90, 10), (90, 10)),
+            (False, True),
+        )
+        self.assertEqual(
+            (failed["decision"], failed["winner"], failed["basis"]),
+            ("no-winner", None, "selected-candidate-failed-tests"),
+        )
+        self.assertFalse(failed["promotion_requested"])
+
+    def test_v2_winner_decision_is_persisted_and_exactly_read_back_before_final_verification(self):
+        nodes, edges = self._v2_durable_graph()
+        decision = self._v2_mappings(nodes["v2_winner_decision"])
+        self.assertEqual(list(decision), [
+            "schema_version", "policy_version", "aggregation_version", "policy_hash",
+            "experiment_id", "inputs_hash", "judgment_receipt_hashes",
+            "candidate_test_receipt_hashes", "vote_totals", "score_totals",
+            "candidate_tests", "selection_basis", "decision", "basis", "winner",
+            "promotion_requested",
+        ])
+        self.assertEqual(decision["promotion_requested"],
+                         {"kind": "literal", "value": False})
+        self.assertEqual(nodes["v2_winner_decision_upsert"]["type"],
+                         "action.datastore.records.upsert")
+        self.assertEqual(nodes["v2_winner_decision_upsert"]["config"]["scope"], "tenant")
+        self.assertEqual(
+            nodes["v2_winner_decision_upsert"]["config"]["collection"],
+            "graphwing_codeoff_decision_v2",
+        )
+        self.assertNotIn("ttl", nodes["v2_winner_decision_upsert"]["config"])
+        self.assertEqual(
+            self._v2_resolve(self._v2_mappings(nodes["v2_winner_decision_key"])["value"]),
+            "graphwing-codeoff-v2:{CTX.INPUT.experiment_id}:decision:winner",
+        )
+        for triple in (
+            ("v2_judgments_ready", "success", "v2_aggregation_inputs"),
+            ("v2_winner_decision", "out", "v2_winner_decision_key"),
+            ("v2_winner_decision_key", "out", "v2_winner_decision_expected_hash"),
+            ("v2_winner_decision_expected_hash", "out", "v2_winner_decision_upsert"),
+            ("v2_winner_decision_upsert", "success", "v2_winner_decision_readback"),
+            ("v2_winner_decision_readback", "success", "v2_winner_decision_readback_hash"),
+            ("v2_winner_decision_readback_hash", "out", "v2_winner_decision_readback_check"),
+            ("v2_winner_decision_readback_check", "out", "v2_winner_decision_readback_gate"),
+            ("v2_winner_decision_readback_gate", "pass", "v2_winner_readback_projection"),
+            ("v2_winner_readback_projection", "out", "v2_winner_gate"),
+            ("v2_winner_gate", "pass", "v2_final_verification_binding"),
+            ("v2_final_verification_binding", "out", "v2_final_verification_pending"),
+        ):
+            self.assertIn(triple, edges)
+        check = self._v2_mappings(nodes["v2_winner_decision_readback_check"])
+        self.assertEqual(set(check),
+                         {"found_matches", "key_matches", "data_matches", "version_matches"})
+        self.assertEqual(check["data_matches"]["left"], {
+            "kind": "getField", "path": "CTX.v2_winner_decision_readback_hash.value",
+        })
+        self.assertEqual(check["data_matches"]["right"], {
+            "kind": "getField", "path": "CTX.v2_winner_decision_expected_hash.value",
+        })
+        self.assertEqual(nodes["v2_final_verification_pending"]["type"], "action.noop")
+        binding = self._v2_mappings(nodes["v2_final_verification_binding"])
+        self.assertEqual(list(binding), [
+            "schema_version", "author_slot", "decision_hash",
+            "aggregation_inputs_hash", "candidate_test_receipt_hash",
+        ])
+        self.assertEqual(binding["author_slot"], {
+            "kind": "getField", "path": "TASKS.v2_winner_decision_readback.data.winner",
+        })
+        for output in ("decision_hash", "aggregation_inputs_hash",
+                       "candidate_test_receipt_hash"):
+            self.assertNotIn("TASKS.v2_read_judgment", json.dumps(binding[output]))
+            self.assertNotIn("TASKS.v2_test_", json.dumps(binding[output]))
+
+    def test_v2_tie_no_winner_missing_judge_and_failed_winner_test_have_no_path_to_verify_promote_commit_or_push(self):
+        nodes, edges = self._v2_durable_graph()
+        forward = {}
+        for source, handle, target in edges:
+            forward.setdefault((source, handle), set()).add(target)
+        self.assertEqual(forward[("v2_winner_gate", "fail")], {"v2_no_winner"})
+        self.assertEqual(forward.get(("v2_no_winner", "success")), None)
+        self.assertIn(("v2_judgment_census_gate", "fail", "v2_judgment_park_join"), edges)
+        for index in (1, 2):
+            self.assertIn(
+                (f"v2_test_{index}_actionable", "fail", "v2_candidate_park_join"), edges,
+            )
+        no_winner = self._evaluate_v2_winner(
+            ("abstain", "abstain", "abstain"),
+            ((50, 50), (50, 50), (50, 50)),
+        )
+        failed = self._evaluate_v2_winner(
+            ("author-1", "author-1", "author-2"),
+            ((90, 10), (90, 10), (90, 10)), (False, True),
+        )
+        for decision in (no_winner, failed):
+            self.assertEqual(decision["winner"], None)
+            self.assertFalse(decision["promotion_requested"])
+            self.assertFalse(NativeGraphRunner.rules_pass(
+                nodes["v2_winner_gate"]["config"], decision,
+            ))
+        reachable = set()
+        frontier = ["v2_no_winner", "v2_judgment_park_join", "v2_candidate_park_join"]
+        adjacency = {}
+        for source, _handle, target in edges:
+            adjacency.setdefault(source, set()).add(target)
+        while frontier:
+            current = frontier.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            frontier.extend(adjacency.get(current, ()))
+        forbidden = {node_id for node_id in nodes if any(
+            token in node_id for token in ("final_verification", "promote", "commit", "push")
+        )}
+        self.assertEqual(reachable & forbidden, set())
+
+    def test_v2_graph_contains_no_code_expression_procedural_nunjucks_daemon_aggregate_or_fallback_redraw_edge(self):
+        nodes, edges = self._v2_durable_graph()
+        v2_nodes = [node for node_id, node in nodes.items() if node_id.startswith("v2_")]
+        self.assertFalse(any(node["type"] == "transforms.codeExpression" for node in v2_nodes))
+        serialized = json.dumps(v2_nodes)
+        for forbidden in ("{%", "codeOffAggregate", "/v1/code-off/aggregate",
+                          "fallback", "redraw", "replacement_judge"):
+            self.assertNotIn(forbidden, serialized)
+        native_types = {
+            nodes[node_id]["type"] for node_id in (
+                "v2_aggregation_rows", "v2_aggregation_totals",
+                "v2_author_1_totals_rows", "v2_author_2_totals_rows",
+                "v2_candidate_test_facts", "v2_selection_comparison",
+                "v2_winner_decision",
+            )
+        }
+        self.assertEqual(native_types, {
+            "transforms.objectBuilder", "transforms.transformArray",
+            "transforms.groupByAggregate",
+        })
+        self.assertFalse(any(
+            source.startswith("v2_") and target in {"aggregate", "eligible", "finalize",
+                                                       "commit", "push"}
+            for source, _handle, target in edges
+        ))
 
     V2_STAGES = (
         ("v2_initialization", "initialization", 0, False),
@@ -28702,9 +28955,13 @@ class NativeGraphRunner:
     def path(context, dotted):
         value = context
         for part in dotted.split("."):
-            if not isinstance(value, dict):
+            if isinstance(value, dict):
+                value = value.get(part)
+            elif isinstance(value, list) and part.isdigit():
+                index = int(part)
+                value = value[index] if index < len(value) else None
+            else:
                 return None
-            value = value.get(part)
         return value
 
     @staticmethod
@@ -28877,6 +29134,43 @@ class NativeGraphRunner:
         self.context["CTX"][config["alias"]] = built
         return "out", built
 
+    def aggregate(self, node):
+        config = node["config"]
+        source = self.evaluate(config["array"]["ast"], self.context) or []
+        if config["operation"] == "first":
+            result = source[0] if source else None
+        elif config["operation"] == "last":
+            result = source[-1] if source else None
+        else:
+            raise AssertionError(config["operation"])
+        built = {"result": result, "itemCount": len(source)}
+        self.context["CTX"][config["alias"]] = built
+        return "out", built
+
+    def group_by_aggregate(self, node):
+        config = node["config"]
+        source = self.render(config["source"]) or []
+        rows = []
+        for item in source:
+            group_value = self.path(item, config["groupBy"])
+            row = next((candidate for candidate in rows
+                        if candidate[config["groupBy"]] == group_value), None)
+            if row is None:
+                row = {config["groupBy"]: group_value}
+                rows.append(row)
+            for aggregation in config["aggregations"]:
+                attribute = self.path(item, aggregation["attribute"])
+                output = aggregation["as"]
+                if aggregation["op"] == "sum":
+                    row[output] = row.get(output, 0) + (attribute or 0)
+                elif aggregation["op"] == "count":
+                    row[output] = row.get(output, 0) + (attribute is not None)
+                else:
+                    raise AssertionError(aggregation["op"])
+        built = {config["output"]: rows, "itemCount": len(source)}
+        self.context["CTX"][config["alias"]] = built
+        return "out", built
+
     def hash_node(self, node):
         config = node["config"]
         self.assertion(
@@ -28934,6 +29228,10 @@ class NativeGraphRunner:
             return self.hash_node(node)
         if kind == "transforms.transformArray":
             return self.transform_array(node)
+        if kind == "transforms.aggregate":
+            return self.aggregate(node)
+        if kind == "transforms.groupByAggregate":
+            return self.group_by_aggregate(node)
         if kind == "transforms.regexReplace":
             raise NativeGraphFenced(node["config"]["input"])
         if kind == "logic.filter":

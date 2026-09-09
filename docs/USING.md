@@ -430,9 +430,10 @@ a business stage or exposes private label ordering, prompts, paths, workspaces,
 or raw output.
 
 The native `code-off-judgment-routing-v2` source topology fixes all three judge
-launches before any judgment read, joins all three terminal callbacks, rejects
-missing, duplicate, abstaining, malformed, out-of-range, or wrong-rubric facts,
-and has no replacement, redraw, fallback, or retry edge. Each actionable
+launches before any judgment read, joins all three terminal callbacks, accepts
+explicit abstentions for score fallback, and rejects missing, duplicate,
+malformed, out-of-range, or wrong-rubric facts without a replacement, redraw,
+fallback, or retry edge. Each actionable
 judgment is projected into the permanent tenant collection
 `graphwing_codeoff_judgment_v2` under the deterministic key
 `graphwing-codeoff-v2:<experiment_id>:judgment:<judge-slot>`. The graph hashes
@@ -445,4 +446,35 @@ The candidate-stage activation gate remains false because atomic tenant fencing
 is not live-proven. V1 `codeOffJudge`, its strict rubric parser, v1 receipt
 nodes, and the complete default v1 path remain unchanged. This is source and
 local fixture proof only; no deployment, OpenAPI re-import, publication, tenant
+readback, provider run, or live canary was performed.
+
+### Issue #188 PR 5 winner-selection boundary
+
+`code-off-aggregation-v2` is now workflow policy expressed only with native
+object builders, array filters, grouped numeric sums, comparisons, and hashes.
+It consumes the exact-read-back three normalized judgment records and two
+candidate-test records. Two preference votes select a provisional author;
+without two votes, summed scores select the provisional author; an exact score
+tie produces no winner. The provisional author is retained only when that
+candidate's durable test fact passed without mutation. The workflow never
+substitutes the other author when the selected candidate failed.
+
+The complete sanitized `code-off-decision-v2` record includes the policy and
+aggregation versions, policy and aggregation-input hashes, all judgment and
+candidate-test receipt hashes, vote and score totals, candidate-test facts,
+selection basis, final basis, winner or null, and
+`promotion_requested: false`. It is stored permanently in tenant collection
+`graphwing_codeoff_decision_v2` under
+`graphwing-codeoff-v2:<experiment_id>:decision:winner`, then read back with
+exact data hash, key, and version equality before the winner path can reach a
+later-slice final-verification binding. Tie, no-winner, missing-judge, and
+failed-candidate-test paths cannot reach final verification, promotion,
+commit, or push. The binding carries only the frozen author slot, decision
+hash, aggregation-input hash, and candidate-test receipt hash; no daemon
+aggregation or winner-confirmation request exists.
+
+The v1 `aggregate_codeoff_results`, `codeoff_aggregate`, aggregate node, and
+eligible filter remain unchanged. The v2 activation gate is still false, and
+final verification and promotion remain later slices. These fixtures prove
+only source catalog behavior; no deployment, re-import, publication, tenant
 readback, provider run, or live canary was performed.
