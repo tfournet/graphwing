@@ -414,3 +414,35 @@ any v2 author, and Graphwing independently rejects a v2 `agentRun`. Author-launc
 transition binding is not yet an active `agentRun` contract. This change claims
 local source/fixture behavior only: no deployment, re-import, publication, tenant
 readback, retention proof, or live canary was performed.
+
+### Issue #188 PR 4 judgment-stage boundary
+
+`codeOffV2Blind` retains private seed-based ordering, `private/blinding.json`,
+opaque judge workspaces, frozen-artifact verification, and identity-leakage
+scanning in Graphwing. It returns only three fixed judge-slot readiness and
+snapshot-hash facts. `codeOffV2ReadJudgment` accepts one exact terminal pinned
+judge job, parses only a bounded duplicate-key-free JSON result, verifies its
+immutable execution receipt and private snapshot, translates private candidate
+labels to sorted `author-1` / `author-2` facts, and returns only the judge slot,
+judgment receipt hash, preferred author slot or abstain, per-author totals,
+dimension values, pass facts, and bounded rationales. Neither operation chooses
+a business stage or exposes private label ordering, prompts, paths, workspaces,
+or raw output.
+
+The native `code-off-judgment-routing-v2` source topology fixes all three judge
+launches before any judgment read, joins all three terminal callbacks, rejects
+missing, duplicate, abstaining, malformed, out-of-range, or wrong-rubric facts,
+and has no replacement, redraw, fallback, or retry edge. Each actionable
+judgment is projected into the permanent tenant collection
+`graphwing_codeoff_judgment_v2` under the deterministic key
+`graphwing-codeoff-v2:<experiment_id>:judgment:<judge-slot>`. The graph hashes
+and exactly reads back each record, including key and version equality, before
+the three-judge census can become ready for the later winner-selection slice.
+Invalid or unavailable judgment paths write and read back a terminal
+`judgment-parked` transition instead.
+
+The candidate-stage activation gate remains false because atomic tenant fencing
+is not live-proven. V1 `codeOffJudge`, its strict rubric parser, v1 receipt
+nodes, and the complete default v1 path remain unchanged. This is source and
+local fixture proof only; no deployment, OpenAPI re-import, publication, tenant
+readback, provider run, or live canary was performed.

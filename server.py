@@ -11506,6 +11506,96 @@ def _codeoff_v2_safety_seal_error(
             return {"error": "candidate safety seal evidence differs", "code": "candidate_safety_seal_tampered"}
     return None
 
+
+def _codeoff_v2_judgment_authority_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+        return None
+    slots = {"judge-fable", "judge-1", "judge-2"}
+    judges = state.get("judges")
+    rejections = state.get("judgment_rejections", {})
+    if not isinstance(judges, dict) or not isinstance(rejections, dict):
+        return {"error": "judgment authority differs", "code": "judgment_authority_tampered"}
+    if not set(judges) <= slots or not set(rejections) <= slots or set(judges) & set(rejections):
+        return {"error": "judgment authority differs", "code": "judgment_authority_tampered"}
+    judgment_events = [
+        event.get("data") for event in events if event.get("kind") == "v2_judgment_read"
+    ]
+    rejection_events = [
+        event.get("data") for event in events if event.get("kind") == "v2_judgment_rejected"
+    ]
+    if len(judgment_events) != len(judges) or len(rejection_events) != len(rejections):
+        return {"error": "judgment authority differs", "code": "judgment_authority_tampered"}
+    try:
+        for slot, stored in judges.items():
+            if not isinstance(stored, dict):
+                raise ValueError("stored judgment is not an object")
+            receipt_hash = stored.get("judgment_receipt_hash")
+            receipt = {
+                key: value for key, value in stored.items()
+                if key != "judgment_receipt_hash"
+            }
+            event = {
+                "judge_slot": slot, "job_id": stored.get("job_id"),
+                "judgment_receipt_hash": receipt_hash,
+                "preferred_author_slot": stored.get("preferred_author_slot"),
+            }
+            if (
+                set(stored) != {
+                    "version", "judge_slot", "job_id", "identity_snapshot_hash",
+                    "execution_identity", "rubric_version", "preferred_author_slot",
+                    "authors", "rationale", "judgment_receipt_hash",
+                }
+                or stored.get("version") != "code-off-v2-judgment-receipt-v1"
+                or stored.get("judge_slot") != slot
+                or stored.get("identity_snapshot_hash")
+                != manifest["identity_snapshot_hashes"][slot]
+                or not isinstance(receipt_hash, str)
+                or hashlib.sha256(codeoff_canonical_json(receipt)).hexdigest()
+                != receipt_hash
+                or _codeoff_read_artifact(root, receipt_hash)
+                != codeoff_canonical_json(receipt)
+                or judgment_events.count(event) != 1
+            ):
+                raise ValueError("stored judgment differs")
+        for slot, rejected in rejections.items():
+            if (
+                not isinstance(rejected, dict)
+                or set(rejected) != {"slot", "job_id", "code"}
+                or rejected.get("slot") != slot
+                or rejection_events.count(rejected) != 1
+            ):
+                raise ValueError("stored rejection differs")
+        seal = state.get("judgment_safety_seal")
+        seal_events = [
+            event.get("data") for event in events
+            if event.get("kind") == "v2_judgment_safety_sealed"
+        ]
+        if seal is None:
+            if seal_events:
+                raise ValueError("unexpected judgment safety event")
+        else:
+            body = {key: value for key, value in seal.items() if key != "seal_hash"}
+            seal_hash = seal.get("seal_hash")
+            event = {"code": seal.get("code"), "seal_hash": seal_hash}
+            if (
+                not isinstance(seal, dict)
+                or set(seal) != {"version", "experiment_id", "code", "seal_hash"}
+                or body.get("version") != "code-off-v2-judgment-safety-seal-v1"
+                or body.get("experiment_id") != root.name
+                or not isinstance(seal_hash, str)
+                or hashlib.sha256(codeoff_canonical_json(body)).hexdigest() != seal_hash
+                or _codeoff_read_artifact(root, seal_hash) != codeoff_canonical_json(body)
+                or seal_events != [event]
+            ):
+                raise ValueError("judgment safety seal differs")
+    except (CodeOffArtifactError, KeyError, OSError, TypeError, ValueError):
+        return {"error": "judgment authority differs", "code": "judgment_authority_tampered"}
+    return None
+
+
 def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     exp, err = _codeoff_id(experiment_id)
     if err:
@@ -11529,6 +11619,9 @@ def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | N
     seal_err = _codeoff_v2_safety_seal_error(root, manifest, state, events)
     if seal_err:
         return None, None, None, seal_err
+    judgment_err = _codeoff_v2_judgment_authority_error(root, manifest, state, events)
+    if judgment_err:
+        return None, None, None, judgment_err
     final_path = root / "final.json"
     if state.get("finalized"):
         final_bytes = codeoff_canonical_json(_codeoff_final_value(manifest, state)) + b"\n"
@@ -13031,6 +13124,477 @@ def codeoff_v2_test_candidate(body: bytes) -> tuple[int, dict[str, Any]]:
         )
 
 
+def _codeoff_v2_judgment_rejection(
+    root: Path, state: dict[str, Any], slot: str, job_id: str, code: str,
+) -> tuple[int, dict[str, Any]]:
+    rejected = state.setdefault("judgment_rejections", {})
+    existing = rejected.get(slot)
+    if existing is None:
+        existing = {"slot": slot, "job_id": job_id, "code": code}
+        rejected[slot] = existing
+        _codeoff_commit_event(root, state, "v2_judgment_rejected", existing)
+    return 422, {
+        "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": root.name, "judge_slot": slot,
+        "code": existing["code"],
+        "error": "judge result is not a bounded structured judgment",
+    }
+
+
+def _codeoff_v2_parse_judgment(
+    raw: Any, expected_snapshot_hash: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    fields = {"rubric_version", "judge_snapshot_hash", "candidates", "preference", "rationale"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        return None, "invalid_judge_result"
+    try:
+        codeoff_canonical_json(raw)
+    except (TypeError, UnicodeEncodeError, ValueError):
+        return None, "invalid_judge_result"
+    if raw.get("judge_snapshot_hash") != expected_snapshot_hash:
+        return None, "judge_snapshot_mismatch"
+    rubric_version = raw.get("rubric_version")
+    rationale = raw.get("rationale")
+    if not (
+        isinstance(rubric_version, str) and 1 <= len(rubric_version) <= 80
+        and isinstance(rationale, str)
+        and 1 <= len(rationale.strip()) <= CODEOFF_MAX_RATIONALE
+        and raw.get("preference") in {"candidate-1", "candidate-2", "abstain"}
+    ):
+        return None, "invalid_judge_result"
+    candidates = raw.get("candidates")
+    if not isinstance(candidates, dict) or set(candidates) != {"candidate-1", "candidate-2"}:
+        return None, "invalid_judge_result"
+    parsed: dict[str, Any] = {}
+    for label in ("candidate-1", "candidate-2"):
+        candidate = candidates.get(label)
+        if not (
+            isinstance(candidate, dict) and set(candidate) == {"scores", "pass", "rationale"}
+            and type(candidate.get("pass")) is bool
+            and isinstance(candidate.get("rationale"), str)
+            and 1 <= len(candidate["rationale"].strip()) <= CODEOFF_MAX_RATIONALE
+        ):
+            return None, "invalid_judge_result"
+        scores = candidate.get("scores")
+        if not (
+            isinstance(scores, dict) and 1 <= len(scores) <= 16
+            and all(
+                isinstance(key, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", key)
+                and type(value) is int and 0 <= value <= 1000
+                for key, value in scores.items()
+            )
+        ):
+            return None, "invalid_judge_result"
+        parsed[label] = {
+            "scores": dict(scores), "total": sum(scores.values()),
+            "pass": candidate["pass"], "rationale": candidate["rationale"].strip(),
+        }
+    return {
+        "rubric_version": rubric_version, "candidates": parsed,
+        "preference": raw["preference"], "rationale": rationale.strip(),
+    }, None
+
+
+def _codeoff_v2_blind_result(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "status": "blinded",
+        "bundles": state["blind_bundles"], "leakage_findings": 0,
+    }
+
+
+def _codeoff_v2_private_blinding(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+) -> dict[str, Any] | None:
+    slots = ("judge-fable", "judge-1", "judge-2")
+    try:
+        private = strict_json_object((root / "private" / "blinding.json").read_bytes())
+        seed_hex = (root / "private" / "seed").read_text()
+        if (
+            set(private) != {"version", "judges"}
+            or private["version"] != "code-off-blinding-v2"
+            or not isinstance(private["judges"], dict)
+            or set(private["judges"]) != set(slots)
+            or not CODEOFF_SEED_RE.fullmatch(seed_hex)
+            or _codeoff_v2_draw(seed_hex, manifest["policy"]) != manifest["selection"]
+        ):
+            return None
+        public = []
+        seed = bytes.fromhex(seed_hex)
+        for slot in slots:
+            value = private["judges"][slot]
+            expected_order = _codeoff_rank(
+                seed, f"blind:{manifest['identities'][slot]['logical_model']}",
+                ["author-1", "author-2"],
+            )
+            expected_labels = {
+                f"candidate-{index + 1}": author_slot
+                for index, author_slot in enumerate(expected_order)
+            }
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"labels", "judge_snapshot_hash", "bundle_hash"}
+                or value["labels"] != expected_labels
+                or value["judge_snapshot_hash"]
+                != manifest["identity_snapshot_hashes"][slot]
+                or state.get("blind_bundle_hashes", {}).get(slot)
+                != value["bundle_hash"]
+            ):
+                return None
+            candidate_facts = {
+                label: {
+                    "tree_manifest_hash": state["candidates"][author_slot]["tree_manifest_hash"],
+                    "artifact_hash": state["candidates"][author_slot]["artifact_hash"],
+                }
+                for label, author_slot in expected_labels.items()
+            }
+            bundle = {
+                "version": "code-off-blind-bundle-v2",
+                "rubric_hash": manifest["rubric_hash"],
+                "candidates": candidate_facts, "leakage_count": 0,
+            }
+            if (
+                _codeoff_read_artifact(root, value["bundle_hash"])
+                != codeoff_canonical_json(bundle)
+                or not codeoff_workspace_path(manifest["experiment_id"], slot).is_dir()
+            ):
+                return None
+            public.append({
+                "slot": slot,
+                "judge_snapshot_hash": value["judge_snapshot_hash"],
+                "leakage_count": 0,
+            })
+        if state.get("blind_bundles") != public:
+            return None
+        return private
+    except (CodeOffArtifactError, KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def codeoff_v2_blind(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "blind request belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("status") != "prepared":
+            return 409, {"error": "blind facts require prepared v2 local authority", "code": "codeoff_v2_not_prepared"}
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
+        if state.get("judgment_safety_seal"):
+            return 422, {
+                "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+                "policy_version": CODEOFF_V2_POLICY_VERSION,
+                "experiment_id": manifest["experiment_id"],
+                "code": state["judgment_safety_seal"]["code"],
+                "error": "judgment safety authority is sealed",
+            }
+        slots = ("judge-fable", "judge-1", "judge-2")
+        if state.get("blind_bundles") is not None:
+            if _codeoff_v2_private_blinding(root, manifest, state) is None:
+                return 409, {"error": "private blind authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+            return 200, _codeoff_v2_blind_result(manifest, state)
+
+        candidates = state.get("candidates")
+        if not isinstance(candidates, dict):
+            return 409, {"error": "candidate authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        leakage: list[dict[str, str]] = []
+        for author_slot in ("author-1", "author-2"):
+            candidate = candidates.get(author_slot)
+            workspace = codeoff_workspace_path(manifest["experiment_id"], author_slot)
+            if not (
+                isinstance(candidate, dict) and candidate.get("freeze")
+                and isinstance(candidate.get("test"), dict)
+                and candidate["test"].get("state") == "completed"
+                and isinstance(candidate.get("tests"), dict)
+            ):
+                return 409, {"error": "both candidates require exact frozen test facts", "code": "candidates_incomplete"}
+            integrity_error = _codeoff_v2_frozen_integrity_error(
+                root, manifest, candidate, workspace
+            )
+            if integrity_error:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, author_slot, integrity_error
+                )
+            try:
+                tree = strict_json_object(
+                    _codeoff_read_artifact(root, candidate["tree_manifest_hash"])
+                )
+                scan = Path(tempfile.mkdtemp(
+                    prefix=f".scan-{author_slot}-",
+                    dir=CODEOFF_WORKSPACES_DIR / manifest["experiment_id"],
+                ))
+                scan.rmdir()
+                try:
+                    _codeoff_extract(
+                        _codeoff_read_artifact(root, candidate["artifact_hash"]), scan
+                    )
+                    leakage.extend(
+                        {"candidate": author_slot, **finding}
+                        for finding in _codeoff_leakage(
+                            scan, workspace, manifest["base_sha"], tree["changes"]
+                        )
+                    )
+                finally:
+                    shutil.rmtree(scan, ignore_errors=True)
+            except (CodeOffArtifactError, FileNotFoundError, OSError, tarfile.TarError,
+                    TypeError, ValueError):
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, author_slot, "candidate_artifact_invalid"
+                )
+        if leakage:
+            seal_body = {
+                "version": "code-off-v2-judgment-safety-seal-v1",
+                "experiment_id": manifest["experiment_id"],
+                "code": "candidate_identity_leakage",
+            }
+            seal_hash = _codeoff_artifact(root, codeoff_canonical_json(seal_body))
+            state["judgment_safety_seal"] = {**seal_body, "seal_hash": seal_hash}
+            _codeoff_commit_event(root, state, "v2_judgment_safety_sealed", {
+                "code": seal_body["code"], "seal_hash": seal_hash,
+            })
+            return 422, {
+                "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+                "policy_version": CODEOFF_V2_POLICY_VERSION,
+                "experiment_id": manifest["experiment_id"],
+                "code": "candidate_identity_leakage",
+                "error": "frozen candidate contains private protocol or author identity leakage",
+                "leakage_findings": len(leakage), "safety_rejected": True,
+            }
+        try:
+            seed_hex = (root / "private" / "seed").read_text()
+        except OSError:
+            return 409, {"error": "private draw authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        if (
+            not CODEOFF_SEED_RE.fullmatch(seed_hex)
+            or _codeoff_v2_draw(seed_hex, manifest["policy"]) != manifest["selection"]
+        ):
+            return 409, {"error": "private draw authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        seed = bytes.fromhex(seed_hex)
+        judges: dict[str, Any] = {}
+        public: list[dict[str, Any]] = []
+        created: list[Path] = []
+        try:
+            for slot in slots:
+                order = _codeoff_rank(
+                    seed, f"blind:{manifest['identities'][slot]['logical_model']}",
+                    ["author-1", "author-2"],
+                )
+                labels = {
+                    f"candidate-{index + 1}": author_slot
+                    for index, author_slot in enumerate(order)
+                }
+                workspace = codeoff_workspace_path(manifest["experiment_id"], slot)
+                if workspace.exists():
+                    raise RuntimeError("judge workspace already exists")
+                workspace.mkdir(parents=True)
+                created.append(workspace)
+                bundle_candidates: dict[str, Any] = {}
+                for label, author_slot in labels.items():
+                    candidate = candidates[author_slot]
+                    _codeoff_extract(
+                        _codeoff_read_artifact(root, candidate["artifact_hash"]),
+                        workspace / label,
+                    )
+                    bundle_candidates[label] = {
+                        "tree_manifest_hash": candidate["tree_manifest_hash"],
+                        "artifact_hash": candidate["artifact_hash"],
+                    }
+                bundle = {
+                    "version": "code-off-blind-bundle-v2",
+                    "rubric_hash": manifest["rubric_hash"],
+                    "candidates": bundle_candidates, "leakage_count": 0,
+                }
+                bundle_hash = _codeoff_artifact(root, codeoff_canonical_json(bundle))
+                _codeoff_init_blind_repo(workspace)
+                snapshot_hash = manifest["identity_snapshot_hashes"][slot]
+                judges[slot] = {
+                    "labels": labels, "judge_snapshot_hash": snapshot_hash,
+                    "bundle_hash": bundle_hash,
+                }
+                public.append({
+                    "slot": slot,
+                    "judge_snapshot_hash": snapshot_hash, "leakage_count": 0,
+                })
+            _codeoff_atomic_json(
+                root / "private" / "blinding.json",
+                {"version": "code-off-blinding-v2", "judges": judges},
+                immutable=True,
+            )
+            state["blind_bundle_hashes"] = {
+                slot: judges[slot]["bundle_hash"] for slot in slots
+            }
+            state["blind_bundles"] = public
+            _codeoff_commit_event(root, state, "v2_blind_bundles_created", {
+                "bundle_hashes": state["blind_bundle_hashes"], "leakage_findings": 0,
+            })
+        except (OSError, RuntimeError, tarfile.TarError):
+            for workspace in created:
+                shutil.rmtree(workspace, ignore_errors=True)
+            raise
+        return 200, _codeoff_v2_blind_result(manifest, state)
+
+
+def _codeoff_v2_author_rationale(value: str, labels: dict[str, str]) -> str:
+    return re.sub(
+        r"\bcandidate-[12]\b",
+        lambda match: labels[match.group(0).lower()],
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def _codeoff_v2_judgment_result(
+    manifest: dict[str, Any], stored: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "status": "judgment-read",
+        "judge_slot": stored["judge_slot"],
+        "judgment_receipt_hash": stored["judgment_receipt_hash"],
+        "rubric_version": stored["rubric_version"],
+        "preferred_author_slot": stored["preferred_author_slot"],
+        "authors": stored["authors"], "rationale": stored["rationale"],
+    }
+
+
+def codeoff_v2_read_judgment(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id", "slot", "job_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    slot = data.get("slot")
+    if slot not in ("judge-fable", "judge-1", "judge-2"):
+        return 400, {"error": "invalid judge slot", "code": "bad_slot"}
+    job_id = data.get("job_id")
+    if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
+        return 400, {"error": "job_id must be one exact server job identifier", "code": "bad_job_id"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "judgment belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("status") != "prepared" or not state.get("blind_bundles"):
+            return 409, {"error": "private blind bundles are unavailable", "code": "not_blinded"}
+        if state.get("judgment_safety_seal"):
+            return 422, {
+                "ok": False, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+                "policy_version": CODEOFF_V2_POLICY_VERSION,
+                "experiment_id": manifest["experiment_id"], "judge_slot": slot,
+                "code": state["judgment_safety_seal"]["code"],
+                "error": "judgment safety authority is sealed",
+            }
+        rejection = state.get("judgment_rejections", {}).get(slot)
+        if isinstance(rejection, dict):
+            return _codeoff_v2_judgment_rejection(
+                root, state, slot, rejection.get("job_id", job_id),
+                rejection.get("code", "invalid_judge_result"),
+            )
+        stored = state.get("judges", {}).get(slot)
+        if isinstance(stored, dict):
+            if stored.get("job_id") != job_id:
+                return 409, {"error": "judge slot already consumed one exact job", "code": "judge_recorded"}
+            try:
+                receipt = {
+                    key: value for key, value in stored.items()
+                    if key != "judgment_receipt_hash"
+                }
+                if (
+                    _codeoff_read_artifact(root, stored["judgment_receipt_hash"])
+                    != codeoff_canonical_json(receipt)
+                ):
+                    raise CodeOffArtifactError("judgment receipt mismatch")
+            except (CodeOffArtifactError, FileNotFoundError, OSError, TypeError):
+                return 409, {"error": "judgment receipt authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+            return 200, _codeoff_v2_judgment_result(manifest, stored)
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
+        job, job_err = _codeoff_validate_job(job_id, state, manifest, slot)
+        if job_err:
+            return 409, job_err
+        assert job is not None
+        try:
+            private = _codeoff_v2_private_blinding(root, manifest, state)
+            if private is None:
+                return 409, {
+                    "error": "private blind authority is unavailable",
+                    "code": "codeoff_v2_authority_unavailable",
+                }
+            judge_private = private["judges"][slot]
+            labels = judge_private["labels"]
+            path = (
+                codeoff_workspace_path(manifest["experiment_id"], slot)
+                / "judge-result.json"
+            )
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024:
+                raise ValueError("judge result exceeds limit")
+            raw = strict_json_object(path.read_bytes())
+        except (KeyError, OSError, TypeError, ValueError):
+            return _codeoff_v2_judgment_rejection(
+                root, state, slot, job_id, "invalid_judge_result"
+            )
+        parsed, parse_code = _codeoff_v2_parse_judgment(
+            raw, judge_private["judge_snapshot_hash"]
+        )
+        if parse_code is not None or parsed is None:
+            return _codeoff_v2_judgment_rejection(
+                root, state, slot, job_id, parse_code or "invalid_judge_result"
+            )
+        authors: dict[str, Any] = {}
+        for author_slot in ("author-1", "author-2"):
+            label = next(
+                label for label, value in labels.items() if value == author_slot
+            )
+            candidate = parsed["candidates"][label]
+            authors[author_slot] = {
+                "total": candidate["total"],
+                "dimensions": {
+                    name: candidate["scores"][name]
+                    for name in sorted(candidate["scores"])
+                },
+                "pass": candidate["pass"],
+                "rationale": _codeoff_v2_author_rationale(
+                    candidate["rationale"], labels
+                ),
+            }
+        preferred = (
+            "abstain" if parsed["preference"] == "abstain"
+            else labels[parsed["preference"]]
+        )
+        receipt = {
+            "version": "code-off-v2-judgment-receipt-v1", "judge_slot": slot,
+            "job_id": job_id,
+            "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
+            "execution_identity": job["execution_identity"],
+            "rubric_version": parsed["rubric_version"],
+            "preferred_author_slot": preferred, "authors": authors,
+            "rationale": _codeoff_v2_author_rationale(parsed["rationale"], labels),
+        }
+        receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
+        stored = {**receipt, "judgment_receipt_hash": receipt_hash}
+        state["judges"][slot] = stored
+        _codeoff_commit_event(root, state, "v2_judgment_read", {
+            "judge_slot": slot, "job_id": job_id,
+            "judgment_receipt_hash": receipt_hash,
+            "preferred_author_slot": preferred,
+        })
+        return 200, _codeoff_v2_judgment_result(manifest, stored)
+
+
 def codeoff_prepare(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id", "repo", "base_sha", "seed", "category", "tags", "category_source", "prompt", "tests", "toolchain", "budgets", "commit_message"})
     if err:
@@ -13539,10 +14103,24 @@ def codeoff_blind(body: bytes) -> tuple[int, dict[str, Any]]:
 
 def _codeoff_judge_prompt(manifest: dict[str, Any], private: dict[str, Any], slot: str) -> bytes:
     expected = private["judges"][slot]["judge_snapshot_hash"]
+    rubric = (
+        manifest.get("policy", {}).get("rubric")
+        if manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
+        else CODEOFF_RUBRIC
+    )
+    if not isinstance(rubric, dict):
+        raise ValueError("judge rubric is unavailable")
+    dimensions = rubric.get("dimensions")
+    if not isinstance(dimensions, dict):
+        raise ValueError("judge dimensions are unavailable")
+    score_contract = ", ".join(
+        f"{name} 0..{maximum}" for name, maximum in dimensions.items()
+    )
+    rubric_version = rubric.get("version")
     return (
-        "CODE-OFF BLIND JUDGE CONTRACT code-off-rubric-v1\n"
+        f"CODE-OFF BLIND JUDGE CONTRACT {rubric_version}\n"
         "Compare candidate-1 and candidate-2 in the current blind workspace. Do not inspect .git, parent directories, APIs, sessions, or model/provider metadata. Do not use network. "
-        "Use the exact rubric and write judge-result.json with no extra keys. Scores: correctness 0..40, tests 0..20, quality 0..20, scope 0..10, maintainability 0..10. "
+        f"Use the exact rubric and write judge-result.json with no extra keys. Scores: {score_contract}. "
         "Each candidate needs scores, boolean pass, and rationale <=1200 characters. Top level needs rubric_version, judge_snapshot_hash, candidates, preference candidate-1|candidate-2|abstain, and rationale.\n"
         f"Locked task category: {manifest['classification']['category']}; tags: {','.join(manifest['classification']['tags'])}\nTask:\n{manifest['task']}\n"
         f"Judge snapshot hash: {expected}\nRubric hash: {manifest['rubric_hash']}\n"
@@ -13980,9 +14558,10 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
     if err:
         return None, err
     assert root and manifest and state
-    if manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION:
+    is_v2 = manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
+    if is_v2 and slot.startswith("author-"):
         return None, {
-            "error": "code-off v2 stops after initialization until workflow cutover",
+            "error": "code-off v2 author launch remains disabled until workflow cutover",
             "code": "codeoff_v2_not_activated",
         }
     identity_err = codeoff_manifest_identity_error(manifest)
@@ -13998,9 +14577,23 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
         prompt = _codeoff_read_artifact(root, prompt_hash)
         budget = manifest["budgets"]["author_seconds"]
     else:
-        if state["status"] not in ("blinded", "judging"):
+        if is_v2:
+            if state.get("judgment_safety_seal"):
+                return None, {
+                    "error": "judgment safety authority is sealed",
+                    "code": state["judgment_safety_seal"].get(
+                        "code", "codeoff_v2_authority_unavailable"
+                    ),
+                }
+            if not state.get("blind_bundles"):
+                return None, {"error": "judge launch requires frozen blind bundles", "code": "bad_experiment_stage"}
+            private = _codeoff_v2_private_blinding(root, manifest, state)
+            if private is None:
+                return None, {"error": "private blind authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+        elif state["status"] not in ("blinded", "judging"):
             return None, {"error": "judge launch requires frozen blind bundles", "code": "bad_experiment_stage"}
-        private = json.loads((root / "private" / "blinding.json").read_text())
+        else:
+            private = json.loads((root / "private" / "blinding.json").read_text())
         prompt = _codeoff_judge_prompt(manifest, private, slot)
         prompt_hash = hashlib.sha256(prompt).hexdigest()
         budget = manifest["budgets"]["judge_seconds"]
@@ -14426,7 +15019,12 @@ def agent_run(
                     "launch_manifest_hash": execution_manifest_hash,
                     "terminal_manifest_hash": None,
                 }
-                state["status"] = "authors_running" if codeoff["slot"].startswith("author-") else "judging"
+                if codeoff["manifest"].get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+                    state["status"] = (
+                        "authors_running"
+                        if codeoff["slot"].startswith("author-")
+                        else "judging"
+                    )
                 _codeoff_commit_event(codeoff["root"], state, "agent_launched", {"slot": codeoff["slot"], "job_id": job_id, "identity_snapshot_hash": hashlib.sha256(codeoff_canonical_json(codeoff["identity"])).hexdigest(), "execution_manifest_hash": execution_manifest_hash, "prompt_hash": codeoff["prompt_hash"]})
             except (OSError, RuntimeError):
                 shutil.rmtree(job_dir(job_id), ignore_errors=True)
@@ -14507,6 +15105,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/v2/test-candidate":
         status, payload = _codeoff_boundary(codeoff_v2_test_candidate, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/blind":
+        status, payload = _codeoff_boundary(codeoff_v2_blind, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/read-judgment":
+        status, payload = _codeoff_boundary(codeoff_v2_read_judgment, body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/prepare":
         status, payload = _codeoff_boundary(codeoff_prepare, body, repos)
