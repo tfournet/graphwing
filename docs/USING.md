@@ -85,11 +85,13 @@ It POSTs to this host's `/v1/rewst/fire`, which proxies to the Rewst webhook. Do
 
 On red, files stay. No `gitRestore`. Three suite-reds or a second spec-review nack parks. You continue, discard (the only wipe), split, restamp size, or tag `decision`.
 
-### Canonical native routing policy (issue #186, slice 4)
+### Canonical native routing and durable recovery policy (issue #186, slice 5)
 
-`graphwing-routing-policy` accepts `class`, `work_kind`, `size`, `ac_count`, and `seams`; only the fallback branch also accepts the closed `agent-evidence-v1` packet returned by `agentEvidenceVerify`. Native AST/object nodes validate and normalize those values, apply at most one size bump, select the current normal-v1 writer and class/effective-size budget, choose zero, one, or two distinct opposing-provider reviewers, and preserve the characterized one-hop availability alternate matrix. Writer effort remains work-kind-specific; reviewer effort is independently `medium` or `high`. Every present role carries one complete `route-execution-profile-v2` bound to the deterministic decision hash.
+`graphwing-routing-policy` preserves the normal-v1 writer, budget, reviewer, and one-hop availability-fallback matrices. Its native route-state lane owns `provider-recovery-v1` history in tenant Datastore collection `graphwing_routing_state_v1`. The first `implement-slice` invocation uses its Rewst run identity as `routing_run_id`; later invocations carry only that opaque locator. Primary, fallback, and optional fresh-primary facts are loaded from the stored row, hashed canonically, locally reverified through `agentEvidenceVerify`, ordered by terminal timestamps, and checked for one repo and branch. Write success is followed by same-key Datastore readback; data hash, record key, and version must match before a route is returned.
 
-The graph's policy version is `workflow-normal-v1`, with `normal-v1` and `availability-fallback-v1` retained as compatibility behavior labels. `implement-slice` and `pr-drive` invoke the exact published workflow/version for initial writers and routed reviewers. When an initial writer fails, `implement-slice` sends only its job ID and exact callback session identity to `agentEvidenceVerify`; Graphwing rereads and validates the terminal job and returns normalized facts without selecting an alternate. The fallback policy child accepts only exact primary provider-availability facts, chooses one characterized alternate, and parks on verification, policy, action, or receipt failure without a second fallback. Same-session corrections reuse the successful receipt identity and never invoke policy again. `scripts/drive-pr.py` does not select a route or initialize aggregate policy; it submits intent for an existing Rewst-owned v2 run. The v1 route and fallback endpoints remain for compatibility, and later-invocation recovery remains v1 pending slice 5. This source change performs no import, publication, provider call, or live canary.
+`launcherCapability` is a read-only daemon fact operation. It resolves only the configured launcher and returns `available | unavailable`, a path-free fingerprint when available, and a canned diagnostic otherwise. It never chooses a route or invokes a provider. A stored `missing_binary` failure returns to primary only after this current capability is available. Authentication, quota, rate, network, overload, and 5xx failures retain fallback unless a distinct later successful primary job is verified. Same-session corrections reuse the successful receipt identity and never invoke routing policy again. Missing local jobs, a changed daemon-instance challenge, evidence/hash/order drift, and Datastore write/readback mismatch park recovery instead of reconstructing authority from tenant data.
+
+The v1 `POST /v1/slice/route/recovery` request remains available for rollback compatibility, but `graphwing-implement-slice` no longer calls it or carries route/receipt objects between invocations. This is source-catalog proof only: no import, publication, provider call, tenant readback, or live canary is claimed.
 
 ### Native effort contract (Phases 2–3)
 
@@ -144,26 +146,11 @@ health, command, and configuration checks only; a missing non-writer executable 
 and one-hop fallback gate are unchanged. Compact diagnostics and provider-recovery
 evidence never copy callback data, paths, provider output, or traces.
 
-Provider recovery is a new invocation decision, never an active-session decision.
-After a successful one-hop fallback, a later manual/API invocation payload may set
-`recovery_version: provider-recovery-v1` and supply the prior primary/fallback routes
-and receipts. The recovery endpoint re-reads both terminal job files. Missing,
-malformed, mismatched, nonterminal, or out-of-order evidence stops the run. A prior
-successful fallback is the only recovery state both continuation paths carry forward;
-a normal or recovered-primary run omits the marker.
-`missing_binary` is rechecked with the same request-time resolver used by `agentRun`
-preflight and worker launch; an explicit `GRAPHWING_<LAUNCHER>_BIN` remains
-authoritative. Authentication, quota, rate, network, overload, and 5xx
-failures stay on fallback unless the payload also supplies a distinct, later successful
-normal-primary job receipt. The check never invokes a launcher or provider. Corrections
-and review-nack resumes remain pinned to the successful session receipt selected at the
-start of that invocation.
+Provider recovery remains a new-invocation decision, never an active-session decision. `implement-slice` now supplies only `routing_run_id` on a later invocation. The policy reads primary, fallback, and optional fresh-primary evidence from tenant Datastore, then locally reverifies each stored job before use. The legacy `provider-recovery-v1` daemon request and `POST /v1/slice/route/recovery` remain compatible for rollback callers but are not part of the workflow call graph.
 
-Lane 66 did not run or publish a live Rewst canary. Catalog fixtures assert the
-`CTX.<objectBuilder alias>.<field>` recovery-switch path and fallback precedence, using
-the alias convention recorded in issue-52 git history, but they do not prove how a live
-tenant version will evaluate those expressions. Publish/canary verification remains a
-separate runtime step.
+A prior `missing_binary` can return to primary only after `launcherCapability` verifies the configured binary's current path-free fingerprint. Authentication, quota, rate, network, overload, and 5xx failures stay on fallback without a distinct later verified primary success. Corrections and review-nack resumes remain pinned to the already successful session. A replacement daemon, missing local job, stale or cross-provenance evidence, or route-state write/readback mismatch parks. No local cache, job file, or tenant row is used to silently reconstruct lost local authority.
+
+These fixtures prove only the source catalog and local native evaluation. Publication, tenant retention/readback, and live canary behavior remain separately gated.
 
 ### Sealed normalized attempt facts
 

@@ -4,7 +4,7 @@
     "title": "graphwing",
 
     "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
-    "version": "0.5.5"
+    "version": "0.5.6"
   },
   "servers": [
     {
@@ -488,6 +488,22 @@
         },
         "responses": {
           "200": { "description": "fallback row", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SliceRoute" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/launcher/capability": {
+      "post": {
+        "operationId": "launcherCapability",
+        "tags": ["agent"],
+        "summary": "Report the configured launcher's current path-free capability without choosing a route or invoking a provider.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LauncherCapabilityRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "closed current launcher capability", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LauncherCapability" } } } },
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
@@ -1490,6 +1506,7 @@
           "size": { "type": "string", "enum": ["S", "M", "L"] },
           "ac_count": { "type": ["integer", "string"] },
           "seams": { "type": ["integer", "string"] },
+          "routing_run_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "description": "Opaque Rewst-owned locator for durable routing recovery." },
           "recovery_version": { "type": "string", "enum": ["provider-recovery-v1"], "description": "Explicit later-invocation recovery marker. Omit it and every recovery evidence field for an ordinary continuation; otherwise the exact version and all four prior route/receipt objects are required." },
           "prior_primary_route": { "$ref": "#/components/schemas/SliceRoute" },
           "prior_primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" },
@@ -1532,6 +1549,26 @@
           "seams": { "type": "integer" },
           "primary_route": { "$ref": "#/components/schemas/SliceRoute" },
           "primary_receipt": { "$ref": "#/components/schemas/AgentReceipt" }
+        }
+      },
+      "LauncherCapabilityRequest": {
+        "type": "object",
+        "required": ["launcher"],
+        "additionalProperties": false,
+        "properties": {
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] }
+        }
+      },
+      "LauncherCapability": {
+        "type": "object",
+        "required": ["capability_version", "launcher", "state", "launcher_version", "diagnostic"],
+        "additionalProperties": false,
+        "properties": {
+          "capability_version": { "type": "string", "const": "launcher-capability-v1" },
+          "launcher": { "type": "string", "enum": ["codex", "claude", "grok"] },
+          "state": { "type": "string", "enum": ["available", "unavailable"] },
+          "launcher_version": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+          "diagnostic": { "oneOf": [{ "$ref": "#/components/schemas/Diagnostic" }, { "type": "null" }] }
         }
       },
       "SliceRouteRecoveryRequest": {

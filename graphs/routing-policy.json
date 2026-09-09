@@ -1,7 +1,7 @@
 {
   "slug": "graphwing-routing-policy",
   "name": "graphwing-routing-policy",
-  "description": "Deterministic Rewst-native routing policy. Preserves normal-v1 primary/reviewer behavior and the characterized one-hop availability fallback, emitting closed route-execution-profile-v2 decisions from verified facts; malformed inputs fail closed.",
+  "description": "Deterministic Rewst-native routing and recovery policy. Preserves normal-v1 and one-hop availability fallback, persists authoritative route history in tenant Datastore, revalidates local evidence and launcher capability, and hard-fails mismatched readback.",
   "spec": {
     "meta": {
       "useSearchAttributes": true,
@@ -115,6 +115,30 @@
                 "kind": "getField",
                 "path": "CTX.INPUT.agent_evidence"
               }
+            },
+            {
+              "id": "m7",
+              "output": "routing_run_id",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.routing_run_id"
+              }
+            },
+            {
+              "id": "m8",
+              "output": "invocation_run_id",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.invocation_run_id"
+              }
+            },
+            {
+              "id": "m9",
+              "output": "route_evidence",
+              "expression": {
+                "kind": "getField",
+                "path": "CTX.INPUT.route_evidence"
+              }
             }
           ]
         }
@@ -168,37 +192,261 @@
                     "kind": "literal",
                     "value": [
                       "work_kind",
-                      "seams|work_kind",
-                      "ac_count|work_kind",
-                      "ac_count|seams|work_kind",
-                      "size|work_kind",
-                      "seams|size|work_kind",
-                      "ac_count|size|work_kind",
-                      "ac_count|seams|size|work_kind",
-                      "class|work_kind",
-                      "class|seams|work_kind",
-                      "ac_count|class|work_kind",
-                      "ac_count|class|seams|work_kind",
-                      "class|size|work_kind",
-                      "class|seams|size|work_kind",
-                      "ac_count|class|size|work_kind",
-                      "ac_count|class|seams|size|work_kind",
+                      "route_evidence|work_kind",
+                      "invocation_run_id|work_kind",
+                      "invocation_run_id|route_evidence|work_kind",
+                      "routing_run_id|work_kind",
+                      "route_evidence|routing_run_id|work_kind",
+                      "invocation_run_id|routing_run_id|work_kind",
+                      "invocation_run_id|route_evidence|routing_run_id|work_kind",
                       "agent_evidence|work_kind",
+                      "agent_evidence|route_evidence|work_kind",
+                      "agent_evidence|invocation_run_id|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|work_kind",
+                      "agent_evidence|routing_run_id|work_kind",
+                      "agent_evidence|route_evidence|routing_run_id|work_kind",
+                      "agent_evidence|invocation_run_id|routing_run_id|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|routing_run_id|work_kind",
+                      "seams|work_kind",
+                      "route_evidence|seams|work_kind",
+                      "invocation_run_id|seams|work_kind",
+                      "invocation_run_id|route_evidence|seams|work_kind",
+                      "routing_run_id|seams|work_kind",
+                      "route_evidence|routing_run_id|seams|work_kind",
+                      "invocation_run_id|routing_run_id|seams|work_kind",
+                      "invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
                       "agent_evidence|seams|work_kind",
+                      "agent_evidence|route_evidence|seams|work_kind",
+                      "agent_evidence|invocation_run_id|seams|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|seams|work_kind",
+                      "agent_evidence|routing_run_id|seams|work_kind",
+                      "agent_evidence|route_evidence|routing_run_id|seams|work_kind",
+                      "agent_evidence|invocation_run_id|routing_run_id|seams|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|work_kind",
+                      "ac_count|route_evidence|work_kind",
+                      "ac_count|invocation_run_id|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|work_kind",
+                      "ac_count|routing_run_id|work_kind",
+                      "ac_count|route_evidence|routing_run_id|work_kind",
+                      "ac_count|invocation_run_id|routing_run_id|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|routing_run_id|work_kind",
                       "ac_count|agent_evidence|work_kind",
+                      "ac_count|agent_evidence|route_evidence|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|work_kind",
+                      "ac_count|agent_evidence|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|route_evidence|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|routing_run_id|work_kind",
+                      "ac_count|seams|work_kind",
+                      "ac_count|route_evidence|seams|work_kind",
+                      "ac_count|invocation_run_id|seams|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|seams|work_kind",
+                      "ac_count|routing_run_id|seams|work_kind",
+                      "ac_count|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|invocation_run_id|routing_run_id|seams|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
                       "ac_count|agent_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|route_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
+                      "size|work_kind",
+                      "route_evidence|size|work_kind",
+                      "invocation_run_id|size|work_kind",
+                      "invocation_run_id|route_evidence|size|work_kind",
+                      "routing_run_id|size|work_kind",
+                      "route_evidence|routing_run_id|size|work_kind",
+                      "invocation_run_id|routing_run_id|size|work_kind",
+                      "invocation_run_id|route_evidence|routing_run_id|size|work_kind",
                       "agent_evidence|size|work_kind",
+                      "agent_evidence|route_evidence|size|work_kind",
+                      "agent_evidence|invocation_run_id|size|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|size|work_kind",
+                      "agent_evidence|routing_run_id|size|work_kind",
+                      "agent_evidence|route_evidence|routing_run_id|size|work_kind",
+                      "agent_evidence|invocation_run_id|routing_run_id|size|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
+                      "seams|size|work_kind",
+                      "route_evidence|seams|size|work_kind",
+                      "invocation_run_id|seams|size|work_kind",
+                      "invocation_run_id|route_evidence|seams|size|work_kind",
+                      "routing_run_id|seams|size|work_kind",
+                      "route_evidence|routing_run_id|seams|size|work_kind",
+                      "invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
                       "agent_evidence|seams|size|work_kind",
+                      "agent_evidence|route_evidence|seams|size|work_kind",
+                      "agent_evidence|invocation_run_id|seams|size|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "agent_evidence|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|route_evidence|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|size|work_kind",
+                      "ac_count|route_evidence|size|work_kind",
+                      "ac_count|invocation_run_id|size|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|size|work_kind",
+                      "ac_count|routing_run_id|size|work_kind",
+                      "ac_count|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|invocation_run_id|routing_run_id|size|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
                       "ac_count|agent_evidence|size|work_kind",
+                      "ac_count|agent_evidence|route_evidence|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|size|work_kind",
+                      "ac_count|agent_evidence|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|seams|size|work_kind",
+                      "ac_count|route_evidence|seams|size|work_kind",
+                      "ac_count|invocation_run_id|seams|size|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "ac_count|routing_run_id|seams|size|work_kind",
+                      "ac_count|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "ac_count|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
                       "ac_count|agent_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|route_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
+                      "class|work_kind",
+                      "class|route_evidence|work_kind",
+                      "class|invocation_run_id|work_kind",
+                      "class|invocation_run_id|route_evidence|work_kind",
+                      "class|routing_run_id|work_kind",
+                      "class|route_evidence|routing_run_id|work_kind",
+                      "class|invocation_run_id|routing_run_id|work_kind",
+                      "class|invocation_run_id|route_evidence|routing_run_id|work_kind",
                       "agent_evidence|class|work_kind",
+                      "agent_evidence|class|route_evidence|work_kind",
+                      "agent_evidence|class|invocation_run_id|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|work_kind",
+                      "agent_evidence|class|routing_run_id|work_kind",
+                      "agent_evidence|class|route_evidence|routing_run_id|work_kind",
+                      "agent_evidence|class|invocation_run_id|routing_run_id|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|work_kind",
+                      "class|seams|work_kind",
+                      "class|route_evidence|seams|work_kind",
+                      "class|invocation_run_id|seams|work_kind",
+                      "class|invocation_run_id|route_evidence|seams|work_kind",
+                      "class|routing_run_id|seams|work_kind",
+                      "class|route_evidence|routing_run_id|seams|work_kind",
+                      "class|invocation_run_id|routing_run_id|seams|work_kind",
+                      "class|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
                       "agent_evidence|class|seams|work_kind",
+                      "agent_evidence|class|route_evidence|seams|work_kind",
+                      "agent_evidence|class|invocation_run_id|seams|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|seams|work_kind",
+                      "agent_evidence|class|routing_run_id|seams|work_kind",
+                      "agent_evidence|class|route_evidence|routing_run_id|seams|work_kind",
+                      "agent_evidence|class|invocation_run_id|routing_run_id|seams|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|class|work_kind",
+                      "ac_count|class|route_evidence|work_kind",
+                      "ac_count|class|invocation_run_id|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|work_kind",
+                      "ac_count|class|routing_run_id|work_kind",
+                      "ac_count|class|route_evidence|routing_run_id|work_kind",
+                      "ac_count|class|invocation_run_id|routing_run_id|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|routing_run_id|work_kind",
                       "ac_count|agent_evidence|class|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|work_kind",
+                      "ac_count|agent_evidence|class|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|routing_run_id|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|work_kind",
+                      "ac_count|class|seams|work_kind",
+                      "ac_count|class|route_evidence|seams|work_kind",
+                      "ac_count|class|invocation_run_id|seams|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|seams|work_kind",
+                      "ac_count|class|routing_run_id|seams|work_kind",
+                      "ac_count|class|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|class|invocation_run_id|routing_run_id|seams|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
                       "ac_count|agent_evidence|class|seams|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|seams|work_kind",
+                      "ac_count|agent_evidence|class|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|routing_run_id|seams|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|seams|work_kind",
+                      "class|size|work_kind",
+                      "class|route_evidence|size|work_kind",
+                      "class|invocation_run_id|size|work_kind",
+                      "class|invocation_run_id|route_evidence|size|work_kind",
+                      "class|routing_run_id|size|work_kind",
+                      "class|route_evidence|routing_run_id|size|work_kind",
+                      "class|invocation_run_id|routing_run_id|size|work_kind",
+                      "class|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
                       "agent_evidence|class|size|work_kind",
+                      "agent_evidence|class|route_evidence|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|size|work_kind",
+                      "agent_evidence|class|routing_run_id|size|work_kind",
+                      "agent_evidence|class|route_evidence|routing_run_id|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|routing_run_id|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
+                      "class|seams|size|work_kind",
+                      "class|route_evidence|seams|size|work_kind",
+                      "class|invocation_run_id|seams|size|work_kind",
+                      "class|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "class|routing_run_id|seams|size|work_kind",
+                      "class|route_evidence|routing_run_id|seams|size|work_kind",
+                      "class|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "class|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
                       "agent_evidence|class|seams|size|work_kind",
+                      "agent_evidence|class|route_evidence|seams|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|seams|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "agent_evidence|class|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|class|route_evidence|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|class|size|work_kind",
+                      "ac_count|class|route_evidence|size|work_kind",
+                      "ac_count|class|invocation_run_id|size|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|size|work_kind",
+                      "ac_count|class|routing_run_id|size|work_kind",
+                      "ac_count|class|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|class|invocation_run_id|routing_run_id|size|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
                       "ac_count|agent_evidence|class|size|work_kind",
-                      "ac_count|agent_evidence|class|seams|size|work_kind"
+                      "ac_count|agent_evidence|class|route_evidence|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|size|work_kind",
+                      "ac_count|agent_evidence|class|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|routing_run_id|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|size|work_kind",
+                      "ac_count|class|seams|size|work_kind",
+                      "ac_count|class|route_evidence|seams|size|work_kind",
+                      "ac_count|class|invocation_run_id|seams|size|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "ac_count|class|routing_run_id|seams|size|work_kind",
+                      "ac_count|class|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|class|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "ac_count|class|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|route_evidence|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|routing_run_id|seams|size|work_kind",
+                      "ac_count|agent_evidence|class|invocation_run_id|route_evidence|routing_run_id|seams|size|work_kind"
                     ]
                   }
                 },
@@ -1656,14 +1904,22 @@
               "output": "requested",
               "expression": {
                 "kind": "binary",
-                "operator": "!=",
+                "operator": "or",
                 "left": {
-                  "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence"
+                  "kind": "binary",
+                  "operator": "!=",
+                  "left": {
+                    "kind": "getField",
+                    "path": "CTX.routing_policy_input.agent_evidence"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": null
+                  }
                 },
                 "right": {
-                  "kind": "literal",
-                  "value": null
+                  "kind": "getField",
+                  "path": "CTX.recovery_choice_shape.retain_fallback"
                 }
               }
             }
@@ -1718,7 +1974,7 @@
                       "filter": "keys",
                       "input": {
                         "kind": "getField",
-                        "path": "CTX.routing_policy_input.agent_evidence"
+                        "path": "CTX.routing_recovery_evidence.value"
                       },
                       "filterArgs": []
                     },
@@ -1745,7 +2001,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.evidence_version"
+                  "path": "CTX.routing_recovery_evidence.value.evidence_version"
                 },
                 "right": {
                   "kind": "literal",
@@ -1761,7 +2017,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.kind"
+                  "path": "CTX.routing_recovery_evidence.value.kind"
                 },
                 "right": {
                   "kind": "literal",
@@ -1777,7 +2033,7 @@
                 "operator": "!=",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.job_id"
+                  "path": "CTX.routing_recovery_evidence.value.job_id"
                 },
                 "right": {
                   "kind": "literal",
@@ -1793,7 +2049,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.role"
+                  "path": "CTX.routing_recovery_evidence.value.role"
                 },
                 "right": {
                   "kind": "literal",
@@ -1809,7 +2065,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.terminal_status"
+                  "path": "CTX.routing_recovery_evidence.value.terminal_status"
                 },
                 "right": {
                   "kind": "literal",
@@ -1825,7 +2081,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.failure_class"
+                  "path": "CTX.routing_recovery_evidence.value.failure_class"
                 },
                 "right": {
                   "kind": "literal",
@@ -1841,7 +2097,7 @@
                 "operator": "in",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                  "path": "CTX.routing_recovery_evidence.value.failure_code"
                 },
                 "right": {
                   "kind": "literal",
@@ -1865,7 +2121,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.failover_eligible"
+                  "path": "CTX.routing_recovery_evidence.value.failover_eligible"
                 },
                 "right": {
                   "kind": "literal",
@@ -1890,7 +2146,7 @@
                       "filter": "keys",
                       "input": {
                         "kind": "getField",
-                        "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                        "path": "CTX.routing_recovery_evidence.value.route_execution_profile"
                       },
                       "filterArgs": []
                     },
@@ -1917,7 +2173,7 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                  "path": "CTX.routing_recovery_evidence.value.route_execution_profile"
                 },
                 "right": {
                   "kind": "object",
@@ -1999,7 +2255,7 @@
                       "filter": "keys",
                       "input": {
                         "kind": "getField",
-                        "path": "CTX.routing_policy_input.agent_evidence.session_identity"
+                        "path": "CTX.routing_recovery_evidence.value.session_identity"
                       },
                       "filterArgs": []
                     },
@@ -2026,11 +2282,11 @@
                 "operator": "==",
                 "left": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.session_identity.route_execution_profile"
+                  "path": "CTX.routing_recovery_evidence.value.session_identity.route_execution_profile"
                 },
                 "right": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile"
+                  "path": "CTX.routing_recovery_evidence.value.route_execution_profile"
                 }
               }
             },
@@ -2057,11 +2313,11 @@
                           "operator": "==",
                           "left": {
                             "kind": "getField",
-                            "path": "CTX.routing_policy_input.agent_evidence.session_identity.launcher"
+                            "path": "CTX.routing_recovery_evidence.value.session_identity.launcher"
                           },
                           "right": {
                             "kind": "getField",
-                            "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.launcher"
+                            "path": "CTX.routing_recovery_evidence.value.route_execution_profile.launcher"
                           }
                         },
                         "right": {
@@ -2069,11 +2325,11 @@
                           "operator": "==",
                           "left": {
                             "kind": "getField",
-                            "path": "CTX.routing_policy_input.agent_evidence.session_identity.provider"
+                            "path": "CTX.routing_recovery_evidence.value.session_identity.provider"
                           },
                           "right": {
                             "kind": "getField",
-                            "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.provider"
+                            "path": "CTX.routing_recovery_evidence.value.route_execution_profile.provider"
                           }
                         }
                       },
@@ -2082,11 +2338,11 @@
                         "operator": "==",
                         "left": {
                           "kind": "getField",
-                          "path": "CTX.routing_policy_input.agent_evidence.session_identity.model"
+                          "path": "CTX.routing_recovery_evidence.value.session_identity.model"
                         },
                         "right": {
                           "kind": "getField",
-                          "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.model"
+                          "path": "CTX.routing_recovery_evidence.value.route_execution_profile.model"
                         }
                       }
                     },
@@ -2095,11 +2351,11 @@
                       "operator": "==",
                       "left": {
                         "kind": "getField",
-                        "path": "CTX.routing_policy_input.agent_evidence.session_identity.requested_effort"
+                        "path": "CTX.routing_recovery_evidence.value.session_identity.requested_effort"
                       },
                       "right": {
                         "kind": "getField",
-                        "path": "CTX.routing_policy_input.agent_evidence.route_execution_profile.requested_effort"
+                        "path": "CTX.routing_recovery_evidence.value.route_execution_profile.requested_effort"
                       }
                     }
                   },
@@ -2108,7 +2364,7 @@
                     "operator": "==",
                     "left": {
                       "kind": "getField",
-                      "path": "CTX.routing_policy_input.agent_evidence.session_identity.effort_source"
+                      "path": "CTX.routing_recovery_evidence.value.session_identity.effort_source"
                     },
                     "right": {
                       "kind": "literal",
@@ -2121,7 +2377,7 @@
                   "operator": "==",
                   "left": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.effective_effort"
+                    "path": "CTX.routing_recovery_evidence.value.session_identity.effective_effort"
                   },
                   "right": {
                     "kind": "conditional",
@@ -2179,11 +2435,11 @@
                   "operator": "==",
                   "left": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.repo"
+                    "path": "CTX.routing_recovery_evidence.value.session_identity.repo"
                   },
                   "right": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.repo"
+                    "path": "CTX.routing_recovery_evidence.value.repo"
                   }
                 },
                 "right": {
@@ -2191,11 +2447,11 @@
                   "operator": "==",
                   "left": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.session_identity.branch"
+                    "path": "CTX.routing_recovery_evidence.value.session_identity.branch"
                   },
                   "right": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.branch"
+                    "path": "CTX.routing_recovery_evidence.value.branch"
                   }
                 }
               }
@@ -2211,7 +2467,7 @@
                   "operator": "!=",
                   "left": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.created_at"
+                    "path": "CTX.routing_recovery_evidence.value.created_at"
                   },
                   "right": {
                     "kind": "literal",
@@ -2223,7 +2479,7 @@
                   "operator": "!=",
                   "left": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.finished_at"
+                    "path": "CTX.routing_recovery_evidence.value.finished_at"
                   },
                   "right": {
                     "kind": "literal",
@@ -2954,11 +3210,11 @@
                   },
                   "primary_job_id": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.job_id"
+                    "path": "CTX.routing_recovery_evidence.value.job_id"
                   },
                   "failure_code": {
                     "kind": "getField",
-                    "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                    "path": "CTX.routing_recovery_evidence.value.failure_code"
                   },
                   "class": {
                     "kind": "getField",
@@ -3172,7 +3428,7 @@
                 },
                 "right": {
                   "kind": "getField",
-                  "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                  "path": "CTX.routing_recovery_evidence.value.failure_code"
                 }
               }
             },
@@ -3881,22 +4137,22 @@
               "output": "fallback_code",
               "expression": {
                 "kind": "getField",
-                "path": "CTX.routing_policy_input.agent_evidence.failure_code"
+                "path": "CTX.routing_recovery_evidence.value.failure_code"
               }
             }
           ]
         }
       },
       {
-        "id": "route_output",
+        "id": "normal_route_output",
         "type": "transforms.objectBuilder",
-        "label": "Emit route execution profiles v2",
+        "label": "Build normal route candidate",
         "position": {
           "x": 1600,
           "y": 0
         },
         "config": {
-          "alias": "routing_policy_output",
+          "alias": "routing_normal_policy_output",
           "version": 1,
           "mappings": [
             {
@@ -4745,7 +5001,68 @@
             }
           ]
         }
-      }
+      },
+      {"id":"route_output","type":"transforms.objectBuilder","position":{"x":6440,"y":0},"config":{"alias":"routing_policy_output","version":1,"mappings":[{"id":"m1","output":"ok","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.ok"}},{"id":"m2","output":"policy_version","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.policy_version"}},{"id":"m3","output":"compatibility_behavior","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.compatibility_behavior"}},{"id":"m4","output":"decision_id","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.decision_id"}},{"id":"m5","output":"decision_sha256","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.decision_sha256"}},{"id":"m6","output":"class","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.class"}},{"id":"m7","output":"work_kind","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.work_kind"}},{"id":"m8","output":"size_floor","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.size_floor"}},{"id":"m9","output":"size","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.size"}},{"id":"m10","output":"ac_count","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.ac_count"}},{"id":"m11","output":"seams","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.seams"}},{"id":"m12","output":"launcher","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.launcher"}},{"id":"m13","output":"provider","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.provider"}},{"id":"m14","output":"model","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.model"}},{"id":"m15","output":"effort","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.effort"}},{"id":"m16","output":"reason","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reason"}},{"id":"m17","output":"max_turns","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.max_turns"}},{"id":"m18","output":"run_budget_seconds","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.run_budget_seconds"}},{"id":"m19","output":"reviewer_count","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer_count"}},{"id":"m20","output":"reviewer1","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1"}},{"id":"m21","output":"reviewer1_launcher","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_launcher"}},{"id":"m22","output":"reviewer1_provider","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_provider"}},{"id":"m23","output":"reviewer1_model","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_model"}},{"id":"m24","output":"reviewer1_effort","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_effort"}},{"id":"m25","output":"reviewer1_reason","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_reason"}},{"id":"m26","output":"reviewer2","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2"}},{"id":"m27","output":"reviewer2_launcher","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_launcher"}},{"id":"m28","output":"reviewer2_provider","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_provider"}},{"id":"m29","output":"reviewer2_model","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_model"}},{"id":"m30","output":"reviewer2_effort","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_effort"}},{"id":"m31","output":"reviewer2_reason","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_reason"}},{"id":"m32","output":"review","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.review"}},{"id":"m33","output":"writer_execution_profile","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.writer_execution_profile"}},{"id":"m34","output":"reviewer1_execution_profile","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer1_execution_profile"}},{"id":"m35","output":"reviewer2_execution_profile","expression":{"kind":"getField","path":"CTX.routing_selected_route.value.reviewer2_execution_profile"}},{"id":"m36","output":"routing_run_id","expression":{"kind":"getField","path":"CTX.routing_state_locator.routing_run_id"}},{"id":"m37","output":"recovery_version","expression":{"kind":"literal","value":"provider-recovery-v1"}},{"id":"m38","output":"recovery_decision","expression":{"kind":"getField","path":"CTX.routing_selected_route.decision"}},{"id":"m39","output":"recovery_role","expression":{"kind":"getField","path":"CTX.routing_selected_route.role"}}]},"label":"Emit durable routing decision"},
+      {"id":"routing_state_locator","type":"transforms.objectBuilder","position":{"x":1480,"y":120},"config":{"alias":"routing_state_locator","version":1,"mappings":[{"id":"m1","output":"routing_run_id","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"else":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"else":{"kind":"getField","path":"WORKFLOW.runId"}}}},{"id":"m2","output":"record_key","expression":{"kind":"binary","operator":"+","left":{"kind":"literal","value":"graphwing-routing-v1:"},"right":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.routing_run_id"},"else":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"else":{"kind":"getField","path":"WORKFLOW.runId"}}}}},{"id":"m3","output":"invocation_run_id","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"else":{"kind":"getField","path":"WORKFLOW.runId"}}}]},"label":"Resolve Rewst-owned routing locator"},
+      {"id":"route_state_get","type":"action.datastore.records.get","position":{"x":1640,"y":120},"config":{"alias":"route_state_get","scope":"tenant","collection":"graphwing_routing_state_v1","recordKey":"{{ CTX.routing_state_locator.record_key }}"}},
+      {"id":"primary_evidence_hash","type":"transforms.hash","position":{"x":1800,"y":80},"config":{"alias":"primary_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ TASKS.route_state_get.data.primary_evidence }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"fallback_evidence_hash","type":"transforms.hash","position":{"x":1800,"y":80},"config":{"alias":"fallback_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ TASKS.route_state_get.data.fallback_evidence }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"fresh_primary_evidence_hash","type":"transforms.hash","position":{"x":1800,"y":80},"config":{"alias":"fresh_primary_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ TASKS.route_state_get.data.fresh_primary_evidence }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"route_state_shape","type":"transforms.objectBuilder","position":{"x":1960,"y":120},"config":{"alias":"route_state_shape","version":1,"mappings":[{"id":"m1","output":"initial","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}}},{"id":"m2","output":"found","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":true}}},{"id":"m3","output":"record_closed","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"filter","filter":"join","input":{"kind":"filter","filter":"sort","input":{"kind":"filter","filter":"keys","input":{"kind":"getField","path":"TASKS.route_state_get.data"},"filterArgs":[]},"filterArgs":[]},"filterArgs":[{"kind":"literal","value":"|"}]},"right":{"kind":"literal","value":"active_route|daemon_instance_challenge|decision|fallback_evidence|fallback_evidence_sha256|fallback_route|fresh_primary_evidence|fresh_primary_evidence_sha256|origin_workflow_run_id|primary_evidence|primary_evidence_sha256|primary_route|revision|route_input|routing_run_id|state_version"}}}},{"id":"m4","output":"version_valid","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.state_version"},"right":{"kind":"literal","value":"provider-recovery-v1"}}}},{"id":"m5","output":"locator_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.routing_run_id"},"right":{"kind":"getField","path":"CTX.routing_state_locator.routing_run_id"}}}},{"id":"m6","output":"route_input_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.route_input"},"right":{"kind":"object","properties":{"class":{"kind":"getField","path":"CTX.routing_policy_input.class"},"work_kind":{"kind":"getField","path":"CTX.routing_policy_input.work_kind"},"size_floor":{"kind":"getField","path":"CTX.routing_policy_input.size"},"effective_size":{"kind":"getField","path":"CTX.routing_effective_size.value"},"ac_count":{"kind":"getField","path":"CTX.routing_policy_input_normalized.ac_count"},"seams":{"kind":"getField","path":"CTX.routing_policy_input_normalized.seams"}}}}}},{"id":"m7","output":"primary_route_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_route"},"right":{"kind":"getField","path":"CTX.routing_normal_policy_output"}}}},{"id":"m8","output":"primary_evidence_pair","expression":{"kind":"binary","operator":"==","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence_sha256"},"right":{"kind":"literal","value":null}}}},{"id":"m9","output":"fallback_evidence_pair","expression":{"kind":"binary","operator":"==","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence_sha256"},"right":{"kind":"literal","value":null}}}},{"id":"m10","output":"fresh_primary_evidence_pair","expression":{"kind":"binary","operator":"==","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence_sha256"},"right":{"kind":"literal","value":null}}}},{"id":"m11","output":"primary_hash_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence_sha256"},"right":{"kind":"getField","path":"CTX.primary_evidence_hash.value"}}}},{"id":"m12","output":"fallback_hash_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence_sha256"},"right":{"kind":"getField","path":"CTX.fallback_evidence_hash.value"}}}},{"id":"m13","output":"fresh_primary_hash_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence_sha256"},"right":{"kind":"getField","path":"CTX.fresh_primary_evidence_hash.value"}}}},{"id":"m14","output":"primary_evidence_closed","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"filter","filter":"join","input":{"kind":"filter","filter":"sort","input":{"kind":"filter","filter":"keys","input":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"filterArgs":[]},"filterArgs":[]},"filterArgs":[{"kind":"literal","value":"|"}]},"right":{"kind":"literal","value":"branch|created_at|evidence_version|failover_eligible|failure_class|failure_code|finished_at|job_id|kind|repo|role|route_execution_profile|session_identity|terminal_status"}}}},{"id":"m15","output":"fallback_evidence_closed","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"filter","filter":"join","input":{"kind":"filter","filter":"sort","input":{"kind":"filter","filter":"keys","input":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"filterArgs":[]},"filterArgs":[]},"filterArgs":[{"kind":"literal","value":"|"}]},"right":{"kind":"literal","value":"branch|created_at|evidence_version|failover_eligible|failure_class|failure_code|finished_at|job_id|kind|repo|role|route_execution_profile|session_identity|terminal_status"}}}},{"id":"m16","output":"fresh_primary_evidence_closed","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"filter","filter":"join","input":{"kind":"filter","filter":"sort","input":{"kind":"filter","filter":"keys","input":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"},"filterArgs":[]},"filterArgs":[]},"filterArgs":[{"kind":"literal","value":"|"}]},"right":{"kind":"literal","value":"branch|created_at|evidence_version|failover_eligible|failure_class|failure_code|finished_at|job_id|kind|repo|role|route_execution_profile|session_identity|terminal_status"}}}},{"id":"m17","output":"history_consistent","expression":{"kind":"binary","operator":"or","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_route"},"right":{"kind":"literal","value":null}}}},{"id":"m18","output":"has_history","expression":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}}},{"id":"m19","output":"has_recovery","expression":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"right":{"kind":"literal","value":null}}}},{"id":"m20","output":"has_fresh_primary","expression":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"},"right":{"kind":"literal","value":null}}},{"id":"m21","output":"get_key_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.recordKey"},"right":{"kind":"getField","path":"CTX.routing_state_locator.record_key"}}}},{"id":"m22","output":"daemon_challenge_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.daemon_instance_challenge"},"right":{"kind":"getField","path":"TASKS.daemon_challenge.data.server_instance_challenge"}}}}]},"label":"Validate authoritative route state"},
+      {"id":"recovery_evidence_valid","type":"logic.filter","position":{"x":2120,"y":120},"config":{"group":"AND","rules":[{"path":"record_closed","op":"equals","value":true},{"path":"version_valid","op":"equals","value":true},{"path":"locator_matches","op":"equals","value":true},{"path":"route_input_matches","op":"equals","value":true},{"path":"primary_route_matches","op":"equals","value":true},{"path":"primary_evidence_pair","op":"equals","value":true},{"path":"fallback_evidence_pair","op":"equals","value":true},{"path":"fresh_primary_evidence_pair","op":"equals","value":true},{"path":"primary_hash_matches","op":"equals","value":true},{"path":"fallback_hash_matches","op":"equals","value":true},{"path":"fresh_primary_hash_matches","op":"equals","value":true},{"path":"primary_evidence_closed","op":"equals","value":true},{"path":"fallback_evidence_closed","op":"equals","value":true},{"path":"fresh_primary_evidence_closed","op":"equals","value":true},{"path":"history_consistent","op":"equals","value":true},{"path":"get_key_matches","op":"equals","value":true},{"path":"daemon_challenge_matches","op":"equals","value":true}]}},
+      {"id":"recovery_order_shape","type":"transforms.objectBuilder","position":{"x":2280,"y":120},"config":{"alias":"recovery_order_shape","version":1,"mappings":[{"id":"m1","output":"primary_before_fallback","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"<=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.finished_at"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.created_at"}}}},{"id":"m2","output":"fallback_before_fresh","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"<=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.finished_at"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.created_at"}}}},{"id":"m3","output":"jobs_distinct","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.job_id"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.job_id"}},"right":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.job_id"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.job_id"}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.job_id"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.job_id"}}}}}}},{"id":"m4","output":"repo_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.repo"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.repo"}},"right":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.repo"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.repo"}}}}}},{"id":"m5","output":"branch_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.branch"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.branch"}},"right":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.branch"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.branch"}}}}}},{"id":"m6","output":"terminal_sequence","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.terminal_status"},"right":{"kind":"literal","value":"error"}},"right":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.terminal_status"},"right":{"kind":"literal","value":"ok"}},"right":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence.terminal_status"},"right":{"kind":"literal","value":"ok"}}}}}}}]},"label":"Validate evidence order and provenance"},
+      {"id":"recovery_order_valid","type":"logic.filter","position":{"x":2440,"y":120},"config":{"group":"AND","rules":[{"path":"primary_before_fallback","op":"equals","value":true},{"path":"fallback_before_fresh","op":"equals","value":true},{"path":"jobs_distinct","op":"equals","value":true},{"path":"repo_matches","op":"equals","value":true},{"path":"branch_matches","op":"equals","value":true},{"path":"terminal_sequence","op":"equals","value":true}]}},
+      {"id":"recovery_authority_mode","type":"logic.switch","position":{"x":2600,"y":120},"config":{"mode":"rules","cases":[{"label":"verify-history","rules":[{"path":"has_history","op":"equals","value":true}]}],"default":{"label":"default"}}},
+      {"id":"prior_primary_verify","type":"action.graphwing.POST:/v1/agent/evidence/verify","position":{"x":2760,"y":40},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15,"job_id":"{{ TASKS.route_state_get.data.primary_evidence.job_id }}","session_identity":"{{ TASKS.route_state_get.data.primary_evidence.session_identity }}"}},
+      {"id":"fallback_authority_mode","type":"logic.switch","position":{"x":2920,"y":40},"config":{"mode":"rules","cases":[{"label":"verify-fallback","rules":[{"path":"has_recovery","op":"equals","value":true}]}],"default":{"label":"default"}}},
+      {"id":"prior_fallback_verify","type":"action.graphwing.POST:/v1/agent/evidence/verify","position":{"x":3080,"y":0},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15,"job_id":"{{ TASKS.route_state_get.data.fallback_evidence.job_id }}","session_identity":"{{ TASKS.route_state_get.data.fallback_evidence.session_identity }}"}},
+      {"id":"fresh_authority_mode","type":"logic.switch","position":{"x":3240,"y":0},"config":{"mode":"rules","cases":[{"label":"verify-fresh","rules":[{"path":"has_fresh_primary","op":"equals","value":true}]}],"default":{"label":"default"}}},
+      {"id":"fresh_primary_verify","type":"action.graphwing.POST:/v1/agent/evidence/verify","position":{"x":3400,"y":-40},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15,"job_id":"{{ TASKS.route_state_get.data.fresh_primary_evidence.job_id }}","session_identity":"{{ TASKS.route_state_get.data.fresh_primary_evidence.session_identity }}"}},
+      {"id":"recovery_authority_shape","type":"transforms.objectBuilder","position":{"x":3560,"y":0},"config":{"alias":"recovery_authority_shape","version":1,"mappings":[{"id":"m1","output":"primary_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.prior_primary_verify.data"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"}}}},{"id":"m2","output":"fallback_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.prior_fallback_verify.data"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"}}}},{"id":"m3","output":"fresh_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.fresh_primary_verify.data"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"}}}}]},"label":"Require current local evidence authority"},
+      {"id":"recovery_authority_valid","type":"logic.filter","position":{"x":3720,"y":0},"config":{"group":"AND","rules":[{"path":"primary_matches","op":"equals","value":true},{"path":"fallback_matches","op":"equals","value":true},{"path":"fresh_matches","op":"equals","value":true}]}},
+      {"id":"recovery_authority_park","type":"transforms.regexReplace","position":{"x":3720,"y":-120},"config":{"input":"graphwing_recovery_local_authority_unavailable","pattern":"(?=graphwing)","replacement":""}},
+      {"id":"launcher_capability_mode","type":"logic.switch","position":{"x":3880,"y":0},"config":{"mode":"rules","cases":[{"label":"missing-binary","rules":[{"path":"needs_capability","op":"equals","value":true}]}],"default":{"label":"default"}}},
+      {"id":"launcher_capability","type":"action.graphwing.POST:/v1/launcher/capability","position":{"x":4040,"y":-40},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15,"launcher":"{{ TASKS.route_state_get.data.primary_route.launcher }}"}},
+      {"id":"launcher_capability_snap","type":"transforms.objectBuilder","position":{"x":4200,"y":-40},"config":{"alias":"launcher_capability_snap","version":1,"mappings":[{"id":"m1","output":"launcher","expression":{"kind":"getField","path":"TASKS.launcher_capability.data.launcher"}},{"id":"m2","output":"state","expression":{"kind":"getField","path":"TASKS.launcher_capability.data.state"}},{"id":"m3","output":"launcher_version","expression":{"kind":"getField","path":"TASKS.launcher_capability.data.launcher_version"}},{"id":"m4","output":"diagnostic","expression":{"kind":"getField","path":"TASKS.launcher_capability.data.diagnostic"}}]},"label":"Snapshot current launcher capability"},
+      {"id":"recovery_choice_shape","type":"transforms.objectBuilder","position":{"x":4360,"y":0},"config":{"alias":"recovery_choice_shape","version":1,"mappings":[{"id":"m1","output":"current_fallback","expression":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.agent_evidence"},"right":{"kind":"literal","value":null}}},{"id":"m2","output":"has_history","expression":{"kind":"getField","path":"CTX.route_state_shape.has_history"}},{"id":"m3","output":"missing_binary_available","expression":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.failure_code"},"right":{"kind":"literal","value":"missing_binary"}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.launcher_capability_snap.state"},"right":{"kind":"literal","value":"available"}}}},{"id":"m4","output":"fresh_primary_verified","expression":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":true}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.recovery_authority_shape.fresh_matches"},"right":{"kind":"literal","value":true}}}},{"id":"m5","output":"retain_fallback","expression":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":true}},"right":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.failure_code"},"right":{"kind":"literal","value":"missing_binary"}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.launcher_capability_snap.state"},"right":{"kind":"literal","value":"available"}}},"right":{"kind":"literal","value":false}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"},"right":{"kind":"literal","value":false}}}}},{"id":"m6","output":"incomplete_authority","expression":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":true}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"},"right":{"kind":"literal","value":false}}},"right":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.routing_policy_input.agent_evidence"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.routing_policy_input.route_evidence"},"right":{"kind":"literal","value":null}}}}}]},"label":"Choose recovery from authoritative facts"},
+      {"id":"recovery_choice","type":"logic.switch","position":{"x":4520,"y":0},"config":{"mode":"rules","cases":[{"label":"current-fallback","rules":[{"path":"current_fallback","op":"equals","value":true}]},{"label":"incomplete-authority","rules":[{"path":"incomplete_authority","op":"equals","value":true}]},{"label":"missing-binary-primary","rules":[{"path":"missing_binary_available","op":"equals","value":true}]},{"label":"fresh-primary","rules":[{"path":"fresh_primary_verified","op":"equals","value":true}]},{"label":"retain-fallback","rules":[{"path":"retain_fallback","op":"equals","value":true}]}],"default":{"label":"default"}}},
+      {"id":"routing_recovery_evidence","type":"transforms.objectBuilder","position":{"x":4680,"y":-80},"config":{"alias":"routing_recovery_evidence","version":1,"mappings":[{"id":"m1","output":"value","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.agent_evidence"},"right":{"kind":"literal","value":null}},"then":{"kind":"getField","path":"CTX.routing_policy_input.agent_evidence"},"else":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"}}}]},"label":"Select verified fallback evidence"},
+      {"id":"selected_route_normal","type":"transforms.objectBuilder","position":{"x":4840,"y":120},"config":{"alias":"routing_selected_route","version":1,"mappings":[{"id":"m1","output":"value","expression":{"kind":"getField","path":"CTX.routing_normal_policy_output"}},{"id":"m2","output":"decision","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":true}},"then":{"kind":"literal","value":"primary_recovered"},"else":{"kind":"literal","value":"normal"}}},{"id":"m3","output":"role","expression":{"kind":"literal","value":"primary"}}]},"label":"Select primary route"},
+      {"id":"selected_route_fallback","type":"transforms.objectBuilder","position":{"x":4840,"y":-120},"config":{"alias":"routing_selected_route","version":1,"mappings":[{"id":"m1","output":"value","expression":{"kind":"getField","path":"CTX.routing_fallback_policy_output"}},{"id":"m2","output":"decision","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":true}},"then":{"kind":"literal","value":"fallback_retained"},"else":{"kind":"literal","value":"initial_fallback"}}},{"id":"m3","output":"role","expression":{"kind":"literal","value":"availability_fallback"}}]},"label":"Select fallback route"},
+      {"id":"route_state_evidence_next","type":"transforms.objectBuilder","position":{"x":5000,"y":0},"config":{"alias":"route_state_evidence_next","version":1,"mappings":[{"id":"m1","output":"primary","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.recovery_choice_shape.current_fallback"},"right":{"kind":"literal","value":true}},"then":{"kind":"getField","path":"CTX.routing_policy_input.agent_evidence"},"else":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence"}}},{"id":"m2","output":"fallback","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.route_execution_profile"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_route.writer_execution_profile"}}},"then":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data"},"else":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"}}},{"id":"m3","output":"fresh_primary","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence"},"right":{"kind":"literal","value":null}}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.route_execution_profile"},"right":{"kind":"getField","path":"CTX.routing_normal_policy_output.writer_execution_profile"}}},"then":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data"},"else":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.recovery_choice_shape.current_fallback"},"right":{"kind":"literal","value":true}},"then":{"kind":"literal","value":null},"else":{"kind":"getField","path":"TASKS.route_state_get.data.fresh_primary_evidence"}}}}]},"label":"Shape next authoritative evidence"},
+      {"id":"next_primary_evidence_hash","type":"transforms.hash","position":{"x":5160,"y":0},"config":{"alias":"next_primary_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ CTX.route_state_evidence_next.primary }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"next_fallback_evidence_hash","type":"transforms.hash","position":{"x":5160,"y":0},"config":{"alias":"next_fallback_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ CTX.route_state_evidence_next.fallback }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"next_fresh_primary_evidence_hash","type":"transforms.hash","position":{"x":5160,"y":0},"config":{"alias":"next_fresh_primary_evidence_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ CTX.route_state_evidence_next.fresh_primary }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"route_state_next","type":"transforms.objectBuilder","position":{"x":5320,"y":0},"config":{"alias":"route_state_next","version":1,"mappings":[{"id":"m1","output":"state_version","expression":{"kind":"literal","value":"provider-recovery-v1"}},{"id":"m2","output":"routing_run_id","expression":{"kind":"getField","path":"CTX.routing_state_locator.routing_run_id"}},{"id":"m3","output":"origin_workflow_run_id","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":true}},"then":{"kind":"getField","path":"TASKS.route_state_get.data.origin_workflow_run_id"},"else":{"kind":"conditional","condition":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":null}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"right":{"kind":"literal","value":""}}},"then":{"kind":"getField","path":"CTX.routing_policy_input.invocation_run_id"},"else":{"kind":"getField","path":"WORKFLOW.runId"}}}},{"id":"m4","output":"daemon_instance_challenge","expression":{"kind":"getField","path":"TASKS.daemon_challenge.data.server_instance_challenge"}},{"id":"m5","output":"route_input","expression":{"kind":"object","properties":{"class":{"kind":"getField","path":"CTX.routing_policy_input.class"},"work_kind":{"kind":"getField","path":"CTX.routing_policy_input.work_kind"},"size_floor":{"kind":"getField","path":"CTX.routing_policy_input.size"},"effective_size":{"kind":"getField","path":"CTX.routing_effective_size.value"},"ac_count":{"kind":"getField","path":"CTX.routing_policy_input_normalized.ac_count"},"seams":{"kind":"getField","path":"CTX.routing_policy_input_normalized.seams"}}}},{"id":"m6","output":"primary_route","expression":{"kind":"getField","path":"CTX.routing_normal_policy_output"}},{"id":"m7","output":"primary_evidence","expression":{"kind":"getField","path":"CTX.route_state_evidence_next.primary"}},{"id":"m8","output":"primary_evidence_sha256","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_evidence_next.primary"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":null},"else":{"kind":"getField","path":"CTX.next_primary_evidence_hash.value"}}},{"id":"m9","output":"fallback_route","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.routing_selected_route.role"},"right":{"kind":"literal","value":"availability_fallback"}},"then":{"kind":"getField","path":"CTX.routing_selected_route.value"},"else":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_route"}}},{"id":"m10","output":"fallback_evidence","expression":{"kind":"getField","path":"CTX.route_state_evidence_next.fallback"}},{"id":"m11","output":"fallback_evidence_sha256","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_evidence_next.fallback"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":null},"else":{"kind":"getField","path":"CTX.next_fallback_evidence_hash.value"}}},{"id":"m12","output":"fresh_primary_evidence","expression":{"kind":"getField","path":"CTX.route_state_evidence_next.fresh_primary"}},{"id":"m13","output":"fresh_primary_evidence_sha256","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_evidence_next.fresh_primary"},"right":{"kind":"literal","value":null}},"then":{"kind":"literal","value":null},"else":{"kind":"getField","path":"CTX.next_fresh_primary_evidence_hash.value"}}},{"id":"m14","output":"active_route","expression":{"kind":"getField","path":"CTX.routing_selected_route.value"}},{"id":"m15","output":"decision","expression":{"kind":"getField","path":"CTX.routing_selected_route.decision"}},{"id":"m16","output":"revision","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.found"},"right":{"kind":"literal","value":true}},"then":{"kind":"binary","operator":"+","left":{"kind":"getField","path":"TASKS.route_state_get.data.revision"},"right":{"kind":"literal","value":1}},"else":{"kind":"literal","value":1}}}]},"label":"Build durable route state"},
+      {"id":"route_state_expected_hash","type":"transforms.hash","position":{"x":5480,"y":0},"config":{"alias":"route_state_expected_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ CTX.route_state_next }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"route_state_upsert","type":"action.datastore.records.upsert","position":{"x":5640,"y":0},"config":{"alias":"route_state_upsert","scope":"tenant","collection":"graphwing_routing_state_v1","recordKey":"{{ CTX.routing_state_locator.record_key }}","indexedFields":["routing_run_id","state_version","decision"],"data":"{{ CTX.route_state_next }}"}},
+      {"id":"route_state_readback","type":"action.datastore.records.get","position":{"x":5800,"y":0},"config":{"alias":"route_state_readback","scope":"tenant","collection":"graphwing_routing_state_v1","recordKey":"{{ CTX.routing_state_locator.record_key }}"}},
+      {"id":"route_state_readback_hash","type":"transforms.hash","position":{"x":5960,"y":0},"config":{"alias":"route_state_readback_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ TASKS.route_state_readback.data }}","outputFormat":"hex","hexCase":"lower"}},
+      {"id":"route_state_readback_shape","type":"transforms.objectBuilder","position":{"x":6120,"y":0},"config":{"alias":"route_state_readback_shape","version":1,"mappings":[{"id":"m1","output":"found_matches","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_readback.found"},"right":{"kind":"literal","value":true}}},{"id":"m2","output":"key_matches","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_readback.recordKey"},"right":{"kind":"getField","path":"CTX.routing_state_locator.record_key"}}},{"id":"m3","output":"hash_matches","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_readback_hash.value"},"right":{"kind":"getField","path":"CTX.route_state_expected_hash.value"}}},{"id":"m4","output":"version_matches","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_readback.version"},"right":{"kind":"getField","path":"TASKS.route_state_upsert.version"}}}]},"label":"Validate exact route state readback"},
+      {"id":"route_state_readback_valid","type":"logic.filter","position":{"x":6280,"y":0},"config":{"group":"AND","rules":[{"path":"found_matches","op":"equals","value":true},{"path":"key_matches","op":"equals","value":true},{"path":"hash_matches","op":"equals","value":true},{"path":"version_matches","op":"equals","value":true}]}},
+      {"id":"route_state_write_failed","type":"transforms.regexReplace","position":{"x":5800,"y":-160},"config":{"input":"graphwing_route_state_write_failed","pattern":"(?=graphwing)","replacement":""}},
+      {"id":"route_state_readback_failed","type":"transforms.regexReplace","position":{"x":5960,"y":-160},"config":{"input":"graphwing_route_state_readback_failed","pattern":"(?=graphwing)","replacement":""}},
+      {"id":"route_state_readback_mismatch","type":"transforms.regexReplace","position":{"x":6440,"y":-160},"config":{"input":"graphwing_route_state_readback_mismatch","pattern":"(?=graphwing)","replacement":""}},
+      {"id":"recovery_authority_mode_shape","type":"transforms.objectBuilder","position":{"x":2520,"y":120},"config":{"alias":"recovery_authority_mode_shape","version":1,"mappings":[{"id":"m1","output":"has_history","expression":{"kind":"getField","path":"CTX.route_state_shape.has_history"}}]}},
+      {"id":"fallback_authority_mode_shape","type":"transforms.objectBuilder","position":{"x":2920,"y":40},"config":{"alias":"fallback_authority_mode_shape","version":1,"mappings":[{"id":"m1","output":"has_recovery","expression":{"kind":"getField","path":"CTX.route_state_shape.has_recovery"}}]}},
+      {"id":"fresh_authority_mode_shape","type":"transforms.objectBuilder","position":{"x":3240,"y":0},"config":{"alias":"fresh_authority_mode_shape","version":1,"mappings":[{"id":"m1","output":"has_fresh_primary","expression":{"kind":"getField","path":"CTX.route_state_shape.has_fresh_primary"}}]}},
+      {"id":"launcher_capability_mode_shape","type":"transforms.objectBuilder","position":{"x":3800,"y":0},"config":{"alias":"launcher_capability_mode_shape","version":1,"mappings":[{"id":"m1","output":"needs_capability","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.failure_code"},"right":{"kind":"literal","value":"missing_binary"}}}]}},
+      {"id":"join_recovery_authority_park","type":"logic.join.any","label":"recovery authority park","position":{"x":3600,"y":200},"config":{}},
+      {"id":"join_recovery_authority_shape","type":"logic.join.any","label":"recovery authority shape","position":{"x":3680,"y":200},"config":{}},
+      {"id":"join_recovery_choice_shape","type":"logic.join.any","label":"recovery choice shape","position":{"x":3760,"y":200},"config":{}},
+      {"id":"join_routing_recovery_evidence","type":"logic.join.any","label":"routing recovery evidence","position":{"x":3840,"y":200},"config":{}},
+      {"id":"join_fallback_mode","type":"logic.join.any","label":"fallback mode","position":{"x":3920,"y":200},"config":{}},
+      {"id":"join_route_state_evidence_next","type":"logic.join.any","label":"route state evidence next","position":{"x":4000,"y":200},"config":{}},
+      {"id":"join_launcher_capability_mode_shape","type":"logic.join.any","label":"launcher capability mode shape","position":{"x":4080,"y":200},"config":{}},
+      {"id":"join_current_route_evidence_mode_shape","type":"logic.join.any","position":{"x":4900,"y":180},"config":{}},
+      {"id":"current_route_evidence_mode_shape","type":"transforms.objectBuilder","position":{"x":4920,"y":40},"config":{"alias":"current_route_evidence_mode_shape","version":1,"mappings":[{"id":"m1","output":"present","expression":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"CTX.routing_policy_input.route_evidence"},"right":{"kind":"literal","value":null}}}]}},
+      {"id":"current_route_evidence_mode","type":"logic.switch","position":{"x":4980,"y":40},"config":{"mode":"rules","cases":[{"label":"verify","rules":[{"path":"present","op":"equals","value":true}]}],"default":{"label":"absent"}}},
+      {"id":"current_route_evidence_verify","type":"action.graphwing.POST:/v1/agent/evidence/verify","position":{"x":5060,"y":-40},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15,"job_id":"{{ CTX.routing_policy_input.route_evidence.job_id }}","session_identity":"{{ CTX.routing_policy_input.route_evidence.session_identity }}"}},
+      {"id":"current_route_evidence_shape","type":"transforms.objectBuilder","position":{"x":4920,"y":40},"config":{"alias":"current_route_evidence_shape","version":1,"mappings":[{"id":"m1","output":"exact","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data"},"right":{"kind":"getField","path":"CTX.routing_policy_input.route_evidence"}}},{"id":"m2","output":"terminal_success","expression":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.terminal_status"},"right":{"kind":"literal","value":"ok"}}},{"id":"m3","output":"known_route","expression":{"kind":"binary","operator":"or","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.route_execution_profile"},"right":{"kind":"getField","path":"CTX.routing_normal_policy_output.writer_execution_profile"}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.route_execution_profile"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_route.writer_execution_profile"}}}},{"id":"m4","output":"job_distinct","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.job_id"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.job_id"}},"right":{"kind":"binary","operator":"!=","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.job_id"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.job_id"}}}}},{"id":"m5","output":"provenance_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"binary","operator":"and","left":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.repo"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.repo"}},"right":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.branch"},"right":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.branch"}}}}},{"id":"m6","output":"order_matches","expression":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"CTX.route_state_shape.has_history"},"right":{"kind":"literal","value":false}},"then":{"kind":"literal","value":true},"else":{"kind":"conditional","condition":{"kind":"binary","operator":"==","left":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.route_execution_profile"},"right":{"kind":"getField","path":"CTX.routing_normal_policy_output.writer_execution_profile"}},"then":{"kind":"binary","operator":"<=","left":{"kind":"getField","path":"TASKS.route_state_get.data.fallback_evidence.finished_at"},"right":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.created_at"}},"else":{"kind":"binary","operator":"<=","left":{"kind":"getField","path":"TASKS.route_state_get.data.primary_evidence.finished_at"},"right":{"kind":"getField","path":"TASKS.current_route_evidence_verify.data.created_at"}}}}}]}},
+      {"id":"current_route_evidence_valid","type":"logic.filter","position":{"x":5220,"y":-40},"config":{"group":"AND","rules":[{"path":"exact","op":"equals","value":true},{"path":"terminal_success","op":"equals","value":true},{"path":"known_route","op":"equals","value":true},{"path":"job_distinct","op":"equals","value":true},{"path":"provenance_matches","op":"equals","value":true},{"path":"order_matches","op":"equals","value":true}]}},
+      {"id":"routing_state_locator_valid","type":"logic.filter","position":{"x":1560,"y":120},"config":{"group":"AND","rules":[{"path":"routing_run_id","op":"matches","value":"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},{"path":"invocation_run_id","op":"matches","value":"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"}]}},
+      {"id":"routing_state_locator_rejected","type":"transforms.regexReplace","position":{"x":1640,"y":240},"config":{"input":"graphwing_routing_state_locator_rejected","pattern":"(?=graphwing)","replacement":""}},
+      {"id":"daemon_challenge","type":"action.graphwing.GET:/v1/rewst/server-challenge","position":{"x":1600,"y":80},"config":{"integrationInstanceId":"$GRAPHWING_INSTANCE","timeout":15}}
     ],
     "edges": [
       {
@@ -4803,12 +5120,6 @@
         "target": "decision_hash"
       },
       {
-        "id": "e10",
-        "source": "decision_hash",
-        "sourceHandle": "out",
-        "target": "fallback_mode"
-      },
-      {
         "id": "e-fallback-mode",
         "source": "fallback_mode",
         "sourceHandle": "out",
@@ -4818,7 +5129,7 @@
         "id": "e-normal-output",
         "source": "fallback_requested",
         "sourceHandle": "fail",
-        "target": "route_output"
+        "target": "selected_route_normal"
       },
       {
         "id": "e-fallback-facts",
@@ -4879,7 +5190,89 @@
         "source": "policy_input_normalized",
         "sourceHandle": "out",
         "target": "effective_size"
-      }
+      },
+      {"id":"e-route-state-locator","source":"normal_route_output","sourceHandle":"out","target":"routing_state_locator","targetHandle":"in"},
+      {"id":"e-route-state-get","source":"routing_state_locator","sourceHandle":"out","target":"routing_state_locator_valid","targetHandle":"in"},
+      {"id":"e-route-state-primary-hash","source":"route_state_get","sourceHandle":"success","target":"primary_evidence_hash","targetHandle":"in"},
+      {"id":"e-route-state-fallback-hash","source":"primary_evidence_hash","sourceHandle":"out","target":"fallback_evidence_hash","targetHandle":"in"},
+      {"id":"e-route-state-fresh-hash","source":"fallback_evidence_hash","sourceHandle":"out","target":"fresh_primary_evidence_hash","targetHandle":"in"},
+      {"id":"e-route-state-shape","source":"fresh_primary_evidence_hash","sourceHandle":"out","target":"route_state_shape","targetHandle":"in"},
+      {"id":"e-recovery-evidence-valid","source":"route_state_shape","sourceHandle":"out","target":"recovery_evidence_valid","targetHandle":"in"},
+      {"id":"e-recovery-evidence-reject","source":"recovery_evidence_valid","sourceHandle":"fail","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-recovery-order-shape","source":"recovery_evidence_valid","sourceHandle":"pass","target":"recovery_order_shape","targetHandle":"in"},
+      {"id":"e-recovery-order-valid","source":"recovery_order_shape","sourceHandle":"out","target":"recovery_order_valid","targetHandle":"in"},
+      {"id":"e-recovery-order-reject","source":"recovery_order_valid","sourceHandle":"fail","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-verify-primary","source":"recovery_authority_mode","sourceHandle":"case-0","target":"prior_primary_verify","targetHandle":"in"},
+      {"id":"e-primary-verify-fail","source":"prior_primary_verify","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-verify-fallback","source":"fallback_authority_mode","sourceHandle":"case-0","target":"prior_fallback_verify","targetHandle":"in"},
+      {"id":"e-no-fallback-authority","source":"fallback_authority_mode","sourceHandle":"default","target":"join_recovery_authority_shape","targetHandle":"in"},
+      {"id":"e-fallback-verify-fail","source":"prior_fallback_verify","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-verify-fresh","source":"fresh_authority_mode","sourceHandle":"case-0","target":"fresh_primary_verify","targetHandle":"in"},
+      {"id":"e-no-fresh-authority","source":"fresh_authority_mode","sourceHandle":"default","target":"join_recovery_authority_shape","targetHandle":"in"},
+      {"id":"e-fresh-verified","source":"fresh_primary_verify","sourceHandle":"success","target":"join_recovery_authority_shape","targetHandle":"in"},
+      {"id":"e-fresh-verify-fail","source":"fresh_primary_verify","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-authority-valid","source":"recovery_authority_shape","sourceHandle":"out","target":"recovery_authority_valid","targetHandle":"in"},
+      {"id":"e-authority-fail","source":"recovery_authority_valid","sourceHandle":"fail","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-launcher-capability","source":"launcher_capability_mode","sourceHandle":"case-0","target":"launcher_capability","targetHandle":"in"},
+      {"id":"e-no-launcher-capability","source":"launcher_capability_mode","sourceHandle":"default","target":"join_recovery_choice_shape","targetHandle":"in"},
+      {"id":"e-launcher-capability-snap","source":"launcher_capability","sourceHandle":"success","target":"launcher_capability_snap","targetHandle":"in"},
+      {"id":"e-launcher-capability-fail","source":"launcher_capability","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-launcher-choice-shape","source":"launcher_capability_snap","sourceHandle":"out","target":"join_recovery_choice_shape","targetHandle":"in"},
+      {"id":"e-recovery-choice","source":"recovery_choice_shape","sourceHandle":"out","target":"recovery_choice","targetHandle":"in"},
+      {"id":"e-choice-current-fallback","source":"recovery_choice","sourceHandle":"case-0","target":"join_routing_recovery_evidence","targetHandle":"in"},
+      {"id":"e-choice-primary-missing","source":"recovery_choice","sourceHandle":"case-2","target":"join_fallback_mode","targetHandle":"in"},
+      {"id":"e-choice-primary-fresh","source":"recovery_choice","sourceHandle":"case-3","target":"join_fallback_mode","targetHandle":"in"},
+      {"id":"e-choice-retain-fallback","source":"recovery_choice","sourceHandle":"case-4","target":"join_routing_recovery_evidence","targetHandle":"in"},
+      {"id":"e-choice-normal","source":"recovery_choice","sourceHandle":"default","target":"join_fallback_mode","targetHandle":"in"},
+      {"id":"e-recovery-evidence-mode","source":"routing_recovery_evidence","sourceHandle":"out","target":"join_fallback_mode","targetHandle":"in"},
+      {"id":"e-select-fallback-route","source":"fallback_route_output","sourceHandle":"out","target":"selected_route_fallback","targetHandle":"in"},
+      {"id":"e-normal-route-evidence","source":"selected_route_normal","sourceHandle":"out","target":"join_current_route_evidence_mode_shape","targetHandle":"in"},
+      {"id":"e-fallback-route-evidence","source":"selected_route_fallback","sourceHandle":"out","target":"join_current_route_evidence_mode_shape","targetHandle":"in"},
+      {"id":"e-next-primary-hash","source":"route_state_evidence_next","sourceHandle":"out","target":"next_primary_evidence_hash","targetHandle":"in"},
+      {"id":"e-next-fallback-hash","source":"next_primary_evidence_hash","sourceHandle":"out","target":"next_fallback_evidence_hash","targetHandle":"in"},
+      {"id":"e-next-fresh-hash","source":"next_fallback_evidence_hash","sourceHandle":"out","target":"next_fresh_primary_evidence_hash","targetHandle":"in"},
+      {"id":"e-route-state-next","source":"next_fresh_primary_evidence_hash","sourceHandle":"out","target":"route_state_next","targetHandle":"in"},
+      {"id":"e-route-state-expected-hash","source":"route_state_next","sourceHandle":"out","target":"route_state_expected_hash","targetHandle":"in"},
+      {"id":"e-route-state-upsert","source":"route_state_expected_hash","sourceHandle":"out","target":"route_state_upsert","targetHandle":"in"},
+      {"id":"e-route-state-upsert-ok","source":"route_state_upsert","sourceHandle":"success","target":"route_state_readback","targetHandle":"in"},
+      {"id":"e-route-state-upsert-fail","source":"route_state_upsert","sourceHandle":"failure","target":"route_state_write_failed","targetHandle":"in"},
+      {"id":"e-route-state-readback-ok","source":"route_state_readback","sourceHandle":"success","target":"route_state_readback_hash","targetHandle":"in"},
+      {"id":"e-route-state-readback-fail","source":"route_state_readback","sourceHandle":"failure","target":"route_state_readback_failed","targetHandle":"in"},
+      {"id":"e-route-state-readback-shape","source":"route_state_readback_hash","sourceHandle":"out","target":"route_state_readback_shape","targetHandle":"in"},
+      {"id":"e-route-state-readback-valid","source":"route_state_readback_shape","sourceHandle":"out","target":"route_state_readback_valid","targetHandle":"in"},
+      {"id":"e-route-state-readback-pass","source":"route_state_readback_valid","sourceHandle":"pass","target":"route_output","targetHandle":"in"},
+      {"id":"e-route-state-readback-reject","source":"route_state_readback_valid","sourceHandle":"fail","target":"route_state_readback_mismatch","targetHandle":"in"},
+      {"id":"e-recovery-authority-mode-shape","source":"recovery_order_valid","sourceHandle":"pass","target":"recovery_authority_mode_shape","targetHandle":"in"},
+      {"id":"e-recovery-authority-mode","source":"recovery_authority_mode_shape","sourceHandle":"out","target":"recovery_authority_mode","targetHandle":"in"},
+      {"id":"e-fallback-authority-mode-shape","source":"prior_primary_verify","sourceHandle":"success","target":"fallback_authority_mode_shape","targetHandle":"in"},
+      {"id":"e-primary-verified","source":"fallback_authority_mode_shape","sourceHandle":"out","target":"fallback_authority_mode","targetHandle":"in"},
+      {"id":"e-fresh-authority-mode-shape","source":"prior_fallback_verify","sourceHandle":"success","target":"fresh_authority_mode_shape","targetHandle":"in"},
+      {"id":"e-fallback-verified","source":"fresh_authority_mode_shape","sourceHandle":"out","target":"fresh_authority_mode","targetHandle":"in"},
+      {"id":"e-no-history-capability-shape","source":"recovery_authority_mode","sourceHandle":"default","target":"join_launcher_capability_mode_shape","targetHandle":"in"},
+      {"id":"e-authority-pass-shape","source":"recovery_authority_valid","sourceHandle":"pass","target":"join_launcher_capability_mode_shape","targetHandle":"in"},
+      {"id":"e-launcher-capability-mode","source":"launcher_capability_mode_shape","sourceHandle":"out","target":"launcher_capability_mode","targetHandle":"in"},
+      {"id":"e-join_recovery_authority_park","source":"join_recovery_authority_park","sourceHandle":"out","target":"recovery_authority_park","targetHandle":"in"},
+      {"id":"e-join_recovery_authority_shape","source":"join_recovery_authority_shape","sourceHandle":"out","target":"recovery_authority_shape","targetHandle":"in"},
+      {"id":"e-join_recovery_choice_shape","source":"join_recovery_choice_shape","sourceHandle":"out","target":"recovery_choice_shape","targetHandle":"in"},
+      {"id":"e-join_routing_recovery_evidence","source":"join_routing_recovery_evidence","sourceHandle":"out","target":"routing_recovery_evidence","targetHandle":"in"},
+      {"id":"e-join_fallback_mode","source":"join_fallback_mode","sourceHandle":"out","target":"fallback_mode","targetHandle":"in"},
+      {"id":"e-join_route_state_evidence_next","source":"join_route_state_evidence_next","sourceHandle":"out","target":"route_state_evidence_next","targetHandle":"in"},
+      {"id":"e-join_launcher_capability_mode_shape","source":"join_launcher_capability_mode_shape","sourceHandle":"out","target":"launcher_capability_mode_shape","targetHandle":"in"},
+      {"id":"e-normal-route-candidate","source":"decision_hash","sourceHandle":"out","target":"normal_route_output","targetHandle":"in"},
+      {"id":"e-current-route-evidence-mode-shape","source":"join_current_route_evidence_mode_shape","sourceHandle":"out","target":"current_route_evidence_mode_shape","targetHandle":"in"},
+      {"id":"e-current-route-evidence-mode","source":"current_route_evidence_mode_shape","sourceHandle":"out","target":"current_route_evidence_mode","targetHandle":"in"},
+      {"id":"e-current-route-evidence-verify","source":"current_route_evidence_mode","sourceHandle":"case-0","target":"current_route_evidence_verify","targetHandle":"in"},
+      {"id":"e-current-route-evidence-absent","source":"current_route_evidence_mode","sourceHandle":"default","target":"join_route_state_evidence_next","targetHandle":"in"},
+      {"id":"e-current-route-evidence-verified","source":"current_route_evidence_verify","sourceHandle":"success","target":"current_route_evidence_shape","targetHandle":"in"},
+      {"id":"e-current-route-evidence-verify-fail","source":"current_route_evidence_verify","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-current-route-evidence-valid","source":"current_route_evidence_shape","sourceHandle":"out","target":"current_route_evidence_valid","targetHandle":"in"},
+      {"id":"e-current-route-evidence-pass","source":"current_route_evidence_valid","sourceHandle":"pass","target":"join_route_state_evidence_next","targetHandle":"in"},
+      {"id":"e-current-route-evidence-fail","source":"current_route_evidence_valid","sourceHandle":"fail","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-routing-state-locator-pass","source":"routing_state_locator_valid","sourceHandle":"pass","target":"daemon_challenge","targetHandle":"in"},
+      {"id":"e-routing-state-locator-fail","source":"routing_state_locator_valid","sourceHandle":"fail","target":"routing_state_locator_rejected","targetHandle":"in"},
+      {"id":"e-daemon-challenge-get","source":"daemon_challenge","sourceHandle":"success","target":"route_state_get","targetHandle":"in"},
+      {"id":"e-daemon-challenge-fail","source":"daemon_challenge","sourceHandle":"failure","target":"join_recovery_authority_park","targetHandle":"in"},
+      {"id":"e-choice-incomplete-authority","source":"recovery_choice","sourceHandle":"case-1","target":"join_recovery_authority_park","targetHandle":"in"}
     ]
   }
 }

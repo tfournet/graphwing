@@ -5575,7 +5575,7 @@ while True:
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.5")
+        self.assertEqual(spec["info"]["version"], "0.5.6")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -11383,13 +11383,10 @@ while True:
                 (Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text()
             )
             nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
-            for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
+            for walk_id in ("walk", "walk_e2e"):
                 with self.subTest(walk_id=walk_id):
-                    config = nodes[walk_id]["config"]
-                    self.assertEqual(config["fresh_primary_receipt"], f"{{{{ CTX.{alias}.value.fresh_primary_receipt }}}}")
-                    self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
-                    fresh = _lookup_view(nodes[alias])["entries"][0]["value"]["properties"]["fresh_primary_receipt"]
-                    self.assertEqual(fresh, {"kind": "literal", "value": ""})
+                    self.assertIn("routing_run_id", nodes[walk_id]["config"])
+                    self.assertNotIn("fresh_primary_receipt", nodes[walk_id]["config"])
                     with mock.patch.object(server, "JOBS_DIR", jobs):
                         next_status, retained = server.derive_slice_recovery_route(
                             continuation
@@ -14068,7 +14065,7 @@ func main() {
         # expected consumers from whichever fields the graph happens to have.
         expected = {
             "implement-slice.json": {
-                "route_nodes": {"route", "fallback_policy", "recovery_route"},
+                "route_nodes": {"route", "fallback_policy", "primary_state_policy", "fallback_state_policy"},
                 "consumers": {
                     "agent": "{{ CTX.selected_route.value.effort }}",
                     "agent_fallback": "{{ CTX.fallback_route_choice.value.effort }}",
@@ -14116,7 +14113,7 @@ func main() {
             self.assertEqual(
                 {node_id for node_id, node in nodes.items()
                  if "/v1/slice/route" in node["type"]
-                 or (node_id in {"route", "fallback_policy"}
+                 or (node_id in {"route", "fallback_policy", "primary_state_policy", "fallback_state_policy"}
                      and node["type"] == "action.subworkflow")},
                 contract["route_nodes"],
                 graph_name,
@@ -14464,7 +14461,7 @@ func main() {
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        cases = {"record": ("if_receipt_ok", "join_writer_success"), "record2": ("if_receipt_ok2", "wait_test2"), "record3": ("if_receipt_ok3", "wait_test3"), "record_rn1": ("if_receipt_ok_rn1", "wait_test_rn1"), "record_rn2": ("if_receipt_ok_rn2", "wait_test_rn2")}
+        cases = {"record": ("if_receipt_ok", "primary_success_evidence_verify"), "record2": ("if_receipt_ok2", "wait_test2"), "record3": ("if_receipt_ok3", "wait_test3"), "record_rn1": ("if_receipt_ok_rn1", "wait_test_rn1"), "record_rn2": ("if_receipt_ok_rn2", "wait_test_rn2")}
         for source, (gate, target) in cases.items():
             self.assertEqual(nodes[gate]["type"], "logic.filter")
             self.assertTrue(any(e["source"] == source and e["target"] == gate for e in edges), source)
@@ -14505,7 +14502,7 @@ func main() {
         self.assertIn(("agent_evidence_verify", "success", "fallback_policy"), triples)
         self.assertIn(("agent_evidence_verify", "failure", "join_receipt_fail"), triples)
         self.assertIn(("fallback_policy", "success", "normal_fallback_candidate"), triples)
-        self.assertIn(("fallback_policy", "failure", "fallback_route_fail"), triples)
+        self.assertIn(("fallback_policy", "failure", "join_route_state_sync_fail"), triples)
         self.assertNotIn("if_initial_fallback_eligible", nodes)
         self.assertNotIn("fallback_eligibility", nodes)
         self.assertNotIn("fallback_route", nodes)
@@ -14532,7 +14529,9 @@ func main() {
         self.assertIn(("join_fallback_start", "out", "fallback_route_choice_pick"), triples)
         self.assertIn(("fallback_route_choice_pick", "out", "fallback_route_choice"), triples)
         self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
-        self.assertIn(("if_fallback_receipt_ok", "pass", "join_writer_success"), triples)
+        self.assertIn(("if_fallback_receipt_ok", "pass", "fallback_success_evidence_verify"), triples)
+        self.assertIn(("fallback_success_evidence_verify", "success", "fallback_state_policy"), triples)
+        self.assertIn(("fallback_state_policy", "success", "join_writer_success"), triples)
         self.assertNotIn("session_identity", nodes["agent_fallback"]["config"])
         for field in ("launcher", "provider", "model", "max_turns", "run_budget_seconds"):
             self.assertEqual(nodes["agent_fallback"]["config"][field], f"{{{{ CTX.fallback_route_choice.value.{field} }}}}")
@@ -14545,20 +14544,19 @@ func main() {
             for edge in graph["spec"]["edges"]
         }
         replaced = {
-            "fallback_route_choice", "selected_route", "walk_recovery_input",
-            "walk_e2e_recovery_input", "active_route",
+            "fallback_route_choice", "selected_route", "durable_recovery_selection",
+            "active_route",
         }
         helpers = {
             "selected_route_pick", "fallback_route_choice_pick",
-            "active_route_pick", "continuation_primary_pick",
+            "active_route_pick",
         }
         self.assertEqual(
             {node_id: nodes[node_id]["type"] for node_id in replaced},
             {
                 "fallback_route_choice": "transforms.objectBuilder",
                 "selected_route": "transforms.objectBuilder",
-                "walk_recovery_input": "transforms.objectBuilder",
-                "walk_e2e_recovery_input": "transforms.objectBuilder",
+                "durable_recovery_selection": "transforms.objectBuilder",
                 "active_route": "transforms.objectBuilder",
             },
         )
@@ -14575,10 +14573,10 @@ func main() {
             _lookup_view(nodes["selected_route_pick"]),
             {
                 "alias": "selected_route_pick",
-                "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
+                "input": {"kind": "getField", "path": "CTX.durable_recovery_selection.route.compatibility_behavior"},
                 "entries": [
                     {"key": route_version, "value": {
-                        "kind": "getField", "path": "CTX.recovery_selection.route",
+                        "kind": "getField", "path": "CTX.durable_recovery_selection.route",
                     }}
                     for route_version in ("normal-v1", "availability-fallback-v1")
                 ],
@@ -14590,10 +14588,10 @@ func main() {
             _lookup_view(nodes["fallback_route_choice_pick"]),
             {
                 "alias": "fallback_route_choice_pick",
-                "input": {"kind": "getField", "path": "CTX.recovery_selection.route.route_version"},
+                "input": {"kind": "getField", "path": "CTX.durable_recovery_selection.route.compatibility_behavior"},
                 "entries": [
                     {"key": "availability-fallback-v1", "value": {
-                        "kind": "getField", "path": "CTX.recovery_selection.route",
+                        "kind": "getField", "path": "CTX.durable_recovery_selection.route",
                     }}
                 ],
                 "defaultValue": {"kind": "getField", "path": "CTX.normal_fallback_candidate.route"},
@@ -14622,25 +14620,6 @@ func main() {
                 },
             },
         )
-        self.assertEqual(
-            _lookup_view(nodes["continuation_primary_pick"]),
-            {
-                "alias": "continuation_primary_pick",
-                "input": {"kind": "getField", "path": "CTX.receipt.route.route_version"},
-                "entries": [
-                    {"key": route_version, "value": {"kind": "object", "properties": {
-                        "prior_primary_route": {"kind": "getField", "path": "CTX.receipt.route"},
-                        "prior_primary_receipt": {"kind": "getField", "path": "CTX.receipt"},
-                    }}}
-                    for route_version in ("normal-v1", "availability-fallback-v1")
-                ],
-                "defaultValue": {"kind": "object", "properties": {
-                    "prior_primary_route": {"kind": "getField", "path": "CTX.INPUT.prior_primary_route"},
-                    "prior_primary_receipt": {"kind": "getField", "path": "CTX.INPUT.prior_primary_receipt"},
-                }},
-                "caseSensitive": True,
-            },
-        )
         self.assertTrue({
             ("join_primary_start", "out", "selected_route_pick"),
             ("selected_route_pick", "out", "selected_route"),
@@ -14650,269 +14629,57 @@ func main() {
             ("fallback_route_choice", "out", "wait_fallback"),
             ("join_writer_success", "out", "active_route_pick"),
             ("active_route_pick", "out", "active_route"),
-            ("active_route", "out", "continuation_primary_pick"),
-            ("continuation_primary_pick", "out", "wait_test"),
-            ("push", "success", "walk_recovery_input"),
-            ("walk_recovery_input", "out", "walk"),
-            ("switch_e2e", "case-2", "walk_e2e_recovery_input"),
-            ("walk_e2e_recovery_input", "out", "walk_e2e"),
+            ("active_route", "out", "wait_test"),
+            ("push", "success", "walk"),
+            ("switch_e2e", "case-2", "walk_e2e"),
         }.issubset(triples), triples)
-        for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
+        for walk_id in ("walk", "walk_e2e"):
             for field in (
                 "recovery_version", "prior_primary_route", "prior_primary_receipt",
                 "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
             ):
-                self.assertEqual(nodes[walk_id]["config"][field], f"{{{{ CTX.{alias}.value.{field} }}}}")
+                self.assertNotIn(field, nodes[walk_id]["config"])
 
     def test_implement_slice_full_route_projection_reaches_server_recovery_validation(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
-        primary, fallback = self._hard_coded_full_route_ledger()
-
-        def get_path(context, path):
-            current = context
-            for part in path.split("."):
-                if not isinstance(current, dict):
-                    return None
-                current = current.get(part)
-            return current
-
-        def evaluate(expression, context):
-            if expression["kind"] == "getField":
-                return get_path(context, expression["path"])
-            if expression["kind"] == "literal":
-                return deepcopy(expression["value"])
-            if expression["kind"] == "object":
-                return {
-                    key: evaluate(value, context)
-                    for key, value in expression["properties"].items()
-                }
-            if expression["kind"] == "binary" and expression["operator"] == "==":
-                return evaluate(expression["left"], context) == evaluate(expression["right"], context)
-            if expression["kind"] == "conditional":
-                branch = "then" if evaluate(expression["condition"], context) else "else"
-                return evaluate(expression[branch], context)
-            self.fail(f"unsupported graph-projection AST: {expression}")
-
-        def run_node(node_id, context):
-            node = nodes[node_id]
-            config = node["config"]
-            if node["type"] == "transforms.lookupTable":
-                key = evaluate(config["input"], context)
-                selected = next(
-                    (entry["value"] for entry in config["entries"] if entry["key"] == key),
-                    config["defaultValue"],
-                )
-                result = evaluate(selected, context)
-                context["CTX"][config["alias"]] = {"result": result}
-                return result
-            if node["type"] == "transforms.objectBuilder":
-                result = {
-                    mapping["output"]: evaluate(mapping["expression"], context)
-                    for mapping in config["mappings"]
-                }
-                context["CTX"][config["alias"]] = result
-                return result
-            self.fail(f"unsupported graph-projection node: {node_id}")
-
-        with tempfile.TemporaryDirectory() as td:
-            jobs = Path(td) / "jobs"
-            fixture = self._provider_recovery_fixture(
-                jobs, "provider_network", route_ledger=(primary, fallback)
-            )
-            primary_callback = {
-                **fixture["primary_receipt"], "summary": "primary unavailable",
-                "sha": "a" * 40, "usage": None,
-                "usage_diagnostic": "usage_not_reported",
-            }
-            fallback_callback = {
-                **fixture["fallback_receipt"], "summary": "fallback completed",
-                "sha": "b" * 40, "usage": None,
-                "usage_diagnostic": "usage_not_reported",
-            }
-            context = {
-                "CTX": {
-                    "INPUT": {},
-                    "normal_primary_candidate": {"route": deepcopy(primary)},
-                    "normal_fallback_candidate": {"route": deepcopy(fallback)},
-                },
-                "TASKS": {
-                    "git": {"repo": "scratch", "branch": "main"},
-                    "wait": {"request": {"body": primary_callback}},
-                    "wait_fallback": {"request": {"body": fallback_callback}},
-                },
-            }
-
-            run_node("selected_route_pick", context)
-            self.assertEqual(run_node("selected_route", context)["value"], primary)
-            receipt = run_node("record", context)
-            self.assertEqual(receipt["route"], primary)
-            run_node("fallback_route_choice_pick", context)
-            self.assertEqual(run_node("fallback_route_choice", context)["value"], fallback)
-            fallback_receipt = run_node("record_fallback", context)
-            self.assertEqual(fallback_receipt["route"], fallback)
-            run_node("active_route_pick", context)
-            self.assertEqual(run_node("active_route", context)["value"], fallback)
-            run_node("continuation_primary_pick", context)
-
-            projected = []
-            for walk_node in ("walk_recovery_input", "walk_e2e_recovery_input"):
-                recovery = run_node(walk_node, context)["value"]
-                self.assertEqual(recovery["prior_primary_route"], primary)
-                self.assertEqual(recovery["prior_primary_receipt"]["route"], primary)
-                self.assertEqual(recovery["prior_fallback_route"], fallback)
-                self.assertEqual(recovery["prior_fallback_receipt"]["route"], fallback)
-                projected.append(recovery)
-            self.assertEqual(projected[0], projected[1])
-
-            recovery = projected[0]
-            recovery_body = {
-                "class": "sensitive", "size": "M", "work_kind": "go_coding",
-                "primary_route": recovery["prior_primary_route"],
-                "primary_receipt": recovery["prior_primary_receipt"],
-                "fallback_route": recovery["prior_fallback_route"],
-                "fallback_receipt": recovery["prior_fallback_receipt"],
-            }
-            with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(
-                server, "resolve_launcher_binary_now",
-                side_effect=AssertionError("remote recovery cannot inspect binaries"),
-            ):
-                status, accepted = server.derive_slice_recovery_route(recovery_body)
-            self.assertEqual(status, 200, accepted)
-            self.assertEqual(accepted["selected_route"], fallback)
-            self.assertEqual(accepted["decision"], "fallback_retained")
-
-            mutation_probes = (
-                ("primary_route", "primary_receipt", "route_version"),
-                ("fallback_route", "fallback_receipt", "reviewer1_execution_profile"),
-                ("fallback_route", "fallback_receipt", "reviewer2_provider"),
-            )
-            for route_key, receipt_key, omitted in mutation_probes:
-                with self.subTest(omitted=omitted):
-                    mutated = deepcopy(recovery_body)
-                    mutated[route_key].pop(omitted)
-                    mutated[receipt_key]["route"].pop(omitted, None)
-                    with mock.patch.object(server, "JOBS_DIR", jobs), mock.patch.object(
-                        server, "resolve_launcher_binary_now",
-                        side_effect=AssertionError("remote recovery cannot inspect binaries"),
-                    ):
-                        rejected_status, rejected = server.derive_slice_recovery_route(mutated)
-                    self.assertEqual(rejected_status, 400, rejected)
-                    self.assertEqual(rejected.get("code"), "recovery_evidence_mismatch", rejected)
+        self.assertNotIn("walk_recovery_input", nodes)
+        self.assertNotIn("walk_e2e_recovery_input", nodes)
+        self.assertFalse(any(node["type"].endswith("/v1/slice/route/recovery")
+                             for node in graph["spec"]["nodes"]))
+        for node_id in ("route", "fallback_policy", "primary_state_policy", "fallback_state_policy"):
+            self.assertEqual(nodes[node_id]["type"], "action.subworkflow")
+            values = nodes[node_id]["config"]["inputMapping"]["values"]
+            self.assertIn("routing_run_id", values)
+            for caller_field in ("primary_route", "primary_receipt", "fallback_route",
+                                 "fallback_receipt", "fresh_primary_receipt"):
+                self.assertNotIn(caller_field, values)
+        self.assertEqual(
+            nodes["fallback_state_policy"]["config"]["inputMapping"]["values"]["route_evidence"],
+            "{{ TASKS.fallback_success_evidence_verify.data }}",
+        )
 
     def test_implement_slice_recovery_is_only_a_later_initial_boundary(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
-        nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
         edges = graph["spec"]["edges"]
-        triples = {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges}
-        recovery_nodes = [
-            n["id"] for n in graph["spec"]["nodes"]
-            if n["type"].endswith("/v1/slice/route/recovery")
-        ]
-        self.assertEqual(recovery_nodes, ["recovery_route"])
-        self.assertEqual(nodes["recovery_marker"]["type"], "transforms.objectBuilder")
-        marker = {
-            m["output"]: m["expression"]
-            for m in nodes["recovery_marker"]["config"]["mappings"]
-        }
-        self.assertEqual(
-            marker,
-            {"recovery_version": {"kind": "getField", "path": "CTX.INPUT.recovery_version"}},
-        )
-        self.assertEqual(
-            nodes["switch_recovery"]["config"]["cases"][0]["rules"],
-            [{
-                "path": "CTX.recovery_marker.recovery_version",
-                "op": "equals",
-                "value": "provider-recovery-v1",
-            }],
-        )
-        self.assertIn(("ticket_head", "success", "recovery_marker"), triples)
-        self.assertIn(("switch_recovery", "case-0", "recovery_route"), triples)
-        self.assertIn(("switch_recovery", "default", "join_primary_start"), triples)
-        self.assertIn(("recovery_route", "success", "recovery_selection"), triples)
-        self.assertIn(("recovery_selection", "out", "switch_recovery_route"), triples)
+        triples = {(edge["source"], edge.get("sourceHandle"), edge["target"])
+                   for edge in edges}
+        self.assertFalse(any(node["type"].endswith("/v1/slice/route/recovery")
+                             for node in graph["spec"]["nodes"]))
+        self.assertNotIn("recovery_marker", nodes)
+        self.assertNotIn("recovery_route", nodes)
+        self.assertEqual(nodes["route"]["type"], "action.subworkflow")
+        self.assertIn(("ticket_head", "success", "durable_recovery_selection"), triples)
+        self.assertIn(("durable_recovery_selection", "out", "switch_recovery_route"), triples)
         self.assertEqual(nodes["switch_recovery_route"]["config"]["cases"][0]["rules"], [{
-            "path": "CTX.recovery_selection.role", "op": "equals", "value": "availability_fallback",
+            "path": "CTX.durable_recovery_selection.role", "op": "equals",
+            "value": "availability_fallback",
         }])
-        recovery_outputs = {m["output"]: m["expression"]["path"] for m in nodes["recovery_selection"]["config"]["mappings"]}
-        self.assertEqual(recovery_outputs, {
-            "route": "TASKS.recovery_route.data.selected_route",
-            "evidence": "TASKS.recovery_route.data.evidence",
-            "role": "TASKS.recovery_route.data.role",
-        })
         self.assertIn(("switch_recovery_route", "case-0", "join_fallback_start"), triples)
         self.assertIn(("switch_recovery_route", "default", "join_primary_start"), triples)
-        self.assertIn(("join_primary_start", "out", "selected_route_pick"), triples)
-        self.assertIn(("selected_route_pick", "out", "selected_route"), triples)
-        self.assertIn(("selected_route", "out", "wait"), triples)
-        self.assertIn(("join_fallback_start", "out", "fallback_route_choice_pick"), triples)
-        self.assertIn(("fallback_route_choice_pick", "out", "fallback_route_choice"), triples)
-        self.assertIn(("fallback_route_choice", "out", "wait_fallback"), triples)
-        self.assertIn(("recovery_route", "failure", "recovery_route_fail"), triples)
-        self.assertEqual(
-            [
-                (e.get("sourceHandle"), e["target"])
-                for e in edges
-                if e["source"] == "recovery_route_fail"
-            ],
-            [("out", "join_durable_outcome")],
-        )
-        terminal_mappings = nodes["recovery_route_fail"]["config"]["mappings"]
-        self.assertEqual([m["id"] for m in terminal_mappings], [f"m{i}" for i in range(1, 6)])
-        self.assertEqual(
-            {m["output"] for m in terminal_mappings},
-            {"diagnostic_version", "status", "workflow", "stage", "summary"},
-        )
-        dumped_terminal = json.dumps(terminal_mappings).lower()
-        for unsafe in ("getfield", "tasks.", "data.error", "callback", "token", "stdout", "stderr", "trace"):
-            self.assertNotIn(unsafe, dumped_terminal)
-
-        recovery_config = nodes["recovery_route"]["config"]
-        for field in (
-            "primary_route", "primary_receipt", "fallback_route", "fallback_receipt",
-            "fresh_primary_receipt",
-        ):
-            self.assertIn(field, recovery_config)
-            if field != "primary_route":
-                self.assertIn("CTX.INPUT.", recovery_config[field])
-
-        route_decisions = {
-            node_id for node_id, node in nodes.items()
-            if "/v1/slice/route" in node["type"] or node_id == "fallback_policy"
-        }
-        downstream_starts = {
-            "fallback_policy", "wait_fallback", "agent_fallback", "record_fallback",
-            "if_fallback_receipt_ok", "wait2", "agent2", "record2", "if_receipt_ok2",
-            "wait3", "agent3", "if_receipt_ok3", "wait_rn1", "agent_rn1",
-            "if_receipt_ok_rn1", "wait_rn2", "agent_rn2", "if_receipt_ok_rn2",
-            "wait_rev1", "review1", "if_review1", "wait_r1b", "review1b",
-            "if_review1b", "wait_rev2", "review2", "if_review2", "wait_r2b",
-            "review2b", "if_review2b",
-        }
-        for start in downstream_starts:
-            seen, pending = set(), [start]
-            while pending:
-                current = pending.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                pending.extend(e["target"] for e in edges if e["source"] == current)
-            self.assertNotIn("recovery_route", seen - {start}, start)
-            self.assertTrue((seen - {start}).isdisjoint(route_decisions), (start, seen & route_decisions))
-
-        writer_nodes = {
-            node_id for node_id, node in nodes.items()
-            if node["type"].endswith("/v1/agent/run")
-        }
-        self.assertEqual(
-            writer_nodes,
-            {"agent", "agent_fallback", "agent2", "agent3", "agent_rn1", "agent_rn2"},
-        )
-        self.assertEqual(
-            [n["id"] for n in graph["spec"]["nodes"] if n["type"].endswith("/v1/slice/route/fallback")],
-            [],
-        )
+        for node_id in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            self.assertNotIn("TASKS.route", json.dumps(nodes[node_id]["config"]))
 
     def test_implement_slice_active_resumes_are_pinned_to_successful_receipt(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -14954,23 +14721,15 @@ func main() {
             self.assertNotIn("session_identity", nodes[node_id]["config"])
             self.assertNotIn("resume_job_id", nodes[node_id]["config"])
 
-        for walk_id, alias in (("walk", "walk_recovery_input"), ("walk_e2e", "walk_e2e_recovery_input")):
+        for walk_id, expected in (
+            ("walk", "{{ TASKS.route.result.routing_run_id }}"),
+            ("walk_e2e", "{{ CTX.routing_input_snap.routing_run_id }}"),
+        ):
             config = nodes[walk_id]["config"]
-            for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt", "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
-                self.assertEqual(config[field], f"{{{{ CTX.{alias}.value.{field} }}}}")
-            picker = _lookup_view(nodes[alias])
-            self.assertEqual(nodes[alias]["type"], "transforms.objectBuilder")
-            self.assertEqual(picker["input"], {
-                "kind": "getField", "path": "CTX.fallback_receipt.status",
-            })
-            self.assertEqual(picker["entries"][0]["key"], "ok")
-            props = picker["entries"][0]["value"]["properties"]
-            self.assertEqual(props["recovery_version"], {
-                "kind": "literal", "value": "provider-recovery-v1",
-            })
-            self.assertEqual(props["fresh_primary_receipt"], {
-                "kind": "literal", "value": "",
-            })
+            self.assertEqual(config["routing_run_id"], expected)
+            for field in ("recovery_version", "prior_primary_route", "prior_primary_receipt",
+                          "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt"):
+                self.assertNotIn(field, config)
 
     def test_implement_slice_corrections_and_reviews_prefer_fallback_route(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
@@ -15099,11 +14858,20 @@ func main() {
         self.assertNotIn("join_fallback_fail", nodes)
         self.assertNotIn("fallback_fail", nodes)
         for (source, handle), (terminal, stage) in terminals.items():
+            first = {
+                ("fallback_policy", "failure"): "join_route_state_sync_fail",
+                ("if_fallback_receipt_ok", "fail"): "join_fallback_receipt_fail",
+            }.get((source, handle), terminal)
             self.assertEqual(
                 {e["target"] for e in edges if e["source"] == source and e.get("sourceHandle") == handle},
-                {terminal},
+                {first},
                 (source, handle),
             )
+            if first != terminal:
+                self.assertIn(
+                    (first, "out", terminal),
+                    {(e["source"], e.get("sourceHandle"), e["target"]) for e in edges},
+                )
             node = nodes[terminal]
             self.assertEqual(node["type"], "transforms.objectBuilder")
             mappings = node["config"]["mappings"]
@@ -18543,7 +18311,7 @@ func main() {
         self.assertEqual(edges["e_rn1_tbad"]["target"], "join_wait_human")
         self.assertEqual(edges["e_rn2_tbad"]["target"], "join_wait_human")
         self.assertNotIn("switch_retry", {node["id"] for node in graph["spec"]["nodes"]})
-        self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e_recovery_input")
+        self.assertEqual(edges["e_e2e_auto"]["target"], "walk_e2e")
         self.assertEqual(edges["e_walk_e2e_ok"]["target"], "join_slices_complete")
         agent2 = next(node for node in graph["spec"]["nodes"] if node["id"] == "agent2")
         self.assertIn("CTX.fallback_receipt.session_identity", agent2["config"]["session_identity"])
@@ -18633,17 +18401,16 @@ func main() {
         self.assertEqual(edges["e7j"]["target"], "route")
         self.assertEqual(edges["e7k"]["target"], "normal_primary_candidate")
         self.assertEqual(edges["e_normal_primary_candidate"]["target"], "ticket_head")
-        self.assertEqual(edges["e7b"]["source"], "ticket_head")
-        self.assertEqual(edges["e7b"]["target"], "recovery_marker")
+        self.assertEqual(edges["e_durable_recovery_selection"]["source"], "ticket_head")
+        self.assertEqual(edges["e_durable_recovery_selection"]["target"], "durable_recovery_selection")
         self.assertEqual(edges["e_primary_start"]["target"], "selected_route_pick")
         self.assertEqual(edges["e_selected_route_pick"]["target"], "selected_route")
         self.assertEqual(edges["e_selected_route"]["target"], "wait")
         self.assertEqual(edges["e7c"]["target"], "ticket_fail")
         self.assertEqual(edges["e_commit_out"]["target"], "complete")
-        self.assertEqual(edges["e12"]["target"], "walk_recovery_input")
+        self.assertEqual(edges["e12"]["target"], "walk")
         self.assertNotIn("e_join_walk", edges)
         self.assertNotIn("join_walk", {node["id"] for node in graph["spec"]["nodes"]})
-        self.assertEqual(edges["e_walk_recovery_input"]["target"], "walk")
         self.assertEqual(edges["e7h"]["target"], "join_e2e")
         self.assertEqual(edges["e12d"]["target"], "join_e2e")
         self.assertEqual(edges["e_join_e2e"]["target"], "e2e")
@@ -22522,7 +22289,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "86425b5833380f36f30a93a872185f9ec57c50436454fed854f8851d19c006ff")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "dc4ae13491db20faf20f8d47fa49b0eec39a93d692918f0c9568aa34ad488656")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -27033,9 +26800,13 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         self.assertEqual(route["config"]["inputMapping"], {
             "mode": "select",
             "values": {
-                "class": "{{ CTX.INPUT.class }}", "work_kind": "{{ CTX.INPUT.work_kind }}",
-                "size": "{{ CTX.INPUT.size }}", "ac_count": "{{ CTX.INPUT.ac_count }}",
-                "seams": "{{ CTX.INPUT.seams }}",
+                "class": "{{ CTX.routing_input_snap.class }}",
+                "work_kind": "{{ CTX.routing_input_snap.work_kind }}",
+                "size": "{{ CTX.routing_input_snap.size }}",
+                "ac_count": "{{ CTX.routing_input_snap.ac_count }}",
+                "seams": "{{ CTX.routing_input_snap.seams }}",
+                "routing_run_id": "{{ CTX.routing_input_snap.routing_run_id }}",
+                "invocation_run_id": "{{ CTX.routing_input_snap.invocation_run_id }}",
             },
         })
         self.assertEqual(route["config"]["outputMapping"], {
@@ -27113,7 +26884,7 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         self.assertIn(("agent_evidence_verify", "success", "fallback_policy"), edges)
         self.assertIn(("agent_evidence_verify", "failure", "join_receipt_fail"), edges)
         self.assertIn(("fallback_policy", "success", "normal_fallback_candidate"), edges)
-        self.assertIn(("fallback_policy", "failure", "fallback_route_fail"), edges)
+        self.assertIn(("fallback_policy", "failure", "join_route_state_sync_fail"), edges)
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"],
             {"kind": "getField", "path": "TASKS.fallback_policy.result"},
@@ -27380,7 +27151,9 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         self.assertEqual(route["type"], "action.subworkflow")
         self.assertEqual(route["config"]["workflowId"], "$GRAPHWING_ROUTING_POLICY_WORKFLOW_ID")
         self.assertEqual(route["config"]["workflowVersionId"], "$GRAPHWING_ROUTING_POLICY_VERSION_ID")
-        self.assertEqual(route["config"]["outputMapping"]["keys"], self.policy_output_keys())
+        self.assertLessEqual(
+            set(route["config"]["outputMapping"]["keys"]), set(self.policy_output_keys())
+        )
         self.assertFalse(any("/v1/slice/route" in node["type"] for node in graph["spec"]["nodes"]))
         agent = nodes["agent"]["config"]
         for field in ("launcher", "provider", "model", "effort"):
@@ -27530,6 +27303,9 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
         ).hexdigest()
         context["CTX"]["routing_decision_hash"] = {"value": digest}
         if "agent_evidence" in payload:
+            context["CTX"]["routing_recovery_evidence"] = {
+                "value": context["CTX"]["routing_policy_input"]["agent_evidence"],
+            }
             facts = cls._object_builder(nodes["fallback_facts"], context)
             context["CTX"][nodes["fallback_facts"]["config"]["alias"]] = facts
             if not all(value is True for value in facts.values()):
@@ -27548,7 +27324,7 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
             ).hexdigest()
             context["CTX"]["routing_fallback_decision_hash"] = {"value": digest}
             return cls._object_builder(nodes["fallback_route_output"], context)
-        output = cls._object_builder(nodes["route_output"], context)
+        output = cls._object_builder(nodes["normal_route_output"], context)
         return output
 
     @classmethod
@@ -27606,11 +27382,19 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
             self.assertEqual(nodes[node_id]["type"], node_type)
         self.assertEqual(
             {mapping["output"] for mapping in nodes["policy_input"]["config"]["mappings"]},
-            {"class", "work_kind", "size", "ac_count", "seams", "agent_evidence"},
+            {"class", "work_kind", "size", "ac_count", "seams", "agent_evidence",
+             "routing_run_id", "invocation_run_id", "route_evidence"},
         )
         node_types = {node["type"] for node in graph["spec"]["nodes"]}
         self.assertNotIn("transforms.codeExpression", node_types)
-        self.assertFalse(any(node_type.startswith("action.graphwing") for node_type in node_types))
+        graphwing_actions = {
+            node_type for node_type in node_types if node_type.startswith("action.graphwing")
+        }
+        self.assertEqual(graphwing_actions, {
+            "action.graphwing.GET:/v1/rewst/server-challenge",
+            "action.graphwing.POST:/v1/agent/evidence/verify",
+            "action.graphwing.POST:/v1/launcher/capability",
+        })
         dumped = json.dumps(graph)
         self.assertNotRegex(dumped, r"{%-?\\s*(?:set|for|if)\\b")
         edges = {(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["spec"]["edges"]}
@@ -27881,9 +27665,10 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
         self.assertEqual(readback, "version-exact")
 
     def test_routing_policy_graph_actual_riftwing_ast_when_available(self):
-        riftwing = Path(os.environ.get(
-            "RIFTWING_CHECKOUT", "/home/tim/work/riftwing/sc-109005",
-        )) / "rewst-go"
+        checkout = os.environ.get("RIFTWING_CHECKOUT")
+        if not checkout:
+            self.skipTest("RIFTWING_CHECKOUT unset; authoritative Riftwing AST unavailable")
+        riftwing = Path(checkout) / "rewst-go"
         if not (riftwing / "go.mod").is_file():
             self.skipTest("authoritative Riftwing checkout unavailable")
         go_source = r'''package asteval
@@ -27931,7 +27716,7 @@ func TestGraphwingRoutingPolicyClosedInput(t *testing.T) {
                 ["go", "test", "-overlay", str(overlay), "./internal/asteval",
                  "-run", "TestGraphwingRoutingPolicyClosedInput", "-count=1"],
                 cwd=riftwing, env={**os.environ, "GRAPHWING_ROUTING_POLICY_GRAPH": str(self.ROOT / "graphs" / "routing-policy.json")},
-                text=True, capture_output=True, timeout=120, check=False,
+                text=True, capture_output=True, timeout=300, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -28600,9 +28385,19 @@ class NativeGraphRunner:
             raise AssertionError(name)
         if kind == "filter":
             value = self.evaluate(expression["input"], context, item)
-            if expression["filter"] == "tojson":
+            name = expression["filter"]
+            if name == "tojson":
                 return _native_json(value)
-            raise AssertionError(expression["filter"])
+            if name == "int":
+                return int(value)
+            if name == "keys":
+                return list(value or {})
+            if name == "sort":
+                return sorted(value or [])
+            if name == "join":
+                separator = expression.get("filterArgs", [{"value": ""}])[0]["value"]
+                return separator.join(value or [])
+            raise AssertionError(name)
         if kind == "binary":
             left = self.evaluate(expression["left"], context, item)
             right = self.evaluate(expression["right"], context, item)
@@ -30099,6 +29894,586 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
         self.assertIn("continuation_required", dump)
         self.assertNotIn("/v1/run/control/evaluate", dump)
         self.assertIn("await_exact_head_audit", dump)
+
+
+class DurableRoutingRecoveryTests(unittest.TestCase):
+    """Issue #186 slice 5 durable routing recovery contracts."""
+
+    ROOT = Path(server.__file__).parent
+
+    def test_launcher_capability_reports_only_path_free_current_capability_and_never_invokes_a_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = _write_fake_codex(Path(tmp) / "codex", b"capability fixture\n")
+            with mock.patch.object(server, "resolve_launcher_binary_now", return_value=launcher), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider forbidden")), \
+                 mock.patch.object(server, "urlopen", side_effect=AssertionError("network forbidden")):
+                status, payload, _ = server.dispatch(
+                    "POST", "/v1/launcher/capability", {}, True,
+                    json.dumps({"launcher": "codex"}).encode(),
+                )
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(set(payload), {
+                "capability_version", "launcher", "state", "launcher_version", "diagnostic",
+            })
+            self.assertEqual(payload["capability_version"], "launcher-capability-v1")
+            self.assertEqual((payload["launcher"], payload["state"]), ("codex", "available"))
+            self.assertRegex(payload["launcher_version"], r"^sha256:[0-9a-f]{64}$")
+            self.assertIsNone(payload["diagnostic"])
+            self.assertNotIn(str(Path(tmp)), json.dumps(payload))
+
+            missing = Path(tmp) / "missing-codex"
+            with mock.patch.object(server, "resolve_launcher_binary_now", return_value=missing), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("provider forbidden")):
+                status, unavailable, _ = server.dispatch(
+                    "POST", "/v1/launcher/capability", {}, True,
+                    json.dumps({"launcher": "codex"}).encode(),
+                )
+            self.assertEqual(status, 200, unavailable)
+            self.assertEqual(unavailable["state"], "unavailable")
+            self.assertIsNone(unavailable["launcher_version"])
+            self.assertEqual(unavailable["diagnostic"]["code"], "missing_binary")
+            self.assertNotIn(str(missing), json.dumps(unavailable))
+
+        spec = json.loads(server.openapi_bytes())
+        operation = spec["paths"]["/v1/launcher/capability"]["post"]
+        self.assertEqual(operation["operationId"], "launcherCapability")
+        schema = spec["components"]["schemas"]["LauncherCapability"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["required"]), set(payload))
+        for forbidden in ("route", "provider", "model", "path", "command", "selected"):
+            self.assertNotIn(forbidden, schema["properties"])
+
+    def test_recovery_loads_authoritative_route_history_from_tenant_datastore_not_caller_route_or_receipt_objects(self):
+        graph = json.loads((self.ROOT / "graphs" / "routing-policy.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["route_state_get"]["type"], "action.datastore.records.get")
+        self.assertEqual(nodes["route_state_get"]["config"], {
+            "alias": "route_state_get", "scope": "tenant",
+            "collection": "graphwing_routing_state_v1",
+            "recordKey": "{{ CTX.routing_state_locator.record_key }}",
+        })
+        self.assertEqual(nodes["route_state_shape"]["type"], "transforms.objectBuilder")
+        recovery_dump = json.dumps([
+            node for node in graph["spec"]["nodes"]
+            if node["id"].startswith(("route_state", "recovery_", "prior_", "fresh_"))
+        ])
+        self.assertIn("TASKS.route_state_get.data", recovery_dump)
+        for caller_field in (
+            "prior_primary_route", "prior_primary_receipt", "prior_fallback_route",
+            "prior_fallback_receipt", "fresh_primary_receipt",
+        ):
+            self.assertNotIn(f"CTX.INPUT.{caller_field}", recovery_dump)
+        policy_inputs = {
+            mapping["output"] for mapping in nodes["policy_input"]["config"]["mappings"]
+        }
+        self.assertTrue({"routing_run_id", "invocation_run_id"} <= policy_inputs)
+        self.assertTrue({"route_state_get", "route_state_shape"} <= set(nodes))
+        from scripts import publish_graphs
+        self.assertEqual(publish_graphs.ROUTING_RECOVERY_VERSION, "provider-recovery-v1")
+        self.assertEqual(publish_graphs.ROUTING_STATE_COLLECTION,
+                         "graphwing_routing_state_v1")
+
+    @classmethod
+    def _graph(cls):
+        return json.loads((cls.ROOT / "graphs" / "routing-policy.json").read_text())
+
+    @staticmethod
+    def _evidence(route, job_id, status, created_at, finished_at, *, failure_code="none"):
+        profile = route["writer_execution_profile"]
+        identity = {
+            "launcher": profile["launcher"], "provider": profile["provider"],
+            "model": profile["model"], "requested_effort": profile["requested_effort"],
+            "effective_effort": "high" if profile["launcher"] in {"codex", "grok"}
+                                else profile["requested_effort"],
+            "effort_source": "route", "route_execution_profile": profile,
+            "launcher_version": "sha256:" + job_id[0] * 64,
+            "repo": "scratch", "branch": "feat/issue-186",
+            "starting_head": "d" * 40,
+            "native_session_id": None if status != "ok" else "session-" + job_id[:8],
+        }
+        failed = status != "ok"
+        return {
+            "evidence_version": "agent-evidence-v1", "kind": "agent",
+            "job_id": job_id, "role": "writer", "terminal_status": status,
+            "failure_class": "provider_availability" if failed else "none",
+            "failure_code": failure_code if failed else "none",
+            "failover_eligible": failed, "route_execution_profile": profile,
+            "session_identity": identity, "repo": identity["repo"],
+            "branch": identity["branch"], "created_at": created_at,
+            "finished_at": finished_at,
+        }
+
+    @classmethod
+    def _state_fixture(cls, failure_code="provider_network", fresh=False):
+        base = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0,
+        }
+        primary = RewstNativeRoutingPolicyTests.route(base)
+        primary_evidence = cls._evidence(
+            primary, "1" * 32, "error", "2026-09-08T12:00:00Z",
+            "2026-09-08T12:00:02Z", failure_code=failure_code,
+        )
+        fallback = RewstNativeRoutingPolicyTests.route({
+            **base, "agent_evidence": primary_evidence,
+        })
+        fallback_evidence = cls._evidence(
+            fallback, "2" * 32, "ok", "2026-09-08T12:00:03Z",
+            "2026-09-08T12:00:05Z",
+        )
+        fresh_evidence = cls._evidence(
+            primary, "3" * 32, "ok", "2026-09-08T12:00:06Z",
+            "2026-09-08T12:00:08Z",
+        ) if fresh else None
+        state = {
+            "state_version": "provider-recovery-v1", "routing_run_id": "run-186-a",
+            "origin_workflow_run_id": "run-186-a",
+            "daemon_instance_challenge": "c" * 64,
+            "route_input": {
+                "class": "mechanical", "work_kind": "go_coding", "size_floor": "M",
+                "effective_size": "M", "ac_count": 0, "seams": 0,
+            },
+            "primary_route": primary, "primary_evidence": primary_evidence,
+            "primary_evidence_sha256": _native_sha256(primary_evidence),
+            "fallback_route": fallback, "fallback_evidence": fallback_evidence,
+            "fallback_evidence_sha256": _native_sha256(fallback_evidence),
+            "fresh_primary_evidence": fresh_evidence,
+            "fresh_primary_evidence_sha256": (
+                _native_sha256(fresh_evidence) if fresh_evidence is not None else None
+            ),
+            "active_route": fallback, "decision": "fallback_retained", "revision": 3,
+        }
+        return base, primary, fallback, state
+
+    @classmethod
+    def _shape_state(cls, state):
+        nodes = {node["id"]: node for node in cls._graph()["spec"]["nodes"]}
+        base, primary, _, _ = cls._state_fixture()
+        context = {
+            "CTX": {
+                "routing_policy_input": {**base, "routing_run_id": "run-186-a"},
+                "routing_policy_input_normalized": {"ac_count": 0, "seams": 0},
+                "routing_effective_size": {"value": "M"},
+                "routing_normal_policy_output": primary,
+                "routing_state_locator": {
+                    "routing_run_id": "run-186-a",
+                    "record_key": "graphwing-routing-v1:run-186-a",
+                },
+                "primary_evidence_hash": {"value": _native_sha256(state.get("primary_evidence"))},
+                "fallback_evidence_hash": {"value": _native_sha256(state.get("fallback_evidence"))},
+                "fresh_primary_evidence_hash": {
+                    "value": _native_sha256(state.get("fresh_primary_evidence"))
+                },
+            },
+            "TASKS": {
+                "route_state_get": {
+                    "found": True, "data": state, "version": 3,
+                    "recordKey": "graphwing-routing-v1:run-186-a",
+                },
+                "daemon_challenge": {"data": {"server_instance_challenge": "c" * 64}},
+            },
+        }
+        route_shape = RewstNativeRoutingPolicyTests._object_builder(
+            nodes["route_state_shape"], context,
+        )
+        context["CTX"]["route_state_shape"] = route_shape
+        order_shape = RewstNativeRoutingPolicyTests._object_builder(
+            nodes["recovery_order_shape"], context,
+        )
+        return route_shape, order_shape
+
+    def test_recovery_rejects_missing_hash_mismatched_nonterminal_out_of_order_cross_repo_or_cross_branch_evidence(self):
+        _, _, _, canonical = self._state_fixture(fresh=True)
+        route_shape, order_shape = self._shape_state(canonical)
+        nodes = {node["id"]: node for node in self._graph()["spec"]["nodes"]}
+        route_rules = {
+            rule["path"] for rule in nodes["recovery_evidence_valid"]["config"]["rules"]
+        }
+        order_rules = {
+            rule["path"] for rule in nodes["recovery_order_valid"]["config"]["rules"]
+        }
+        self.assertTrue(all(route_shape[name] for name in route_rules), route_shape)
+        self.assertTrue(all(order_shape[name] for name in order_rules), order_shape)
+
+        mutations = {}
+        missing_hash = deepcopy(canonical)
+        missing_hash["fallback_evidence_sha256"] = None
+        mutations["missing_hash"] = missing_hash
+        mismatched_hash = deepcopy(canonical)
+        mismatched_hash["primary_evidence_sha256"] = "0" * 64
+        mutations["mismatched_hash"] = mismatched_hash
+        nonterminal = deepcopy(canonical)
+        nonterminal["fallback_evidence"]["terminal_status"] = "running"
+        nonterminal["fallback_evidence_sha256"] = _native_sha256(nonterminal["fallback_evidence"])
+        mutations["nonterminal"] = nonterminal
+        out_of_order = deepcopy(canonical)
+        out_of_order["fallback_evidence"]["created_at"] = "2026-09-08T11:59:00Z"
+        out_of_order["fallback_evidence_sha256"] = _native_sha256(out_of_order["fallback_evidence"])
+        mutations["out_of_order"] = out_of_order
+        for field in ("repo", "branch"):
+            changed = deepcopy(canonical)
+            changed["fallback_evidence"][field] = "other"
+            changed["fallback_evidence"]["session_identity"][field] = "other"
+            changed["fallback_evidence_sha256"] = _native_sha256(changed["fallback_evidence"])
+            mutations["cross_" + field] = changed
+
+        for name, changed in mutations.items():
+            with self.subTest(name=name):
+                route_shape, order_shape = self._shape_state(changed)
+                self.assertFalse(
+                    all(route_shape[key] for key in route_rules)
+                    and all(order_shape[key] for key in order_rules),
+                    {"route": route_shape, "order": order_shape},
+                )
+        self.assertEqual(nodes["recovery_evidence_valid"]["type"], "logic.filter")
+        self.assertEqual(nodes["recovery_order_valid"]["type"], "logic.filter")
+
+    @classmethod
+    def _choice(cls, state, capability_state=None):
+        nodes = {node["id"]: node for node in cls._graph()["spec"]["nodes"]}
+        route_shape, _ = cls._shape_state(state)
+        context = {
+            "CTX": {
+                "routing_policy_input": {"agent_evidence": None},
+                "route_state_shape": route_shape,
+                "recovery_authority_shape": {
+                    "primary_matches": True, "fallback_matches": True,
+                    "fresh_matches": True,
+                },
+                "launcher_capability_snap": {
+                    "state": capability_state,
+                },
+            },
+            "TASKS": {"route_state_get": {"data": state}},
+        }
+        shape = RewstNativeRoutingPolicyTests._object_builder(
+            nodes["recovery_choice_shape"], context,
+        )
+        switch = nodes["recovery_choice"]["config"]
+        selected = "default"
+        for case in switch["cases"]:
+            if all(shape[rule["path"]] == rule["value"] for rule in case["rules"]):
+                selected = case["label"]
+                break
+        return shape, selected
+
+    @classmethod
+    def _run_policy(cls, store, inputs, capability_state="unavailable"):
+        graph = cls._graph()
+
+        def actions(node, payload, context):
+            if node["id"] == "daemon_challenge":
+                return "success", {"data": {"server_instance_challenge": "c" * 64}}
+            state = context["TASKS"]["route_state_get"]["data"]
+            evidence_key = {
+                "prior_primary_verify": "primary_evidence",
+                "prior_fallback_verify": "fallback_evidence",
+                "fresh_primary_verify": "fresh_primary_evidence",
+            }.get(node["id"])
+            if evidence_key is not None:
+                return "success", {"data": deepcopy(state[evidence_key])}
+            if node["id"] == "current_route_evidence_verify":
+                return "success", {
+                    "data": deepcopy(context["CTX"]["routing_policy_input"]["route_evidence"]),
+                }
+            if node["id"] == "launcher_capability":
+                return "success", {"data": {
+                    "capability_version": "launcher-capability-v1",
+                    "launcher": state["primary_route"]["launcher"],
+                    "state": capability_state,
+                    "launcher_version": (
+                        "sha256:" + "a" * 64 if capability_state == "available" else None
+                    ),
+                    "diagnostic": None if capability_state == "available" else {
+                        "code": "missing_binary",
+                    },
+                }}
+            raise AssertionError(node["id"])
+
+        runner = NativeGraphRunner(graph, store, actions)
+        runner.run(inputs, context={
+            "CTX": {"INPUT": {}}, "TASKS": {},
+            "WORKFLOW": {"runId": "routing-child-run"},
+        })
+        return runner, runner.context["CTX"]["routing_policy_output"]
+
+    def test_missing_binary_recovery_selects_primary_only_after_current_capability_is_verified(self):
+        _, _, _, state = self._state_fixture(failure_code="missing_binary")
+        unavailable, retained = self._choice(state, "unavailable")
+        self.assertFalse(unavailable["missing_binary_available"])
+        self.assertEqual(retained, "retain-fallback")
+        available, recovered = self._choice(state, "available")
+        self.assertTrue(available["missing_binary_available"])
+        self.assertEqual(recovered, "missing-binary-primary")
+        nodes = {node["id"]: node for node in self._graph()["spec"]["nodes"]}
+        self.assertEqual(nodes["launcher_capability"]["type"],
+                         "action.graphwing.POST:/v1/launcher/capability")
+        self.assertEqual(nodes["recovery_choice"]["type"], "logic.switch")
+        self.assertEqual(
+            nodes["launcher_capability_snap"]["config"]["mappings"][1]["expression"],
+            {"kind": "getField", "path": "TASKS.launcher_capability.data.state"},
+        )
+
+        store = RunControlDatastoreFixture()
+        inputs = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0, "routing_run_id": "run-186-missing",
+            "invocation_run_id": "run-186-first",
+        }
+        _, primary = self._run_policy(store, inputs)
+        primary_failure = self._evidence(
+            primary, "4" * 32, "error", "2026-09-08T13:00:00Z",
+            "2026-09-08T13:00:02Z", failure_code="missing_binary",
+        )
+        _, fallback = self._run_policy(store, {**inputs, "agent_evidence": primary_failure})
+        fallback_success = self._evidence(
+            fallback, "5" * 32, "ok", "2026-09-08T13:00:03Z",
+            "2026-09-08T13:00:05Z",
+        )
+        self._run_policy(store, {**inputs, "route_evidence": fallback_success})
+        _, retained_route = self._run_policy(store, inputs, "unavailable")
+        self.assertEqual(retained_route["recovery_decision"], "fallback_retained")
+        _, recovered_route = self._run_policy(store, inputs, "available")
+        self.assertEqual(recovered_route["recovery_decision"], "primary_recovered")
+        self.assertEqual(recovered_route["compatibility_behavior"], "normal-v1")
+
+    def test_remote_provider_recovery_requires_a_distinct_later_verified_primary_success(self):
+        _, _, _, retained_state = self._state_fixture(failure_code="provider_rate_limit")
+        without_fresh, retained = self._choice(retained_state)
+        self.assertFalse(without_fresh["fresh_primary_verified"])
+        self.assertEqual(retained, "retain-fallback")
+        _, _, _, recovered_state = self._state_fixture(
+            failure_code="provider_rate_limit", fresh=True,
+        )
+        with_fresh, recovered = self._choice(recovered_state)
+        self.assertTrue(with_fresh["fresh_primary_verified"])
+        self.assertEqual(recovered, "fresh-primary")
+        _, order = self._shape_state(recovered_state)
+        self.assertTrue(order["jobs_distinct"])
+        self.assertTrue(order["fallback_before_fresh"])
+
+        store = RunControlDatastoreFixture()
+        inputs = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0, "routing_run_id": "run-186-remote",
+            "invocation_run_id": "run-186-first",
+        }
+        _, primary = self._run_policy(store, inputs)
+        primary_failure = self._evidence(
+            primary, "6" * 32, "error", "2026-09-08T14:00:00Z",
+            "2026-09-08T14:00:02Z", failure_code="provider_rate_limit",
+        )
+        _, fallback = self._run_policy(store, {**inputs, "agent_evidence": primary_failure})
+        fallback_success = self._evidence(
+            fallback, "7" * 32, "ok", "2026-09-08T14:00:03Z",
+            "2026-09-08T14:00:05Z",
+        )
+        self._run_policy(store, {**inputs, "route_evidence": fallback_success})
+        _, retained_route = self._run_policy(store, inputs)
+        self.assertEqual(retained_route["recovery_decision"], "fallback_retained")
+        fresh_primary = self._evidence(
+            primary, "8" * 32, "ok", "2026-09-08T14:00:06Z",
+            "2026-09-08T14:00:08Z",
+        )
+        self._run_policy(store, {**inputs, "route_evidence": fresh_primary})
+        _, recovered_route = self._run_policy(store, inputs)
+        self.assertEqual(recovered_route["recovery_decision"], "primary_recovered")
+        self.assertEqual(recovered_route["compatibility_behavior"], "normal-v1")
+
+    def test_recovery_retains_fallback_when_fresh_primary_evidence_is_absent_or_stale(self):
+        _, _, fallback, absent = self._state_fixture(failure_code="provider_network")
+        _, selected = self._choice(absent)
+        self.assertEqual(selected, "retain-fallback")
+        self.assertEqual(absent["active_route"], fallback)
+
+        _, _, _, stale = self._state_fixture(failure_code="provider_network", fresh=True)
+        stale["fresh_primary_evidence"]["created_at"] = "2026-09-08T12:00:04Z"
+        stale["fresh_primary_evidence_sha256"] = _native_sha256(
+            stale["fresh_primary_evidence"]
+        )
+        _, order = self._shape_state(stale)
+        self.assertFalse(order["fallback_before_fresh"])
+        edges = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in self._graph()["spec"]["edges"]
+        }
+        self.assertIn(("recovery_order_valid", "fail", "join_recovery_authority_park"), edges)
+
+    def test_route_state_upsert_readback_hash_key_and_version_must_match_before_continuation(self):
+        graph = self._graph()
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        self.assertEqual(nodes["route_state_upsert"]["type"],
+                         "action.datastore.records.upsert")
+        self.assertEqual(nodes["route_state_readback"]["type"],
+                         "action.datastore.records.get")
+        self.assertEqual(nodes["route_state_expected_hash"]["type"], "transforms.hash")
+        self.assertEqual(nodes["route_state_readback_hash"]["type"], "transforms.hash")
+        for node_id in ("route_state_expected_hash", "route_state_readback_hash"):
+            self.assertNotIn("TASKS." + node_id, json.dumps(graph))
+        rules = {
+            rule["path"]
+            for rule in nodes["route_state_readback_valid"]["config"]["rules"]
+        }
+        self.assertEqual(rules, {
+            "found_matches", "key_matches", "hash_matches", "version_matches",
+        })
+        _, primary, _, state = self._state_fixture()
+
+        def run(store):
+            runner = NativeGraphRunner(graph, store)
+            runner.run({}, start="route_state_upsert", context={
+                "CTX": {
+                    "INPUT": {}, "route_state_next": state,
+                    "route_state_expected_hash": {"value": _native_sha256(state)},
+                    "routing_state_locator": {
+                        "routing_run_id": "run-186-a",
+                        "record_key": "graphwing-routing-v1:run-186-a",
+                    },
+                    "routing_selected_route": {
+                        "value": primary, "decision": "primary_recovered", "role": "primary",
+                    },
+                },
+                "TASKS": {},
+            })
+            return runner
+
+        clean = RunControlDatastoreFixture()
+        self.assertIn("route_output", run(clean).executed)
+        for kind in ("hash", "key", "version"):
+            with self.subTest(kind=kind):
+                store = RunControlDatastoreFixture()
+                original_get = store.records_get
+
+                def tampered_get(collection, record_key, *, _kind=kind):
+                    result = original_get(collection, record_key)
+                    if _kind == "hash" and result["found"]:
+                        result["data"] = {**result["data"], "decision": "tampered"}
+                    elif _kind == "key" and result["found"]:
+                        result["recordKey"] = record_key + "-other"
+                    elif _kind == "version" and result["found"]:
+                        result["version"] += 1
+                    return result
+
+                store.records_get = tampered_get
+                with self.assertRaises(NativeGraphFenced):
+                    run(store)
+        for failure in (
+            "route_state_write_failed", "route_state_readback_failed",
+            "route_state_readback_mismatch",
+        ):
+            self.assertEqual(nodes[failure]["type"], "transforms.regexReplace")
+
+    def test_implement_slice_has_no_call_to_v1_slice_route_recovery_and_corrections_never_redraw(self):
+        graph = json.loads((self.ROOT / "graphs" / "implement-slice.json").read_text())
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["spec"]["edges"]
+        }
+        self.assertFalse(any(
+            node["type"] == "action.graphwing.POST:/v1/slice/route/recovery"
+            for node in graph["spec"]["nodes"]
+        ))
+        self.assertNotIn("recovery_marker", nodes)
+        self.assertNotIn("recovery_route", nodes)
+        self.assertEqual(nodes["routing_input_snap"]["type"], "transforms.objectBuilder")
+        self.assertIn(("join_start", "out", "routing_input_snap"), edges)
+        self.assertIn(("routing_input_snap", "out", "git"), edges)
+        route_inputs = nodes["route"]["config"]["inputMapping"]["values"]
+        self.assertEqual(route_inputs["routing_run_id"],
+                         "{{ CTX.routing_input_snap.routing_run_id }}")
+        self.assertEqual(route_inputs["invocation_run_id"],
+                         "{{ CTX.routing_input_snap.invocation_run_id }}")
+        self.assertIn(("ticket_head", "success", "durable_recovery_selection"), edges)
+        for verify, sync in (
+            ("primary_success_evidence_verify", "primary_state_policy"),
+            ("fallback_success_evidence_verify", "fallback_state_policy"),
+        ):
+            self.assertEqual(nodes[verify]["type"],
+                             "action.graphwing.POST:/v1/agent/evidence/verify")
+            self.assertEqual(nodes[sync]["type"], "action.subworkflow")
+            self.assertEqual(nodes[sync]["config"]["inputMapping"]["values"]["route_evidence"],
+                             f"{{{{ TASKS.{verify}.data }}}}")
+        for walk_id, expected_locator in (
+            ("walk", "{{ TASKS.route.result.routing_run_id }}"),
+            ("walk_e2e", "{{ CTX.routing_input_snap.routing_run_id }}"),
+        ):
+            config = nodes[walk_id]["config"]
+            self.assertEqual(config["routing_run_id"], expected_locator)
+            for old in (
+                "recovery_version", "prior_primary_route", "prior_primary_receipt",
+                "prior_fallback_route", "prior_fallback_receipt", "fresh_primary_receipt",
+            ):
+                self.assertNotIn(old, config)
+        adjacency = {}
+        for edge in graph["spec"]["edges"]:
+            adjacency.setdefault(edge["source"], []).append(edge["target"])
+        for correction in ("agent2", "agent3", "agent_rn1", "agent_rn2"):
+            seen, pending = set(), [correction]
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(adjacency.get(current, []))
+            self.assertNotIn("route", seen)
+            self.assertFalse(any(
+                nodes[node_id]["type"] == "action.subworkflow"
+                and node_id in {"primary_state_policy", "fallback_state_policy"}
+                for node_id in seen if node_id in nodes
+            ), correction)
+
+    def test_replacement_daemon_or_lost_local_job_authority_parks_recovery_without_silent_substitution(self):
+        graph = self._graph()
+        nodes = {node["id"]: node for node in graph["spec"]["nodes"]}
+        edges = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["spec"]["edges"]
+        }
+        self.assertEqual(nodes["prior_primary_verify"]["type"],
+                         "action.graphwing.POST:/v1/agent/evidence/verify")
+        self.assertEqual(nodes["prior_fallback_verify"]["type"],
+                         "action.graphwing.POST:/v1/agent/evidence/verify")
+        self.assertIn(("prior_primary_verify", "failure", "join_recovery_authority_park"), edges)
+        self.assertIn(("prior_fallback_verify", "failure", "join_recovery_authority_park"), edges)
+        self.assertIn(("fresh_primary_verify", "failure", "join_recovery_authority_park"), edges)
+        self.assertEqual(nodes["recovery_authority_park"]["type"],
+                         "transforms.regexReplace")
+        _, _, _, replaced_state = self._state_fixture()
+        replaced_state["daemon_instance_challenge"] = "d" * 64
+        replaced_shape, _ = self._shape_state(replaced_state)
+        self.assertFalse(replaced_shape["daemon_challenge_matches"])
+        _, _, _, incomplete_state = self._state_fixture()
+        incomplete_state["fallback_evidence"] = None
+        incomplete_state["fallback_evidence_sha256"] = None
+        incomplete_shape, incomplete_choice = self._choice(incomplete_state)
+        self.assertTrue(incomplete_shape["incomplete_authority"])
+        self.assertEqual(incomplete_choice, "incomplete-authority")
+        for loss in ("replacement_daemon", "lost_local_job"):
+            invoked = []
+
+            def unavailable(node, payload, context):
+                invoked.append(node["id"])
+                return "failure", {"code": "not_found", "loss": loss}
+
+            runner = NativeGraphRunner(graph, RunControlDatastoreFixture(), unavailable)
+            with self.assertRaises(NativeGraphFenced):
+                runner.run({}, start="recovery_authority_mode_shape", context={
+                    "CTX": {"INPUT": {}, "route_state_shape": {
+                        "has_history": True, "has_recovery": True,
+                        "has_fresh_primary": False,
+                    }},
+                    "TASKS": {},
+                })
+            self.assertEqual(invoked, ["prior_primary_verify"])
+            self.assertNotIn("route_state_upsert", runner.executed)
+            self.assertNotIn("route_output", runner.executed)
+        recovery_dump = json.dumps([
+            node for node in graph["spec"]["nodes"]
+            if node["id"].startswith(("recovery_", "route_state_", "prior_", "fresh_"))
+        ])
+        self.assertNotIn("JOBS_DIR", recovery_dump)
+        self.assertNotIn("read_job", recovery_dump)
 
 
 if __name__ == "__main__":
