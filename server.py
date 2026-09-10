@@ -2130,7 +2130,35 @@ def _codeoff_git_gate(data: dict[str, Any], repo_name: str, repo: Path, phase: s
         return err
     assert root and manifest and state
     final = state.get("final_verification") or {}
-    if not (state.get("finalized") and state.get("status") == "completed" and final.get("commit_eligible") is True and final.get("push_eligible") is True and hmac.compare_digest(str(final.get("receipt_hash") or ""), receipt_hash)):
+    if manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION:
+        promotion = state.get("promotion") or {}
+        slot = promotion.get("author_slot")
+        eligible = (
+            slot in ("author-1", "author-2")
+            and promotion.get("version") == "code-off-promotion-v2"
+            and hmac.compare_digest(
+                str(promotion.get("final_verification_receipt_hash") or ""), receipt_hash,
+            )
+            and promotion.get("tree_manifest_hash") == final.get("tree_manifest_hash")
+            and promotion.get("artifact_hash") == final.get("artifact_hash")
+            and promotion.get("git_tree") == final.get("git_tree")
+            and promotion.get("promoted_tree_hash") == final.get("tree_manifest_hash")
+            and _codeoff_v2_promotion_authority_error(root, state) is None
+            and _codeoff_v2_final_authority_error(
+                root, manifest, state, slot, str(promotion.get("decision_hash") or ""),
+                receipt_hash,
+            ) is None
+            and _codeoff_v2_candidate_authority_error(
+                root, manifest, state, slot,
+            ) is None
+        )
+    else:
+        eligible = (
+            state.get("finalized") and state.get("status") == "completed"
+            and final.get("commit_eligible") is True and final.get("push_eligible") is True
+            and hmac.compare_digest(str(final.get("receipt_hash") or ""), receipt_hash)
+        )
+    if not eligible:
         return {"error": "code-off final verification is not eligible or does not match", "code": "codeoff_gate_rejected"}
     if manifest.get("repo") != repo_name:
         return {"error": "code-off receipt belongs to a different repo", "code": "codeoff_repo_mismatch"}
@@ -13856,7 +13884,10 @@ def _codeoff_validate_job(job_id: Any, state: dict[str, Any], manifest: dict[str
         return None, {"error": "slot requires its exact successful terminal agent receipt", "code": "agent_receipt_mismatch"}
     return job, None
 
-def _codeoff_verify_artifact(root: Path, manifest: dict[str, Any], repo: Path, candidate: dict[str, Any], phase: str) -> dict[str, Any]:
+def _codeoff_verify_artifact(
+    root: Path, manifest: dict[str, Any], repo: Path, candidate: dict[str, Any],
+    phase: str, *, run_tests: bool = True,
+) -> dict[str, Any]:
     parent = CODEOFF_WORKSPACES_DIR / manifest["experiment_id"]
     parent.mkdir(parents=True, exist_ok=True)
     staging = parent / f".verify-{phase}-{uuid.uuid4().hex}"
@@ -13875,7 +13906,7 @@ def _codeoff_verify_artifact(root: Path, manifest: dict[str, Any], repo: Path, c
         _branch, head, git_err = current_branch_head(staging)
         if before["manifest_bytes"] != frozen_manifest or before["manifest_hash"] != candidate["tree_manifest_hash"] or git_err or head != manifest["base_sha"] or not run_git(staging, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok"):
             raise CodeOffArtifactError("frozen artifact does not materialize as its exact git tree")
-        tests = _codeoff_run_tests(root, manifest, staging, phase)
+        tests = _codeoff_run_tests(root, manifest, staging, phase) if run_tests else None
         after = codeoff_tree_snapshot(staging, manifest["base_sha"])
         _branch, after_head, after_err = current_branch_head(staging)
         no_mutation = after["manifest_hash"] == candidate["tree_manifest_hash"] and not after_err and after_head == manifest["base_sha"] and run_git(staging, ["diff", "--cached", "--quiet", manifest["base_sha"]]).get("ok") is True
@@ -14271,6 +14302,230 @@ def _codeoff_clear_tree(root: Path) -> None:
         else:
             path.unlink()
 
+def _codeoff_v2_candidate_authority_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any], slot: str,
+) -> dict[str, Any] | None:
+    candidate = state.get("candidates", {}).get(slot)
+    if not isinstance(candidate, dict) or candidate.get("safety_seal"):
+        return {"error": "candidate authority is unavailable", "code": "codeoff_v2_authority_unavailable"}
+    job, job_err = _codeoff_validate_job(candidate.get("job_id"), state, manifest, slot)
+    if job_err:
+        return job_err
+    integrity_error = _codeoff_v2_frozen_integrity_error(
+        root, manifest, candidate, codeoff_workspace_path(manifest["experiment_id"], slot),
+    )
+    if integrity_error:
+        return {"error": "frozen candidate authority differs", "code": integrity_error}
+    tests = candidate.get("tests")
+    binding = candidate.get("test")
+    try:
+        receipt_hash = tests.get("receipt_hash") if isinstance(tests, dict) else None
+        exact_test_receipt = (
+            isinstance(tests, dict)
+            and isinstance(binding, dict)
+            and binding.get("state") == "completed"
+            and binding.get("receipt_hash") == receipt_hash
+            and _codeoff_read_artifact(root, receipt_hash)
+            == codeoff_canonical_json({key: value for key, value in tests.items() if key != "receipt_hash"})
+        )
+    except (CodeOffArtifactError, OSError, TypeError):
+        exact_test_receipt = False
+    if not exact_test_receipt:
+        return {"error": "candidate test receipt authority differs", "code": "candidate_receipt_mismatch"}
+    assert job is not None and isinstance(tests, dict) and isinstance(binding, dict)
+    events = _codeoff_events(root, state)
+    freeze_event = {
+        "slot": slot, "transition_id": candidate["freeze"]["transition_id"],
+        "transition_payload_hash": candidate["freeze"]["transition_payload_hash"],
+        "tree_manifest_hash": candidate["tree_manifest_hash"],
+        "artifact_hash": candidate["artifact_hash"],
+        "receipt_hash": candidate["freeze_receipt_hash"],
+    }
+    test_event = {
+        "slot": slot, "transition_id": binding["transition_id"],
+        "transition_payload_hash": binding["transition_payload_hash"],
+        "pass": tests["pass"], "receipt_hash": tests["receipt_hash"],
+        "no_mutation": True,
+    }
+    if (
+        [event.get("data") for event in events if event.get("kind") == "v2_candidate_frozen"].count(freeze_event) != 1
+        or [event.get("data") for event in events if event.get("kind") == "v2_candidate_tested"].count(test_event) != 1
+    ):
+        return {"error": "candidate event authority differs", "code": "candidate_receipt_mismatch"}
+    return None
+
+
+def _codeoff_v2_final_result(manifest: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "status": "final-verified",
+        "author_slot": receipt["author_slot"], "decision_hash": receipt["decision_hash"],
+        "aggregation_inputs_hash": receipt["aggregation_inputs_hash"],
+        "identities_hash": receipt["identities_hash"],
+        "identity_snapshot_hash": receipt["identity_snapshot_hash"],
+        "tree_manifest_hash": receipt["tree_manifest_hash"],
+        "artifact_hash": receipt["artifact_hash"],
+        "freeze_receipt_hash": receipt["freeze_receipt_hash"],
+        "candidate_test_receipt_hash": receipt["candidate_test_receipt_hash"],
+        "tests_pass": receipt["tests_pass"], "no_mutation": receipt["no_mutation"],
+        "final_test_receipt_hash": receipt["final_test_receipt_hash"],
+        "git_tree": receipt["git_tree"],
+        "final_verification_receipt_hash": receipt["receipt_hash"],
+        "tests": receipt["tests"],
+    }
+
+
+def codeoff_v2_verify_final(
+    body: bytes, repos: dict[str, str],
+) -> tuple[int, dict[str, Any]]:
+    fields = {
+        "experiment_id", "author_slot", "decision_hash", "aggregation_inputs_hash",
+        "candidate_test_receipt_hash",
+    }
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    slot = data.get("author_slot")
+    if slot not in ("author-1", "author-2"):
+        return 400, {"error": "author_slot must be author-1 or author-2", "code": "bad_slot"}
+    if any(
+        not isinstance(data.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None
+        for key in ("decision_hash", "aggregation_inputs_hash", "candidate_test_receipt_hash")
+    ):
+        return 400, {"error": "verification hashes must be lowercase SHA-256 digests", "code": "bad_verification_hash"}
+    request_hash = hashlib.sha256(codeoff_canonical_json(data)).hexdigest()
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "final verification belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("status") != "prepared":
+            return 409, {"error": "final verification requires prepared v2 authority", "code": "codeoff_v2_not_prepared"}
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
+        authority_err = _codeoff_v2_candidate_authority_error(root, manifest, state, slot)
+        if authority_err:
+            if authority_err.get("code") in {
+                "candidate_mutated", "candidate_artifact_invalid", "candidate_ignored_paths",
+                "candidate_receipt_mismatch", "agent_receipt_mismatch",
+                "codeoff_identity_unpinned",
+            }:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, str(authority_err["code"]),
+                )
+            return 409, authority_err
+        candidate = state["candidates"][slot]
+        if candidate["tests"]["receipt_hash"] != data["candidate_test_receipt_hash"]:
+            return 409, {"error": "decision names a different candidate test receipt", "code": "candidate_receipt_mismatch"}
+        existing = state.get("final_verification")
+        if existing is not None:
+            if not isinstance(existing, dict) or existing.get("request_hash") != request_hash:
+                return 409, {"error": "final verification is already bound to another decision", "code": "final_verification_conflict"}
+            receipt_hash = existing.get("receipt_hash")
+            try:
+                exact = (
+                    _codeoff_read_artifact(root, receipt_hash)
+                    == codeoff_canonical_json({
+                        key: value for key, value in existing.items()
+                        if key != "receipt_hash"
+                    })
+                )
+            except (CodeOffArtifactError, OSError, TypeError):
+                exact = False
+            event = {
+                "author_slot": slot, "decision_hash": data["decision_hash"],
+                "receipt_hash": receipt_hash, "tests_pass": existing.get("tests_pass"),
+                "no_mutation": existing.get("no_mutation"),
+            }
+            exact = (
+                exact
+                and existing.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
+                and existing.get("policy_version") == CODEOFF_V2_POLICY_VERSION
+                and existing.get("experiment_id") == manifest["experiment_id"]
+                and existing.get("author_slot") == slot
+                and existing.get("decision_hash") == data["decision_hash"]
+                and existing.get("aggregation_inputs_hash") == data["aggregation_inputs_hash"]
+                and existing.get("candidate_test_receipt_hash")
+                == data["candidate_test_receipt_hash"]
+                and _codeoff_v2_final_test_receipt_exact(root, existing)
+                and [
+                    item.get("data") for item in _codeoff_events(root, state)
+                    if item.get("kind") == "v2_final_verified"
+                ].count(event) == 1
+            )
+            if not exact:
+                return 409, {
+                    "error": "final verification receipt authority is unavailable",
+                    "code": "codeoff_v2_authority_unavailable",
+                }
+            return 200, _codeoff_v2_final_result(manifest, existing)
+        candidate_snapshot = dict(candidate)
+        repo_raw = repos.get(manifest["repo"])
+        repo = Path(repo_raw) if isinstance(repo_raw, str) and repo_raw else Path("/__graphwing_missing_repo__")
+        if not repo.is_dir():
+            return 409, {"error": "target repo is no longer allowlisted", "code": "repo_unavailable"}
+    verified = _codeoff_verify_artifact(
+        root, manifest, repo, candidate_snapshot, "final-v2",
+    )
+    verification = verified["tests"]
+    assert isinstance(verification, dict)
+    normalized_tests = [{
+        "name": item["name"], "status": "passed" if item["pass"] else "failed",
+        "returncode": item["returncode"], "elapsed_seconds": item["elapsed_seconds"],
+        "log_hash": item["log_hash"],
+    } for item in verification["tests"]]
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        authority_err = _codeoff_v2_candidate_authority_error(root, manifest, state, slot)
+        if authority_err:
+            return _codeoff_v2_candidate_safety_locked(
+                root, state, slot, str(authority_err.get("code") or "candidate_receipt_mismatch"),
+            )
+        candidate = state["candidates"][slot]
+        if any(
+            candidate.get(key) != candidate_snapshot.get(key)
+            for key in ("job_id", "tree_manifest_hash", "artifact_hash", "freeze_receipt_hash", "tests")
+        ):
+            return _codeoff_v2_candidate_safety_locked(root, state, slot, "candidate_mutated")
+        if state.get("final_verification") is not None:
+            return 409, {"error": "final verification changed during isolated verification", "code": "final_verification_conflict"}
+        receipt = {
+            "version": "code-off-final-verification-v2",
+            "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+            "policy_version": CODEOFF_V2_POLICY_VERSION,
+            "experiment_id": manifest["experiment_id"], "request_hash": request_hash,
+            "author_slot": slot, "decision_hash": data["decision_hash"],
+            "aggregation_inputs_hash": data["aggregation_inputs_hash"],
+            "identities_hash": manifest["identities_hash"],
+            "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
+            "tree_manifest_hash": candidate["tree_manifest_hash"],
+            "artifact_hash": candidate["artifact_hash"],
+            "freeze_receipt_hash": candidate["freeze_receipt_hash"],
+            "candidate_test_receipt_hash": candidate["tests"]["receipt_hash"],
+            "tests_pass": verification["pass"], "no_mutation": verified["no_mutation"],
+            "final_test_receipt_hash": verification["receipt_hash"],
+            "git_tree": verified["git_tree"], "tests": normalized_tests,
+        }
+        receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(receipt))
+        receipt["receipt_hash"] = receipt_hash
+        state["final_verification"] = receipt
+        state["final_test_summary"] = _codeoff_test_summary(verification)
+        _codeoff_commit_event(root, state, "v2_final_verified", {
+            "author_slot": slot, "decision_hash": data["decision_hash"],
+            "receipt_hash": receipt_hash, "tests_pass": verification["pass"],
+            "no_mutation": verified["no_mutation"],
+        })
+        return 200, _codeoff_v2_final_result(manifest, receipt)
+
+
 def _codeoff_apply_verified(verified: dict[str, Any], target: Path, base_sha: str) -> None:
     tree = verified.get("git_tree")
     if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
@@ -14296,6 +14551,289 @@ def _codeoff_restore_base(target: Path, manifest: dict[str, Any]) -> bool:
         return False
     branch, head, err = current_branch_head(target)
     return bool(hard.get("ok") and clean.get("ok") and snapshot["manifest_hash"] == manifest["base_snapshot_hash"] and not err and branch == manifest["branch"] and head == manifest["base_sha"])
+
+def _codeoff_v2_final_test_receipt_exact(
+    root: Path, receipt: dict[str, Any],
+) -> bool:
+    try:
+        test_receipt = strict_json_object(
+            _codeoff_read_artifact(root, receipt.get("final_test_receipt_hash"))
+        )
+        tests = test_receipt.get("tests")
+        if not isinstance(tests, list):
+            return False
+        normalized = [{
+            "name": item["name"], "status": "passed" if item["pass"] else "failed",
+            "returncode": item["returncode"],
+            "elapsed_seconds": float(item["elapsed_seconds"]),
+            "log_hash": item["log_hash"],
+        } for item in tests]
+        return bool(
+            set(test_receipt) == {
+                "version", "phase", "started_at", "finished_at", "elapsed_seconds",
+                "pass", "tests",
+            }
+            and test_receipt.get("version") == "code-off-test-receipt-v1"
+            and test_receipt.get("phase") == "final-v2"
+            and test_receipt.get("pass") is receipt.get("tests_pass")
+            and normalized == receipt.get("tests")
+        )
+    except (CodeOffArtifactError, KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _codeoff_v2_final_authority_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any], slot: str,
+    decision_hash: str, receipt_hash: str,
+) -> dict[str, Any] | None:
+    receipt = state.get("final_verification")
+    if not (
+        isinstance(receipt, dict)
+        and receipt.get("version") == "code-off-final-verification-v2"
+        and receipt.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
+        and receipt.get("policy_version") == CODEOFF_V2_POLICY_VERSION
+        and receipt.get("experiment_id") == manifest.get("experiment_id")
+        and receipt.get("author_slot") == slot
+        and receipt.get("decision_hash") == decision_hash
+        and receipt.get("receipt_hash") == receipt_hash
+        and receipt.get("identities_hash") == manifest.get("identities_hash")
+        and receipt.get("identity_snapshot_hash")
+        == manifest.get("identity_snapshot_hashes", {}).get(slot)
+        and receipt.get("tests_pass") is True
+        and receipt.get("no_mutation") is True
+        and isinstance(receipt.get("git_tree"), str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", receipt["git_tree"]) is not None
+    ):
+        return {"error": "final verification does not authorize this promotion", "code": "final_verification_mismatch"}
+    candidate = state.get("candidates", {}).get(slot)
+    candidate_tests = candidate.get("tests") if isinstance(candidate, dict) else None
+    if not isinstance(candidate, dict) or any(
+        receipt.get(receipt_key) != candidate.get(candidate_key)
+        for receipt_key, candidate_key in (
+            ("tree_manifest_hash", "tree_manifest_hash"),
+            ("artifact_hash", "artifact_hash"),
+            ("freeze_receipt_hash", "freeze_receipt_hash"),
+        )
+    ) or not isinstance(candidate_tests, dict) or (
+        receipt.get("candidate_test_receipt_hash") != candidate_tests.get("receipt_hash")
+    ):
+        return {"error": "final verification names a different frozen candidate", "code": "final_verification_mismatch"}
+    try:
+        artifact_exact = (
+            _codeoff_read_artifact(root, receipt_hash)
+            == codeoff_canonical_json({
+                key: value for key, value in receipt.items() if key != "receipt_hash"
+            })
+        )
+    except (CodeOffArtifactError, OSError, TypeError):
+        artifact_exact = False
+    event = {
+        "author_slot": slot, "decision_hash": decision_hash,
+        "receipt_hash": receipt_hash, "tests_pass": True, "no_mutation": True,
+    }
+    events = _codeoff_events(root, state)
+    if not artifact_exact or not _codeoff_v2_final_test_receipt_exact(root, receipt) or [
+        item.get("data") for item in events if item.get("kind") == "v2_final_verified"
+    ].count(event) != 1:
+        return {"error": "final verification receipt authority differs", "code": "codeoff_v2_authority_unavailable"}
+    return None
+
+
+def _codeoff_v2_pristine_target_error(
+    repo: Path, manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    branch, head, git_err = current_branch_head(repo)
+    if git_err:
+        return {"error": "target repository identity is unavailable", "code": "promotion_base_unavailable"}
+    if branch != manifest["branch"]:
+        return {"error": "target branch differs from the frozen base", "code": "promotion_branch_mismatch"}
+    if head != manifest["base_sha"]:
+        return {"error": "target HEAD moved from the frozen base", "code": "promotion_head_moved"}
+    index = run_git(repo, ["diff", "--cached", "--name-only", "-z", manifest["base_sha"]])
+    status = run_git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])
+    ignored = run_git(repo, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])
+    if not index.get("ok") or not status.get("ok") or not ignored.get("ok"):
+        return {"error": "target repository state is unavailable", "code": "promotion_base_unavailable"}
+    if index.get("stdout"):
+        return {"error": "target index differs from the frozen base", "code": "promotion_index_dirty"}
+    if status.get("stdout") or ignored.get("stdout"):
+        return {"error": "target worktree differs from the pristine base", "code": "promotion_base_mutated"}
+    try:
+        snapshot = codeoff_tree_snapshot(repo, manifest["base_sha"])
+    except (OSError, RuntimeError):
+        return {"error": "target tree is unavailable", "code": "promotion_base_unavailable"}
+    if snapshot["manifest_hash"] != manifest["base_snapshot_hash"]:
+        return {"error": "target tree differs from the pristine base", "code": "promotion_base_mutated"}
+    return None
+
+
+def _codeoff_v2_promotion_authority_error(
+    root: Path, state: dict[str, Any],
+) -> dict[str, Any] | None:
+    promotion = state.get("promotion")
+    if not isinstance(promotion, dict) or set(promotion) != {
+        "version", "author_slot", "decision_hash",
+        "final_verification_receipt_hash", "tree_manifest_hash", "artifact_hash",
+        "promoted_tree_hash", "git_tree",
+    } or promotion.get("version") != "code-off-promotion-v2":
+        return {"error": "promotion authority differs", "code": "promotion_authority_changed"}
+    events = _codeoff_events(root, state)
+    if [
+        item.get("data") for item in events if item.get("kind") == "v2_promoted"
+    ].count(promotion) != 1:
+        return {"error": "promotion event authority differs", "code": "promotion_authority_changed"}
+    return None
+
+
+def _codeoff_v2_promotion_result(
+    manifest: dict[str, Any], promotion: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "status": "promoted",
+        "author_slot": promotion["author_slot"],
+        "decision_hash": promotion["decision_hash"],
+        "final_verification_receipt_hash": promotion["final_verification_receipt_hash"],
+        "tree_manifest_hash": promotion["tree_manifest_hash"],
+        "artifact_hash": promotion["artifact_hash"],
+        "promoted_tree_hash": promotion["promoted_tree_hash"],
+        "git_tree": promotion["git_tree"],
+    }
+
+
+def codeoff_v2_promote(
+    body: bytes, repos: dict[str, str],
+) -> tuple[int, dict[str, Any]]:
+    fields = {
+        "experiment_id", "author_slot", "decision_hash",
+        "final_verification_receipt_hash",
+    }
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    slot = data.get("author_slot")
+    if slot not in ("author-1", "author-2"):
+        return 400, {"error": "author_slot must be author-1 or author-2", "code": "bad_slot"}
+    if any(
+        not isinstance(data.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None
+        for key in ("decision_hash", "final_verification_receipt_hash")
+    ):
+        return 400, {"error": "promotion hashes must be lowercase SHA-256 digests", "code": "bad_promotion_hash"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "promotion belongs to another protocol", "code": "protocol_mismatch"}
+        if state.get("promotion") is not None:
+            return 409, {"error": "exact promotion is a one-time effect", "code": "promotion_replayed"}
+        identity_err = codeoff_manifest_identity_error(manifest)
+        if identity_err:
+            return 409, identity_err
+        final_err = _codeoff_v2_final_authority_error(
+            root, manifest, state, slot, data["decision_hash"],
+            data["final_verification_receipt_hash"],
+        )
+        if final_err:
+            return 409, final_err
+        candidate_err = _codeoff_v2_candidate_authority_error(root, manifest, state, slot)
+        if candidate_err:
+            if candidate_err.get("code") in {
+                "candidate_mutated", "candidate_artifact_invalid", "candidate_ignored_paths",
+                "candidate_receipt_mismatch", "agent_receipt_mismatch",
+            }:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, str(candidate_err["code"]),
+                )
+            return 409, candidate_err
+        repo_raw = repos.get(manifest["repo"])
+        repo = Path(repo_raw) if isinstance(repo_raw, str) and repo_raw else Path("/__graphwing_missing_repo__")
+        if not repo.is_dir():
+            return 409, {"error": "target repo is no longer allowlisted", "code": "repo_unavailable"}
+        target_err = _codeoff_v2_pristine_target_error(repo, manifest)
+        if target_err:
+            return 409, target_err
+        candidate_snapshot = dict(state["candidates"][slot])
+        final_snapshot = dict(state["final_verification"])
+    materialized = _codeoff_verify_artifact(
+        root, manifest, repo, candidate_snapshot, "promote-v2", run_tests=False,
+    )
+    if not materialized["no_mutation"] or materialized["git_tree"] != final_snapshot["git_tree"]:
+        return 409, {"error": "frozen artifact differs from final verification", "code": "final_verification_mismatch"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=True)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if state.get("promotion") is not None:
+            return 409, {"error": "exact promotion is a one-time effect", "code": "promotion_replayed"}
+        final_err = _codeoff_v2_final_authority_error(
+            root, manifest, state, slot, data["decision_hash"],
+            data["final_verification_receipt_hash"],
+        )
+        if final_err:
+            return 409, final_err
+        candidate_err = _codeoff_v2_candidate_authority_error(root, manifest, state, slot)
+        if candidate_err:
+            if candidate_err.get("code") in {
+                "candidate_mutated", "candidate_artifact_invalid", "candidate_ignored_paths",
+                "candidate_receipt_mismatch", "agent_receipt_mismatch",
+            }:
+                return _codeoff_v2_candidate_safety_locked(
+                    root, state, slot, str(candidate_err["code"]),
+                )
+            return 409, candidate_err
+        target_err = _codeoff_v2_pristine_target_error(repo, manifest)
+        if target_err:
+            return 409, target_err
+        candidate = state["candidates"][slot]
+        if any(
+            candidate.get(key) != candidate_snapshot.get(key)
+            for key in ("job_id", "tree_manifest_hash", "artifact_hash", "freeze_receipt_hash", "tests")
+        ) or state.get("final_verification") != final_snapshot:
+            return 409, {"error": "promotion authority changed during materialization", "code": "promotion_authority_changed"}
+        try:
+            _codeoff_apply_verified(materialized, repo, manifest["base_sha"])
+            after = codeoff_tree_snapshot(repo, manifest["base_sha"])
+            after_branch, after_head, after_err = current_branch_head(repo)
+            index = run_git(repo, ["diff", "--cached", "--name-only", "-z", manifest["base_sha"]])
+            exact = (
+                after["manifest_hash"] == candidate["tree_manifest_hash"]
+                and not after_err and after_branch == manifest["branch"]
+                and after_head == manifest["base_sha"] and index.get("ok") is True
+                and not index.get("stdout")
+            )
+            if not exact:
+                raise RuntimeError("applied tree differs from the exact frozen artifact")
+        except (OSError, RuntimeError):
+            restored = _codeoff_restore_base(repo, manifest)
+            return 500, {
+                "ok": False,
+                "error": "exact promotion failed and target was restored" if restored else "exact promotion and base restoration failed",
+                "code": "promotion_apply_failed" if restored else "promotion_restore_failed",
+                "retryable": restored,
+            }
+        promotion = {
+            "version": "code-off-promotion-v2", "author_slot": slot,
+            "decision_hash": data["decision_hash"],
+            "final_verification_receipt_hash": data["final_verification_receipt_hash"],
+            "tree_manifest_hash": candidate["tree_manifest_hash"],
+            "artifact_hash": candidate["artifact_hash"],
+            "promoted_tree_hash": after["manifest_hash"],
+            "git_tree": materialized["git_tree"],
+        }
+        state["promotion"] = promotion
+        try:
+            _codeoff_commit_event(root, state, "v2_promoted", promotion)
+        except (OSError, RuntimeError):
+            if not _codeoff_restore_base(repo, manifest):
+                return 500, {"ok": False, "error": "promotion receipt persistence and base restoration failed", "code": "promotion_restore_failed", "retryable": False}
+            raise
+        return 200, _codeoff_v2_promotion_result(manifest, promotion)
+
 
 def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
@@ -15111,6 +15649,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/v2/read-judgment":
         status, payload = _codeoff_boundary(codeoff_v2_read_judgment, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/verify-final":
+        status, payload = _codeoff_boundary(codeoff_v2_verify_final, body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/promote":
+        status, payload = _codeoff_boundary(codeoff_v2_promote, body, repos)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/prepare":
         status, payload = _codeoff_boundary(codeoff_prepare, body, repos)
