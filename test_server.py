@@ -21754,12 +21754,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "20e11066b2575e20d5e1761c45b53d340dbc4c98e0951df4fb0eaa3c61187105",
+            "5b7fbfc9ba2db481f780b7a88fd967dd07dd075d3400b113cf429baa92a39674",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 460)
-        self.assertEqual(len(graph["spec"]["edges"]), 549)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 460)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 549)
+        self.assertEqual(len(graph["spec"]["nodes"]), 480)
+        self.assertEqual(len(graph["spec"]["edges"]), 570)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 480)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 570)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21886,7 +21886,12 @@ class CodeOffTests(unittest.TestCase):
         )
         expected_v2_leaves |= {
             "v2_candidate_contract_disabled", "v2_candidate_parked",
-            "v2_judgment_parked", "v2_final_verification_pending", "v2_no_winner",
+            "v2_judgment_parked", "v2_no_winner",
+            "v2_final_verification_failed", "v2_promotion_disabled",
+            "v2_promoted", "v2_promotion_failed",
+            "v2_promotion_requested_write_failed",
+            "v2_promotion_requested_readback_failed",
+            "v2_promotion_requested_readback_mismatch",
             "v2_winner_decision_write_failed", "v2_winner_decision_readback_failed",
             "v2_winner_decision_readback_mismatch",
         } | {
@@ -22045,6 +22050,8 @@ class CodeOffTests(unittest.TestCase):
                 "v2_read_judgment_0": "v2_judgment_park_join",
                 "v2_read_judgment_1": "v2_judgment_park_join",
                 "v2_read_judgment_2": "v2_judgment_park_join",
+                "v2_verify_final": "v2_final_verification_failed",
+                "v2_promote": "v2_promotion_failed",
             }.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
@@ -22112,7 +22119,7 @@ class CodeOffTests(unittest.TestCase):
                     "v2_judgment_2", "v2_judgment_parked",
                     "v2_candidate_parked",
                 )
-             ] + ["v2_winner_decision_upsert"],
+             ] + ["v2_winner_decision_upsert", "v2_promotion_requested_upsert"],
         )
         key_expression = json.dumps(
             nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
@@ -22225,8 +22232,12 @@ class CodeOffTests(unittest.TestCase):
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
             "policy_v2_parked", "v2_candidate_contract_disabled",
-            "v2_candidate_parked", "v2_judgment_parked",
-            "v2_final_verification_pending", "v2_no_winner",
+            "v2_candidate_parked", "v2_judgment_parked", "v2_no_winner",
+            "v2_final_verification_failed", "v2_promotion_disabled",
+            "v2_promoted", "v2_promotion_failed",
+            "v2_promotion_requested_write_failed",
+            "v2_promotion_requested_readback_failed",
+            "v2_promotion_requested_readback_mismatch",
             "v2_winner_decision_write_failed", "v2_winner_decision_readback_failed",
             "v2_winner_decision_readback_mismatch",
         } | {
@@ -22591,6 +22602,328 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         server.write_job(job)
         self.assertTrue(server._codeoff_record_terminal_manifest(job))
         return job
+
+    def _v2_tested_candidate(self, experiment_id, slot="author-1", *, tests=None):
+        self._initialize(experiment_id, tests=tests)
+        workspace = server.codeoff_workspace_path(experiment_id, slot)
+        (workspace / "candidate.py").write_text(f"SLOT = {slot!r}\n")
+        job_id = hashlib.sha256(f"{experiment_id}:{slot}".encode()).hexdigest()[:32]
+        self._bind_v2_terminal_job(experiment_id, slot, job_id)
+        freeze_status, frozen = self._post_v2(
+            "freeze-candidate", self._v2_freeze_body(experiment_id, slot, job_id),
+        )
+        self.assertEqual(freeze_status, 200, frozen)
+        test_status, tested = self._post_v2(
+            "test-candidate", self._v2_test_body(experiment_id, frozen, slot),
+        )
+        self.assertEqual(test_status, 200, tested)
+        return frozen, tested
+
+    @staticmethod
+    def _v2_final_body(experiment_id, tested, slot="author-1"):
+        return {
+            "experiment_id": experiment_id,
+            "author_slot": slot,
+            "decision_hash": "d" * 64,
+            "aggregation_inputs_hash": "e" * 64,
+            "candidate_test_receipt_hash": tested["test_receipt_hash"],
+        }
+
+    def test_v2_verify_final_never_mutates_target_and_returns_closed_test_tree_and_receipt_facts(self):
+        experiment_id = "final-verification-facts-v2"
+        frozen, tested = self._v2_tested_candidate(experiment_id)
+        before_tree = server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"]
+        before_status = subprocess.run(
+            ["git", "-C", str(self.repo), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+
+        status, facts = self._post_v2(
+            "verify-final", self._v2_final_body(experiment_id, tested),
+        )
+
+        self.assertEqual(status, 200, facts)
+        self.assertEqual(set(facts), {
+            "ok", "protocol_version", "policy_version", "experiment_id", "status",
+            "author_slot", "decision_hash", "aggregation_inputs_hash", "identities_hash",
+            "identity_snapshot_hash", "tree_manifest_hash", "artifact_hash",
+            "freeze_receipt_hash", "candidate_test_receipt_hash", "tests_pass",
+            "no_mutation", "final_test_receipt_hash", "git_tree",
+            "final_verification_receipt_hash", "tests",
+        })
+        self.assertEqual(
+            (facts["status"], facts["tests_pass"], facts["no_mutation"]),
+            ("final-verified", True, True),
+        )
+        self.assertEqual(
+            (facts["tree_manifest_hash"], facts["artifact_hash"],
+             facts["freeze_receipt_hash"], facts["candidate_test_receipt_hash"]),
+            (frozen["tree_manifest_hash"], frozen["artifact_hash"],
+             frozen["freeze_receipt_hash"], tested["test_receipt_hash"]),
+        )
+        self.assertEqual([item["name"] for item in facts["tests"]], ["fixture-pass"])
+        openapi = json.loads(server.openapi_bytes())
+        operation = openapi["paths"]["/v1/code-off/v2/verify-final"]["post"]
+        self.assertEqual(operation["operationId"], "codeOffV2VerifyFinal")
+        schemas = openapi["components"]["schemas"]
+        self.assertEqual(set(schemas["CodeOffV2VerifyFinalRequest"]["required"]), {
+            "experiment_id", "author_slot", "decision_hash", "aggregation_inputs_hash",
+            "candidate_test_receipt_hash",
+        })
+        self.assertEqual(set(schemas["CodeOffV2VerifyFinalResult"]["required"]), set(facts))
+        self.assertEqual(
+            server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"], before_tree,
+        )
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.repo), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True, capture_output=True, text=True,
+        ).stdout, before_status)
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        self.assertEqual(state["status"], "prepared")
+        self.assertFalse(state["finalized"])
+        self.assertIsNone(state.get("promotion"))
+        self.assertFalse([
+            path for path in (self.workspaces / experiment_id).iterdir()
+            if path.name.startswith((".verify-", ".extract-"))
+        ])
+
+    def test_v2_workflow_owns_promotion_request_and_failed_final_test_or_mutation_has_no_promote_edge(self):
+        nodes, edges = self._v2_durable_graph()
+        self.assertEqual(
+            nodes["v2_verify_final"]["type"],
+            "action.graphwing.POST:/v1/code-off/v2/verify-final",
+        )
+        self.assertEqual(nodes["v2_verify_final"]["config"], {
+            "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 1230,
+            "experiment_id": "{{ CTX.INPUT.experiment_id }}",
+            "author_slot": "{{ CTX.v2_final_verification_binding.author_slot }}",
+            "decision_hash": "{{ CTX.v2_final_verification_binding.decision_hash }}",
+            "aggregation_inputs_hash": "{{ CTX.v2_final_verification_binding.aggregation_inputs_hash }}",
+            "candidate_test_receipt_hash": "{{ CTX.v2_final_verification_binding.candidate_test_receipt_hash }}",
+        })
+        for triple in (
+            ("v2_final_verification_binding", "out", "v2_verify_final"),
+            ("v2_verify_final", "success", "v2_final_verification_actionability"),
+            ("v2_verify_final", "failure", "v2_final_verification_failed"),
+            ("v2_final_verification_actionability", "out", "v2_final_verification_gate"),
+            ("v2_final_verification_gate", "fail", "v2_final_verification_failed"),
+            ("v2_final_verification_gate", "pass", "v2_promotion_requested_record"),
+            ("v2_promotion_requested_record", "out", "v2_promotion_requested_key"),
+            ("v2_promotion_requested_key", "out", "v2_promotion_requested_expected_hash"),
+            ("v2_promotion_requested_expected_hash", "out", "v2_promotion_requested_upsert"),
+            ("v2_promotion_requested_upsert", "success", "v2_promotion_requested_readback"),
+            ("v2_promotion_requested_readback", "success", "v2_promotion_requested_readback_hash"),
+            ("v2_promotion_requested_readback_hash", "out", "v2_promotion_requested_readback_check"),
+            ("v2_promotion_requested_readback_check", "out", "v2_promotion_requested_readback_gate"),
+            ("v2_promotion_requested_readback_gate", "pass", "v2_promotion_activation"),
+            ("v2_promotion_activation", "out", "v2_promotion_activation_gate"),
+            ("v2_promotion_activation_gate", "pass", "v2_promote"),
+            ("v2_promotion_activation_gate", "fail", "v2_promotion_disabled"),
+        ):
+            self.assertIn(triple, edges)
+        facts = self._v2_mappings(nodes["v2_final_verification_actionability"])
+        self.assertEqual(set(facts), {
+            "protocol_matches", "policy_matches", "slot_matches", "decision_matches",
+            "aggregation_inputs_match", "candidate_test_receipt_matches", "tests_pass",
+            "no_mutation",
+        })
+        runner = NativeGraphRunner.rules_pass
+        gate = nodes["v2_final_verification_gate"]["config"]
+        self.assertTrue(runner(gate, {key: True for key in facts}))
+        for failed_field in ("tests_pass", "no_mutation"):
+            values = {key: True for key in facts}
+            values[failed_field] = False
+            self.assertFalse(runner(gate, values), failed_field)
+        promotion = self._v2_mappings(nodes["v2_promotion_requested_record"])
+        self.assertEqual(list(promotion), [
+            "schema_version", "policy_version", "experiment_id", "author_slot",
+            "decision_hash", "final_verification_receipt_hash", "tree_manifest_hash",
+            "artifact_hash", "promotion_requested",
+        ])
+        self.assertEqual(promotion["promotion_requested"], {"kind": "literal", "value": True})
+        self.assertEqual(nodes["v2_promotion_requested_upsert"]["config"]["scope"], "tenant")
+        self.assertEqual(
+            nodes["v2_promotion_requested_upsert"]["config"]["collection"],
+            "graphwing_codeoff_decision_v2",
+        )
+        self.assertEqual(
+            self._v2_resolve(self._v2_mappings(nodes["v2_promotion_requested_key"])["value"]),
+            "graphwing-codeoff-v2:{CTX.INPUT.experiment_id}:decision:promotion",
+        )
+        check = self._v2_mappings(nodes["v2_promotion_requested_readback_check"])
+        self.assertEqual(set(check),
+                         {"found_matches", "key_matches", "data_matches", "version_matches"})
+        for expression in (check["data_matches"]["left"], check["data_matches"]["right"]):
+            self.assertTrue(expression["path"].startswith("CTX."), expression)
+        activation = self._v2_mappings(nodes["v2_promotion_activation"])
+        self.assertEqual(activation["activation_enabled"], {"kind": "literal", "value": False})
+        self.assertEqual(nodes["v2_promote"]["config"], {
+            "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 120,
+            "experiment_id": "{{ CTX.INPUT.experiment_id }}",
+            "author_slot": "{{ TASKS.v2_promotion_requested_readback.data.author_slot }}",
+            "decision_hash": "{{ TASKS.v2_promotion_requested_readback.data.decision_hash }}",
+            "final_verification_receipt_hash": "{{ TASKS.v2_promotion_requested_readback.data.final_verification_receipt_hash }}",
+        })
+        forward = {}
+        for source, _handle, target in edges:
+            forward.setdefault(source, set()).add(target)
+        reachable, frontier = set(), ["v2_final_verification_failed"]
+        while frontier:
+            current = frontier.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            frontier.extend(forward.get(current, ()))
+        self.assertNotIn("v2_promote", reachable)
+
+    def test_v2_promote_applies_only_the_requested_frozen_tree_bound_to_decision_and_verification_hashes(self):
+        experiment_id = "exact-promotion-v2"
+        frozen, tested = self._v2_tested_candidate(experiment_id)
+        verify_body = self._v2_final_body(experiment_id, tested)
+        verify_status, verified = self._post_v2("verify-final", verify_body)
+        self.assertEqual(verify_status, 200, verified)
+        base_tree = server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"]
+
+        status, promoted = self._post_v2("promote", {
+            "experiment_id": experiment_id,
+            "author_slot": "author-1",
+            "decision_hash": verify_body["decision_hash"],
+            "final_verification_receipt_hash": verified["final_verification_receipt_hash"],
+        })
+
+        self.assertEqual(status, 200, promoted)
+        self.assertEqual(set(promoted), {
+            "ok", "protocol_version", "policy_version", "experiment_id", "status",
+            "author_slot", "decision_hash", "final_verification_receipt_hash",
+            "tree_manifest_hash", "artifact_hash", "promoted_tree_hash", "git_tree",
+        })
+        self.assertEqual(promoted["status"], "promoted")
+        openapi = json.loads(server.openapi_bytes())
+        operation = openapi["paths"]["/v1/code-off/v2/promote"]["post"]
+        self.assertEqual(operation["operationId"], "codeOffV2Promote")
+        schemas = openapi["components"]["schemas"]
+        self.assertEqual(set(schemas["CodeOffV2PromoteRequest"]["required"]), {
+            "experiment_id", "author_slot", "decision_hash",
+            "final_verification_receipt_hash",
+        })
+        self.assertEqual(set(schemas["CodeOffV2PromoteResult"]["required"]), set(promoted))
+        self.assertNotEqual(promoted["promoted_tree_hash"], base_tree)
+        self.assertEqual(
+            (promoted["tree_manifest_hash"], promoted["artifact_hash"],
+             promoted["promoted_tree_hash"], promoted["git_tree"]),
+            (frozen["tree_manifest_hash"], frozen["artifact_hash"],
+             frozen["tree_manifest_hash"], verified["git_tree"]),
+        )
+        self.assertEqual(
+            server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"],
+            frozen["tree_manifest_hash"],
+        )
+        gate = {
+            "codeoff_experiment_id": experiment_id,
+            "final_verification_hash": verified["final_verification_receipt_hash"],
+            "message": "feat: promote code-off winner",
+        }
+        self.assertIsNone(server._codeoff_git_gate(gate, "scratch", self.repo, "commit"))
+        state = json.loads((self.records / experiment_id / "state.json").read_text())
+        self.assertEqual(state["status"], "prepared")
+        self.assertFalse(state["finalized"])
+        self.assertEqual(state["promotion"], {
+            "version": "code-off-promotion-v2", "author_slot": "author-1",
+            "decision_hash": verify_body["decision_hash"],
+            "final_verification_receipt_hash": verified["final_verification_receipt_hash"],
+            "tree_manifest_hash": frozen["tree_manifest_hash"],
+            "artifact_hash": frozen["artifact_hash"],
+            "promoted_tree_hash": frozen["tree_manifest_hash"],
+            "git_tree": verified["git_tree"],
+        })
+        self.assertFalse([
+            path for path in (self.workspaces / experiment_id).iterdir()
+            if path.name.startswith((".verify-", ".extract-"))
+        ])
+
+    def test_v2_promote_rejects_moved_head_dirty_index_changed_base_mutated_winner_replay_and_wrong_slot_without_touching_target(self):
+        def target_state():
+            return (
+                subprocess.run(
+                    ["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True,
+                    capture_output=True, text=True,
+                ).stdout,
+                subprocess.run(
+                    ["git", "-C", str(self.repo), "status", "--porcelain=v1", "--untracked-files=all"],
+                    check=True, capture_output=True, text=True,
+                ).stdout,
+                server.codeoff_tree_snapshot(self.repo, self.base_sha)["manifest_hash"],
+            )
+
+        def verified_request(experiment_id):
+            _frozen, tested = self._v2_tested_candidate(experiment_id)
+            final_body = self._v2_final_body(experiment_id, tested)
+            verify_status, verified = self._post_v2("verify-final", final_body)
+            self.assertEqual(verify_status, 200, verified)
+            return {
+                "experiment_id": experiment_id, "author_slot": "author-1",
+                "decision_hash": final_body["decision_hash"],
+                "final_verification_receipt_hash": verified["final_verification_receipt_hash"],
+            }
+
+        cases = (
+            ("moved-head-promotion-v2", "promotion_head_moved", lambda _eid: subprocess.run(
+                ["git", "-C", str(self.repo), "commit", "--allow-empty", "-m", "moved"],
+                check=True, capture_output=True,
+            )),
+            ("dirty-index-promotion-v2", "promotion_index_dirty", lambda _eid: (
+                (self.repo / "README.md").write_text("staged\n"),
+                subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True),
+                subprocess.run(
+                    ["git", "-C", str(self.repo), "restore", "--worktree", "--source=HEAD", "README.md"],
+                    check=True,
+                ),
+            )),
+            ("changed-base-promotion-v2", "promotion_base_mutated", lambda _eid:
+             (self.repo / "README.md").write_text("operator change\n")),
+            ("mutated-winner-promotion-v2", "candidate_mutated", lambda eid:
+             (server.codeoff_workspace_path(eid, "author-1") / "candidate.py").write_text("changed\n")),
+        )
+        for experiment_id, expected_code, mutate in cases:
+            with self.subTest(case=expected_code):
+                subprocess.run(["git", "-C", str(self.repo), "reset", "--hard", self.base_sha],
+                               check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(self.repo), "clean", "-fdx"],
+                               check=True, capture_output=True)
+                request = verified_request(experiment_id)
+                mutate(experiment_id)
+                before = target_state()
+                status, rejected = self._post_v2("promote", request)
+                expected_status = 422 if expected_code == "candidate_mutated" else 409
+                self.assertEqual((status, rejected["code"]),
+                                 (expected_status, expected_code), rejected)
+                self.assertEqual(target_state(), before)
+
+        subprocess.run(["git", "-C", str(self.repo), "reset", "--hard", self.base_sha],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "clean", "-fdx"],
+                       check=True, capture_output=True)
+        wrong_slot = verified_request("wrong-slot-promotion-v2")
+        wrong_slot["author_slot"] = "author-2"
+        before = target_state()
+        status, rejected = self._post_v2("promote", wrong_slot)
+        self.assertEqual((status, rejected["code"]), (409, "final_verification_mismatch"), rejected)
+        self.assertEqual(target_state(), before)
+
+        wrong_decision = verified_request("wrong-decision-promotion-v2")
+        wrong_decision["decision_hash"] = "f" * 64
+        before = target_state()
+        status, rejected = self._post_v2("promote", wrong_decision)
+        self.assertEqual((status, rejected["code"]), (409, "final_verification_mismatch"), rejected)
+        self.assertEqual(target_state(), before)
+
+        replay = verified_request("replayed-promotion-v2")
+        promoted_status, promoted = self._post_v2("promote", replay)
+        self.assertEqual(promoted_status, 200, promoted)
+        before = target_state()
+        status, rejected = self._post_v2("promote", replay)
+        self.assertEqual((status, rejected["code"]), (409, "promotion_replayed"), rejected)
+        self.assertEqual(target_state(), before)
 
     def test_v2_candidate_test_returns_facts_and_does_not_choose_park_or_advance(self):
         experiment_id = "candidate-facts-v2"
@@ -24106,7 +24439,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             ("v2_winner_decision_readback_gate", "pass", "v2_winner_readback_projection"),
             ("v2_winner_readback_projection", "out", "v2_winner_gate"),
             ("v2_winner_gate", "pass", "v2_final_verification_binding"),
-            ("v2_final_verification_binding", "out", "v2_final_verification_pending"),
+            ("v2_final_verification_binding", "out", "v2_verify_final"),
         ):
             self.assertIn(triple, edges)
         check = self._v2_mappings(nodes["v2_winner_decision_readback_check"])
@@ -24118,7 +24451,8 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(check["data_matches"]["right"], {
             "kind": "getField", "path": "CTX.v2_winner_decision_expected_hash.value",
         })
-        self.assertEqual(nodes["v2_final_verification_pending"]["type"], "action.noop")
+        self.assertEqual(nodes["v2_verify_final"]["type"],
+                         "action.graphwing.POST:/v1/code-off/v2/verify-final")
         binding = self._v2_mappings(nodes["v2_final_verification_binding"])
         self.assertEqual(list(binding), [
             "schema_version", "author_slot", "decision_hash",
@@ -24353,6 +24687,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "v2_blind", "v2_judge_0_launch", "v2_judge_1_launch",
             "v2_judge_2_launch", "v2_read_judgment_0",
             "v2_read_judgment_1", "v2_read_judgment_2",
+            "v2_verify_final", "v2_promote",
         })
         self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
         self.assertEqual(forward.get("v2_continuation_disabled"), {"v2_candidate_stage_contract"})

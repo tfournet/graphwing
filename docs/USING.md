@@ -478,3 +478,37 @@ eligible filter remain unchanged. The v2 activation gate is still false, and
 final verification and promotion remain later slices. These fixtures prove
 only source catalog behavior; no deployment, re-import, publication, tenant
 readback, provider run, or live canary was performed.
+
+### Issue #188 PR 6 final-verification and exact-promotion boundary
+
+`codeOffV2VerifyFinal` consumes the workflow-selected author slot, durable
+decision and aggregation-input hashes, and the exact candidate-test receipt.
+It rereads the pinned author job, execution manifests, identity hashes, frozen
+manifest/archive, freeze receipt, candidate-test receipt, and event anchors.
+The frozen artifact is materialized in a disposable Git worktree and the
+initialization-locked recipes run there. The response contains only closed
+per-test, tree, identity, and content-addressed receipt facts. The target branch,
+HEAD, index, and worktree are not changed.
+
+Native nodes compare the returned slot and hashes and require both passing
+recipes and no mutation before writing `promotion_requested: true` under the
+experiment-scoped `:decision:promotion` key. The write is followed by same-key
+tenant readback with exact payload hash, key, and version checks. Failed tests,
+mutation, action failure, and readback failure have no edge to promotion. Hash
+outputs are consumed from `CTX`.
+
+`codeOffV2Promote` accepts only the exact author slot, decision hash, and final
+verification receipt hash. It freshly checks the original branch and HEAD, an
+empty index and pristine base tree, frozen artifact equality, author identity,
+execution/candidate/final receipt authority, and one-time effect state. It
+materializes the artifact again without rerunning policy or tests, applies only
+the verified Git tree, verifies the resulting tree, and restores the pristine
+base after an interrupted apply or receipt write. The v2 `gitCommit` and
+`gitPush` safety gates require that same final-verification hash and the exact
+promoted tree; they do not select a winner.
+
+The v1 `codeOffFinalize` operation and `final_verified` graph path remain
+unchanged. The source graph retains literal-false v2 candidate activation and
+adds a separate literal-false promotion gate. No v2 promotion is activated by
+this change. Deployment, OpenAPI re-import, workflow publication/readback, and
+live proof require separate approval.
