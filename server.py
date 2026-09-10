@@ -11624,6 +11624,51 @@ def _codeoff_v2_judgment_authority_error(
     return None
 
 
+def _codeoff_v2_local_seal_authority_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+        return None
+    seal = state.get("local_seal")
+    seal_events = [
+        event.get("data") for event in events if event.get("kind") == "v2_local_sealed"
+    ]
+    if seal is None:
+        return None if not seal_events else {
+            "error": "local seal authority differs", "code": "local_seal_tampered",
+        }
+    if not isinstance(seal, dict):
+        return {"error": "local seal authority differs", "code": "local_seal_tampered"}
+    try:
+        body = {key: value for key, value in seal.items() if key != "seal_receipt_hash"}
+        receipt_hash = seal.get("seal_receipt_hash")
+        event = {
+            "terminal_record_hash": seal.get("terminal_record_hash"),
+            "terminal_event_hash": seal.get("terminal_event_hash"),
+            "seal_receipt_hash": receipt_hash,
+        }
+        exact = (
+            isinstance(seal, dict)
+            and set(seal) == {
+                "version", "experiment_id", "terminal_record_hash",
+                "terminal_event_hash", "agent_job_ids", "attempt_receipt_hashes",
+                "sealed_at", "seal_receipt_hash",
+            }
+            and seal.get("version") == "code-off-v2-local-seal-v1"
+            and seal.get("experiment_id") == root.name
+            and isinstance(receipt_hash, str)
+            and hashlib.sha256(codeoff_canonical_json(body)).hexdigest() == receipt_hash
+            and _codeoff_read_artifact(root, receipt_hash) == codeoff_canonical_json(body)
+            and seal_events == [event]
+        )
+    except (CodeOffArtifactError, OSError, TypeError):
+        exact = False
+    if not exact:
+        return {"error": "local seal authority differs", "code": "local_seal_tampered"}
+    return None
+
+
 def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     exp, err = _codeoff_id(experiment_id)
     if err:
@@ -11650,6 +11695,9 @@ def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | N
     judgment_err = _codeoff_v2_judgment_authority_error(root, manifest, state, events)
     if judgment_err:
         return None, None, None, judgment_err
+    local_seal_err = _codeoff_v2_local_seal_authority_error(root, manifest, state, events)
+    if local_seal_err:
+        return None, None, None, local_seal_err
     final_path = root / "final.json"
     if state.get("finalized"):
         final_bytes = codeoff_canonical_json(_codeoff_final_value(manifest, state)) + b"\n"
@@ -11662,8 +11710,11 @@ def _codeoff_load(experiment_id: Any, *, active: bool = False) -> tuple[Path | N
             return None, None, None, {"error": "final record is unreadable", "code": "record_unreadable"}
     elif os.path.lexists(final_path):
         return None, None, None, {"error": "unexpected final record", "code": "final_tampered"}
-    if active and state.get("finalized"):
-        return None, None, None, {"error": "experiment is finalized and cannot reopen", "code": "experiment_finalized"}
+    if active and (state.get("finalized") or state.get("local_seal") is not None):
+        return None, None, None, {
+            "error": "experiment execution authority is sealed and cannot reopen",
+            "code": "experiment_finalized",
+        }
     return root, manifest, state, None
 
 def _codeoff_write_state(root: Path, state: dict[str, Any]) -> None:
@@ -14835,6 +14886,308 @@ def codeoff_v2_promote(
         return 200, _codeoff_v2_promotion_result(manifest, promotion)
 
 
+def _codeoff_v2_attempt_fact(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any], slot: str, job_id: Any,
+) -> dict[str, Any]:
+    unavailable = {
+        "job_id": job_id if isinstance(job_id, str) else None,
+        "slot": slot, "work_role": codeoff_slot_work_role(slot),
+        "terminal_status": None, "usage": None,
+        "usage_diagnostic": "usage_authority_unavailable", "receipt_hash": None,
+        "started_at": None, "finished_at": None, "elapsed_seconds": None,
+    }
+    try:
+        job = read_job(job_id) if isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        job = None
+    if not is_agent_job_record(job):
+        return unavailable
+    assert isinstance(job, dict)
+    receipt = job.get("receipt")
+    identity = manifest.get("identities", {}).get(slot)
+    entry = state.get("execution_manifests", {}).get(slot, {}).get(job_id)
+    launch = _codeoff_launch_execution_manifest(job)
+    try:
+        launch_hash = entry.get("launch_manifest_hash") if isinstance(entry, dict) else None
+        launch_exact = (
+            isinstance(identity, dict) and launch is not None
+            and isinstance(launch_hash, str)
+            and _codeoff_read_artifact(root, launch_hash) == codeoff_canonical_json(launch)
+            and [
+                event.get("data") for event in _codeoff_events(root, state)
+                if event.get("kind") == "agent_launched"
+            ].count({
+                "slot": slot, "job_id": job_id,
+                "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
+                "execution_manifest_hash": launch_hash,
+                "prompt_hash": launch.get("prompt_hash"),
+            }) == 1
+        )
+    except (CodeOffArtifactError, KeyError, OSError, TypeError):
+        launch_exact = False
+    expected_profile = {
+        "launcher": identity.get("launcher") if isinstance(identity, dict) else None,
+        "provider": identity.get("provider") if isinstance(identity, dict) else None,
+        "model": identity.get("exact_model") if isinstance(identity, dict) else None,
+        "requested_effort": identity.get("requested_effort") if isinstance(identity, dict) else None,
+        "effective_effort": identity.get("effective_effort") if isinstance(identity, dict) else None,
+        "effort_source": CODEOFF_EFFORT_SOURCE,
+        "launcher_version": identity.get("launcher_version") if isinstance(identity, dict) else None,
+    }
+    terminal_status = job.get("status")
+    receipt_status = receipt.get("status") if isinstance(receipt, dict) else None
+    status_exact = (
+        (terminal_status == "completed" and receipt_status == "ok")
+        or (terminal_status == "failed" and receipt_status in ("error", "timeout"))
+    )
+    trusted_profile = trusted_agent_profile(job)
+    profile_exact = (
+        isinstance(trusted_profile, dict)
+        and all(trusted_profile.get(key) == value for key, value in expected_profile.items())
+        and isinstance(receipt, dict) and receipt_profile_matches_job(job, receipt)
+        and receipt.get("job_id") == job_id
+        and job.get("codeoff_workspace") == {
+            "experiment_id": manifest.get("experiment_id"), "slot": slot,
+        }
+    )
+    if terminal_status == "completed":
+        hashes = _codeoff_execution_manifest_hashes(root, state, slot, str(job_id))
+        terminal_exact = bool(
+            hashes is not None and isinstance(receipt, dict)
+            and _codeoff_terminal_identity_matches(job, receipt, identity)
+        )
+    else:
+        terminal_exact = bool(
+            isinstance(entry, dict) and entry.get("terminal_manifest_hash") is None
+            and not any(
+                event.get("kind") == "agent_terminal_manifest"
+                and event.get("data", {}).get("slot") == slot
+                and event.get("data", {}).get("job_id") == job_id
+                for event in _codeoff_events(root, state)
+            )
+        )
+    if not (launch_exact and profile_exact and status_exact and terminal_exact):
+        unavailable["usage_diagnostic"] = "usage_authority_mismatch"
+        return unavailable
+    usage, diagnostic = authorized_receipt_usage("agent", receipt)
+    with TERMINAL_RECEIPT_AUTHORITY_LOCK:
+        expected_digest = TERMINAL_RECEIPT_AUTHORITY.get(("agent", str(job_id)))
+    try:
+        actual_digest = _terminal_receipt_digest("agent", receipt)
+    except (TypeError, ValueError):
+        actual_digest = None
+    receipt_hash = (
+        actual_digest if isinstance(expected_digest, str) and isinstance(actual_digest, str)
+        and hmac.compare_digest(expected_digest, actual_digest) else None
+    )
+    if receipt_hash is None:
+        usage, diagnostic = None, diagnostic or "usage_authority_unavailable"
+    return {
+        "job_id": job_id, "slot": slot, "work_role": codeoff_slot_work_role(slot),
+        "terminal_status": terminal_status, "usage": usage,
+        "usage_diagnostic": diagnostic, "receipt_hash": receipt_hash,
+        "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
+        "elapsed_seconds": _codeoff_elapsed(job.get("started_at"), job.get("finished_at")),
+    }
+
+
+def _codeoff_v2_named_test_facts(receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{
+        "name": item.get("name"),
+        "status": "passed" if item.get("pass") is True else "failed",
+        "returncode": item.get("returncode"),
+        "elapsed_seconds": (
+            float(item["elapsed_seconds"])
+            if isinstance(item.get("elapsed_seconds"), (int, float, Decimal))
+            else item.get("elapsed_seconds")
+        ),
+        "log_hash": item.get("log_hash"),
+    } for item in receipt.get("tests", []) if isinstance(item, dict)]
+
+
+def _codeoff_v2_execution_authority_error(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+) -> dict[str, Any] | None:
+    identity_err = codeoff_manifest_identity_error(manifest)
+    if identity_err:
+        return identity_err
+    for slot in ("author-1", "author-2"):
+        candidate = state.get("candidates", {}).get(slot)
+        if isinstance(candidate, dict) and isinstance(candidate.get("tests"), dict):
+            authority_err = _codeoff_v2_candidate_authority_error(
+                root, manifest, state, slot,
+            )
+            if authority_err:
+                return authority_err
+    final = state.get("final_verification")
+    if isinstance(final, dict) and not _codeoff_v2_final_test_receipt_exact(root, final):
+        return {
+            "error": "final test receipt authority differs",
+            "code": "final_verification_mismatch",
+        }
+    return None
+
+
+def _codeoff_v2_execution_facts(
+    root: Path, manifest: dict[str, Any], state: dict[str, Any],
+) -> dict[str, Any]:
+    attempts = [
+        _codeoff_v2_attempt_fact(root, manifest, state, slot, job_id)
+        for slot in ("author-1", "author-2", "judge-fable", "judge-1", "judge-2")
+        for job_id in state.get("agent_jobs", {}).get(slot, [])
+    ]
+    candidate_tests = []
+    for slot in ("author-1", "author-2"):
+        candidate = state.get("candidates", {}).get(slot)
+        tests = candidate.get("tests") if isinstance(candidate, dict) else None
+        if not isinstance(tests, dict):
+            continue
+        if _codeoff_v2_candidate_authority_error(root, manifest, state, slot) is not None:
+            continue
+        candidate_tests.append({
+            "slot": slot, "tests_pass": tests.get("pass"), "no_mutation": True,
+            "test_receipt_hash": tests.get("receipt_hash"),
+            "started_at": tests.get("started_at"), "finished_at": tests.get("finished_at"),
+            "elapsed_seconds": tests.get("elapsed_seconds"),
+            "tests": _codeoff_v2_named_test_facts(tests),
+        })
+    final_tests = []
+    final = state.get("final_verification")
+    if isinstance(final, dict) and _codeoff_v2_final_test_receipt_exact(root, final):
+        try:
+            test_receipt = strict_json_object(
+                _codeoff_read_artifact(root, final.get("final_test_receipt_hash"))
+            )
+        except (CodeOffArtifactError, OSError, TypeError, ValueError):
+            test_receipt = None
+        if isinstance(test_receipt, dict):
+            final_tests.append({
+                "author_slot": final.get("author_slot"),
+                "tests_pass": final.get("tests_pass"),
+                "no_mutation": final.get("no_mutation"),
+                "test_receipt_hash": final.get("final_test_receipt_hash"),
+                "final_verification_receipt_hash": final.get("receipt_hash"),
+                "started_at": test_receipt.get("started_at"),
+                "finished_at": test_receipt.get("finished_at"),
+                "elapsed_seconds": (
+                    float(test_receipt["elapsed_seconds"])
+                    if isinstance(test_receipt.get("elapsed_seconds"), (int, float, Decimal))
+                    else test_receipt.get("elapsed_seconds")
+                ),
+                "tests": _codeoff_v2_named_test_facts(test_receipt),
+            })
+    facts = {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": manifest["experiment_id"], "authority_available": True,
+        "attempts": attempts, "candidate_tests": candidate_tests,
+        "final_tests": final_tests,
+    }
+    facts["facts_receipt_hash"] = hashlib.sha256(codeoff_canonical_json(facts)).hexdigest()
+    return facts
+
+
+def codeoff_v2_execution_facts(body: bytes) -> tuple[int, dict[str, Any]]:
+    data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "execution facts belong to another protocol", "code": "protocol_mismatch"}
+        authority_err = _codeoff_v2_execution_authority_error(root, manifest, state)
+        if authority_err:
+            return 409, authority_err
+        return 200, _codeoff_v2_execution_facts(root, manifest, state)
+
+
+def _codeoff_v2_local_seal_result(seal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True, "protocol_version": CODEOFF_V2_PROTOCOL_VERSION,
+        "policy_version": CODEOFF_V2_POLICY_VERSION,
+        "experiment_id": seal["experiment_id"], "authority_sealed": True,
+        **{key: seal[key] for key in (
+            "terminal_record_hash", "terminal_event_hash", "agent_job_ids",
+            "attempt_receipt_hashes", "sealed_at", "seal_receipt_hash",
+        )},
+    }
+
+
+def codeoff_v2_seal_local(body: bytes) -> tuple[int, dict[str, Any]]:
+    fields = {"experiment_id", "terminal_record_hash", "terminal_event_hash"}
+    data, err = _codeoff_body(body, fields, exact=True)
+    if err:
+        return 400, err
+    assert data is not None
+    if any(
+        not isinstance(data.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None
+        for key in ("terminal_record_hash", "terminal_event_hash")
+    ):
+        return 400, {"error": "terminal hashes must be lowercase SHA-256 digests", "code": "bad_terminal_hash"}
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        if manifest.get("protocol_version") != CODEOFF_V2_PROTOCOL_VERSION:
+            return 409, {"error": "local seal belongs to another protocol", "code": "protocol_mismatch"}
+        existing = state.get("local_seal")
+        if existing is not None:
+            if (
+                existing.get("terminal_record_hash") != data["terminal_record_hash"]
+                or existing.get("terminal_event_hash") != data["terminal_event_hash"]
+            ):
+                return 409, {"error": "local authority is sealed to another terminal record", "code": "local_seal_conflict"}
+            return 200, _codeoff_v2_local_seal_result(existing)
+        authority_err = _codeoff_v2_execution_authority_error(root, manifest, state)
+        if authority_err:
+            return 409, authority_err
+        launched = json.loads(json.dumps(state.get("agent_jobs", {})))
+    drain_err = _codeoff_wait_for_jobs(state)
+    if drain_err:
+        return 409, drain_err
+    with CODEOFF_LOCK:
+        root, manifest, state, load_err = _codeoff_load(data.get("experiment_id"), active=False)
+        if load_err:
+            return 409, load_err
+        assert root is not None and manifest is not None and state is not None
+        authority_err = _codeoff_v2_execution_authority_error(root, manifest, state)
+        if authority_err:
+            return 409, authority_err
+        if state.get("agent_jobs", {}) != launched:
+            return 409, {"error": "code-off launches changed during local sealing", "code": "agent_jobs_changed"}
+        facts = _codeoff_v2_execution_facts(root, manifest, state)
+        job_ids = sorted({
+            attempt["job_id"] for attempt in facts["attempts"]
+            if isinstance(attempt.get("job_id"), str)
+        })
+        seal = {
+            "version": "code-off-v2-local-seal-v1",
+            "experiment_id": manifest["experiment_id"],
+            "terminal_record_hash": data["terminal_record_hash"],
+            "terminal_event_hash": data["terminal_event_hash"],
+            "agent_job_ids": job_ids,
+            "attempt_receipt_hashes": {
+                attempt["job_id"]: attempt["receipt_hash"] for attempt in facts["attempts"]
+                if isinstance(attempt.get("job_id"), str)
+            },
+            "sealed_at": utcnow(),
+        }
+        receipt_hash = _codeoff_artifact(root, codeoff_canonical_json(seal))
+        seal["seal_receipt_hash"] = receipt_hash
+        state["local_seal"] = seal
+        _codeoff_commit_event(root, state, "v2_local_sealed", {
+            "terminal_record_hash": data["terminal_record_hash"],
+            "terminal_event_hash": data["terminal_event_hash"],
+            "seal_receipt_hash": receipt_hash,
+        })
+        return 200, _codeoff_v2_local_seal_result(seal)
+
+
 def codeoff_finalize(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, Any]]:
     data, err = _codeoff_body(body, {"experiment_id"}, exact=True)
     if err:
@@ -15058,8 +15411,9 @@ def codeoff_cleanup(body: bytes, repos: dict[str, str]) -> tuple[int, dict[str, 
     if load_err:
         return 400, load_err
     assert root and manifest and state
-    if not state.get("finalized"):
-        return 409, {"error": "cleanup is refused before finalization", "code": "not_finalized"}
+    is_v2 = manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
+    if not state.get("finalized") and not (is_v2 and isinstance(state.get("local_seal"), dict)):
+        return 409, {"error": "cleanup is refused before durable terminal readback and local sealing", "code": "not_finalized"}
     workspace_root = CODEOFF_WORKSPACES_DIR / manifest["experiment_id"]
     repo_raw = repos.get(manifest["repo"])
     repo = Path(repo_raw) if isinstance(repo_raw, str) and repo_raw else Path("/__graphwing_missing_repo__")
@@ -15655,6 +16009,12 @@ def dispatch_inner(
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/v2/promote":
         status, payload = _codeoff_boundary(codeoff_v2_promote, body, repos)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/execution-facts":
+        status, payload = _codeoff_boundary(codeoff_v2_execution_facts, body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/code-off/v2/seal-local":
+        status, payload = _codeoff_boundary(codeoff_v2_seal_local, body)
         return json_out(status, payload)
     if method == "POST" and path == "/v1/code-off/prepare":
         status, payload = _codeoff_boundary(codeoff_prepare, body, repos)

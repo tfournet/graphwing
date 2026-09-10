@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -21754,12 +21755,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "5b7fbfc9ba2db481f780b7a88fd967dd07dd075d3400b113cf429baa92a39674",
+            "7e0ffd62f0e95e9547d7fc9eebaf9c79387333d1e1ad1b4c785e0d02367c887f",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 480)
-        self.assertEqual(len(graph["spec"]["edges"]), 570)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 480)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 570)
+        self.assertEqual(len(graph["spec"]["nodes"]), 532)
+        self.assertEqual(len(graph["spec"]["edges"]), 633)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 532)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 633)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -21872,7 +21873,7 @@ class CodeOffTests(unittest.TestCase):
         self.assertTrue(all("author_1" in path for path in paths_to("author_2")))
         self.assertTrue(all({"judge_fable", "judge_1"} <= set(path) for path in paths_to("judge_2")))
         leaves = {node_id for node_id in nodes if not forward.get(node_id)}
-        expected_v2_leaves = {"policy_v2_parked"} | {
+        expected_v2_leaves = {
             f"{prefix}_{suffix}"
             for prefix in ("v2_experiment", "v2_initialization", "v2_initialized", "v2_parked")
             for suffix in ("write_failed", "readback_failed", "readback_mismatch")
@@ -21885,10 +21886,10 @@ class CodeOffTests(unittest.TestCase):
             "v2_candidates_ready", "v2_candidate_parked",
         )
         expected_v2_leaves |= {
-            "v2_candidate_contract_disabled", "v2_candidate_parked",
-            "v2_judgment_parked", "v2_no_winner",
-            "v2_final_verification_failed", "v2_promotion_disabled",
-            "v2_promoted", "v2_promotion_failed",
+            "v2_terminal_complete", "v2_local_seal_unavailable", "v2_cleanup_failed",
+            "v2_terminal_record_write_failed", "v2_terminal_record_readback_failed",
+            "v2_terminal_record_readback_mismatch", "v2_terminal_event_write_failed",
+            "v2_terminal_event_readback_failed", "v2_terminal_event_readback_mismatch",
             "v2_promotion_requested_write_failed",
             "v2_promotion_requested_readback_failed",
             "v2_promotion_requested_readback_mismatch",
@@ -22052,6 +22053,11 @@ class CodeOffTests(unittest.TestCase):
                 "v2_read_judgment_2": "v2_judgment_park_join",
                 "v2_verify_final": "v2_final_verification_failed",
                 "v2_promote": "v2_promotion_failed",
+                "v2_commit": "v2_terminal_park_join",
+                "v2_push": "v2_terminal_park_join",
+                "v2_execution_facts": "v2_local_loss_facts",
+                "v2_seal_local": "v2_local_seal_unavailable",
+                "v2_cleanup": "v2_cleanup_failed",
             }.get(node_id, "join_terminal")
             self.assertIn((node_id, "failure", expected_target), triples, node_id)
 
@@ -22119,7 +22125,8 @@ class CodeOffTests(unittest.TestCase):
                     "v2_judgment_2", "v2_judgment_parked",
                     "v2_candidate_parked",
                 )
-             ] + ["v2_winner_decision_upsert", "v2_promotion_requested_upsert"],
+             ] + ["v2_winner_decision_upsert", "v2_promotion_requested_upsert",
+                  "v2_terminal_record_upsert", "v2_terminal_event_upsert"],
         )
         key_expression = json.dumps(
             nodes["economics_record_key"]["config"]["mappings"][0]["expression"]
@@ -22231,10 +22238,10 @@ class CodeOffTests(unittest.TestCase):
         expected = {
             "economics_recorded", "economics_write_failed",
             "economics_readback_failed", "economics_readback_mismatch",
-            "policy_v2_parked", "v2_candidate_contract_disabled",
-            "v2_candidate_parked", "v2_judgment_parked", "v2_no_winner",
-            "v2_final_verification_failed", "v2_promotion_disabled",
-            "v2_promoted", "v2_promotion_failed",
+            "v2_terminal_complete", "v2_local_seal_unavailable", "v2_cleanup_failed",
+            "v2_terminal_record_write_failed", "v2_terminal_record_readback_failed",
+            "v2_terminal_record_readback_mismatch", "v2_terminal_event_write_failed",
+            "v2_terminal_event_readback_failed", "v2_terminal_event_readback_mismatch",
             "v2_promotion_requested_write_failed",
             "v2_promotion_requested_readback_failed",
             "v2_promotion_requested_readback_mismatch",
@@ -22523,7 +22530,10 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             **self._v2_transition(experiment_id, stage, ordinal, payload),
         }
 
-    def _bind_v2_terminal_job(self, experiment_id, slot="author-1", job_id="a" * 32):
+    def _bind_v2_terminal_job(
+        self, experiment_id, slot="author-1", job_id="a" * 32, *, usage=None,
+        usage_diagnostic="usage_not_reported", terminal_status="completed",
+    ):
         root = self.records / experiment_id
         manifest = json.loads((root / "manifest.json").read_text())
         state = json.loads((root / "state.json").read_text())
@@ -22564,13 +22574,16 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
                 "launcher", "provider", "model", "native_session_id",
             )},
         }
+        success = terminal_status == "completed"
+        self.assertIn(terminal_status, ("completed", "failed"))
         receipt = {
-            "status": "ok", "job_id": job_id, **profile,
-            "session_identity": session_identity,
-            "execution_identity": execution_identity, "summary": "fixture",
+            "status": "ok" if success else "error", "job_id": job_id, **profile,
+            "session_identity": session_identity, "summary": "fixture",
+            **({"execution_identity": execution_identity} if success else {}),
+            "usage": usage, "usage_diagnostic": usage_diagnostic if usage is None else None,
         }
         job = {
-            "job_id": job_id, "kind": "agent", "status": "completed",
+            "job_id": job_id, "kind": "agent", "status": terminal_status,
             "repo": session_identity["repo"], "branch": branch,
             "starting_head": head,
             "cwd": str(server.codeoff_workspace_path(experiment_id, slot)),
@@ -22582,7 +22595,8 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "run_budget_seconds": budget,
             "started_at": "2026-09-03T12:00:00Z",
             "finished_at": "2026-09-03T12:00:01Z",
-            "execution_identity": execution_identity, "receipt": receipt,
+            "receipt": receipt,
+            **({"execution_identity": execution_identity} if success else {}),
         }
         launch = server._codeoff_launch_execution_manifest(job)
         self.assertIsNotNone(launch)
@@ -22597,10 +22611,13 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "slot": slot, "job_id": job_id,
             "identity_snapshot_hash": manifest["identity_snapshot_hashes"][slot],
             "execution_manifest_hash": launch_hash,
-            "prompt_hash": manifest["prompt_hash"],
+            "prompt_hash": prompt_hash,
         })
         server.write_job(job)
-        self.assertTrue(server._codeoff_record_terminal_manifest(job))
+        server.seal_terminal_receipt_authority("agent", receipt)
+        self.addCleanup(server.clear_terminal_receipt_authority, "agent", job_id)
+        if success:
+            self.assertTrue(server._codeoff_record_terminal_manifest(job))
         return job
 
     def _v2_tested_candidate(self, experiment_id, slot="author-1", *, tests=None):
@@ -24514,7 +24531,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertFalse(any(node["type"] == "transforms.codeExpression" for node in v2_nodes))
         serialized = json.dumps(v2_nodes)
         for forbidden in ("{%", "codeOffAggregate", "/v1/code-off/aggregate",
-                          "fallback", "redraw", "replacement_judge"):
+                          "fallback_route", "redraw", "replacement_judge"):
             self.assertNotIn(forbidden, serialized)
         native_types = {
             nodes[node_id]["type"] for node_id in (
@@ -24533,6 +24550,334 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
                                                        "commit", "push"}
             for source, _handle, target in edges
         ))
+
+    @staticmethod
+    def _v2_usage(**overrides):
+        usage = {
+            "usage_version": server.USAGE_VERSION,
+            "fresh_input_tokens": 10, "cached_input_tokens": 2,
+            "cache_write_tokens": 1, "output_tokens": 4, "reasoning_tokens": 3,
+            "provider_cost_usd": 0.1, "wall_seconds": 1.25, "turns_observed": 2,
+        }
+        usage.update(overrides)
+        return usage
+
+    def test_v2_execution_facts_report_every_author_judge_candidate_and_final_attempt_without_computing_economics_or_status(self):
+        experiment_id = "execution-facts-v2"
+        self._initialize(experiment_id)
+        tested = {}
+        jobs = {}
+        for index, slot in enumerate(("author-1", "author-2"), 1):
+            workspace = server.codeoff_workspace_path(experiment_id, slot)
+            (workspace / "candidate.py").write_text(f"SLOT = {slot!r}\n")
+            job_id = str(index) * 32
+            jobs[slot] = self._bind_v2_terminal_job(
+                experiment_id, slot, job_id,
+                usage=self._v2_usage(output_tokens=index * 4),
+            )
+            freeze_status, frozen = self._post_v2(
+                "freeze-candidate", self._v2_freeze_body(experiment_id, slot, job_id),
+            )
+            self.assertEqual(freeze_status, 200, frozen)
+            test_status, tested[slot] = self._post_v2(
+                "test-candidate", self._v2_test_body(experiment_id, frozen, slot),
+            )
+            self.assertEqual(test_status, 200, tested[slot])
+        self.assertEqual(self._post_v2("blind", {"experiment_id": experiment_id})[0], 200)
+        for index, slot in enumerate(("judge-fable", "judge-1", "judge-2"), 3):
+            jobs[slot] = self._bind_v2_terminal_job(
+                experiment_id, slot, str(index) * 32,
+                usage=self._v2_usage(output_tokens=index * 4),
+                terminal_status="failed" if slot == "judge-2" else "completed",
+            )
+        final_status, final = self._post_v2(
+            "verify-final", self._v2_final_body(experiment_id, tested["author-1"]),
+        )
+        self.assertEqual(final_status, 200, final)
+
+        status, facts = self._post_v2("execution-facts", {"experiment_id": experiment_id})
+
+        self.assertEqual(status, 200, facts)
+        self.assertEqual(set(facts), {
+            "ok", "protocol_version", "policy_version", "experiment_id",
+            "authority_available", "attempts", "candidate_tests", "final_tests",
+            "facts_receipt_hash",
+        })
+        self.assertTrue(facts["authority_available"])
+        openapi = json.loads(server.openapi_bytes())
+        self.assertEqual(
+            openapi["paths"]["/v1/code-off/v2/execution-facts"]["post"]["operationId"],
+            "codeOffV2ExecutionFacts",
+        )
+        self.assertEqual(
+            set(openapi["components"]["schemas"]["CodeOffV2ExecutionFactsResult"]["required"]),
+            set(facts),
+        )
+        self.assertEqual(
+            [(attempt["slot"], attempt["job_id"]) for attempt in facts["attempts"]],
+            [(slot, jobs[slot]["job_id"]) for slot in
+             ("author-1", "author-2", "judge-fable", "judge-1", "judge-2")],
+        )
+        for attempt in facts["attempts"]:
+            self.assertEqual(set(attempt), {
+                "job_id", "slot", "work_role", "terminal_status", "usage",
+                "usage_diagnostic", "receipt_hash", "started_at", "finished_at",
+                "elapsed_seconds",
+            })
+            self.assertIsNotNone(attempt["usage"], attempt)
+            self.assertIsNone(attempt["usage_diagnostic"])
+            self.assertRegex(attempt["receipt_hash"], r"^[0-9a-f]{64}$")
+            self.assertEqual(attempt["elapsed_seconds"], 1.0)
+        self.assertEqual([fact["slot"] for fact in facts["candidate_tests"]],
+                         ["author-1", "author-2"])
+        self.assertEqual(len(facts["final_tests"]), 1)
+        self.assertEqual(facts["final_tests"][0]["author_slot"], "author-1")
+        self.assertEqual(
+            facts["facts_receipt_hash"],
+            hashlib.sha256(server.codeoff_canonical_json({
+                key: value for key, value in facts.items() if key != "facts_receipt_hash"
+            })).hexdigest(),
+        )
+        serialized = json.dumps(facts)
+        for forbidden in ("economics", "aggregate", "total_cost", "winner", "outcome",
+                          '"status": "completed"', '"status": "parked"'):
+            self.assertNotIn(forbidden, serialized.lower())
+
+        server.clear_terminal_receipt_authority("agent", jobs["judge-2"]["job_id"])
+        status, missing = self._post_v2("execution-facts", {"experiment_id": experiment_id})
+        self.assertEqual(status, 200, missing)
+        lost = next(item for item in missing["attempts"] if item["slot"] == "judge-2")
+        self.assertIsNone(lost["usage"])
+        self.assertEqual(lost["usage_diagnostic"], "usage_authority_unavailable")
+        self.assertIsNone(lost["receipt_hash"])
+
+        (server.codeoff_workspace_path(experiment_id, "author-1") / "candidate.py").write_text(
+            "SLOT = 'mutated-after-test'\n"
+        )
+        corrupt_status, corrupt = self._post_v2(
+            "execution-facts", {"experiment_id": experiment_id},
+        )
+        self.assertEqual((corrupt_status, corrupt["code"]), (409, "candidate_mutated"))
+
+    def test_v2_native_economics_deduplicates_job_ids_preserves_missing_usage_and_never_emits_inexact_provider_cost_sum(self):
+        nodes, _edges = self._v2_durable_graph()
+        unique = nodes["v2_execution_attempts_unique"]
+        self.assertEqual(unique["type"], "transforms.transformArray")
+        self.assertEqual(unique["config"]["operation"], "unique")
+        self.assertEqual(unique["config"]["uniqueBy"], "item.job_id")
+        for node_id in ("v2_execution_usage_rollup", "v2_test_economics_rollup"):
+            self.assertEqual(nodes[node_id]["type"], "transforms.groupByAggregate")
+
+        reported = {
+            "job_id": "a" * 32, "slot": "author-1", "work_role": "author",
+            "terminal_status": "completed", "usage": self._v2_usage(),
+            "usage_diagnostic": None, "receipt_hash": "1" * 64,
+            "started_at": "2026-09-03T12:00:00Z",
+            "finished_at": "2026-09-03T12:00:01Z", "elapsed_seconds": 1.0,
+        }
+        missing = {
+            "job_id": "b" * 32, "slot": "judge-1", "work_role": "judge",
+            "terminal_status": "failed", "usage": None,
+            "usage_diagnostic": "usage_not_reported", "receipt_hash": "2" * 64,
+            "started_at": "2026-09-03T12:00:00Z",
+            "finished_at": "2026-09-03T12:00:03Z", "elapsed_seconds": 3.0,
+        }
+        runner = NativeGraphRunner(
+            json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text()),
+            None,
+        )
+        runner.context = {
+            "CTX": {"INPUT": {"experiment_id": "economics-native-v2"}},
+            "TASKS": {"v2_execution_facts": {"data": {
+                "attempts": [reported, deepcopy(reported), missing],
+                "candidate_tests": [{
+                    "slot": "author-1", "tests_pass": True, "no_mutation": True,
+                    "test_receipt_hash": "3" * 64, "elapsed_seconds": 2.0, "tests": [],
+                }],
+                "final_tests": [{
+                    "author_slot": "author-1", "tests_pass": True, "no_mutation": True,
+                    "test_receipt_hash": "4" * 64,
+                    "final_verification_receipt_hash": "5" * 64,
+                    "elapsed_seconds": 4.0, "tests": [],
+                }],
+            }}},
+        }
+        order = (
+            "v2_execution_attempts_unique", "v2_execution_usage_rows",
+            "v2_execution_usage_rollup", "v2_author_usage_rows", "v2_author_usage",
+            "v2_judge_usage_rows", "v2_judge_usage", "v2_candidate_test_economics_rows",
+            "v2_final_test_economics_rows", "v2_test_economics_rows",
+            "v2_test_economics_rollup", "v2_candidate_test_economics_rollup_rows",
+            "v2_candidate_test_economics_pick", "v2_final_test_economics_rollup_rows",
+            "v2_final_test_economics_pick", "v2_economics",
+        )
+        for node_id in order:
+            runner.execute(nodes[node_id], {})
+        economics = runner.context["CTX"]["v2_economics"]
+        self.assertEqual(economics["authors"]["attempts"], 1)
+        self.assertEqual(economics["authors"]["output_tokens"], 4)
+        self.assertEqual(economics["authors"]["turns_observed"], 2)
+        self.assertEqual(economics["judges"]["attempts"], 1)
+        self.assertEqual(economics["judges"]["missing_usage_attempts"], 1)
+        self.assertEqual(economics["judges"]["usage_attempts"], 0)
+        self.assertIsNone(economics["judges"]["turns_observed"])
+        self.assertIn("usage_not_reported", economics["judges"]["usage_diagnostics"])
+        self.assertEqual(economics["tests"]["candidate"]["attempts"], 1)
+        self.assertEqual(economics["tests"]["final"]["elapsed_seconds"], 4.0)
+        self.assertIsNone(economics["provider_cost_usd"])
+        self.assertIn("provider_cost_aggregation_unavailable",
+                      economics["usage_diagnostics"])
+        self.assertNotIn("0.30000000000000004", json.dumps(economics))
+
+    def test_v2_terminal_record_contains_policy_judgments_decision_economics_outcome_and_receipt_hashes_with_no_secret_fields(self):
+        nodes, edges = self._v2_durable_graph()
+        terminal = self._v2_mappings(nodes["v2_terminal_record"])
+        self.assertEqual(list(terminal), [
+            "schema_version", "protocol_version", "policy_version", "policy_hash",
+            "experiment_id", "workflow", "policy", "judgments", "decision",
+            "economics", "promotion", "commit", "push", "final_status", "reason",
+            "receipt_hashes",
+        ])
+        self.assertEqual(terminal["policy"],
+                         {"kind": "getField", "path": "CTX.codeoff_policy_v2.value"})
+        self.assertEqual(
+            self._v2_paths(terminal["judgments"]),
+            [f"TASKS.v2_judgment_{index}_readback.data" for index in range(3)],
+        )
+        self.assertEqual(terminal["decision"], {
+            "kind": "getField", "path": "TASKS.v2_winner_decision_readback.data",
+        })
+        self.assertEqual(terminal["economics"],
+                         {"kind": "getField", "path": "CTX.v2_economics"})
+        workflow_paths = set(self._v2_paths(terminal["workflow"]))
+        self.assertEqual(workflow_paths,
+                         {"WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"})
+        event = self._v2_mappings(nodes["v2_terminal_event"])
+        self.assertEqual(event["experiment"], {
+            "kind": "getField", "path": "TASKS.v2_terminal_record_readback.data",
+        })
+        self.assertEqual(nodes["v2_terminal_record_upsert"]["config"]["collection"],
+                         "graphwing_codeoff_experiment_v2")
+        self.assertEqual(nodes["v2_terminal_event_upsert"]["config"]["collection"],
+                         "graphwing_codeoff_transition_v2")
+        self.assertIn(("v2_terminal_record_readback_gate", "pass", "v2_terminal_event"), edges)
+        projection = json.dumps([nodes["v2_terminal_record"], nodes["v2_terminal_event"]]).lower()
+        for forbidden in ("seed\"", "blind_map", "candidate-1", "candidate-2", "prompt",
+                          "log_ref", "stdout", "stderr", "token", "webhook", "/home/"):
+            self.assertNotIn(forbidden, projection)
+
+    def test_v2_success_cannot_complete_when_terminal_upsert_get_hash_key_or_version_readback_fails(self):
+        nodes, edges = self._v2_durable_graph()
+        adjacency = {}
+        for source, handle, target in edges:
+            adjacency.setdefault((source, handle), set()).add(target)
+        for prefix in ("v2_terminal_record", "v2_terminal_event"):
+            self.assertEqual(nodes[f"{prefix}_upsert"]["type"],
+                             "action.datastore.records.upsert")
+            self.assertEqual(nodes[f"{prefix}_readback"]["type"],
+                             "action.datastore.records.get")
+            self.assertEqual(nodes[f"{prefix}_readback_hash"]["type"], "transforms.hash")
+            check = self._v2_mappings(nodes[f"{prefix}_readback_check"])
+            self.assertEqual(set(check),
+                             {"found_matches", "key_matches", "data_matches", "version_matches"})
+            self.assertEqual(adjacency[(f"{prefix}_upsert", "failure")],
+                             {f"{prefix}_write_failed"})
+            self.assertEqual(adjacency[(f"{prefix}_readback", "failure")],
+                             {f"{prefix}_readback_failed"})
+            self.assertEqual(adjacency[(f"{prefix}_readback_gate", "fail")],
+                             {f"{prefix}_readback_mismatch"})
+            for suffix in ("write_failed", "readback_failed", "readback_mismatch"):
+                fence = nodes[f"{prefix}_{suffix}"]
+                self.assertEqual(fence["type"], "transforms.regexReplace")
+        required = {
+            "v2_terminal_record_upsert", "v2_terminal_record_readback",
+            "v2_terminal_record_readback_hash", "v2_terminal_record_readback_check",
+            "v2_terminal_record_readback_gate", "v2_terminal_event_upsert",
+            "v2_terminal_event_readback", "v2_terminal_event_readback_hash",
+            "v2_terminal_event_readback_check", "v2_terminal_event_readback_gate",
+        }
+        forward = {}
+        for source, _handle, target in edges:
+            forward.setdefault(source, set()).add(target)
+        paths = []
+        def walk(node, path):
+            if node == "v2_terminal_complete":
+                paths.append(path + [node])
+                return
+            for child in forward.get(node, ()):
+                if child not in path:
+                    walk(child, path + [node])
+        walk("v2_terminal_completed", [])
+        self.assertTrue(paths)
+        self.assertTrue(all(required <= set(path) for path in paths), paths)
+
+    def test_v2_cleanup_after_durable_terminal_preserves_rewst_history_and_local_loss_before_terminal_becomes_parked(self):
+        experiment_id = "terminal-cleanup-v2"
+        self._initialize(experiment_id)
+        with mock.patch.object(
+            server, "_codeoff_finalize_record",
+            side_effect=AssertionError("v2 local seal cannot choose an outcome"),
+        ):
+            status, sealed = self._post_v2("seal-local", {
+                "experiment_id": experiment_id,
+                "terminal_record_hash": "a" * 64,
+                "terminal_event_hash": "b" * 64,
+            })
+        self.assertEqual(status, 200, sealed)
+        openapi = json.loads(server.openapi_bytes())
+        self.assertEqual(
+            openapi["paths"]["/v1/code-off/v2/seal-local"]["post"]["operationId"],
+            "codeOffV2SealLocal",
+        )
+        self.assertEqual(
+            set(openapi["components"]["schemas"]["CodeOffV2SealLocalResult"]["required"]),
+            set(sealed),
+        )
+        self.assertEqual(set(sealed), {
+            "ok", "protocol_version", "policy_version", "experiment_id",
+            "authority_sealed", "terminal_record_hash", "terminal_event_hash",
+            "agent_job_ids", "attempt_receipt_hashes", "sealed_at", "seal_receipt_hash",
+        })
+        for forbidden in ("status", "reason", "outcome", "winner"):
+            self.assertNotIn(forbidden, sealed)
+        cleanup_status, cleaned, _ = server.dispatch(
+            "POST", "/v1/code-off/cleanup", {}, True,
+            json.dumps({"experiment_id": experiment_id}).encode(),
+        )
+        self.assertEqual(cleanup_status, 200, cleaned)
+        self.assertTrue(cleaned["record_preserved"])
+        self.assertFalse((self.workspaces / experiment_id).exists())
+        self.assertTrue((self.records / experiment_id / "state.json").is_file())
+        replay_status, replay = self._post_v2("seal-local", {
+            "experiment_id": experiment_id,
+            "terminal_record_hash": "a" * 64,
+            "terminal_event_hash": "b" * 64,
+        })
+        self.assertEqual((replay_status, replay), (200, sealed))
+
+        lost_id = "terminal-local-loss-v2"
+        self._initialize(lost_id)
+        shutil.rmtree(self.records / lost_id)
+        lost_status, lost = self._post_v2("seal-local", {
+            "experiment_id": lost_id,
+            "terminal_record_hash": "c" * 64,
+            "terminal_event_hash": "d" * 64,
+        })
+        self.assertEqual((lost_status, lost["code"]), (409, "experiment_not_found"))
+
+        nodes, edges = self._v2_durable_graph()
+        self.assertIn(("v2_execution_facts", "failure", "v2_local_loss_facts"), edges)
+        loss = self._v2_mappings(nodes["v2_local_loss_facts"])
+        self.assertEqual(loss["final_status"], {"kind": "literal", "value": "parked"})
+        self.assertEqual(loss["reason"],
+                         {"kind": "literal", "value": "local_authority_unavailable"})
+        self.assertIn(("v2_terminal_event_readback_gate", "pass", "v2_seal_local"), edges)
+        self.assertIn(("v2_seal_local", "success", "v2_cleanup"), edges)
+        inbound_cleanup = {(source, handle) for source, handle, target in edges
+                           if target == "v2_cleanup"}
+        self.assertEqual(inbound_cleanup, {("v2_seal_local", "success")})
+        for node_id in ("v2_local_seal_unavailable", "v2_cleanup_failed"):
+            self.assertEqual(nodes[node_id]["type"], "transforms.regexReplace")
 
     V2_STAGES = (
         ("v2_initialization", "initialization", 0, False),
@@ -24642,6 +24987,9 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         # keys and payloads, so no per-run or wall-clock value may reach them.
         for node_id in self._v2_durable_nodes(nodes):
             paths = self._v2_paths(nodes[node_id]["config"]["mappings"])
+            if node_id == "v2_terminal_record":
+                self.assertTrue({"WORKFLOW.id", "WORKFLOW.version", "WORKFLOW.runId"} <= set(paths))
+                continue
             for path in paths:
                 self.assertNotIn("runId", path, node_id)
                 self.assertNotIn("runUrl", path, node_id)
@@ -24687,7 +25035,8 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "v2_blind", "v2_judge_0_launch", "v2_judge_1_launch",
             "v2_judge_2_launch", "v2_read_judgment_0",
             "v2_read_judgment_1", "v2_read_judgment_2",
-            "v2_verify_final", "v2_promote",
+            "v2_verify_final", "v2_promote", "v2_commit", "v2_push",
+            "v2_execution_facts", "v2_seal_local", "v2_cleanup",
         })
         self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
         self.assertEqual(forward.get("v2_continuation_disabled"), {"v2_candidate_stage_contract"})
@@ -29461,8 +29810,12 @@ class NativeGraphRunner:
                 self.evaluate(config["concatValue"]["ast"], self.context) or [])
         elif operation == "unique":
             built = []
+            unique_by = config.get("uniqueBy")
+            seen = []
             for item in source:
-                if item not in built:
+                value = self.path({"item": item}, unique_by) if unique_by else item
+                if value not in seen:
+                    seen.append(value)
                     built.append(item)
         else:
             raise AssertionError(operation)
