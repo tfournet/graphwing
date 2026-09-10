@@ -512,3 +512,41 @@ unchanged. The source graph retains literal-false v2 candidate activation and
 adds a separate literal-false promotion gate. No v2 promotion is activated by
 this change. Deployment, OpenAPI re-import, workflow publication/readback, and
 live proof require separate approval.
+
+### Issue #188 PR 7 economics and terminal-outcome boundary
+
+`codeOffV2ExecutionFacts` reads the accepted v2 author and judge jobs from
+local execution authority and returns one closed fact per accepted job. Usage
+is present only when the terminal receipt seal still verifies; missing,
+malformed, unavailable, or mismatched usage remains null with its diagnostic.
+The response also carries content-addressed candidate and final test facts,
+receipt hashes, timestamps, and elapsed time. It does not sum spend, select a
+winner, or name an experiment outcome.
+
+Native workflow nodes deduplicate attempts by authoritative job ID and compute
+separate author, judge, candidate-test, and final-test economics. Per-attempt
+provider cost remains available when reported, but every aggregate
+`provider_cost_usd` is null with
+`provider_cost_aggregation_unavailable`; the native binary-float sum is not
+presented as exact decimal arithmetic.
+
+Every v2 terminal leg now converges on the permanent experiment key and an
+immutable experiment-scoped terminal-event key. Both records contain the full
+policy, normalized durable judgments, winner/no-winner decision, economics,
+promotion/commit/push facts, final status and reason, workflow identity, and
+receipt hashes. Each upsert is followed by same-key get plus payload-hash,
+record-key, and version equality. A failed write, get, or comparison hard-fails
+before success.
+
+Only after both exact readbacks does `codeOffV2SealLocal` drain every known job
+and bind disposable local execution authority to the two durable record hashes.
+It returns seal facts and cannot choose `parked` or `completed`. Cleanup follows
+that seal, removes only local staging, and leaves the Rewst records untouched.
+If local authority is already gone, native workflow policy records a parked
+terminal outcome; it cannot reconstruct selection or manufacture a winner.
+
+The v1 economics helper, final-record helper, terminal operation,
+`graphwing_codeoff_economics_v1` collection, and both v1 terminalization nodes
+remain compatible. V2 author and promotion activation remain false. No deploy,
+OpenAPI re-import, publication, tenant readback, retention proof, provider run,
+or live canary was performed.
