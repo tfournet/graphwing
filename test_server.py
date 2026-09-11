@@ -12409,8 +12409,8 @@ func main() {
         self.assertEqual(
             [node["id"] for node in graph["nodes"]
              if node["type"] == "action.datastore.records.upsert"],
-            ["durable_outcome_upsert", "mechanical_build_state_upsert",
-             "mechanical_event_upsert"],
+            ["durable_outcome_upsert", "mechanical_pre_effect_event_upsert",
+             "mechanical_build_state_upsert", "mechanical_event_upsert"],
         )
         # The pending dashboard notification is not terminal; the same wait can
         # later acknowledge or time out and only that terminal leg is persisted.
@@ -12427,13 +12427,19 @@ func main() {
                 "mechanical_lease_excluded", "mechanical_resume_id_rejected",
                 "mechanical_event_mismatch", "mechanical_stage_rejected",
                 "mechanical_state_load_failed", "mechanical_event_load_failed",
-                "mechanical_lease_claim_failed", "mechanical_lease_readback_failed",
+                "mechanical_lease_claim_failed", "mechanical_lease_claim_read_failed",
+                "mechanical_lease_readback_failed",
+                "mechanical_pre_effect_event_write_failed",
+                "mechanical_pre_effect_event_readback_failed",
+                "mechanical_pre_effect_event_readback_mismatch",
                 "mechanical_build_state_write_failed",
                 "mechanical_build_state_readback_failed",
                 "mechanical_build_state_readback_mismatch",
                 "mechanical_event_write_failed", "mechanical_event_readback_failed",
                 "mechanical_event_readback_mismatch",
-                "mechanical_lease_release_failed", "mechanical_lease_release_mismatch",
+                "mechanical_lease_release_failed",
+                "mechanical_lease_release_readback_failed",
+                "mechanical_lease_release_mismatch",
             },
         )
 
@@ -14855,6 +14861,7 @@ func main() {
                     "mechanical_event_readback_failed",
                     "mechanical_event_readback_mismatch",
                     "mechanical_lease_release_failed",
+                    "mechanical_lease_release_readback_failed",
                     "mechanical_lease_release_mismatch",
                 },
                 (source, handle, leaves),
@@ -22901,7 +22908,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9af13f590899d950bd3aaf4f392b00e73907f5a6bc6a35ebe0f89263686b24bb")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "6f2720d2213e8c98fe0b7bf0fda379cec88ef6ac600e0256119ebceed5a1e0d7")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -28459,7 +28466,7 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertIn(("run_input", "out", "switch_auto_merge_input"), edges)
         self.assertIn(("merge_authorization", "out", "mechanical_resume_id_snap"), edges)
         self.assertIn(("mechanical_resume_id_snap", "out", "mechanical_resume_id_gate"), edges)
-        self.assertIn(("mechanical_lease_gate", "pass", "git"), edges)
+        self.assertIn(("mechanical_pre_effect_event_readback_gate", "pass", "git"), edges)
         auth_rules = nodes["switch_auto_merge_input"]["config"]["cases"][0]["rules"]
         self.assertEqual(auth_rules, [{"path": "auto_merge_requested", "op": "equals",
                                       "value": True}])
@@ -30124,21 +30131,37 @@ class RunControlDatastoreFixture:
         self.kv: dict[tuple[str, str], dict[str, Any]] = {}
         self.records: dict[tuple[str, str], dict[str, Any]] = {}
         self.writes: list[tuple] = []
+        self.now = 0
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def _kv_entry(self, namespace, key):
+        store_key = (namespace, key)
+        entry = self.kv.get(store_key)
+        if entry is not None and entry.get("expires_at") is not None \
+                and entry["expires_at"] <= self.now:
+            del self.kv[store_key]
+            return None
+        return entry
 
     def kv_get(self, namespace, key):
-        entry = self.kv.get((namespace, key))
+        entry = self._kv_entry(namespace, key)
         if entry is None:
             return {"ok": True, "found": False, "value": None, "version": 0}
         return {"ok": True, "found": True, "value": deepcopy(entry["value"]),
                 "version": entry["version"]}
 
-    def kv_compare_and_swap(self, namespace, key, expected_version, value):
-        entry = self.kv.get((namespace, key))
+    def kv_compare_and_swap(self, namespace, key, expected_version, value, ttl_seconds=None):
+        entry = self._kv_entry(namespace, key)
         current = entry["version"] if entry else 0
         if current != expected_version:
             return {"ok": True, "swapped": False,
                     "value": deepcopy(entry["value"]) if entry else None, "version": current}
-        self.kv[(namespace, key)] = {"value": deepcopy(value), "version": current + 1}
+        expires_at = self.now + ttl_seconds if ttl_seconds else None
+        self.kv[(namespace, key)] = {
+            "value": deepcopy(value), "version": current + 1, "expires_at": expires_at,
+        }
         self.writes.append(("kv", namespace, key, current + 1))
         return {"ok": True, "swapped": True, "value": deepcopy(value), "version": current + 1}
 
@@ -30468,6 +30491,7 @@ class NativeGraphRunner:
             result = self.store.kv_compare_and_swap(
                 config["namespace"], self.render(config["key"]),
                 self.render(config["expectedVersion"]), self.render(config["value"]),
+                self.render(config.get("ttlSeconds")),
             )
         elif kind == "action.datastore.records.get":
             result = self.store.records_get(config["collection"], self.render(config["recordKey"]))
@@ -31092,8 +31116,10 @@ class RunControlDurableStateV2Tests(unittest.TestCase):
             store = clone()
             original_cas = store.kv_compare_and_swap
 
-            def rewind(namespace, key, expected_version, value):
-                result = original_cas(namespace, key, expected_version, value)
+            def rewind(namespace, key, expected_version, value, ttl_seconds=None):
+                result = original_cas(
+                    namespace, key, expected_version, value, ttl_seconds,
+                )
                 if result["swapped"]:
                     store.kv[(namespace, key)]["version"] = expected_version + 5
                 return result
@@ -31866,6 +31892,18 @@ class MechanicalBuildResumeTests(unittest.TestCase):
             for edge in cls.graph(name)["spec"]["edges"]
         }
 
+    @staticmethod
+    def lease_context(snapshot, event_id, run_id, event_hash, stage):
+        return {
+            "CTX": {
+                snapshot: {"build_id": "build-52", "event_id": event_id},
+                "mechanical_event_hash": {"value": event_hash},
+                "mechanical_resume_decision_snap": {"current_stage": stage},
+            },
+            "TASKS": {},
+            "WORKFLOW": {"runId": run_id},
+        }
+
     def test_resume_reads_durable_build_and_event_before_any_local_effect(self):
         for graph_name, snapshot, live_entry in (
             ("implement-slice", "mechanical_resume_input_snap", "git"),
@@ -31900,12 +31938,13 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 self.assertIn(
                     ("mechanical_resume_decision_snap", "out", "mechanical_resume_switch"), triples,
                 )
-                self.assertFalse(any(
-                    edge["target"] == live_entry and edge["source"] not in {
-                        "mechanical_lease_gate", "merge_authorization",
-                    }
-                    for edge in self.graph(graph_name)["spec"]["edges"]
-                ))
+                self.assertEqual(
+                    {
+                        edge["source"] for edge in self.graph(graph_name)["spec"]["edges"]
+                        if edge["target"] == live_entry
+                    },
+                    {"mechanical_pre_effect_event_readback_gate"},
+                )
 
     def test_event_id_exact_replay_returns_record_and_mismatch_is_rejected(self):
         for graph_name in ("implement-slice", "pr-drive"):
@@ -31945,12 +31984,26 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 claim = nodes["mechanical_lease_claim"]
                 self.assertEqual(claim["type"], "action.datastore.kv.compareAndSwap")
                 self.assertEqual(claim["config"]["namespace"], self.LEASE_NAMESPACE)
-                self.assertEqual(claim["config"]["expectedVersion"], 0)
-                self.assertGreater(claim["config"]["ttlSeconds"], 0)
+                self.assertEqual(
+                    claim["config"]["expectedVersion"],
+                    "{{ CTX.mechanical_lease_claim_snap.expected_version }}",
+                )
+                self.assertEqual(claim["config"]["ttlSeconds"], 0)
+                self.assertEqual(nodes["mechanical_lease_claim_read"]["type"],
+                                 "action.datastore.kv.get")
                 self.assertEqual(nodes["mechanical_lease_readback"]["type"],
                                  "action.datastore.kv.get")
                 self.assertIn(
-                    ("mechanical_lease_gate", "fail", "mechanical_lease_excluded"), triples,
+                    ("mechanical_lease_claim_available", "fail",
+                     "mechanical_lease_excluded_join"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_lease_gate", "fail", "mechanical_lease_excluded_join"),
+                    triples,
+                )
+                self.assertIn(
+                    ("mechanical_lease_excluded_join", "out", "mechanical_lease_excluded"),
+                    triples,
                 )
                 self.assertFalse(any(
                     edge["source"] == "mechanical_lease_excluded" for edge in
@@ -31958,7 +32011,17 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 ))
                 release = nodes["mechanical_lease_release"]
                 self.assertEqual(release["type"], "action.datastore.kv.compareAndSwap")
-                self.assertEqual(release["config"]["expectedVersion"], 1)
+                self.assertEqual(
+                    release["config"]["expectedVersion"],
+                    "{{ CTX.mechanical_lease_release_snap.claimed_version }}",
+                )
+                self.assertEqual(release["config"]["ttlSeconds"], 0)
+                release_snap = json.dumps(nodes["mechanical_lease_release_snap"])
+                self.assertIn("TASKS.mechanical_lease_release_readback.value.owner_workflow_run_id",
+                              release_snap)
+                self.assertIn("TASKS.mechanical_lease_release_readback.value.claimed_version",
+                              release_snap)
+                self.assertNotIn("TASKS.mechanical_lease_claim.version", release_snap)
 
     def test_allowed_next_stage_is_native_and_terminal_result_is_durable(self):
         contracts = {
@@ -32002,7 +32065,23 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                     self.assertNotIn("TASKS.mechanical_build_state_hash", check_dump)
                     self.assertNotIn("TASKS.mechanical_event_hash_record", check_dump)
                 self.assertIn(
-                    ("mechanical_event_readback_gate", "pass", "mechanical_lease_release"), triples,
+                    ("mechanical_lease_gate", "pass", "mechanical_pre_effect_event"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_pre_effect_event_readback_gate", "pass", "git"), triples,
+                )
+                pre_effect_dump = json.dumps(nodes["mechanical_pre_effect_event_readback_check"])
+                self.assertIn("CTX.mechanical_pre_effect_event_readback_hash.value",
+                              pre_effect_dump)
+                self.assertIn("CTX.mechanical_pre_effect_event_hash.value", pre_effect_dump)
+                self.assertNotIn("TASKS.mechanical_pre_effect_event_hash", pre_effect_dump)
+                self.assertIn(
+                    ("mechanical_event_readback_gate", "pass",
+                     "mechanical_lease_release_readback"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_lease_release_owner_gate", "pass",
+                     "mechanical_lease_release"), triples,
                 )
 
     def test_native_resume_decision_replays_exact_event_and_fences_changed_input(self):
@@ -32122,6 +32201,146 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 self.assertIn("mechanical_lease_excluded", runner.executed)
                 self.assertNotIn("git", runner.executed)
                 self.assertEqual(len(store.writes), 0)
+
+    def test_native_owner_release_allows_next_event_claim_and_excludes_stale_owner(self):
+        for graph_name, snapshot, stage in (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "post_pr"),
+        ):
+            with self.subTest(graph=graph_name):
+                graph = self.graph(graph_name)
+                store = RunControlDatastoreFixture()
+                key = "graphwing-mechanical-build-lease-v1:build-52"
+
+                def stop_at_git(node, payload, context):
+                    if node["id"] == "git":
+                        return "halt", {"ok": True}
+                    raise AssertionError(node["id"])
+
+                first = NativeGraphRunner(graph, store, stop_at_git)
+                first.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-first", "run-first", "a" * 64, stage,
+                ))
+                self.assertIn("mechanical_pre_effect_event_upsert", first.executed)
+                self.assertIn("git", first.executed)
+                store.advance(20000)
+                self.assertTrue(store.kv_get(self.LEASE_NAMESPACE, key)["found"])
+                first.run({}, start="mechanical_lease_release_readback", context=first.context)
+                stale_context = deepcopy(first.context)
+                released = store.kv_get(self.LEASE_NAMESPACE, key)
+                self.assertEqual(released["version"], 2)
+                self.assertEqual(
+                    released["value"]["schema_version"],
+                    "graphwing-mechanical-build-lease-release-v1",
+                )
+
+                second = NativeGraphRunner(graph, store, stop_at_git)
+                second.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-second", "run-second", "b" * 64, stage,
+                ))
+                self.assertIn("git", second.executed)
+                current = store.kv_get(self.LEASE_NAMESPACE, key)
+                self.assertEqual(current["version"], 3)
+                self.assertEqual(current["value"]["owner_workflow_run_id"], "run-second")
+
+                concurrent = NativeGraphRunner(graph, store, stop_at_git)
+                concurrent.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-third", "run-third", "c" * 64, stage,
+                ))
+                self.assertIn("mechanical_lease_excluded", concurrent.executed)
+                self.assertNotIn("git", concurrent.executed)
+
+                stale_release = NativeGraphRunner(graph, store, stop_at_git)
+                with self.assertRaisesRegex(
+                    NativeGraphFenced, "graphwing_mechanical_lease_release_mismatch",
+                ):
+                    stale_release.run(
+                        {}, start="mechanical_lease_release_readback", context=stale_context,
+                    )
+                self.assertEqual(
+                    store.kv_get(self.LEASE_NAMESPACE, key)["value"]["owner_workflow_run_id"],
+                    "run-second",
+                )
+
+    def test_native_pre_effect_event_replay_skips_git_and_missing_record_advances(self):
+        for graph_name, snapshot, stage in (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "post_pr"),
+        ):
+            with self.subTest(graph=graph_name):
+                graph = self.graph(graph_name)
+                store = RunControlDatastoreFixture()
+                event_hash = "d" * 64
+                event = {
+                    "schema_version": "graphwing-mechanical-build-event-v1",
+                    "build_id": "build-52",
+                    "event_id": "event-in-progress",
+                    "event_sha256": event_hash,
+                    "workflow_slug": f"graphwing-{graph_name}",
+                    "workflow_run_id": "run-interrupted",
+                    "stage": stage,
+                    "terminal": False,
+                    "terminal_outcome": {"status": "in_progress"},
+                }
+                event_key = "graphwing-mechanical-build-event-v1:build-52:event-in-progress"
+                store.records_upsert(self.EVENT_COLLECTION, event_key, event)
+                context = {
+                    "CTX": {
+                        snapshot: {"build_id": "build-52", "event_id": "event-in-progress"},
+                        "mechanical_event_hash": {"value": event_hash},
+                    },
+                    "TASKS": {
+                        "mechanical_build_state_get": {"found": True, "data": {
+                            "schema_version": "graphwing-mechanical-build-v1",
+                            "build_id": "build-52", "stage": stage,
+                        }},
+                        "mechanical_event_get": store.records_get(
+                            self.EVENT_COLLECTION, event_key,
+                        ),
+                    },
+                    "WORKFLOW": {"runId": "run-replay"},
+                }
+                replay = NativeGraphRunner(
+                    graph, store,
+                    lambda node, payload, ctx: (_ for _ in ()).throw(
+                        AssertionError(f"effect repeated: {node['id']}")
+                    ),
+                )
+                replay.run({}, start="mechanical_resume_decision_snap", context=context)
+                self.assertNotIn("git", replay.executed)
+                self.assertEqual(
+                    replay.context["CTX"]["mechanical_event_replay"]["status"],
+                    "in_progress",
+                )
+                self.assertEqual(
+                    replay.context["CTX"]["mechanical_event_replay"]["record"], event,
+                )
+
+                missing = deepcopy(context)
+                missing["CTX"][snapshot]["event_id"] = "event-new"
+                missing["CTX"]["mechanical_event_hash"]["value"] = "e" * 64
+                missing["TASKS"]["mechanical_event_get"] = {
+                    "found": False, "data": None,
+                }
+
+                def stop_at_git(node, payload, current):
+                    if node["id"] == "git":
+                        return "halt", {"ok": True}
+                    raise AssertionError(node["id"])
+
+                advance = NativeGraphRunner(graph, RunControlDatastoreFixture(), stop_at_git)
+                advance.run({}, start="mechanical_resume_decision_snap", context=missing)
+                self.assertLess(
+                    advance.executed.index("mechanical_pre_effect_event_upsert"),
+                    advance.executed.index("git"),
+                )
+                durable = advance.store.records_get(
+                    self.EVENT_COLLECTION,
+                    "graphwing-mechanical-build-event-v1:build-52:event-new",
+                )["data"]
+                self.assertEqual(durable["event_sha256"], "e" * 64)
+                self.assertFalse(durable["terminal"])
+                self.assertEqual(durable["terminal_outcome"], {"status": "in_progress"})
 
     def test_native_stage_gate_admits_only_the_workflow_next_stage(self):
         cases = (
@@ -32673,7 +32892,7 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
         self.assertIn(("mechanical_resume_input_snap", "out", "mechanical_resume_id_gate"), edges)
         self.assertIn(("mechanical_resume_id_gate", "pass", "routing_input_snap"), edges)
         self.assertIn(("routing_input_snap", "out", "mechanical_event_hash"), edges)
-        self.assertIn(("mechanical_lease_gate", "pass", "git"), edges)
+        self.assertIn(("mechanical_pre_effect_event_readback_gate", "pass", "git"), edges)
         route_inputs = nodes["route"]["config"]["inputMapping"]["values"]
         self.assertEqual(route_inputs["routing_run_id"],
                          "{{ CTX.routing_input_snap.routing_run_id }}")
