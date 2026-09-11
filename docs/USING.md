@@ -133,6 +133,8 @@ Published slug: `graphwing-implement-slice`. Use the manual/form trigger or an a
 ```json
 {
   "input": {
+    "build_id": "issue-52-mechanical-build",
+    "event_id": "pre-pr-slice-01",
     "repo": "riftwing",
     "branch": "story/your-branch",
     "index": "slices/demo/index.json",
@@ -256,6 +258,44 @@ surfaces remain compatibility-only until the approved v2 workflow cutover and li
 zero-caller proof.
 
 ## Drive a PR to green
+
+The mechanical resume entry uses the same durable `build_id` created by
+`graphwing-implement-slice` and a new `event_id` for each bounded post-PR
+advance. Start `graphwing-pr-drive` through the manual/form/API path with these
+fields in addition to its existing inputs:
+
+```json
+{
+  "input": {
+    "build_id": "issue-52-mechanical-build",
+    "event_id": "post-pr-check-01",
+    "repo": "riftwing",
+    "pr_number": "3526",
+    "test": "riftwing-local-gates",
+    "commit_message": "fix: address review findings",
+    "run_control_id": "rc1-example",
+    "auto_merge": false
+  }
+}
+```
+
+An exact repeat of that event returns its stored result without reacquiring the
+lease or repeating a local effect. Reusing `post-pr-check-01` with any changed
+input fails closed. A different event may advance only from
+`pre_pr_complete`, `post_pr`, or `awaiting_merge`; completed, closed, malformed,
+and cross-build state does not re-enter local work. The tenant-scoped lease is
+acquired before Git or GitHub actions and released only after exact build/event
+readback. CI/review facts, at most one existing remediation writer, final
+head-bound verification, workflow merge intent, and the terminal result are
+recorded by Rewst. The merge operation still performs its independent fresh
+head, test, check, hold, authorization, and merge validation.
+
+This slice has no browser, screenshot, human visual-design, or preview-stack
+nodes. Local fixtures prove only source behavior; they do not claim import,
+publication, tenant readback, or a live canary.
+
+The legacy drive helper below predates the `build_id`/`event_id` resume entry;
+use the manual/form/API payload above for this slice.
 
 The active v1 call path is source-derived and pinned in the [issue #187 ownership and call-path baseline](notes/run-control-activation-recovery.md#issue-187-ownership-and-call-path-baseline). It remains compatibility behavior during the workflow-owned v2 migration; do not treat local run-control state as permanent authority.
 
