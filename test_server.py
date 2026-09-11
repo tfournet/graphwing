@@ -18704,6 +18704,7 @@ func main() {
             return found
 
         inputs = {stem: input_fields(graph) for stem, graph in graphs.items()}
+        source_only_inputs = {"code-off": {"policy_version"}}
         for stem, graph in graphs.items():
             payload = re.search(r"\bPayload:\s*([^.]*)", graph["description"])
             if payload:
@@ -18734,7 +18735,7 @@ func main() {
         for rel, catalog in catalogs.items():
             for stem, graph in graphs.items():
                 documented = set(re.findall(r"`([a-z][a-z0-9_]*)`", catalog[graph["slug"]][1]))
-                expected = inputs[stem]
+                expected = inputs[stem] - source_only_inputs.get(stem, set())
                 if stem in {"implement-slice", "pr-drive"}:
                     self.assertTrue(all(f"`{field}`" in using for field in resume_fields))
                     expected = expected - resume_fields
@@ -22358,12 +22359,12 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "7e0ffd62f0e95e9547d7fc9eebaf9c79387333d1e1ad1b4c785e0d02367c887f",
+            "559877d8a0df7a4d09cb92123e629ea9b3a1d90d74d0cf0119d590ff569cdaea",
         )
-        self.assertEqual(len(graph["spec"]["nodes"]), 532)
-        self.assertEqual(len(graph["spec"]["edges"]), 633)
-        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 532)
-        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 633)
+        self.assertEqual(len(graph["spec"]["nodes"]), 533)
+        self.assertEqual(len(graph["spec"]["edges"]), 634)
+        self.assertEqual(len({node["id"] for node in graph["spec"]["nodes"]}), 533)
+        self.assertEqual(len({edge["id"] for edge in graph["spec"]["edges"]}), 634)
 
     def test_codeoff_graph_is_bounded_waited_fanned_in_and_terminal_gated(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())
@@ -22397,7 +22398,9 @@ class CodeOffTests(unittest.TestCase):
             self.assertIsNotNone(expected, edge)
             self.assertIn(edge.get("sourceHandle"), expected, edge)
 
-        self.assertIn(("trigger", "out", "policy_version"), triples)
+        self.assertIn(("trigger", "out", "policy_version_snap"), triples)
+        self.assertIn(("policy_version_snap", "out", "policy_version"), triples)
+        self.assertNotIn(("trigger", "out", "policy_version"), triples)
         self.assertIn(("policy_version", "default", "prepare"), triples)
         self.assertIn(("policy_version", "case-0", "policy_v2"), triples)
         self.assertIn(("prepare", "success", "switch_prepare"), triples)
@@ -27102,6 +27105,20 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
                 self.assertIn(("trigger", "out", "v2_state_version_snap"), edges)
                 self.assertIn(("v2_state_version_snap", "out", "v2_state_version_route"), edges)
                 self.assertNotIn(("trigger", "out", "v2_state_version_route"), edges)
+
+    def test_codeoff_policy_version_switch_reads_input_via_snap(self):
+        spec = json.loads((Path(server.__file__).parent / "graphs" / "code-off.json").read_text())["spec"]
+        nodes = {node["id"]: node for node in spec["nodes"]}
+        edges = {(e["source"], e.get("sourceHandle"), e["target"]) for e in spec["edges"]}
+        self.assertIn("policy_version_snap", nodes)
+        snap = nodes["policy_version_snap"]
+        self.assertEqual(snap["type"], "transforms.objectBuilder")
+        mapping = next(item for item in snap["config"]["mappings"] if item["output"] == "policy_version")
+        self.assertEqual(mapping["expression"],
+                         {"kind": "getField", "path": "CTX.INPUT.policy_version"})
+        self.assertIn(("trigger", "out", "policy_version_snap"), edges)
+        self.assertIn(("policy_version_snap", "out", "policy_version"), edges)
+        self.assertNotIn(("trigger", "out", "policy_version"), edges)
 
     def test_v2_policy_route_reads_decision_via_snap(self):
         spec = json.loads((Path(server.__file__).parent / "graphs" / "run-control-state.json").read_text())["spec"]
