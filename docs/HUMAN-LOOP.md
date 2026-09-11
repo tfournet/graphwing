@@ -42,6 +42,12 @@ Claude Code manages plugin skills as a unit, so the current client cannot disabl
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is authoritative. Rewst workflows own business policy and durable workflow state, including routing, retries, review actionability, lifecycle transitions, winner selection, merge eligibility, and terminal outcomes.
 
+The mechanical issue-52 recut adds `build_id` plus idempotent `event_id` continuation to the existing `implement-slice` and `pr-drive` graphs. Each invocation reads tenant state, accepts only its allowed next stage, and acquires a per-build compare-and-swap lease before local effects. An exact repeated event returns its durable result; the same event ID with changed input fails closed.
+
+`implement-slice` advances `new | pre_pr` to `pre_pr | pre_pr_complete`. `pr-drive` accepts `pre_pr_complete | post_pr | awaiting_merge`, records normalized CI/review monitoring outcomes, reuses its existing one-writer remediation boundary, performs final exact-head verification, records human or requested merge intent, and stores `post_pr | awaiting_merge | completed | closed`.
+
+This recut is mechanical only. It adds no human visual-design loop, browser or screenshot operation, preview-stack lifecycle, or second workflow. Those remain outside this source slice.
+
 Graphwing performs bounded local execution, reports normalized facts, and enforces authentication, allowlists, identity and receipt verification, atomic local effects, and non-bypassable safety. The daemon rejects unsafe work but does not choose product policy. The north star is one resumable, live-proven pre- and post-PR lifecycle.
 
 Workflow decides whether merge is requested. The daemon freshly verifies the exact head, named-test evidence, checks, holds, authorization, and merge operation. Each workflow replacement must be live-proven before the superseded daemon policy is removed.

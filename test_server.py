@@ -7738,7 +7738,13 @@ while True:
         # reconciliation and cannot fall through to final evidence on stale audit data.
         self.assertIn(("switch_needs_fix", "default", "final_view"), triples)
         self.assertIn(("rc_reconcile", "success", "post_correction_lifecycle"), triples)
-        self.assertFalse(any(e["source"] == "post_correction_lifecycle" for e in edges))
+        self.assertEqual(
+            {
+                edge["target"] for edge in edges
+                if edge["source"] == "post_correction_lifecycle"
+            },
+            {"mechanical_post_outcome_join"},
+        )
         self.assertIn(("final_view", "success", "final_checks"), triples)
         self.assertIn(("final_checks", "success", "final_confirm_view"), triples)
         self.assertIn(("final_confirm_view", "success", "final_policy_fact_validity_snap"), triples)
@@ -7750,8 +7756,14 @@ while True:
         self.assertIn(("final_reason_ready", "out", "final_checkout"), triples)
         for node_id in nodes:
             if node_id.startswith("final_reason_") and node_id != "final_reason_ready":
-                self.assertFalse(any(e["source"] == node_id for e in edges),
-                                 "a non-ready final state must terminate before final_wait")
+                self.assertEqual(
+                    {
+                        edge["target"] for edge in edges
+                        if edge["source"] == node_id
+                    },
+                    {"mechanical_post_outcome_join"},
+                    "a non-ready final state may only record its durable terminal fact",
+                )
         state_mappings = {m["output"]: m["expression"]
                           for m in nodes["final_policy_snap"]["config"]["mappings"]}
         self.assertEqual(state_mappings["headRefOid"],
@@ -8160,7 +8172,10 @@ while True:
                 continue
             reachable.add(source)
             pending.extend(outgoing.get(source, ()))
-        self.assertEqual(reachable, {
+        reachable_without_resume = {
+            node_id for node_id in reachable if not node_id.startswith("mechanical_")
+        }
+        self.assertEqual(reachable_without_resume, {
             "rc_evidence_join", "rc_diff", "rc_diff_hash", "rc_constraint_candidates",
             "rc_constraint_signals", "rc_progress", "rc_reconcile",
             "post_correction_lifecycle",
@@ -8168,8 +8183,14 @@ while True:
         })
         self.assertTrue({"iter_writer_task", "rc_state", "rc_consume", "agent", "wait_fix"}
                         .isdisjoint(reachable))
-        self.assertFalse(any(edge[0] == "review_infrastructure_hold" for edge in triples))
-        self.assertFalse(any(edge[0] == "await_exact_head_audit" for edge in triples))
+        self.assertEqual(
+            {edge[2] for edge in triples if edge[0] == "review_infrastructure_hold"},
+            {"mechanical_post_outcome_join"},
+        )
+        self.assertEqual(
+            {edge[2] for edge in triples if edge[0] == "await_exact_head_audit"},
+            {"mechanical_post_outcome_join"},
+        )
         for node_id in ("review_infrastructure_hold", "await_exact_head_audit",
                         "correction_head", "correction_view",
                         "correction_push_receipt"):
@@ -12388,7 +12409,8 @@ func main() {
         self.assertEqual(
             [node["id"] for node in graph["nodes"]
              if node["type"] == "action.datastore.records.upsert"],
-            ["durable_outcome_upsert"],
+            ["durable_outcome_upsert", "mechanical_build_state_upsert",
+             "mechanical_event_upsert"],
         )
         # The pending dashboard notification is not terminal; the same wait can
         # later acknowledge or time out and only that terminal leg is persisted.
@@ -12401,7 +12423,17 @@ func main() {
             {
                 "herdr_waiting", "durable_outcome_written",
                 "durable_outcome_write_failed", "durable_outcome_readback_failed",
-                "durable_outcome_readback_mismatch",
+                "durable_outcome_readback_mismatch", "mechanical_event_replay",
+                "mechanical_lease_excluded", "mechanical_resume_id_rejected",
+                "mechanical_event_mismatch", "mechanical_stage_rejected",
+                "mechanical_state_load_failed", "mechanical_event_load_failed",
+                "mechanical_lease_claim_failed", "mechanical_lease_readback_failed",
+                "mechanical_build_state_write_failed",
+                "mechanical_build_state_readback_failed",
+                "mechanical_build_state_readback_mismatch",
+                "mechanical_event_write_failed", "mechanical_event_readback_failed",
+                "mechanical_event_readback_mismatch",
+                "mechanical_lease_release_failed", "mechanical_lease_release_mismatch",
             },
         )
 
@@ -14816,6 +14848,14 @@ func main() {
                     "durable_outcome_write_failed",
                     "durable_outcome_readback_failed",
                     "durable_outcome_readback_mismatch",
+                    "mechanical_build_state_write_failed",
+                    "mechanical_build_state_readback_failed",
+                    "mechanical_build_state_readback_mismatch",
+                    "mechanical_event_write_failed",
+                    "mechanical_event_readback_failed",
+                    "mechanical_event_readback_mismatch",
+                    "mechanical_lease_release_failed",
+                    "mechanical_lease_release_mismatch",
                 },
                 (source, handle, leaves),
             )
@@ -18650,10 +18690,16 @@ func main() {
             rows = catalogs[rel] = table_rows(root / rel)
             self.assertEqual(set(rows), slugs, rel)
 
+        using = (root / "docs" / "USING.md").read_text()
+        resume_fields = {"build_id", "event_id"}
         for rel, catalog in catalogs.items():
             for stem, graph in graphs.items():
                 documented = set(re.findall(r"`([a-z][a-z0-9_]*)`", catalog[graph["slug"]][1]))
-                self.assertEqual(documented, inputs[stem], f"{rel} {graph['slug']} inputs")
+                expected = inputs[stem]
+                if stem in {"implement-slice", "pr-drive"}:
+                    self.assertTrue(all(f"`{field}`" in using for field in resume_fields))
+                    expected = expected - resume_fields
+                self.assertEqual(documented, expected, f"{rel} {graph['slug']} inputs")
 
         from scripts import publish_graphs as pg
 
@@ -22855,7 +22901,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "dc4ae13491db20faf20f8d47fa49b0eec39a93d692918f0c9568aa34ad488656")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9af13f590899d950bd3aaf4f392b00e73907f5a6bc6a35ebe0f89263686b24bb")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -28129,8 +28175,11 @@ class PrDriveGraphTests(unittest.TestCase):
         edges = {(e["source"], e.get("sourceHandle"), e["target"])
                  for e in spec["edges"]}
         self.assertIn(("switch_needs_fix", "case-1", "review_infrastructure_hold"), edges)
-        self.assertFalse(any(source == "review_infrastructure_hold"
-                             for source, _handle, _target in edges))
+        self.assertEqual(
+            {target for source, _handle, target in edges
+             if source == "review_infrastructure_hold"},
+            {"mechanical_post_outcome_join"},
+        )
 
     def test_pr_drive_budget_exhaustion_parks_with_complete_attempt_evidence(self):
         spec = self.load()["spec"]
@@ -28202,8 +28251,11 @@ class PrDriveGraphTests(unittest.TestCase):
         post = {m["output"]: m["expression"]
                 for m in nodes["post_correction_lifecycle"]["config"]["mappings"]}
         self.assertIn("await_exact_head_audit", json.dumps(post["state"]))
-        self.assertFalse(any(source == "post_correction_lifecycle"
-                             for source, _handle, _target in edges))
+        self.assertEqual(
+            {target for source, _handle, target in edges
+             if source == "post_correction_lifecycle"},
+            {"mechanical_post_outcome_join"},
+        )
 
     def test_pr_drive_writer_task_has_no_code_expression_or_procedural_nunjucks(self):
         spec = self.load()["spec"]
@@ -28405,7 +28457,9 @@ class PrDriveGraphTests(unittest.TestCase):
         self.assertIn("auto_merge_requested", run_input)
         self.assertNotIn("auto_merge_authorized", run_input)
         self.assertIn(("run_input", "out", "switch_auto_merge_input"), edges)
-        self.assertIn(("merge_authorization", "out", "git"), edges)
+        self.assertIn(("merge_authorization", "out", "mechanical_resume_id_snap"), edges)
+        self.assertIn(("mechanical_resume_id_snap", "out", "mechanical_resume_id_gate"), edges)
+        self.assertIn(("mechanical_lease_gate", "pass", "git"), edges)
         auth_rules = nodes["switch_auto_merge_input"]["config"]["cases"][0]["rules"]
         self.assertEqual(auth_rules, [{"path": "auto_merge_requested", "op": "equals",
                                       "value": True}])
@@ -31742,7 +31796,15 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
                       for key in node["config"]["outputMapping"]["keys"]}
             return "success", result
 
-        runner = NativeGraphRunner(graph, store, actions)
+        verified_graph = deepcopy(graph)
+        verified_graph["spec"]["edges"] = [
+            edge for edge in verified_graph["spec"]["edges"]
+            if not (
+                edge["source"] == "human_merge"
+                and edge["target"] == "mechanical_post_outcome_join"
+            )
+        ]
+        runner = NativeGraphRunner(verified_graph, store, actions)
         runner.run({}, start="rc_verified_state", context={
             "CTX": {"run_input": {"run_control_id": durable.run_control_id()}},
             "TASKS": {"route": {"result": {
@@ -31779,6 +31841,351 @@ class RunControlAuthoritativePolicyV2Tests(unittest.TestCase):
         self.assertIn("continuation_required", dump)
         self.assertNotIn("/v1/run/control/evaluate", dump)
         self.assertIn("await_exact_head_audit", dump)
+
+
+class MechanicalBuildResumeTests(unittest.TestCase):
+    """Issue #52 mechanical pre/post-PR resume contract."""
+
+    ROOT = Path(server.__file__).parent
+    BUILD_COLLECTION = "graphwing_mechanical_builds_v1"
+    EVENT_COLLECTION = "graphwing_mechanical_build_events_v1"
+    LEASE_NAMESPACE = "graphwing_mechanical_build_leases_v1"
+
+    @classmethod
+    def graph(cls, name):
+        return json.loads((cls.ROOT / "graphs" / f"{name}.json").read_text())
+
+    @classmethod
+    def nodes(cls, name):
+        return {node["id"]: node for node in cls.graph(name)["spec"]["nodes"]}
+
+    @classmethod
+    def triples(cls, name):
+        return {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in cls.graph(name)["spec"]["edges"]
+        }
+
+    def test_resume_reads_durable_build_and_event_before_any_local_effect(self):
+        for graph_name, snapshot, live_entry in (
+            ("implement-slice", "mechanical_resume_input_snap", "git"),
+            ("pr-drive", "run_input", "git"),
+        ):
+            with self.subTest(graph=graph_name):
+                nodes = self.nodes(graph_name)
+                triples = self.triples(graph_name)
+                inputs = nodes["form"]["config"]["inputs"]
+                self.assertTrue(inputs["build_id"]["required"])
+                self.assertTrue(inputs["event_id"]["required"])
+                mappings = {
+                    mapping["output"]: mapping["expression"]
+                    for mapping in nodes[snapshot]["config"]["mappings"]
+                }
+                self.assertEqual(mappings["build_id"],
+                                 {"kind": "getField", "path": "CTX.INPUT.build_id"})
+                self.assertEqual(mappings["event_id"],
+                                 {"kind": "getField", "path": "CTX.INPUT.event_id"})
+                self.assertEqual(nodes["mechanical_event_hash"]["type"], "transforms.hash")
+                self.assertIn(f"CTX.{snapshot}", nodes["mechanical_event_hash"]["config"]["input"])
+                self.assertEqual(nodes["mechanical_build_state_get"]["config"]["collection"],
+                                 self.BUILD_COLLECTION)
+                self.assertEqual(nodes["mechanical_event_get"]["config"]["collection"],
+                                 self.EVENT_COLLECTION)
+                self.assertIn(
+                    ("mechanical_build_state_get", "success", "mechanical_event_get"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_event_get", "success", "mechanical_resume_decision_snap"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_resume_decision_snap", "out", "mechanical_resume_switch"), triples,
+                )
+                self.assertFalse(any(
+                    edge["target"] == live_entry and edge["source"] not in {
+                        "mechanical_lease_gate", "merge_authorization",
+                    }
+                    for edge in self.graph(graph_name)["spec"]["edges"]
+                ))
+
+    def test_event_id_exact_replay_returns_record_and_mismatch_is_rejected(self):
+        for graph_name in ("implement-slice", "pr-drive"):
+            with self.subTest(graph=graph_name):
+                nodes = self.nodes(graph_name)
+                triples = self.triples(graph_name)
+                switch = nodes["mechanical_resume_switch"]
+                cases = {
+                    case["label"]: case["rules"] for case in switch["config"]["cases"]
+                }
+                self.assertEqual(cases["replay"], [
+                    {"path": "decision", "op": "equals", "value": "replay"},
+                ])
+                self.assertEqual(cases["event_mismatch"], [
+                    {"path": "decision", "op": "equals", "value": "event_mismatch"},
+                ])
+                self.assertIn(
+                    ("mechanical_resume_switch", "case-0", "mechanical_event_replay"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_resume_switch", "case-1", "mechanical_event_mismatch"), triples,
+                )
+                replay_dump = json.dumps(nodes["mechanical_event_replay"])
+                self.assertIn("TASKS.mechanical_event_get.data", replay_dump)
+                self.assertNotIn("mechanical_lease_claim", replay_dump)
+                self.assertEqual(nodes["mechanical_event_mismatch"]["type"],
+                                 "transforms.regexReplace")
+                decision_dump = json.dumps(nodes["mechanical_resume_decision_snap"])
+                self.assertIn("CTX.mechanical_event_hash.value", decision_dump)
+                self.assertNotIn("TASKS.mechanical_event_hash", decision_dump)
+
+    def test_lease_compare_and_swap_excludes_a_concurrent_advance(self):
+        for graph_name in ("implement-slice", "pr-drive"):
+            with self.subTest(graph=graph_name):
+                nodes = self.nodes(graph_name)
+                triples = self.triples(graph_name)
+                claim = nodes["mechanical_lease_claim"]
+                self.assertEqual(claim["type"], "action.datastore.kv.compareAndSwap")
+                self.assertEqual(claim["config"]["namespace"], self.LEASE_NAMESPACE)
+                self.assertEqual(claim["config"]["expectedVersion"], 0)
+                self.assertGreater(claim["config"]["ttlSeconds"], 0)
+                self.assertEqual(nodes["mechanical_lease_readback"]["type"],
+                                 "action.datastore.kv.get")
+                self.assertIn(
+                    ("mechanical_lease_gate", "fail", "mechanical_lease_excluded"), triples,
+                )
+                self.assertFalse(any(
+                    edge["source"] == "mechanical_lease_excluded" for edge in
+                    self.graph(graph_name)["spec"]["edges"]
+                ))
+                release = nodes["mechanical_lease_release"]
+                self.assertEqual(release["type"], "action.datastore.kv.compareAndSwap")
+                self.assertEqual(release["config"]["expectedVersion"], 1)
+
+    def test_allowed_next_stage_is_native_and_terminal_result_is_durable(self):
+        contracts = {
+            "implement-slice": {
+                "allowed": {"new", "pre_pr"},
+                "terminal_source": "durable_outcome_written",
+                "stages": {"pre_pr", "pre_pr_complete"},
+            },
+            "pr-drive": {
+                "allowed": {"pre_pr_complete", "post_pr", "awaiting_merge"},
+                "terminal_source": "mechanical_post_outcome_join",
+                "stages": {"post_pr", "awaiting_merge", "completed", "closed"},
+            },
+        }
+        for graph_name, contract in contracts.items():
+            with self.subTest(graph=graph_name):
+                nodes = self.nodes(graph_name)
+                triples = self.triples(graph_name)
+                decision_dump = json.dumps(nodes["mechanical_resume_decision_snap"])
+                for stage in contract["allowed"]:
+                    self.assertIn(f'"value": "{stage}"', decision_dump)
+                state = nodes["mechanical_build_state"]
+                self.assertEqual(state["type"], "transforms.objectBuilder")
+                state_dump = json.dumps(state)
+                for stage in contract["stages"]:
+                    self.assertIn(f'"value": "{stage}"', state_dump)
+                self.assertEqual(nodes["mechanical_build_state_upsert"]["config"]["collection"],
+                                 self.BUILD_COLLECTION)
+                self.assertEqual(nodes["mechanical_event_upsert"]["config"]["collection"],
+                                 self.EVENT_COLLECTION)
+                self.assertIn(
+                    ("mechanical_build_state_hash", "out", "mechanical_build_state_upsert"), triples,
+                )
+                self.assertIn(
+                    ("mechanical_event_hash_record", "out", "mechanical_event_upsert"), triples,
+                )
+                for check_id in ("mechanical_build_state_readback_check",
+                                 "mechanical_event_readback_check"):
+                    check_dump = json.dumps(nodes[check_id])
+                    self.assertIn("CTX.mechanical_", check_dump)
+                    self.assertNotIn("TASKS.mechanical_build_state_hash", check_dump)
+                    self.assertNotIn("TASKS.mechanical_event_hash_record", check_dump)
+                self.assertIn(
+                    ("mechanical_event_readback_gate", "pass", "mechanical_lease_release"), triples,
+                )
+
+    def test_native_resume_decision_replays_exact_event_and_fences_changed_input(self):
+        for graph_name, snapshot in (
+            ("implement-slice", "mechanical_resume_input_snap"),
+            ("pr-drive", "run_input"),
+        ):
+            with self.subTest(graph=graph_name):
+                event_hash = "a" * 64
+                event = {
+                    "schema_version": "graphwing-mechanical-build-event-v1",
+                    "build_id": "build-52",
+                    "event_id": "event-1",
+                    "event_sha256": event_hash,
+                    "stage": "pre_pr",
+                    "terminal_outcome": {"status": "ok"},
+                }
+                context = {
+                    "CTX": {
+                        snapshot: {"build_id": "build-52", "event_id": "event-1"},
+                        "mechanical_event_hash": {"value": event_hash},
+                    },
+                    "TASKS": {
+                        "mechanical_build_state_get": {"found": True, "data": {
+                            "schema_version": "graphwing-mechanical-build-v1",
+                            "build_id": "build-52", "stage": "pre_pr",
+                        }},
+                        "mechanical_event_get": {"found": True, "data": event},
+                    },
+                    "WORKFLOW": {"runId": "run-replay"},
+                }
+                runner = NativeGraphRunner(self.graph(graph_name), RunControlDatastoreFixture())
+                runner.run({}, start="mechanical_resume_decision_snap", context=context)
+                self.assertEqual(
+                    runner.context["CTX"]["mechanical_event_replay"]["terminal_outcome"],
+                    {"status": "ok"},
+                )
+                changed = deepcopy(context)
+                changed["CTX"]["mechanical_event_hash"]["value"] = "b" * 64
+                with self.assertRaisesRegex(
+                    NativeGraphFenced, "graphwing_mechanical_event_id_input_mismatch",
+                ):
+                    NativeGraphRunner(
+                        self.graph(graph_name), RunControlDatastoreFixture(),
+                    ).run({}, start="mechanical_resume_decision_snap", context=changed)
+
+    def test_state_readback_completes_replay_if_event_write_was_interrupted(self):
+        for graph_name, snapshot, stage in (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "post_pr"),
+        ):
+            with self.subTest(graph=graph_name):
+                event_hash = "9" * 64
+                context = {
+                    "CTX": {
+                        snapshot: {"build_id": "build-52", "event_id": "event-partial"},
+                        "mechanical_event_hash": {"value": event_hash},
+                    },
+                    "TASKS": {
+                        "mechanical_build_state_get": {"found": True, "data": {
+                            "schema_version": "graphwing-mechanical-build-v1",
+                            "build_id": "build-52", "stage": stage,
+                            "last_event_id": "event-partial",
+                            "last_event_sha256": event_hash,
+                            "terminal_outcome": {"status": "recorded-before-interruption"},
+                        }},
+                        "mechanical_event_get": {"found": False, "data": None},
+                    },
+                    "WORKFLOW": {"runId": "run-after-interruption"},
+                }
+                runner = NativeGraphRunner(
+                    self.graph(graph_name), RunControlDatastoreFixture(),
+                    lambda node, payload, ctx: (_ for _ in ()).throw(
+                        AssertionError(f"effect repeated: {node['id']}")
+                    ),
+                )
+                runner.run({}, start="mechanical_resume_decision_snap", context=context)
+                replay = runner.context["CTX"]["mechanical_event_replay"]
+                self.assertEqual(replay["status"], "replayed")
+                self.assertEqual(
+                    replay["terminal_outcome"],
+                    {"status": "recorded-before-interruption"},
+                )
+
+    def test_native_lease_cas_blocks_second_owner_before_local_effect(self):
+        for graph_name, snapshot in (
+            ("implement-slice", "mechanical_resume_input_snap"),
+            ("pr-drive", "run_input"),
+        ):
+            with self.subTest(graph=graph_name):
+                store = RunControlDatastoreFixture()
+                key = "graphwing-mechanical-build-lease-v1:build-52"
+                store.kv[(self.LEASE_NAMESPACE, key)] = {
+                    "version": 1,
+                    "value": {
+                        "schema_version": "graphwing-mechanical-build-lease-v1",
+                        "build_id": "build-52", "event_id": "event-first",
+                        "event_sha256": "c" * 64,
+                        "owner_workflow_run_id": "run-first",
+                    },
+                }
+                context = {
+                    "CTX": {
+                        snapshot: {"build_id": "build-52", "event_id": "event-second"},
+                        "mechanical_event_hash": {"value": "d" * 64},
+                    },
+                    "TASKS": {},
+                    "WORKFLOW": {"runId": "run-second"},
+                }
+                runner = NativeGraphRunner(
+                    self.graph(graph_name), store,
+                    lambda node, payload, ctx: (_ for _ in ()).throw(
+                        AssertionError(f"local effect reached: {node['id']}")
+                    ),
+                )
+                runner.run({}, start="mechanical_lease_value", context=context)
+                self.assertIn("mechanical_lease_excluded", runner.executed)
+                self.assertNotIn("git", runner.executed)
+                self.assertEqual(len(store.writes), 0)
+
+    def test_native_stage_gate_admits_only_the_workflow_next_stage(self):
+        cases = (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "pre_pr_complete"),
+        )
+        for graph_name, snapshot, stage in cases:
+            with self.subTest(graph=graph_name):
+                context = {
+                    "CTX": {
+                        snapshot: {"build_id": "build-52", "event_id": "event-next"},
+                        "mechanical_event_hash": {"value": "e" * 64},
+                    },
+                    "TASKS": {
+                        "mechanical_build_state_get": {"found": True, "data": {
+                            "schema_version": "graphwing-mechanical-build-v1",
+                            "build_id": "build-52", "stage": stage,
+                        }},
+                        "mechanical_event_get": {"found": False, "data": None},
+                    },
+                    "WORKFLOW": {"runId": "run-next"},
+                }
+                runner = NativeGraphRunner(
+                    self.graph(graph_name), RunControlDatastoreFixture(),
+                    lambda node, payload, ctx: ("halt", {}),
+                )
+                runner.run({}, start="mechanical_resume_decision_snap", context=context)
+                self.assertIn("git", runner.executed)
+                self.assertNotIn("mechanical_stage_rejected", runner.executed)
+
+        blocked = {
+            "CTX": {
+                "mechanical_resume_input_snap": {
+                    "build_id": "build-52", "event_id": "event-late",
+                },
+                "mechanical_event_hash": {"value": "f" * 64},
+            },
+            "TASKS": {
+                "mechanical_build_state_get": {"found": True, "data": {
+                    "schema_version": "graphwing-mechanical-build-v1",
+                    "build_id": "build-52", "stage": "pre_pr_complete",
+                }},
+                "mechanical_event_get": {"found": False, "data": None},
+            },
+            "WORKFLOW": {"runId": "run-late"},
+        }
+        with self.assertRaisesRegex(
+            NativeGraphFenced, "graphwing_mechanical_resume_stage_rejected",
+        ):
+            NativeGraphRunner(
+                self.graph("implement-slice"), RunControlDatastoreFixture(),
+            ).run({}, start="mechanical_resume_decision_snap", context=blocked)
+
+    def test_mechanical_resume_slice_has_no_visual_or_preview_lifecycle_nodes(self):
+        forbidden = ("playwright", "screenshot", "preview", "surfaceup", "surfacestop")
+        for graph_name in ("implement-slice", "pr-drive"):
+            resume_nodes = [
+                node for node in self.graph(graph_name)["spec"]["nodes"]
+                if node["id"].startswith("mechanical_")
+            ]
+            self.assertTrue(resume_nodes)
+            dumped = json.dumps(resume_nodes).lower()
+            for term in forbidden:
+                self.assertNotIn(term, dumped, (graph_name, term))
 
 
 class DurableRoutingRecoveryTests(unittest.TestCase):
@@ -32262,8 +32669,11 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
         self.assertNotIn("recovery_marker", nodes)
         self.assertNotIn("recovery_route", nodes)
         self.assertEqual(nodes["routing_input_snap"]["type"], "transforms.objectBuilder")
-        self.assertIn(("join_start", "out", "routing_input_snap"), edges)
-        self.assertIn(("routing_input_snap", "out", "git"), edges)
+        self.assertIn(("join_start", "out", "mechanical_resume_input_snap"), edges)
+        self.assertIn(("mechanical_resume_input_snap", "out", "mechanical_resume_id_gate"), edges)
+        self.assertIn(("mechanical_resume_id_gate", "pass", "routing_input_snap"), edges)
+        self.assertIn(("routing_input_snap", "out", "mechanical_event_hash"), edges)
+        self.assertIn(("mechanical_lease_gate", "pass", "git"), edges)
         route_inputs = nodes["route"]["config"]["inputMapping"]["values"]
         self.assertEqual(route_inputs["routing_run_id"],
                          "{{ CTX.routing_input_snap.routing_run_id }}")
