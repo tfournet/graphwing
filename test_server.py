@@ -11573,7 +11573,7 @@ while True:
         # active-session corrections consume the immutable receipt identity.
         self.assertEqual(
             nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]["path"],
-            "TASKS.route.result",
+            "TASKS.route.result.routing_policy_output",
         )
         self.assertEqual(nodes["selected_route"]["type"], "transforms.objectBuilder")
         self.assertEqual(
@@ -11582,7 +11582,7 @@ while True:
         )
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"]["path"],
-            "TASKS.fallback_policy.result",
+            "TASKS.fallback_policy.result.routing_policy_output",
         )
         self.assertEqual(nodes["fallback_route_choice"]["type"], "transforms.objectBuilder")
         self.assertEqual(
@@ -14692,6 +14692,9 @@ func main() {
                              for node in graph["spec"]["nodes"]))
         for node_id in ("route", "fallback_policy", "primary_state_policy", "fallback_state_policy"):
             self.assertEqual(nodes[node_id]["type"], "action.subworkflow")
+            self.assertEqual(nodes[node_id]["config"]["outputMapping"], {
+                "mode": "select", "keys": ["routing_policy_output"],
+            })
             values = nodes[node_id]["config"]["inputMapping"]["values"]
             self.assertIn("routing_run_id", values)
             for caller_field in ("primary_route", "primary_receipt", "fallback_route",
@@ -14716,7 +14719,7 @@ func main() {
         self.assertIn(("ticket_head", "success", "durable_recovery_selection"), triples)
         self.assertEqual(nodes["if_recovery_route_valid"]["config"]["rules"], [{
             "path": "role", "op": "matches",
-            "value": "^(primary|availability_fallback)$",
+            "value": "^(|primary|availability_fallback)$",
         }])
         self.assertIn(
             ("durable_recovery_selection", "out", "if_recovery_route_valid"), triples
@@ -14783,7 +14786,7 @@ func main() {
             self.assertNotIn("resume_job_id", nodes[node_id]["config"])
 
         for walk_id, expected in (
-            ("walk", "{{ TASKS.route.result.routing_run_id }}"),
+            ("walk", "{{ TASKS.route.result.routing_policy_output.routing_run_id }}"),
             ("walk_e2e", "{{ CTX.routing_input_snap.routing_run_id }}"),
         ):
             config = nodes[walk_id]["config"]
@@ -22937,7 +22940,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9a37fc5159fdfd032bd3bbdecc6e933acdfba30d5f9611e49d8900f1b6f14c7b")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "fc4f0d89a226b4820a78d8e179b949bead32d9974596cddd5f40a643d21f2d20")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -28736,7 +28739,7 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             },
         })
         self.assertEqual(route["config"]["outputMapping"], {
-            "mode": "select", "keys": self.policy_output_keys(),
+            "mode": "select", "keys": ["routing_policy_output"],
         })
         self.assertFalse(any(
             node["type"] == "action.graphwing.POST:/v1/slice/route"
@@ -28744,7 +28747,28 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         ))
         self.assertNotIn("TASKS.route.data", json.dumps(graph))
         primary = nodes["normal_primary_candidate"]["config"]["mappings"][0]["expression"]
-        self.assertEqual(primary, {"kind": "getField", "path": "TASKS.route.result"})
+        self.assertEqual(primary, {
+            "kind": "getField", "path": "TASKS.route.result.routing_policy_output",
+        })
+        recovery = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["durable_recovery_selection"]["config"]["mappings"]
+        }
+        self.assertEqual(recovery["route"], {
+            "kind": "getField", "path": "TASKS.route.result.routing_policy_output",
+        })
+        self.assertEqual(recovery["role"], {
+            "kind": "coalesce",
+            "primary": {
+                "kind": "getField",
+                "path": "TASKS.route.result.routing_policy_output.recovery_role",
+            },
+            "fallback": {"kind": "literal", "value": ""},
+        })
+        self.assertEqual(recovery["decision"], {
+            "kind": "getField",
+            "path": "TASKS.route.result.routing_policy_output.recovery_decision",
+        })
         self.assertEqual(nodes["agent"]["config"]["route_execution_profile"],
                          "{{ CTX.selected_route.value.writer_execution_profile }}")
         durable = {
@@ -28772,6 +28796,61 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             nodes["map_switch_rev2"]["config"]["mappings"][0]["expression"],
             {"kind": "getField", "path": "CTX.active_route.value.reviewer_count"},
         )
+
+    def test_implement_slice_missing_recovery_role_defaults_to_primary(self):
+        graph = self.graph("implement-slice")
+        route = {
+            "compatibility_behavior": "normal-v1",
+            "launcher": "codex",
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "recovery_decision": "initial_primary",
+            "routing_run_id": "routing-run-1",
+        }
+
+        cases = (
+            (route, "default"),
+            ({**route, "recovery_role": None}, "default"),
+            ({**route, "recovery_role": ""}, "default"),
+            ({**route, "recovery_role": "primary"}, "default"),
+            ({**route, "recovery_role": "availability_fallback"}, "case-0"),
+        )
+        for output, expected_switch in cases:
+            with self.subTest(role=output.get("recovery_role", "missing")):
+                runner = NativeGraphRunner(graph, None)
+                runner.context = {
+                    "CTX": {"INPUT": {}},
+                    "TASKS": {"route": {"result": {"routing_policy_output": output}}},
+                }
+                runner.execute(runner.nodes["durable_recovery_selection"], {})
+                selection = runner.context["CTX"]["durable_recovery_selection"]
+                self.assertEqual(selection["route"], output)
+                self.assertEqual(selection["decision"], "initial_primary")
+                self.assertEqual(selection["routing_run_id"], "routing-run-1")
+                filter_handle, _ = runner.execute(
+                    runner.nodes["if_recovery_route_valid"], selection,
+                )
+                self.assertEqual(filter_handle, "pass")
+                _, snapped = runner.execute(runner.nodes["recovery_route_snap"], selection)
+                switch_handle, _ = runner.execute(
+                    runner.nodes["switch_recovery_route"], snapped,
+                )
+                self.assertEqual(switch_handle, expected_switch)
+
+        invalid = NativeGraphRunner(graph, None)
+        invalid.context = {
+            "CTX": {"INPUT": {}},
+            "TASKS": {"route": {"result": {"routing_policy_output": {
+                **route, "recovery_role": "invalid",
+            }}}},
+        }
+        _, selection = invalid.execute(
+            invalid.nodes["durable_recovery_selection"], {},
+        )
+        filter_handle, _ = invalid.execute(
+            invalid.nodes["if_recovery_route_valid"], selection,
+        )
+        self.assertEqual(filter_handle, "fail")
 
     def test_implement_slice_fallback_has_no_call_to_v1_slice_route_fallback(self):
         graph = self.graph("implement-slice")
@@ -28802,7 +28881,7 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
             "{{ TASKS.agent_evidence_verify.data }}",
         )
         self.assertEqual(fallback_policy["outputMapping"], {
-            "mode": "select", "keys": self.policy_output_keys(),
+            "mode": "select", "keys": ["routing_policy_output"],
         })
         edges = {(edge["source"], edge.get("sourceHandle"), edge["target"])
                  for edge in graph["edges"]}
@@ -28813,7 +28892,7 @@ class WorkflowRoutingConsumerTests(unittest.TestCase):
         self.assertIn(("fallback_policy", "failure", "join_route_state_sync_fail"), edges)
         self.assertEqual(
             nodes["normal_fallback_candidate"]["config"]["mappings"][0]["expression"],
-            {"kind": "getField", "path": "TASKS.fallback_policy.result"},
+            {"kind": "getField", "path": "TASKS.fallback_policy.result.routing_policy_output"},
         )
         self.assertEqual(
             nodes["agent_fallback"]["config"]["route_execution_profile"],
@@ -33059,7 +33138,7 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
             self.assertEqual(nodes[sync]["config"]["inputMapping"]["values"]["route_evidence"],
                              f"{{{{ TASKS.{verify}.data }}}}")
         for walk_id, expected_locator in (
-            ("walk", "{{ TASKS.route.result.routing_run_id }}"),
+            ("walk", "{{ TASKS.route.result.routing_policy_output.routing_run_id }}"),
             ("walk_e2e", "{{ CTX.routing_input_snap.routing_run_id }}"),
         ):
             config = nodes[walk_id]["config"]
