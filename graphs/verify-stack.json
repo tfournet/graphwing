@@ -1,27 +1,40 @@
 {
   "slug": "graphwing-verify-stack",
   "name": "graphwing-verify-stack",
-  "description": "Hard-coded: stackStatus then one scalar port parameter. Success retains diagnostic-v1 evidence; action failures end with sanitized stage receipts. Payload: stack, port.",
+  "description": "Hard-coded: surfaceStatus then surfaceUp for the configured full surface, followed by one scalar port proof. Success retains diagnostic-v1 evidence; action failures end with sanitized stage receipts. Payload: stack, port.",
   "spec": {
     "meta": { "useSearchAttributes": true },
     "nodes": [
       { "id": "trigger", "type": "trigger.manual", "label": "Start", "position": { "x": 0, "y": 80 }, "config": {} },
       {
-        "id": "stack",
-        "type": "action.graphwing.GET:/v1/stack/status",
-        "label": "stackStatus",
+        "id": "surface_status",
+        "type": "action.graphwing.GET:/v1/surface/status",
+        "label": "surfaceStatus full",
         "position": { "x": 280, "y": 80 },
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 30,
-          "stack": "{{ CTX.INPUT.stack }}"
+          "stack": "{{ CTX.INPUT.stack }}",
+          "surface": "full"
+        }
+      },
+      {
+        "id": "surface_up",
+        "type": "action.graphwing.POST:/v1/surface/up",
+        "label": "surfaceUp full",
+        "position": { "x": 560, "y": 80 },
+        "config": {
+          "integrationInstanceId": "$GRAPHWING_INSTANCE",
+          "timeout": 600,
+          "stack": "{{ CTX.INPUT.stack }}",
+          "surface": "full"
         }
       },
       {
         "id": "ports",
         "type": "action.graphwing.GET:/v1/port/check",
         "label": "portCheck",
-        "position": { "x": 560, "y": 80 },
+        "position": { "x": 840, "y": 80 },
         "config": {
           "integrationInstanceId": "$GRAPHWING_INSTANCE",
           "timeout": 15,
@@ -32,27 +45,32 @@
         "id": "record",
         "type": "transforms.objectBuilder",
         "label": "Snapshot",
-        "position": { "x": 840, "y": 80 },
+        "position": { "x": 1120, "y": 80 },
         "config": {
           "alias": "snapshot",
           "version": 1,
           "mappings": [
-            { "id": "m1", "output": "stack", "expression": { "kind": "getField", "path": "TASKS.stack.data.stack" } },
-            { "id": "m2", "output": "healthy", "expression": { "kind": "getField", "path": "TASKS.stack.data.healthy" } },
-            { "id": "m3", "output": "ports", "expression": { "kind": "getField", "path": "TASKS.ports.data.ports" } },
-            { "id": "m4", "output": "stack_diagnostic", "expression": { "kind": "getField", "path": "TASKS.stack.data.diagnostic" } },
-            { "id": "m5", "output": "port_diagnostic", "expression": { "kind": "getField", "path": "TASKS.ports.data.diagnostic" } }
+            { "id": "m1", "output": "stack", "expression": { "kind": "getField", "path": "TASKS.surface_up.data.stack" } },
+            { "id": "m2", "output": "surface", "expression": { "kind": "getField", "path": "TASKS.surface_up.data.surface" } },
+            { "id": "m3", "output": "healthy", "expression": { "kind": "getField", "path": "TASKS.surface_up.data.healthy" } },
+            { "id": "m4", "output": "ports", "expression": { "kind": "getField", "path": "TASKS.ports.data.ports" } },
+            { "id": "m5", "output": "status_diagnostic", "expression": { "kind": "getField", "path": "TASKS.surface_status.data.diagnostic" } },
+            { "id": "m6", "output": "up_diagnostic", "expression": { "kind": "getField", "path": "TASKS.surface_up.data.diagnostic" } },
+            { "id": "m7", "output": "port_diagnostic", "expression": { "kind": "getField", "path": "TASKS.ports.data.diagnostic" } }
           ]
         }
       },
-      { "id": "stack_diagnostic", "type": "transforms.objectBuilder", "label": "stackStatus diagnostic", "position": { "x": 560, "y": -80 }, "config": { "alias": "stack_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "stack_status" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "stack_status action failed" } }] } },
-      { "id": "ports_diagnostic", "type": "transforms.objectBuilder", "label": "portCheck diagnostic", "position": { "x": 840, "y": -80 }, "config": { "alias": "port_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "port_check" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "port_check action failed" } }] } }
+      { "id": "surface_status_diagnostic", "type": "transforms.objectBuilder", "label": "surfaceStatus diagnostic", "position": { "x": 560, "y": -160 }, "config": { "alias": "surface_status_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "surface_status" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "surface_status action failed" } }] } },
+      { "id": "surface_up_diagnostic", "type": "transforms.objectBuilder", "label": "surfaceUp diagnostic", "position": { "x": 840, "y": -160 }, "config": { "alias": "surface_up_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "surface_up" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "surface_up action failed" } }] } },
+      { "id": "ports_diagnostic", "type": "transforms.objectBuilder", "label": "portCheck diagnostic", "position": { "x": 1120, "y": -160 }, "config": { "alias": "port_diagnostic_receipt", "version": 1, "mappings": [{ "id": "m1", "output": "diagnostic_version", "expression": { "kind": "literal", "value": "diagnostic-v1" } }, { "id": "m2", "output": "status", "expression": { "kind": "literal", "value": "error" } }, { "id": "m3", "output": "workflow", "expression": { "kind": "literal", "value": "verify-stack" } }, { "id": "m4", "output": "stage", "expression": { "kind": "literal", "value": "port_check" } }, { "id": "m5", "output": "summary", "expression": { "kind": "literal", "value": "port_check action failed" } }] } }
     ],
     "edges": [
-      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "stack", "targetHandle": "in" },
-      { "id": "e2", "source": "stack", "sourceHandle": "success", "target": "ports", "targetHandle": "in" },
-      { "id": "e3", "source": "ports", "sourceHandle": "success", "target": "record", "targetHandle": "in" },
-      { "id": "e_stack_diagnostic", "source": "stack", "sourceHandle": "failure", "target": "stack_diagnostic", "targetHandle": "in" },
+      { "id": "e1", "source": "trigger", "sourceHandle": "out", "target": "surface_status", "targetHandle": "in" },
+      { "id": "e2", "source": "surface_status", "sourceHandle": "success", "target": "surface_up", "targetHandle": "in" },
+      { "id": "e3", "source": "surface_up", "sourceHandle": "success", "target": "ports", "targetHandle": "in" },
+      { "id": "e4", "source": "ports", "sourceHandle": "success", "target": "record", "targetHandle": "in" },
+      { "id": "e_surface_status_diagnostic", "source": "surface_status", "sourceHandle": "failure", "target": "surface_status_diagnostic", "targetHandle": "in" },
+      { "id": "e_surface_up_diagnostic", "source": "surface_up", "sourceHandle": "failure", "target": "surface_up_diagnostic", "targetHandle": "in" },
       { "id": "e_ports_diagnostic", "source": "ports", "sourceHandle": "failure", "target": "ports_diagnostic", "targetHandle": "in" }
     ]
   }
