@@ -14714,9 +14714,27 @@ func main() {
         self.assertNotIn("recovery_route", nodes)
         self.assertEqual(nodes["route"]["type"], "action.subworkflow")
         self.assertIn(("ticket_head", "success", "durable_recovery_selection"), triples)
-        self.assertIn(("durable_recovery_selection", "out", "switch_recovery_route"), triples)
+        self.assertEqual(nodes["if_recovery_route_valid"]["config"]["rules"], [{
+            "path": "role", "op": "matches",
+            "value": "^(primary|availability_fallback)$",
+        }])
+        self.assertIn(
+            ("durable_recovery_selection", "out", "if_recovery_route_valid"), triples
+        )
+        self.assertIn(("if_recovery_route_valid", "fail", "recovery_route_fail"), triples)
+        self.assertIn(("if_recovery_route_valid", "pass", "recovery_route_snap"), triples)
+        self.assertEqual(
+            nodes["recovery_route_snap"]["config"]["mappings"],
+            [{
+                "id": "m1", "output": "role",
+                "expression": {
+                    "kind": "getField", "path": "CTX.durable_recovery_selection.role",
+                },
+            }],
+        )
+        self.assertIn(("recovery_route_snap", "out", "switch_recovery_route"), triples)
         self.assertEqual(nodes["switch_recovery_route"]["config"]["cases"][0]["rules"], [{
-            "path": "CTX.durable_recovery_selection.role", "op": "equals",
+            "path": "role", "op": "equals",
             "value": "availability_fallback",
         }])
         self.assertIn(("switch_recovery_route", "case-0", "join_fallback_start"), triples)
@@ -18595,6 +18613,17 @@ func main() {
                 self.assertEqual(server.public_base_url(), "https://gw.example.com")
         with mock.patch.dict(os.environ, {"GRAPHWING_PUBLIC_URL": "https://override.example"}):
             self.assertEqual(server.public_base_url(), "https://override.example")
+
+    def test_implement_slice_non_trigger_nodes_have_incoming_edges(self):
+        graph = json.loads(
+            (Path(__file__).resolve().parent / "graphs" / "implement-slice.json").read_text()
+        )["spec"]
+        incoming = {edge["target"] for edge in graph["edges"]}
+        orphaned = {
+            node["id"] for node in graph["nodes"]
+            if not node["type"].startswith("trigger.") and node["id"] not in incoming
+        }
+        self.assertEqual(orphaned, set())
 
     def test_graphs_fan_in_targets_are_joins(self):
         graphs = Path(__file__).resolve().parent / "graphs"
@@ -22908,7 +22937,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "c89b31088e26682f382010fe8d0e9ad6eb73e6255df54ea29b3938ac3a9541a8")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "9a37fc5159fdfd032bd3bbdecc6e933acdfba30d5f9611e49d8900f1b6f14c7b")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):

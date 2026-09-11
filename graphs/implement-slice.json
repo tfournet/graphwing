@@ -292,7 +292,9 @@
           "rel": "{{ TASKS.frontier.data.path }}"
         }
       },
-      {"id":"switch_recovery_route","type":"logic.switch","label":"recovery selected route","position":{"x":580,"y":-40},"config":{"mode":"rules","cases":[{"label":"fallback","rules":[{"path":"CTX.durable_recovery_selection.role","op":"equals","value":"availability_fallback"}]}],"default":{"label":"primary"}}},
+      {"id":"if_recovery_route_valid","type":"logic.filter","label":"Valid durable recovery selection","position":{"x":570,"y":-40},"config":{"mode":"all","rules":[{"path":"role","op":"matches","value":"^(primary|availability_fallback)$"}]}},
+      {"id":"recovery_route_snap","type":"transforms.objectBuilder","label":"Snapshot recovery role for routing","position":{"x":575,"y":-40},"config":{"alias":"recovery_route_snap","version":1,"mappings":[{"id":"m1","output":"role","expression":{"kind":"getField","path":"CTX.durable_recovery_selection.role"}}]}},
+      {"id":"switch_recovery_route","type":"logic.switch","label":"recovery selected route","position":{"x":580,"y":-40},"config":{"mode":"rules","cases":[{"label":"fallback","rules":[{"path":"role","op":"equals","value":"availability_fallback"}]}],"default":{"label":"primary"}}},
       { "id": "join_primary_start", "type": "logic.join.any", "label": "Join primary starts", "position": { "x": 600, "y": 80 }, "config": { "stopOnFirst": true } },
       { "id": "join_fallback_start", "type": "logic.join.any", "label": "Join fallback starts", "position": { "x": 1200, "y": -40 }, "config": { "stopOnFirst": true } },
       {"id":"fallback_route_choice","type":"transforms.objectBuilder","label":"Materialize actual fallback route","position":{"x":1240,"y":-40},"config":{"alias":"fallback_route_choice","version":1,"mappings":[{"id":"m1","output":"value","expression":{"kind":"getField","path":"CTX.fallback_route_choice_pick.value"}}]}},
@@ -1103,7 +1105,10 @@
       {"id":"e_start_routing_snap","source":"join_start","sourceHandle":"out","target":"mechanical_resume_input_snap","targetHandle":"in"},
       {"id":"e_routing_snap_git","source":"routing_input_snap","sourceHandle":"out","target":"mechanical_event_hash","targetHandle":"in"},
       {"id":"e_durable_recovery_selection","source":"ticket_head","sourceHandle":"success","target":"durable_recovery_selection","targetHandle":"in"},
-      {"id":"e_durable_recovery_switch","source":"durable_recovery_selection","sourceHandle":"out","target":"switch_recovery_route","targetHandle":"in"},
+      {"id":"e_durable_recovery_validate","source":"durable_recovery_selection","sourceHandle":"out","target":"if_recovery_route_valid","targetHandle":"in"},
+      {"id":"e_durable_recovery_valid","source":"if_recovery_route_valid","sourceHandle":"pass","target":"recovery_route_snap","targetHandle":"in"},
+      {"id":"e_durable_recovery_invalid","source":"if_recovery_route_valid","sourceHandle":"fail","target":"recovery_route_fail","targetHandle":"in"},
+      {"id":"e_durable_recovery_switch","source":"recovery_route_snap","sourceHandle":"out","target":"switch_recovery_route","targetHandle":"in"},
       {"id":"e_primary_success_verify","source":"if_receipt_ok","sourceHandle":"pass","target":"primary_success_evidence_verify","targetHandle":"in"},
       {"id":"e_primary_success_sync","source":"primary_success_evidence_verify","sourceHandle":"success","target":"primary_state_policy","targetHandle":"in"},
       {"id":"e_primary_success_verify_fail","source":"primary_success_evidence_verify","sourceHandle":"failure","target":"join_receipt_fail","targetHandle":"in"},
