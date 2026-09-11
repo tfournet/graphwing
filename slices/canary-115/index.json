@@ -1,0 +1,11 @@
+{
+  "tickets": [
+    {
+      "id": "01-wait-pending",
+      "path": "slices/canary-115/01-wait-pending.md",
+      "blocked_by": [],
+      "kind": "build",
+      "status": "open"
+    }
+  ]
+}
