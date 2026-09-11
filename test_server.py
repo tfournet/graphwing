@@ -32986,7 +32986,29 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
             writer_sync.context["CTX"]["route_state_readback_hash"]["value"],
             writer_sync.context["CTX"]["route_state_expected_hash"]["value"],
         )
+        primary_record = store.records[(
+            "graphwing_routing_state_v1", "graphwing-routing-v1:run-186-persist",
+        )]["data"]
+        self.assertEqual(primary_record["primary_evidence"], primary_success)
+        self.assertEqual(
+            primary_record["primary_evidence_sha256"],
+            "b388021bbb98a61b1e8c9e047e6ecbe1e42cd9c5c303e6c9f53290cb559ec006",
+        )
+        for field in (
+            "fallback_evidence", "fallback_evidence_sha256",
+            "fresh_primary_evidence", "fresh_primary_evidence_sha256",
+        ):
+            self.assertIsNone(primary_record[field])
+        later_sync, later_route = self._run_policy(store, inputs)
+        self.assertTrue(later_sync.context["CTX"]["route_state_shape"]["has_history"])
+        self.assertEqual(
+            later_sync.context["CTX"]["routing_selected_route_normal"]["decision"],
+            "primary_recovered",
+        )
+        self.assertEqual(later_route["recovery_decision"], "primary_recovered")
 
+        store = RunControlDatastoreFixture()
+        _, primary = self._run_policy(store, inputs)
         primary_failure = self._evidence(
             primary, "a" * 32, "error", "2026-09-08T15:01:00Z",
             "2026-09-08T15:01:02Z", failure_code="provider_network",
