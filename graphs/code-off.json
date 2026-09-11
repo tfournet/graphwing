@@ -17,6 +17,7 @@
         },
         "config": {}
       },
+      {"id":"policy_version_snap","type":"transforms.objectBuilder","label":"Snap input policy protocol","position":{"x":60,"y":300},"config":{"alias":"policy_version_snap","version":1,"mappings":[{"id":"m1","output":"policy_version","expression":{"kind":"getField","path":"CTX.INPUT.policy_version"}}]}},
       {"id":"policy_version","type":"logic.switch","label":"Select explicit policy protocol","position":{"x":120,"y":300},"config":{"mode":"rules","cases":[{"label":"code-off-policy-v2","rules":[{"path":"policy_version","op":"equals","value":"code-off-policy-v2"}]}],"default":{"label":"code-off-policy-v1"}}},
       {"id":"policy_v2","type":"transforms.objectBuilder","label":"Build closed workflow-owned v2 policy","position":{"x":220,"y":-200},"config":{"alias":"codeoff_policy_v2","version":1,"mappings":[{"id":"m1","output":"value","expression":{"kind":"object","properties":{"version":{"kind":"literal","value":"code-off-policy-v2"},"draw_algorithm_version":{"kind":"literal","value":"code-off-draw-v1"},"seed_commitment_version":{"kind":"literal","value":"code-off-seed-commitment-v1"},"participants":{"kind":"literal","value":[{"logical_model":"grok","exact_model":"grok-4.6","provider":"xai","launcher":"grok","author":true,"random_judge":true,"eligible":true},{"logical_model":"sol","exact_model":"gpt-5.6-sol","provider":"openai","launcher":"codex","author":true,"random_judge":true,"eligible":true},{"logical_model":"terra","exact_model":"gpt-5.6-terra","provider":"openai","launcher":"codex","author":true,"random_judge":true,"eligible":true},{"logical_model":"sonnet","exact_model":"claude-sonnet-5","provider":"anthropic","launcher":"claude","author":true,"random_judge":true,"eligible":true},{"logical_model":"opus","exact_model":"claude-opus-5","provider":"anthropic","launcher":"claude","author":true,"random_judge":true,"eligible":true},{"logical_model":"fable","exact_model":"claude-fable-5","provider":"anthropic","launcher":"claude","author":false,"random_judge":false,"eligible":true}]},"fixed_judge":{"kind":"literal","value":"fable"},"fixed_judge_count":{"kind":"literal","value":1},"author_count":{"kind":"literal","value":2},"random_judge_count":{"kind":"literal","value":2},"role_effort":{"kind":"literal","value":{"author":"default","judge":"default","source":"explicit","inference_profile_version":"code-off-inference-profile-v1"}},"rubric":{"kind":"literal","value":{"version":"code-off-rubric-v2","dimensions":{"correctness":40,"tests":20,"quality":20,"scope":10,"maintainability":10},"preference":["candidate-1","candidate-2","abstain"]}},"aggregation":{"kind":"literal","value":{"version":"code-off-aggregation-v2","preference_votes_required":2,"fallback":"summed_scores","exact_tie":"no_winner","winner_must_pass_candidate_tests":true}},"classification":{"kind":"object","properties":{"version":{"kind":"literal","value":"code-category-v2"},"category":{"kind":"getField","path":"CTX.INPUT.category"},"tags":{"kind":"getField","path":"CTX.INPUT.tags"},"source":{"kind":"getField","path":"CTX.INPUT.category_source"}}},"budgets":{"kind":"getField","path":"CTX.INPUT.budgets"},"as_of":{"kind":"literal","value":"2026-09-03"},"expires_at":{"kind":"literal","value":"2026-10-03"}}}}]}},
       {"id":"policy_v2_hash","type":"transforms.hash","label":"Hash complete v2 policy","position":{"x":360,"y":-200},"config":{"alias":"codeoff_policy_v2_hash","mode":"hash","algorithm":"sha256","inputKind":"json_stringify","input":"{{ CTX.codeoff_policy_v2.value }}","outputFormat":"hex","hexCase":"lower"}},
@@ -1848,13 +1849,8 @@
       {"id":"v2_cleanup_failed","type":"transforms.regexReplace","label":"V2 durable terminal preserved after cleanup failure","position":{"x":32080,"y":160},"config":{"input":"graphwing_codeoff_v2_cleanup_failed","pattern":"(?=graphwing)","replacement":""}}
     ],
     "edges": [
-      {
-        "id": "e_start",
-        "source": "trigger",
-        "sourceHandle": "out",
-        "target": "policy_version",
-        "targetHandle": "in"
-      },
+      {"id":"e_policy_version_snap","source":"trigger","sourceHandle":"out","target":"policy_version_snap","targetHandle":"in"},
+      {"id":"e_start","source":"policy_version_snap","sourceHandle":"out","target":"policy_version","targetHandle":"in"},
       {"id":"e_policy_v1","source":"policy_version","sourceHandle":"default","target":"prepare","targetHandle":"in"},
       {"id":"e_policy_v2","source":"policy_version","sourceHandle":"case-0","target":"policy_v2","targetHandle":"in"},
       {"id":"e_policy_v2_hash","source":"policy_v2","sourceHandle":"out","target":"policy_v2_hash","targetHandle":"in"},
