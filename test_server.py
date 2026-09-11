@@ -29143,6 +29143,55 @@ class RewstNativeRoutingPolicyTests(unittest.TestCase):
         graph = json.loads((cls.ROOT / "graphs" / "routing-policy.json").read_text())
         return graph, {node["id"]: node for node in graph["spec"]["nodes"]}
 
+    def test_object_builder_aliases_are_unique(self):
+        graph, _ = self.load()
+        aliases = [
+            node["config"]["alias"]
+            for node in graph["spec"]["nodes"]
+            if node["type"] == "transforms.objectBuilder"
+        ]
+        self.assertEqual(len(aliases), len(set(aliases)), aliases)
+
+    def test_selected_route_branches_rejoin_into_one_canonical_alias(self):
+        graph, nodes = self.load()
+        self.assertEqual(
+            nodes["selected_route_normal"]["config"]["alias"],
+            "routing_selected_route_normal",
+        )
+        self.assertEqual(
+            nodes["selected_route_fallback"]["config"]["alias"],
+            "routing_selected_route_fallback",
+        )
+        self.assertEqual(nodes["selected_route"]["config"]["alias"], "routing_selected_route")
+        mappings = {
+            mapping["output"]: mapping["expression"]
+            for mapping in nodes["selected_route"]["config"]["mappings"]
+        }
+        for field in ("value", "decision", "role"):
+            self.assertEqual(mappings[field], {
+                "kind": "coalesce",
+                "primary": {
+                    "kind": "getField",
+                    "path": f"CTX.routing_selected_route_normal.{field}",
+                },
+                "fallback": {
+                    "kind": "getField",
+                    "path": f"CTX.routing_selected_route_fallback.{field}",
+                },
+            })
+        edges = {
+            (edge["source"], edge.get("sourceHandle"), edge["target"])
+            for edge in graph["spec"]["edges"]
+        }
+        self.assertIn(
+            ("join_current_route_evidence_mode_shape", "out", "selected_route"),
+            edges,
+        )
+        self.assertIn(
+            ("selected_route", "out", "current_route_evidence_mode_shape"),
+            edges,
+        )
+
     @staticmethod
     def _path(context, path):
         value = context
