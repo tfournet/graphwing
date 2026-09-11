@@ -22908,7 +22908,7 @@ func main() {
         self.assertIn('install["code_off"]', source)
         implement = json.loads((Path(server.__file__).parent / "graphs" / "implement-slice.json").read_text())
         spec = json.dumps(implement["spec"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(hashlib.sha256(spec).hexdigest(), "6f2720d2213e8c98fe0b7bf0fda379cec88ef6ac600e0256119ebceed5a1e0d7")
+        self.assertEqual(hashlib.sha256(spec).hexdigest(), "c89b31088e26682f382010fe8d0e9ad6eb73e6255df54ea29b3938ac3a9541a8")
 
 
 class CodeOffPolicyMigrationTests(unittest.TestCase):
@@ -31988,7 +31988,7 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                     claim["config"]["expectedVersion"],
                     "{{ CTX.mechanical_lease_claim_snap.expected_version }}",
                 )
-                self.assertEqual(claim["config"]["ttlSeconds"], 0)
+                self.assertEqual(claim["config"]["ttlSeconds"], 14400)
                 self.assertEqual(nodes["mechanical_lease_claim_read"]["type"],
                                  "action.datastore.kv.get")
                 self.assertEqual(nodes["mechanical_lease_readback"]["type"],
@@ -32202,6 +32202,80 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 self.assertNotIn("git", runner.executed)
                 self.assertEqual(len(store.writes), 0)
 
+    def test_native_expired_crashed_lease_allows_distinct_event_claim_and_reaches_git(self):
+        for graph_name, snapshot, stage in (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "post_pr"),
+        ):
+            with self.subTest(graph=graph_name):
+                graph = self.graph(graph_name)
+                store = RunControlDatastoreFixture()
+                key = "graphwing-mechanical-build-lease-v1:build-52"
+
+                def stop_at_git(node, payload, context):
+                    if node["id"] == "git":
+                        return "halt", {"ok": True}
+                    raise AssertionError(node["id"])
+
+                first = NativeGraphRunner(graph, store, stop_at_git)
+                first.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-crashed", "run-crashed", "a" * 64, stage,
+                ))
+                self.assertIn("git", first.executed)
+
+                store.advance(14401)
+                self.assertFalse(store.kv_get(self.LEASE_NAMESPACE, key)["found"])
+
+                recovery = NativeGraphRunner(graph, store, stop_at_git)
+                recovery.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-recovery", "run-recovery", "b" * 64, stage,
+                ))
+                self.assertIn("mechanical_pre_effect_event_upsert", recovery.executed)
+                self.assertIn("git", recovery.executed)
+                current = store.kv_get(self.LEASE_NAMESPACE, key)
+                self.assertEqual(current["value"]["event_id"], "event-recovery")
+                self.assertEqual(current["value"]["owner_workflow_run_id"], "run-recovery")
+
+    def test_native_stale_owner_release_cannot_overwrite_recovery_claim(self):
+        for graph_name, snapshot, stage in (
+            ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
+            ("pr-drive", "run_input", "post_pr"),
+        ):
+            with self.subTest(graph=graph_name):
+                graph = self.graph(graph_name)
+                store = RunControlDatastoreFixture()
+                key = "graphwing-mechanical-build-lease-v1:build-52"
+
+                def stop_at_git(node, payload, context):
+                    if node["id"] == "git":
+                        return "halt", {"ok": True}
+                    raise AssertionError(node["id"])
+
+                first = NativeGraphRunner(graph, store, stop_at_git)
+                first.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-crashed", "run-crashed", "a" * 64, stage,
+                ))
+                stale_context = deepcopy(first.context)
+
+                store.advance(14401)
+                recovery = NativeGraphRunner(graph, store, stop_at_git)
+                recovery.run({}, start="mechanical_lease_claim_read", context=self.lease_context(
+                    snapshot, "event-recovery", "run-recovery", "b" * 64, stage,
+                ))
+                current = store.kv_get(self.LEASE_NAMESPACE, key)
+                self.assertEqual(current["value"]["owner_workflow_run_id"], "run-recovery")
+                writes_before_stale_release = list(store.writes)
+
+                stale_release = NativeGraphRunner(graph, store, stop_at_git)
+                with self.assertRaisesRegex(
+                    NativeGraphFenced, "graphwing_mechanical_lease_release_mismatch",
+                ):
+                    stale_release.run(
+                        {}, start="mechanical_lease_release_readback", context=stale_context,
+                    )
+                self.assertEqual(store.writes, writes_before_stale_release)
+                self.assertEqual(store.kv_get(self.LEASE_NAMESPACE, key), current)
+
     def test_native_owner_release_allows_next_event_claim_and_excludes_stale_owner(self):
         for graph_name, snapshot, stage in (
             ("implement-slice", "mechanical_resume_input_snap", "pre_pr"),
@@ -32223,8 +32297,6 @@ class MechanicalBuildResumeTests(unittest.TestCase):
                 ))
                 self.assertIn("mechanical_pre_effect_event_upsert", first.executed)
                 self.assertIn("git", first.executed)
-                store.advance(20000)
-                self.assertTrue(store.kv_get(self.LEASE_NAMESPACE, key)["found"])
                 first.run({}, start="mechanical_lease_release_readback", context=first.context)
                 stale_context = deepcopy(first.context)
                 released = store.kv_get(self.LEASE_NAMESPACE, key)
