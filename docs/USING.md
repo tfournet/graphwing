@@ -10,6 +10,84 @@ Use your normal editor or terminal; optional Herdr session `graphwing`, tab `gra
 
 Allowlisted short names are `$GRAPHWING_HOME/repos.json`. Graph `cwd` / `repo` fields use those names, not paths.
 
+## Allowlisted service surfaces
+
+`GET /v1/stack/status` remains the read-only whole-stack snapshot. A stack used by
+`surfaceStatus`, `surfaceUp`, or `surfaceStop` also declares a closed lifecycle
+inventory in `$GRAPHWING_HOME/stacks.json`:
+
+```json
+{
+  "ports": [3100, 5432],
+  "stacks": [
+    {
+      "name": "riftwing-dev",
+      "cwd": "repos/riftwing-dev",
+      "runtime": "podman",
+      "compose_file": "compose.yaml",
+      "services": ["api", "db", "worker"],
+      "ports": [3100, 5432],
+      "health": [],
+      "surfaces": [
+        {
+          "name": "api",
+          "services": ["api"],
+          "dependencies": ["db"],
+          "ports": [3100],
+          "health": [
+            {"name": "api", "url": "http://127.0.0.1:3100/health"}
+          ],
+          "wait_seconds": 30
+        },
+        {
+          "name": "full",
+          "services": ["api", "db", "worker"],
+          "dependencies": [],
+          "ports": [3100, 5432],
+          "health": [],
+          "wait_seconds": 60
+        }
+      ]
+    }
+  ]
+}
+```
+
+`runtime` is exactly `podman` or `docker`; `compose_file` is relative to the
+stack's fixed `cwd`. The lowercase stack name is also passed as Compose's fixed
+`--project-name`, so environment or file-level project names cannot redirect an
+operation to another worktree. `services` is the complete Compose service inventory. Every
+surface has a nonempty owned service list and may declare start-only
+`dependencies`, loopback HTTP(S) health probes, and ports from the stack's
+allowlist. The required `full` surface covers every configured service.
+Duplicate stacks, Compose scopes, services, surfaces, probes, or ports; unknown
+service/dependency/port names; incomplete `full` inventories; extra fields; and
+unsafe runtime or Compose paths fail configuration loading. Configuration is bounded
+to 64 stacks, 64 services and surfaces per stack, 64 total targets per surface,
+32 ports and health probes per list, and `wait_seconds` from 1 through 300.
+
+The three operation inputs are closed:
+
+- `surfaceStatus`: query parameters `stack` and `surface` only. It runs Compose
+  `ps` plus configured probes and returns a bounded `surface-lifecycle-v1`
+  receipt without changing services.
+- `surfaceUp`: JSON `{ "stack": "riftwing-dev", "surface": "api" }` only. It
+  runs the fixed Compose project with `up -d --no-deps` for exactly the surface
+  services plus declared dependencies, then waits up to configured
+  `wait_seconds` for every target service, health probe, and port.
+- `surfaceStop`: the same two-field JSON body. It uses Compose `stop` for only
+  the surface's owned `services`; dependencies and unrelated services remain
+  running, and named volumes remain attached.
+
+Failures return canned diagnostics and never trigger cleanup. These operations
+never run `compose down`, prune, `rm`, volume or image deletion, host-wide
+cleanup, daemon restart, another stack/worktree, arbitrary shell, or a generic
+Docker/Podman API. Callers cannot supply a path, service, Compose argument,
+runtime binary, or environment override.
+
+A legacy stack entry without `surfaces` remains available only to `stackStatus`
+and `portCheck`; lifecycle operations reject every surface for that entry.
+
 ## Claude skills preflight
 
 Use only Graphwing's qualified operator-loop names:
@@ -251,7 +329,7 @@ Code-off receipts remain independent issue-67 commit/push gates and cannot waive
 
 | Slug | When |
 |---|---|
-| `graphwing-verify-stack` | Stack down before e2e. Payload `{ "input": { "stack", "port" } }`; success includes stack/port diagnostics and action failures terminate with compact diagnostic stage receipts. |
+| `graphwing-verify-stack` | Starts the allowlisted `full` surface with `surfaceStatus` → `surfaceUp`, then proves one allowlisted port before e2e. Payload `{ "input": { "stack", "port" } }`; failures terminate with compact diagnostic stage receipts. |
 | `graphwing-pr-status` | Read remote-only PR state with `{ "input": { "pr": 3624 } }` through an API start. Webhook starts remain disabled because they do not create `CTX.INPUT`. |
 | `graphwing-pr-drive` | One bounded fix slice when remote checks/findings are red; start via manual/form/API run, not webhook. |
 

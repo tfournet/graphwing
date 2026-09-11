@@ -518,9 +518,16 @@ DIAGNOSTIC_METADATA = {
     "cmd_failed": ("local_infrastructure", "command", "bounded_command", "local command failed"),
     "timeout": ("local_infrastructure", "command", "bounded_command", "local command timed out"),
     "missing_port": ("workflow_failure", "request", "validated_input", "port input is required"),
+    "bad_json": ("workflow_failure", "request", "validated_input", "request body is not valid JSON"),
+    "missing_stack": ("workflow_failure", "request", "validated_input", "stack input is required"),
+    "missing_surface": ("workflow_failure", "request", "validated_input", "surface input is required"),
     "bad_port": ("workflow_failure", "request", "validated_input", "port input is invalid"),
     "unknown_port": ("workflow_failure", "request", "validated_input", "port is not allowlisted"),
     "unknown_stack": ("workflow_failure", "request", "validated_input", "stack is not configured"),
+    "unknown_surface": ("workflow_failure", "request", "validated_input", "surface is not configured"),
+    "unexpected_fields": ("workflow_failure", "request", "validated_input", "request contains unsupported fields"),
+    "surface_unhealthy": ("local_infrastructure", "stack", "compose_snapshot", "local surface is unhealthy"),
+    "surface_still_running": ("local_infrastructure", "stack", "compose_snapshot", "local surface did not stop"),
     "primary_execution_profile_mismatch": ("workflow_failure", "execution", "closed_failure_code", "bounded workflow operation failed"),
 }
 
@@ -1673,44 +1680,184 @@ def load_rr(repos: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
 def load_stacks() -> tuple[dict[str, dict[str, Any]], set[int]]:
     if not STACKS_PATH.is_file():
         return {}, set()
-    data = json.loads(STACKS_PATH.read_text())
-    if not isinstance(data, dict):
-        raise RuntimeError(f"stacks.json must be an object: {STACKS_PATH}")
-    ports: set[int] = set()
-    for raw in data.get("ports") or []:
-        try:
-            p = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= p <= 65535:
-            ports.add(p)
+    data = json.loads(
+        STACKS_PATH.read_text(),
+        object_pairs_hook=_rewst_unique_object,
+        parse_constant=_reject_rewst_json_constant,
+    )
+    if not isinstance(data, dict) or set(data) - {"ports", "stacks"}:
+        raise RuntimeError(f"stacks.json must be a closed object: {STACKS_PATH}")
+
+    def names(raw: Any, label: str, *, required: bool = False) -> list[str]:
+        if not isinstance(raw, list) or (required and not raw) or len(raw) > 64:
+            raise RuntimeError(f"{label} must be a bounded{' non-empty' if required else ''} list")
+        out = []
+        for value in raw:
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+                raise RuntimeError(f"{label} contains an invalid name")
+            if value in out:
+                raise RuntimeError(f"{label} contains duplicate entry '{value}'")
+            out.append(value)
+        return out
+
+    def port_list(raw: Any, label: str) -> list[int]:
+        if not isinstance(raw, list) or len(raw) > 32:
+            raise RuntimeError(f"{label} must be a bounded list")
+        out = []
+        for value in raw:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RuntimeError(f"{label} contains an invalid port")
+            port = value
+            if not 1 <= port <= 65535 or port in out:
+                raise RuntimeError(f"{label} contains an invalid or duplicate port")
+            out.append(port)
+        return out
+
+    def health_list(raw: Any, label: str) -> list[dict[str, str]]:
+        if not isinstance(raw, list) or len(raw) > 32:
+            raise RuntimeError(f"{label} must be a bounded list")
+        out = []
+        seen = set()
+        for probe in raw:
+            if not isinstance(probe, dict) or set(probe) != {"name", "url"}:
+                raise RuntimeError(f"{label} contains an invalid health probe")
+            name = probe.get("name")
+            url = probe.get("url")
+            parsed = urlparse(url) if isinstance(url, str) else None
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name)
+                or name in seen
+                or parsed is None
+                or parsed.scheme not in {"http", "https"}
+                or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost"}
+            ):
+                raise RuntimeError(f"{label} contains an invalid or duplicate health probe")
+            seen.add(name)
+            out.append({"name": name, "url": url})
+        return out
+
+    ports = set(port_list(data.get("ports", []), "ports"))
+    raw_stacks = data.get("stacks", [])
+    if not isinstance(raw_stacks, list) or len(raw_stacks) > 64:
+        raise RuntimeError(f"stacks.json stacks must be a bounded list: {STACKS_PATH}")
     stacks: dict[str, dict[str, Any]] = {}
-    for item in data.get("stacks") or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
+    compose_scopes: set[tuple[str, str]] = set()
+    stack_fields = {
+        "name", "cwd", "runtime", "compose_file", "services", "surfaces", "health", "ports",
+    }
+    surface_fields = {
+        "name", "services", "dependencies", "health", "ports", "wait_seconds",
+    }
+    for item in raw_stacks:
+        if not isinstance(item, dict) or set(item) - stack_fields:
+            raise RuntimeError("stacks.json contains an invalid stack entry")
+        name = item.get("name")
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", name)
+            or name in stacks
+        ):
+            raise RuntimeError("stacks.json contains an invalid or duplicate stack name")
         cwd = resolve_under_home(item.get("cwd") or ".")
-        if not name or not cwd.is_dir():
+        if not cwd.is_dir():
+            raise RuntimeError(f"stack '{name}' cwd is unavailable")
+        compose_file = item.get("compose_file", "docker-compose.yml")
+        if not isinstance(compose_file, str):
+            raise RuntimeError(f"stack '{name}' compose_file must be a string")
+        compose_path = Path(compose_file)
+        if compose_file and (compose_path.is_absolute() or ".." in compose_path.parts):
+            raise RuntimeError(f"stack '{name}' compose_file must be relative to its cwd")
+        health = health_list(item.get("health", []), f"stack '{name}' health")
+        stack_ports = port_list(item.get("ports", []), f"stack '{name}' ports")
+        ports.update(stack_ports)
+        scope = (str(cwd), compose_file)
+        if scope in compose_scopes:
+            raise RuntimeError(f"stack '{name}' duplicates another Compose scope")
+        compose_scopes.add(scope)
+
+        has_surface_schema = "surfaces" in item
+        if not has_surface_schema:
+            if "runtime" in item or "services" in item:
+                raise RuntimeError(f"stack '{name}' has incomplete surface configuration")
+            stacks[name] = {
+                "name": name,
+                "cwd": cwd,
+                "runtime": "podman",
+                "compose_file": compose_file,
+                "health": health,
+                "ports": stack_ports,
+                "services": [],
+                "surfaces": {},
+            }
             continue
-        health = []
-        for h in item.get("health") or []:
-            if isinstance(h, dict) and h.get("name") and h.get("url"):
-                health.append({"name": str(h["name"]), "url": str(h["url"])})
-        sport: list[int] = []
-        for raw in item.get("ports") or []:
-            try:
-                p = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= p <= 65535:
-                sport.append(p)
-                ports.add(p)
+
+        runtime = item.get("runtime")
+        if runtime not in {"podman", "docker"}:
+            raise RuntimeError(f"stack '{name}' runtime must be podman or docker")
+        if not compose_file:
+            raise RuntimeError(f"stack '{name}' compose_file is required for surfaces")
+        services = names(item.get("services"), f"stack '{name}' services", required=True)
+        raw_surfaces = item.get("surfaces")
+        if not isinstance(raw_surfaces, list) or not raw_surfaces or len(raw_surfaces) > 64:
+            raise RuntimeError(f"stack '{name}' surfaces must be a bounded non-empty list")
+        surfaces: dict[str, dict[str, Any]] = {}
+        for surface in raw_surfaces:
+            if not isinstance(surface, dict) or set(surface) - surface_fields:
+                raise RuntimeError(f"stack '{name}' contains an invalid surface entry")
+            surface_name = surface.get("name")
+            if (
+                not isinstance(surface_name, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", surface_name)
+                or surface_name in surfaces
+            ):
+                raise RuntimeError(f"stack '{name}' contains an invalid or duplicate surface name")
+            owned = names(
+                surface.get("services"),
+                f"stack '{name}' surface '{surface_name}' services",
+                required=True,
+            )
+            dependencies = names(
+                surface.get("dependencies", []),
+                f"stack '{name}' surface '{surface_name}' dependencies",
+            )
+            if set(owned) & set(dependencies) or len(owned) + len(dependencies) > 64:
+                raise RuntimeError(f"stack '{name}' surface '{surface_name}' repeats or exceeds dependencies")
+            unknown = (set(owned) | set(dependencies)) - set(services)
+            if unknown:
+                raise RuntimeError(f"stack '{name}' surface '{surface_name}' names an unknown service")
+            surface_ports = port_list(
+                surface.get("ports", []),
+                f"stack '{name}' surface '{surface_name}' ports",
+            )
+            if set(surface_ports) - set(stack_ports):
+                raise RuntimeError(f"stack '{name}' surface '{surface_name}' names an unknown port")
+            wait_seconds = surface.get("wait_seconds", 30)
+            if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int) or not 1 <= wait_seconds <= 300:
+                raise RuntimeError(f"stack '{name}' surface '{surface_name}' wait_seconds must be 1..300")
+            surfaces[surface_name] = {
+                "name": surface_name,
+                "services": owned,
+                "dependencies": dependencies,
+                "health": health_list(
+                    surface.get("health", []),
+                    f"stack '{name}' surface '{surface_name}' health",
+                ),
+                "ports": surface_ports,
+                "wait_seconds": wait_seconds,
+            }
+        full = surfaces.get("full")
+        if full is None or set(full["services"] + full["dependencies"]) != set(services):
+            raise RuntimeError(f"stack '{name}' full surface must list every configured service")
         stacks[name] = {
             "name": name,
             "cwd": cwd,
-            "compose_file": str(item.get("compose_file") or "docker-compose.yml"),
+            "runtime": runtime,
+            "compose_file": compose_file,
             "health": health,
-            "ports": sport,
+            "ports": stack_ports,
+            "services": services,
+            "surfaces": surfaces,
         }
     if not stacks and not ports:
         raise RuntimeError(f"stacks.json has no stacks or ports: {STACKS_PATH}")
@@ -6644,6 +6791,320 @@ def parse_compose_ps(raw: str) -> list[dict[str, Any]]:
     return out
 
 
+def compose_command(spec: dict[str, Any]) -> list[str]:
+    args = [str(spec.get("runtime") or "podman"), "compose"]
+    if spec.get("surfaces") and spec.get("name"):
+        args.extend(["--project-name", str(spec["name"])])
+    compose_file = str(spec.get("compose_file") or "")
+    if compose_file:
+        args.extend(["-f", compose_file])
+    return args
+
+
+def compose_environment(spec: dict[str, Any]) -> dict[str, str] | None:
+    return podman_env() if spec.get("runtime", "podman") == "podman" else None
+
+
+def surface_error(code: str, error: str, status: int = 400, **extra: Any) -> dict[str, Any]:
+    if isinstance(extra.get("fields"), list):
+        extra["fields"] = [str(field)[:64] for field in extra["fields"][:16]]
+    return {
+        "ok": False,
+        "error": error,
+        "code": code,
+        "status": status,
+        "diagnostic": compact_diagnostic(code),
+        **extra,
+    }
+
+
+def resolve_surface(
+    stack_name: str | None,
+    surface_name: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    stacks, _ports = load_stacks()
+    if not stacks:
+        return None, None, surface_error(
+            "not_configured", "stacks.json is not configured", 501
+        )
+    if not isinstance(stack_name, str) or not stack_name.strip():
+        return None, None, surface_error("missing_stack", "stack is required")
+    stack_key = stack_name.strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", stack_key):
+        return None, None, surface_error(
+            "unknown_stack", "stack is not configured", allowed=sorted(stacks)
+        )
+    if stack_key not in stacks:
+        return None, None, surface_error(
+            "unknown_stack", f"unknown stack '{stack_key}'", allowed=sorted(stacks)
+        )
+    stack = stacks[stack_key]
+    surfaces = stack.get("surfaces") or {}
+    if not isinstance(surface_name, str) or not surface_name.strip():
+        return None, None, surface_error("missing_surface", "surface is required")
+    surface_key = surface_name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", surface_key):
+        return None, None, surface_error(
+            "unknown_surface", "surface is not configured", allowed=sorted(surfaces)
+        )
+    if surface_key not in surfaces:
+        return None, None, surface_error(
+            "unknown_surface",
+            f"unknown surface '{surface_key}'",
+            allowed=sorted(surfaces),
+        )
+    return stack, surfaces[surface_key], None
+
+
+def parse_surface_request(
+    body: bytes,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        data = json.loads(
+            body.decode("utf-8") if body else "{}",
+            object_pairs_hook=_rewst_unique_object,
+            parse_constant=_reject_rewst_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        return None, None, surface_error("bad_json", "body must be JSON")
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return None, None, surface_error("bad_json", "body must be a JSON object")
+    unexpected = sorted(set(data) - {"stack", "surface"})
+    if unexpected:
+        return None, None, surface_error(
+            "unexpected_fields", "request contains unsupported fields", fields=unexpected
+        )
+    return resolve_surface(data.get("stack"), data.get("surface"))
+
+
+def surface_snapshot(
+    stack: dict[str, Any],
+    surface: dict[str, Any],
+    *,
+    prove_health: bool = True,
+) -> dict[str, Any]:
+    targets = list(dict.fromkeys(surface["services"] + surface["dependencies"]))
+    args = [*compose_command(stack), "ps", "-a", "--format", "json", *targets]
+    result = run_cmd(
+        args,
+        cwd=stack["cwd"],
+        timeout=20,
+        env=compose_environment(stack),
+    )
+    containers = parse_compose_ps(result.get("stdout") or "") if result.get("ok") else []
+    target_set = set(targets)
+    containers = [row for row in containers if row.get("service") in target_set][:64]
+    running_states = {"running", "up"}
+    running = sorted({
+        str(row["service"])
+        for row in containers
+        if row.get("service") in target_set
+        and str(row.get("state") or "").lower() in running_states
+    })
+    health = []
+    for probe in surface["health"] if prove_health else []:
+        checked = probe_loopback(probe["url"])
+        health.append({
+            "name": probe["name"],
+            "ok": bool(checked.get("ok")),
+            "status": checked.get("status") if isinstance(checked.get("status"), int) else None,
+            "diagnostic": checked.get("diagnostic") or compact_diagnostic("unknown_failure"),
+        })
+    ports = [port_probe(port) for port in surface["ports"]] if prove_health else []
+    services_ok = all(target in running for target in targets)
+    health_ok = all(item["ok"] for item in health)
+    ports_ok = all(item["listening"] for item in ports)
+    healthy = bool(result.get("ok")) and services_ok and health_ok and ports_ok
+    if not result.get("ok"):
+        diagnostic = compact_diagnostic(str(result.get("code") or "cmd_failed"))
+    elif not services_ok:
+        diagnostic = compact_diagnostic("surface_unhealthy")
+    elif not health_ok:
+        diagnostic = next(
+            item["diagnostic"] for item in health if not item["ok"]
+        )
+    elif not ports_ok:
+        diagnostic = next(
+            item["diagnostic"] for item in ports if not item["listening"]
+        )
+    else:
+        diagnostic = compact_diagnostic("none")
+    return {
+        "compose_ok": bool(result.get("ok")),
+        "healthy": healthy,
+        "running_services": running,
+        "service_states": containers,
+        "health": health,
+        "ports": ports,
+        "diagnostic": diagnostic,
+    }
+
+
+def surface_receipt(
+    action: str,
+    stack: dict[str, Any],
+    surface: dict[str, Any],
+    snapshot: dict[str, Any],
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "ok": bool(extra.pop("ok", True)),
+        "receipt_version": "surface-lifecycle-v1",
+        "action": action,
+        "stack": stack["name"],
+        "surface": surface["name"],
+        "services": list(surface["services"]),
+        "dependencies": list(surface["dependencies"]),
+        "healthy": bool(snapshot.get("healthy")),
+        "running_services": list(snapshot.get("running_services") or []),
+        "service_states": list(snapshot.get("service_states") or []),
+        "health": list(snapshot.get("health") or []),
+        "ports": list(snapshot.get("ports") or []),
+        "compose_ok": bool(snapshot.get("compose_ok")),
+        "diagnostic": snapshot.get("diagnostic") or compact_diagnostic("unknown_failure"),
+        **extra,
+    }
+
+
+def surface_status(stack_name: str | None, surface_name: str | None) -> dict[str, Any]:
+    stack, surface, error = resolve_surface(stack_name, surface_name)
+    if error:
+        return error
+    assert stack is not None and surface is not None
+    return surface_receipt("status", stack, surface, surface_snapshot(stack, surface))
+
+
+def surface_up(body: bytes) -> tuple[int, dict[str, Any]]:
+    stack, surface, error = parse_surface_request(body)
+    if error:
+        return int(error.get("status", 400)), error
+    assert stack is not None and surface is not None
+    targets = list(dict.fromkeys(surface["services"] + surface["dependencies"]))
+    command = [
+        *compose_command(stack), "up", "-d", "--no-deps", *targets,
+    ]
+    deadline = time.monotonic() + surface["wait_seconds"]
+    result = run_cmd(
+        command,
+        cwd=stack["cwd"],
+        timeout=surface["wait_seconds"],
+        env=compose_environment(stack),
+    )
+    if not result.get("ok"):
+        diagnostic = compact_diagnostic(str(result.get("code") or "cmd_failed"))
+        receipt = surface_receipt(
+            "up",
+            stack,
+            surface,
+            {
+                "compose_ok": False,
+                "healthy": False,
+                "running_services": [],
+                "service_states": [],
+                "health": [],
+                "ports": [],
+                "diagnostic": diagnostic,
+            },
+            ok=False,
+            code=diagnostic["code"],
+            error="configured surface start failed",
+            attempts=0,
+        )
+        command_status = int(result.get("status") or 502)
+        return command_status if command_status in {501, 504} else 502, receipt
+
+    attempts = 0
+    while True:
+        attempts += 1
+        snapshot = surface_snapshot(stack, surface)
+        if snapshot["healthy"]:
+            return 200, surface_receipt(
+                "up", stack, surface, snapshot, attempts=attempts
+            )
+        if time.monotonic() >= deadline:
+            receipt = surface_receipt(
+                "up",
+                stack,
+                surface,
+                snapshot,
+                ok=False,
+                code=snapshot["diagnostic"]["code"],
+                error="configured surface did not become healthy",
+                attempts=attempts,
+            )
+            return 504, receipt
+        time.sleep(0.25)
+
+
+def surface_stop(body: bytes) -> tuple[int, dict[str, Any]]:
+    stack, surface, error = parse_surface_request(body)
+    if error:
+        return int(error.get("status", 400)), error
+    assert stack is not None and surface is not None
+    command = [*compose_command(stack), "stop", *surface["services"]]
+    result = run_cmd(
+        command,
+        cwd=stack["cwd"],
+        timeout=surface["wait_seconds"],
+        env=compose_environment(stack),
+    )
+    if not result.get("ok"):
+        diagnostic = compact_diagnostic(str(result.get("code") or "cmd_failed"))
+        receipt = surface_receipt(
+            "stop",
+            stack,
+            surface,
+            {
+                "compose_ok": False,
+                "healthy": False,
+                "running_services": [],
+                "service_states": [],
+                "health": [],
+                "ports": [],
+                "diagnostic": diagnostic,
+            },
+            ok=False,
+            code=diagnostic["code"],
+            error="configured surface stop failed",
+            stopped=False,
+            volumes_preserved=True,
+        )
+        command_status = int(result.get("status") or 502)
+        return command_status if command_status in {501, 504} else 502, receipt
+
+    snapshot = surface_snapshot(stack, surface, prove_health=False)
+    stopped = not any(
+        service in snapshot["running_services"] for service in surface["services"]
+    )
+    if not snapshot["compose_ok"]:
+        diagnostic = snapshot["diagnostic"]
+        status = 502
+    elif not stopped:
+        diagnostic = compact_diagnostic("surface_still_running")
+        status = 504
+    else:
+        diagnostic = compact_diagnostic("none")
+        status = 200
+    snapshot = {**snapshot, "diagnostic": diagnostic}
+    receipt = surface_receipt(
+        "stop",
+        stack,
+        surface,
+        snapshot,
+        ok=status == 200,
+        stopped=stopped,
+        volumes_preserved=True,
+    )
+    if status != 200:
+        receipt.update({
+            "code": diagnostic["code"],
+            "error": "configured surface did not stop",
+        })
+    return status, receipt
+
+
 def stack_status(name: str | None) -> dict[str, Any]:
     stacks, _ports = load_stacks()
     if not stacks:
@@ -6661,12 +7122,8 @@ def stack_status(name: str | None) -> dict[str, Any]:
         }
     spec = stacks[key]
     cwd: Path = spec["cwd"]
-    compose = spec["compose_file"]
-    args = ["podman", "compose"]
-    if compose:
-        args.extend(["-f", compose])
-    args.extend(["ps", "-a", "--format", "json"])
-    r = run_cmd(args, cwd=cwd, timeout=20, env=podman_env())
+    args = [*compose_command(spec), "ps", "-a", "--format", "json"]
+    r = run_cmd(args, cwd=cwd, timeout=20, env=compose_environment(spec))
     containers = parse_compose_ps(r.get("stdout") or "") if r.get("ok") else []
     health = [{"name": h["name"], **probe_loopback(h["url"])} for h in spec["health"]]
     health_ok = all(h.get("ok") for h in health) if health else bool(containers)
@@ -16048,6 +16505,29 @@ def dispatch_inner(
         out = herdr_agents()
         return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
 
+    if method == "GET" and path == "/v1/surface/status":
+        unexpected = sorted(set(qs) - {"stack", "surface"})
+        ambiguous = any(len(values) != 1 for values in qs.values())
+        if unexpected or ambiguous:
+            out = surface_error(
+                "unexpected_fields", "request contains unsupported fields",
+                fields=unexpected or sorted(qs),
+            )
+        else:
+            out = surface_status(
+                first_query(qs, "stack"), first_query(qs, "surface")
+            )
+        return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)
+    if method == "POST" and path in {"/v1/surface/up", "/v1/surface/stop"} and qs:
+        return json_out(400, surface_error(
+            "unexpected_fields", "request contains unsupported fields", fields=sorted(qs)
+        ))
+    if method == "POST" and path == "/v1/surface/up":
+        status, payload = surface_up(body)
+        return json_out(status, payload)
+    if method == "POST" and path == "/v1/surface/stop":
+        status, payload = surface_stop(body)
+        return json_out(status, payload)
     if method == "GET" and path == "/v1/stack/status":
         out = stack_status(first_query(qs, "stack"))
         return json_out(200 if out.get("ok") else int(out.get("status", 400)), out)

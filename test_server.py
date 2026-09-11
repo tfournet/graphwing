@@ -2315,6 +2315,8 @@ class DispatchTests(unittest.TestCase):
             "provider_rate_limit": ("provider_availability", "provider", "structured_provider_error"),
             "provider_http_5xx": ("provider_availability", "provider", "structured_provider_error"),
             "stack_unhealthy": ("local_infrastructure", "stack", "compose_snapshot"),
+            "surface_unhealthy": ("local_infrastructure", "stack", "compose_snapshot"),
+            "surface_still_running": ("local_infrastructure", "stack", "compose_snapshot"),
             "port_not_listening": ("local_infrastructure", "port", "bounded_port_probe"),
             "health_bad_status": ("local_infrastructure", "health", "bounded_loopback_probe"),
             "cmd_failed": ("local_infrastructure", "command", "bounded_command"),
@@ -2342,9 +2344,11 @@ class DispatchTests(unittest.TestCase):
             | set(server.PROVIDER_AVAILABILITY_CODES)
             | {
                 "none", "not_configured", "bad_health_config", "health_unreachable",
-                "health_bad_status", "stack_unhealthy", "port_not_listening", "cmd_failed",
-                "timeout", "local_binary_missing", "missing_port", "bad_port", "unknown_port",
-                "unknown_stack", "primary_execution_profile_mismatch",
+                "health_bad_status", "stack_unhealthy", "surface_unhealthy",
+                "surface_still_running", "port_not_listening", "cmd_failed",
+                "timeout", "local_binary_missing", "missing_port", "missing_stack",
+                "missing_surface", "bad_json", "bad_port", "unknown_port", "unknown_stack",
+                "unknown_surface", "unexpected_fields", "primary_execution_profile_mismatch",
             }
         )
         self.assertEqual(set(server.DIAGNOSTIC_METADATA), expected_codes)
@@ -5576,7 +5580,7 @@ while True:
         self.assertEqual(status, 200)
         spec = json.loads(payload)
         self.assertEqual(spec["info"]["title"], "graphwing")
-        self.assertEqual(spec["info"]["version"], "0.5.6")
+        self.assertEqual(spec["info"]["version"], "0.6.0")
         self.assertEqual(spec["servers"][0]["url"], "http://127.0.0.1:8645")
         self.assertNotIn("tfour.net", spec["info"]["description"])
         self.assertNotIn("tim-graphwing", spec["info"]["description"])
@@ -14990,7 +14994,7 @@ func main() {
         self.assertIn("`action.graphwing` results", using)
         self.assertIn("`CTX.<alias>`", using)
 
-    def test_verify_stack_uses_action_data_contract_and_sanitized_failure_receipts(self):
+    def test_verify_stack_uses_surface_lifecycle_and_sanitized_failure_receipts(self):
         graph = json.loads((Path(server.__file__).parent / "graphs" / "verify-stack.json").read_text())
         spec = json.loads((Path(server.__file__).parent / "openapi.json").read_text())
         nodes = {n["id"]: n for n in graph["spec"]["nodes"]}
@@ -15001,17 +15005,23 @@ func main() {
         self.assertEqual(len(aliases), len(set(aliases)))
         self.assertEqual(nodes["ports"]["config"]["port"], "{{ CTX.INPUT.port }}")
         self.assertNotIn("ports", nodes["ports"]["config"])
+        for node_id in ("surface_status", "surface_up"):
+            self.assertEqual(nodes[node_id]["config"]["stack"], "{{ CTX.INPUT.stack }}")
+            self.assertEqual(nodes[node_id]["config"]["surface"], "full")
         self.assertEqual(
             {
-                ("trigger", "out", "stack"),
-                ("stack", "success", "ports"),
+                ("trigger", "out", "surface_status"),
+                ("surface_status", "success", "surface_up"),
+                ("surface_up", "success", "ports"),
                 ("ports", "success", "record"),
             },
-            {triple for triple in triples if triple[2] in {"stack", "ports", "record"}},
+            {triple for triple in triples if triple[2] in {
+                "surface_status", "surface_up", "ports", "record",
+            }},
         )
 
         action_contracts = {}
-        for node_id in ("stack", "ports"):
+        for node_id in ("surface_status", "surface_up", "ports"):
             action = nodes[node_id]
             method_path = action["type"].removeprefix("action.graphwing.")
             method, path = method_path.split(":", 1)
@@ -15021,11 +15031,14 @@ func main() {
             action_contracts[node_id] = set(spec["components"]["schemas"][schema_name]["properties"])
 
         mappings = nodes["record"]["config"]["mappings"]
-        self.assertEqual({mapping["output"] for mapping in mappings},
-                         {"stack", "healthy", "ports", "stack_diagnostic", "port_diagnostic"})
+        self.assertEqual(
+            {mapping["output"] for mapping in mappings},
+            {
+                "stack", "surface", "healthy", "ports", "status_diagnostic",
+                "up_diagnostic", "port_diagnostic",
+            },
+        )
         mapping_paths = {mapping["expression"]["path"] for mapping in mappings}
-        self.assertNotIn("TASKS.stack.stack", mapping_paths)
-        self.assertNotIn("TASKS.ports.ports", mapping_paths)
         for mapping in mappings:
             expression = mapping["expression"]
             self.assertEqual(expression["kind"], "getField")
@@ -15033,11 +15046,17 @@ func main() {
             self.assertEqual((root, envelope), ("TASKS", "data"))
             self.assertIn(source, action_contracts)
             self.assertIn(field, action_contracts[source])
+        self.assertNotIn("TASKS.surface_up.healthy", mapping_paths)
 
-        self.assertIn(("stack", "failure", "stack_diagnostic"), triples)
-        self.assertIn(("ports", "failure", "ports_diagnostic"), triples)
+        for source, failure in (
+            ("surface_status", "surface_status_diagnostic"),
+            ("surface_up", "surface_up_diagnostic"),
+            ("ports", "ports_diagnostic"),
+        ):
+            self.assertIn((source, "failure", failure), triples)
         for node_id, stage in (
-            ("stack_diagnostic", "stack_status"),
+            ("surface_status_diagnostic", "surface_status"),
+            ("surface_up_diagnostic", "surface_up"),
             ("ports_diagnostic", "port_check"),
         ):
             node = nodes[node_id]
@@ -15047,14 +15066,14 @@ func main() {
                 [m["id"] for m in node["config"]["mappings"]],
                 [f"m{i}" for i in range(1, len(node["config"]["mappings"]) + 1)],
             )
-            mappings = {m["output"]: m["expression"] for m in node["config"]["mappings"]}
-            self.assertEqual(mappings["diagnostic_version"], {"kind": "literal", "value": "diagnostic-v1"})
-            self.assertEqual(mappings["stage"], {"kind": "literal", "value": stage})
+            mapped = {m["output"]: m["expression"] for m in node["config"]["mappings"]}
+            self.assertEqual(mapped["diagnostic_version"], {"kind": "literal", "value": "diagnostic-v1"})
+            self.assertEqual(mapped["stage"], {"kind": "literal", "value": stage})
             self.assertEqual(
-                mappings["summary"],
+                mapped["summary"],
                 {"kind": "literal", "value": f"{stage} action failed"},
             )
-            dumped = json.dumps(mappings).lower()
+            dumped = json.dumps(mapped).lower()
             self.assertNotIn(".data.diagnostic", dumped)
             for unsafe in ("data.error", "stdout", "stderr", "trace", "token", "url", "cwd", "secret_path"):
                 self.assertNotIn(unsafe, dumped)
@@ -17747,6 +17766,505 @@ func main() {
         self.assertIn(["tab", "close", "w1:t5"], calls)
         self.assertNotIn(["tab", "close", "w1:t3"], calls)
         self.assertNotIn(["tab", "close", "w1:t6"], calls)
+
+    def _surface_stack_spec(self):
+        return {
+            "demo": {
+                "name": "demo",
+                "cwd": Path("."),
+                "runtime": "podman",
+                "compose_file": "compose.yaml",
+                "health": [],
+                "ports": [3100, 5432],
+                "services": ["api", "db", "worker"],
+                "surfaces": {
+                    "api": {
+                        "name": "api",
+                        "services": ["api"],
+                        "dependencies": ["db"],
+                        "health": [{"name": "api", "url": "http://127.0.0.1:3100/health"}],
+                        "ports": [3100],
+                        "wait_seconds": 5,
+                    },
+                    "full": {
+                        "name": "full",
+                        "services": ["api", "db", "worker"],
+                        "dependencies": [],
+                        "health": [],
+                        "ports": [3100, 5432],
+                        "wait_seconds": 5,
+                    },
+                },
+            }
+        }
+
+    def test_load_stacks_rejects_duplicate_unknown_and_incomplete_surface_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "compose.yaml").write_text("services: {}\n")
+            config = {
+                "ports": [3100, 5432],
+                "stacks": [{
+                    "name": "demo",
+                    "cwd": str(root),
+                    "runtime": "podman",
+                    "compose_file": "compose.yaml",
+                    "services": ["api", "db", "worker"],
+                    "ports": [3100, 5432],
+                    "health": [],
+                    "surfaces": [
+                        {"name": "api", "services": ["api"], "dependencies": ["db"],
+                         "ports": [3100], "health": [], "wait_seconds": 5},
+                        {"name": "full", "services": ["api", "db", "worker"],
+                         "dependencies": [], "ports": [3100, 5432], "health": [],
+                         "wait_seconds": 5},
+                    ],
+                }],
+            }
+            config_path = root / "stacks.json"
+            config_path.write_text(json.dumps(config))
+            with mock.patch.object(server, "STACKS_PATH", config_path):
+                stacks, ports = server.load_stacks()
+            self.assertEqual(set(stacks["demo"]["surfaces"]), {"api", "full"})
+            self.assertEqual(stacks["demo"]["runtime"], "podman")
+            self.assertEqual(ports, {3100, 5432})
+
+            invalid = []
+            duplicate_stack = deepcopy(config)
+            duplicate_stack["stacks"].append(deepcopy(duplicate_stack["stacks"][0]))
+            invalid.append(duplicate_stack)
+            duplicate_service = deepcopy(config)
+            duplicate_service["stacks"][0]["services"].append("api")
+            invalid.append(duplicate_service)
+            duplicate_surface = deepcopy(config)
+            duplicate_surface["stacks"][0]["surfaces"].append(
+                deepcopy(duplicate_surface["stacks"][0]["surfaces"][0])
+            )
+            invalid.append(duplicate_surface)
+            missing_services = deepcopy(config)
+            missing_services["stacks"][0]["surfaces"][0].pop("services")
+            invalid.append(missing_services)
+            unknown_service = deepcopy(config)
+            unknown_service["stacks"][0]["surfaces"][0]["dependencies"] = ["other-stack-db"]
+            invalid.append(unknown_service)
+            incomplete_full = deepcopy(config)
+            incomplete_full["stacks"][0]["surfaces"][1]["services"] = ["api", "db"]
+            invalid.append(incomplete_full)
+            duplicate_probe = deepcopy(config)
+            duplicate_probe["stacks"][0]["surfaces"][0]["health"] = [
+                {"name": "ready", "url": "http://127.0.0.1:3100/ready"},
+                {"name": "ready", "url": "http://127.0.0.1:3100/health"},
+            ]
+            invalid.append(duplicate_probe)
+            duplicate_scope = deepcopy(config)
+            duplicate_scope["stacks"].append(deepcopy(duplicate_scope["stacks"][0]))
+            duplicate_scope["stacks"][1]["name"] = "alias"
+            invalid.append(duplicate_scope)
+            bad_runtime = deepcopy(config)
+            bad_runtime["stacks"][0]["runtime"] = "/tmp/compose-wrapper"
+            invalid.append(bad_runtime)
+            escaped_file = deepcopy(config)
+            escaped_file["stacks"][0]["compose_file"] = "../other/compose.yaml"
+            invalid.append(escaped_file)
+            string_port = deepcopy(config)
+            string_port["stacks"][0]["ports"] = ["3100", 5432]
+            invalid.append(string_port)
+            oversized_inventory = deepcopy(config)
+            oversized_inventory["stacks"][0]["services"] = [f"service-{i}" for i in range(65)]
+            oversized_inventory["stacks"][0]["surfaces"] = [{
+                "name": "full",
+                "services": list(oversized_inventory["stacks"][0]["services"]),
+                "dependencies": [], "ports": [], "health": [], "wait_seconds": 5,
+            }]
+            invalid.append(oversized_inventory)
+            unknown_field = deepcopy(config)
+            unknown_field["stacks"][0]["surfaces"][0]["command"] = ["compose", "down"]
+            invalid.append(unknown_field)
+
+            for index, candidate in enumerate(invalid):
+                with self.subTest(index=index):
+                    config_path.write_text(json.dumps(candidate))
+                    with mock.patch.object(server, "STACKS_PATH", config_path):
+                        with self.assertRaises(RuntimeError):
+                            server.load_stacks()
+
+    def test_surface_endpoints_reject_unknown_names_and_all_caller_overrides(self):
+        stack_spec = self._surface_stack_spec()
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd") as run:
+            for path in ("/v1/surface/up", "/v1/surface/stop"):
+                with self.subTest(path=path, duplicate="stack"):
+                    status, payload, _ = server.dispatch(
+                        "POST", path, {}, True,
+                        b'{"stack":"other","stack":"demo","surface":"api"}',
+                    )
+                    self.assertEqual((status, payload["code"]), (400, "bad_json"), payload)
+                for body, code in (
+                    ({"stack": "other", "surface": "api"}, "unknown_stack"),
+                    ({"stack": "demo", "surface": "other"}, "unknown_surface"),
+                ):
+                    with self.subTest(path=path, code=code):
+                        status, payload, _ = server.dispatch(
+                            "POST", path, {}, True, json.dumps(body).encode()
+                        )
+                        self.assertEqual((status, payload["code"]), (400, code), payload)
+                for field in ("path", "service", "services", "command", "compose_args", "runtime", "environment"):
+                    with self.subTest(path=path, field=field, location="body"):
+                        body = {"stack": "demo", "surface": "api", field: "hostile"}
+                        status, payload, _ = server.dispatch(
+                            "POST", path, {}, True, json.dumps(body).encode()
+                        )
+                        self.assertEqual((status, payload["code"]), (400, "unexpected_fields"), payload)
+                    with self.subTest(path=path, field=field, location="query"):
+                        status, payload, _ = server.dispatch(
+                            "POST", path, {field: ["hostile"]}, True,
+                            b'{"stack":"demo","surface":"api"}',
+                        )
+                        self.assertEqual((status, payload["code"]), (400, "unexpected_fields"), payload)
+
+            for body, code in (
+                ({"stack": ["other"], "surface": ["api"]}, "unknown_stack"),
+                ({"stack": ["demo"], "surface": ["other"]}, "unknown_surface"),
+            ):
+                with self.subTest(path="status", code=code):
+                    status, payload, _ = server.dispatch(
+                        "GET", "/v1/surface/status", body, True, b""
+                    )
+                    self.assertEqual((status, payload["code"]), (400, code), payload)
+            for query in (
+                {"stack": ["demo", "other"], "surface": ["api"]},
+                {"stack": ["demo"], "surface": ["api", "other"]},
+            ):
+                with self.subTest(path="status", duplicate=query):
+                    status, payload, _ = server.dispatch(
+                        "GET", "/v1/surface/status", query, True, b""
+                    )
+                    self.assertEqual((status, payload["code"]), (400, "unexpected_fields"), payload)
+            for field in ("path", "service", "services", "command", "compose_args", "runtime", "environment"):
+                with self.subTest(path="status", field=field):
+                    status, payload, _ = server.dispatch(
+                        "GET", "/v1/surface/status",
+                        {"stack": ["demo"], "surface": ["api"], field: ["hostile"]},
+                        True, b"",
+                    )
+                    self.assertEqual((status, payload["code"]), (400, "unexpected_fields"), payload)
+        run.assert_not_called()
+
+    def test_surface_up_uses_only_configured_services_and_waits_for_health_and_ports(self):
+        stack_spec = self._surface_stack_spec()
+        calls = []
+
+        def compose(args, **kwargs):
+            calls.append((list(args), kwargs))
+            if "up" in args:
+                return {"ok": True, "stdout": ""}
+            if "ps" in args:
+                return {"ok": True, "stdout": json.dumps([
+                    {"Name": "demo-api-1", "Service": "api", "State": "running"},
+                    {"Name": "demo-db-1", "Service": "db", "State": "running"},
+                    {"Name": "demo-worker-1", "Service": "worker", "State": "running"},
+                ])}
+            self.fail(args)
+
+        health = [
+            {"ok": False, "diagnostic": server.compact_diagnostic("health_unreachable")},
+            {"ok": True, "status": 200, "diagnostic": server.compact_diagnostic("none")},
+        ]
+        ports = [
+            {"port": 3100, "listening": False, "diagnostic": server.compact_diagnostic("port_not_listening")},
+            {"port": 3100, "listening": True, "diagnostic": server.compact_diagnostic("none")},
+        ]
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", side_effect=compose), \
+             mock.patch.object(server, "probe_loopback", side_effect=health), \
+             mock.patch.object(server, "port_probe", side_effect=ports), \
+             mock.patch.object(server.time, "sleep") as sleep:
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/surface/up", {}, True,
+                b'{"stack":"demo","surface":"api"}',
+            )
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            {key: payload[key] for key in (
+                "receipt_version", "action", "stack", "surface", "services",
+                "dependencies", "healthy", "attempts",
+            )},
+            {
+                "receipt_version": "surface-lifecycle-v1", "action": "up",
+                "stack": "demo", "surface": "api", "services": ["api"],
+                "dependencies": ["db"], "healthy": True, "attempts": 2,
+            },
+        )
+        self.assertEqual(payload["diagnostic"]["code"], "none")
+        self.assertLess(len(json.dumps(payload)), 8192)
+        self.assertNotIn("http://", json.dumps(payload))
+        self.assertGreaterEqual(sleep.call_count, 1)
+        up = next(args for args, _kwargs in calls if "up" in args)
+        self.assertEqual(
+            up,
+            ["podman", "compose", "--project-name", "demo", "-f", "compose.yaml", "up", "-d", "--no-deps", "api", "db"],
+        )
+        for args, kwargs in calls:
+            self.assertEqual(kwargs["cwd"], Path("."))
+            self.assertNotIn("worker", args if "up" in args else [])
+            for forbidden in ("down", "prune", "--volumes", "-v", "rm"):
+                self.assertNotIn(forbidden, args)
+
+    def test_surface_up_failure_is_diagnostic_and_never_runs_cleanup(self):
+        stack_spec = self._surface_stack_spec()
+        calls = []
+
+        def fail_up(args, **_kwargs):
+            calls.append(list(args))
+            return {"ok": False, "code": "cmd_failed", "error": "secret compose failure"}
+
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", side_effect=fail_up):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/surface/up", {}, True,
+                b'{"stack":"demo","surface":"api"}',
+            )
+        self.assertEqual(status, 502, payload)
+        self.assertEqual(payload["diagnostic"]["code"], "cmd_failed")
+        self.assertNotIn("secret", json.dumps(payload))
+        self.assertEqual(len(calls), 1)
+        for args in calls:
+            for forbidden in ("down", "prune", "--volumes", "-v", "rm", "stop"):
+                self.assertNotIn(forbidden, args)
+
+    def test_surface_mutations_preserve_missing_binary_and_timeout_statuses(self):
+        stack_spec = self._surface_stack_spec()
+        for result, expected in (
+            ({"ok": False, "code": "local_binary_missing", "status": 501}, 501),
+            ({"ok": False, "code": "timeout", "status": 504}, 504),
+        ):
+            for path in ("/v1/surface/up", "/v1/surface/stop"):
+                with self.subTest(path=path, expected=expected), \
+                     mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+                     mock.patch.object(server, "run_cmd", return_value=result):
+                    status, payload, _ = server.dispatch(
+                        "POST", path, {}, True,
+                        b'{"stack":"demo","surface":"api"}',
+                    )
+                self.assertEqual(status, expected, payload)
+                self.assertEqual(payload["diagnostic"]["code"], result["code"])
+
+    def test_surface_up_health_timeout_is_diagnostic_and_non_destructive(self):
+        stack_spec = self._surface_stack_spec()
+        stack_spec["demo"]["surfaces"]["api"]["wait_seconds"] = 1
+        calls = []
+
+        def compose(args, **_kwargs):
+            calls.append(list(args))
+            if "up" in args:
+                return {"ok": True, "stdout": ""}
+            if "ps" in args:
+                return {"ok": True, "stdout": json.dumps([
+                    {"Name": "demo-api-1", "Service": "api", "State": "running"},
+                    {"Name": "demo-db-1", "Service": "db", "State": "running"},
+                ])}
+            self.fail(args)
+
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", side_effect=compose), \
+             mock.patch.object(server, "probe_loopback", return_value={
+                 "ok": False, "diagnostic": server.compact_diagnostic("health_unreachable"),
+             }), mock.patch.object(server, "port_probe", return_value={
+                 "port": 3100, "listening": True, "diagnostic": server.compact_diagnostic("none"),
+             }), mock.patch.object(server.time, "monotonic", side_effect=[0.0, 2.0]):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/surface/up", {}, True,
+                b'{"stack":"demo","surface":"api"}',
+            )
+
+        self.assertEqual((status, payload["code"]), (504, "health_unreachable"), payload)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["attempts"], 1)
+        self.assertNotIn("http://", json.dumps(payload))
+        for args in calls:
+            for forbidden in ("down", "prune", "--volumes", "-v", "rm", "stop"):
+                self.assertNotIn(forbidden, args)
+
+    def test_surface_lifecycle_requires_auth_and_both_exact_names(self):
+        stack_spec = self._surface_stack_spec()
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd") as run:
+            for method, path, query, body in (
+                ("GET", "/v1/surface/status", {"stack": ["demo"], "surface": ["api"]}, b""),
+                ("POST", "/v1/surface/up", {}, b'{"stack":"demo","surface":"api"}'),
+                ("POST", "/v1/surface/stop", {}, b'{"stack":"demo","surface":"api"}'),
+            ):
+                with self.subTest(path=path, case="auth"):
+                    status, payload, _ = server.dispatch(method, path, query, False, body)
+                    self.assertEqual((status, payload["code"]), (401, "unauthorized"))
+
+            hostile = "../other-worktree/" + "x" * 500
+            for body, code in (
+                ({"stack": hostile, "surface": "api"}, "unknown_stack"),
+                ({"stack": "demo", "surface": hostile}, "unknown_surface"),
+            ):
+                with self.subTest(hostile=code):
+                    status, payload, _ = server.dispatch(
+                        "POST", "/v1/surface/up", {}, True, json.dumps(body).encode()
+                    )
+                    self.assertEqual((status, payload["code"]), (400, code), payload)
+                    self.assertNotIn(hostile, json.dumps(payload))
+                    self.assertLess(len(json.dumps(payload)), 2048)
+            for method, path in (
+                ("POST", "/v1/surface/up"),
+                ("POST", "/v1/surface/stop"),
+            ):
+                for body, code in (
+                    ({"surface": "api"}, "missing_stack"),
+                    ({"stack": "demo"}, "missing_surface"),
+                    ({"stack": ["demo"], "surface": "api"}, "missing_stack"),
+                    ({"stack": "demo", "surface": ["api"]}, "missing_surface"),
+                ):
+                    with self.subTest(path=path, code=code, body=body):
+                        status, payload, _ = server.dispatch(
+                            method, path, {}, True, json.dumps(body).encode()
+                        )
+                        self.assertEqual((status, payload["code"]), (400, code), payload)
+            for query, code in (
+                ({"surface": ["api"]}, "missing_stack"),
+                ({"stack": ["demo"]}, "missing_surface"),
+            ):
+                with self.subTest(path="status", code=code):
+                    status, payload, _ = server.dispatch(
+                        "GET", "/v1/surface/status", query, True, b""
+                    )
+                    self.assertEqual((status, payload["code"]), (400, code), payload)
+        run.assert_not_called()
+
+    def test_surface_actions_cannot_cross_the_selected_stack_scope(self):
+        stack_spec = self._surface_stack_spec()
+        other = deepcopy(stack_spec["demo"])
+        other["name"] = "other"
+        other["cwd"] = Path("/other-worktree")
+        other["compose_file"] = "other-compose.yaml"
+        stack_spec["other"] = other
+        calls = []
+
+        def compose(args, **kwargs):
+            calls.append((list(args), kwargs))
+            if "stop" in args:
+                return {"ok": True, "stdout": ""}
+            if "ps" in args:
+                return {"ok": True, "stdout": json.dumps([
+                    {"Name": "demo-api-1", "Service": "api", "State": "exited"},
+                    {"Name": "demo-db-1", "Service": "db", "State": "running"},
+                ])}
+            self.fail(args)
+
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", side_effect=compose):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/surface/stop", {}, True,
+                b'{"stack":"demo","surface":"api"}',
+            )
+
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(calls)
+        for args, kwargs in calls:
+            self.assertEqual(kwargs["cwd"], Path("."))
+            self.assertNotIn("other-compose.yaml", args)
+            self.assertNotIn("/other-worktree", json.dumps(args))
+
+    def test_surface_stop_preserves_dependencies_volumes_and_unrelated_services(self):
+        stack_spec = self._surface_stack_spec()
+        calls = []
+
+        def compose(args, **kwargs):
+            calls.append((list(args), kwargs))
+            if "stop" in args:
+                return {"ok": True, "stdout": ""}
+            if "ps" in args:
+                return {"ok": True, "stdout": json.dumps([
+                    {"Name": "demo-api-1", "Service": "api", "State": "exited"},
+                    {"Name": "demo-db-1", "Service": "db", "State": "running"},
+                    {"Name": "demo-worker-1", "Service": "worker", "State": "running"},
+                ])}
+            self.fail(args)
+
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", side_effect=compose):
+            status, payload, _ = server.dispatch(
+                "POST", "/v1/surface/stop", {}, True,
+                b'{"stack":"demo","surface":"api"}',
+            )
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["action"], "stop")
+        self.assertTrue(payload["stopped"])
+        self.assertTrue(payload["volumes_preserved"])
+        stop = next(args for args, _kwargs in calls if "stop" in args)
+        self.assertEqual(
+            stop,
+            ["podman", "compose", "--project-name", "demo", "-f", "compose.yaml", "stop", "api"],
+        )
+        self.assertNotIn("db", stop)
+        self.assertNotIn("worker", stop)
+        for args, _kwargs in calls:
+            for forbidden in ("down", "prune", "--volumes", "-v", "rm"):
+                self.assertNotIn(forbidden, args)
+
+    def test_surface_status_covers_complete_configured_inventory_read_only(self):
+        stack_spec = self._surface_stack_spec()
+        compose = {"ok": True, "stdout": json.dumps([
+            {"Name": "demo-api-1", "Service": "api", "State": "running"},
+            {"Name": "demo-db-1", "Service": "db", "State": "running"},
+            {"Name": "demo-worker-1", "Service": "worker", "State": "running"},
+        ])}
+        with mock.patch.object(server, "load_stacks", return_value=(stack_spec, {3100, 5432})), \
+             mock.patch.object(server, "run_cmd", return_value=compose) as run, \
+             mock.patch.object(server, "probe_loopback", return_value={
+                 "ok": True, "status": 200, "diagnostic": server.compact_diagnostic("none"),
+             }), mock.patch.object(server, "port_probe", return_value={
+                 "port": 3100, "listening": True, "diagnostic": server.compact_diagnostic("none"),
+             }):
+            receipts = {}
+            for surface in stack_spec["demo"]["surfaces"]:
+                status, payload, _ = server.dispatch(
+                    "GET", "/v1/surface/status",
+                    {"stack": ["demo"], "surface": [surface]}, True, b"",
+                )
+                self.assertEqual(status, 200, payload)
+                receipts[surface] = payload
+
+        self.assertEqual(set(receipts), set(stack_spec["demo"]["surfaces"]))
+        self.assertEqual(receipts["api"]["services"], ["api"])
+        self.assertEqual(receipts["api"]["dependencies"], ["db"])
+        for call in run.call_args_list:
+            args = call.args[0]
+            self.assertIn("ps", args)
+            self.assertNotIn("up", args)
+            self.assertNotIn("stop", args)
+
+    def test_surface_lifecycle_openapi_is_closed_and_docs_pin_the_safety_contract(self):
+        root = Path(server.__file__).resolve().parent
+        spec = json.loads((root / "openapi.json").read_text())
+        self.assertEqual(
+            {
+                path: next(iter(spec["paths"][path].values()))["operationId"]
+                for path in ("/v1/surface/status", "/v1/surface/up", "/v1/surface/stop")
+            },
+            {
+                "/v1/surface/status": "surfaceStatus",
+                "/v1/surface/up": "surfaceUp",
+                "/v1/surface/stop": "surfaceStop",
+            },
+        )
+        request = spec["components"]["schemas"]["SurfaceRequest"]
+        self.assertEqual(request["required"], ["stack", "surface"])
+        self.assertFalse(request["additionalProperties"])
+        self.assertEqual(set(request["properties"]), {"stack", "surface"})
+        docs = (root / "docs" / "USING.md").read_text()
+        for text in (
+            "surfaceStatus", "surfaceUp", "surfaceStop", "compose down", "--no-deps",
+            "named volumes", "runtime", "compose_file", "services", "dependencies",
+        ):
+            self.assertIn(text, docs)
 
     def test_stack_status_dispatch_diagnostics_success_unknown_not_configured(self):
         stack_spec = {

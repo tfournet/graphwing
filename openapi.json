@@ -3,8 +3,8 @@
   "info": {
     "title": "graphwing",
 
-    "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted scripts and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
-    "version": "0.5.6"
+    "description": "Local node catalog for Rewst Graph. Deterministic git/gh/file/units/herdr/stack/port plus allowlisted service surfaces, scripts, and tests. rrRun is an optional plugin when rr.json is present. One-job agent loops return 202 + job_id; completion POSTs an artifact receipt to response_webhook_url (action.wait.webhook). Cloud GitHub/Shortcut stay Rewst integrations. PR driver is a Graph of these nodes, not one agentRun. Public server URL is written by named-tunnel setup (cloudflared-meta.json) or GRAPHWING_PUBLIC_URL; catalog default is loopback.",
+    "version": "0.6.0"
   },
   "servers": [
     {
@@ -23,6 +23,7 @@
     { "name": "agent" },
     { "name": "script" },
     { "name": "stack" },
+    { "name": "surface" },
     { "name": "port" },
     { "name": "test" },
     { "name": "rr" },
@@ -873,6 +874,55 @@
         }
       }
     },
+    "/v1/surface/status": {
+      "get": {
+        "operationId": "surfaceStatus",
+        "tags": ["surface"],
+        "summary": "Read one configured service surface without changing Compose state.",
+        "parameters": [
+          { "name": "stack", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "surface", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "bounded surface status receipt", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } },
+          "400": { "$ref": "#/components/responses/DiagnosticError" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "501": { "$ref": "#/components/responses/DiagnosticError" }
+        }
+      }
+    },
+    "/v1/surface/up": {
+      "post": {
+        "operationId": "surfaceUp",
+        "tags": ["surface"],
+        "summary": "Start only one allowlisted surface and its declared dependencies, then prove configured services, health, and ports.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceRequest" } } } },
+        "responses": {
+          "200": { "description": "healthy surface receipt", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } },
+          "400": { "$ref": "#/components/responses/DiagnosticError" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "501": { "description": "surface configuration or Compose binary unavailable", "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/DiagnosticError" }, { "$ref": "#/components/schemas/SurfaceReceipt" }] } } } },
+          "502": { "description": "configured Compose command failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } },
+          "504": { "description": "configured proof did not become healthy in time", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } }
+        }
+      }
+    },
+    "/v1/surface/stop": {
+      "post": {
+        "operationId": "surfaceStop",
+        "tags": ["surface"],
+        "summary": "Stop only one surface's owned services without Compose down, dependency stop, or volume removal.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceRequest" } } } },
+        "responses": {
+          "200": { "description": "stopped surface receipt", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } },
+          "400": { "$ref": "#/components/responses/DiagnosticError" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "501": { "description": "surface configuration or Compose binary unavailable", "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/DiagnosticError" }, { "$ref": "#/components/schemas/SurfaceReceipt" }] } } } },
+          "502": { "description": "configured Compose command or status proof failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } },
+          "504": { "description": "configured services remained running", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SurfaceReceipt" } } } }
+        }
+      }
+    },
     "/v1/stack/status": {
       "get": {
         "operationId": "stackStatus",
@@ -1253,7 +1303,7 @@
           "diagnostic_version": { "type": "string", "enum": ["diagnostic-v1"] },
           "category": { "type": "string", "enum": ["none", "provider_availability", "local_infrastructure", "workflow_failure"] },
           "component": { "type": "string", "enum": ["none", "provider", "binary", "config", "auth", "network", "health", "stack", "port", "command", "request", "execution"] },
-          "code": { "type": "string", "enum": ["adapter_contract_invalid", "bad_health_config", "bad_port", "branch_mismatch", "cancelled", "cmd_failed", "head_mismatch", "health_bad_status", "health_unreachable", "invalid_receipt", "launcher_version_mismatch", "local_binary_missing", "missing_binary", "missing_port", "missing_prompt", "model_reported_error", "model_stopped", "none", "not_configured", "port_not_listening", "primary_execution_profile_mismatch", "process_exit", "provider_authentication", "provider_http_5xx", "provider_network", "provider_overloaded", "provider_quota", "provider_rate_limit", "reported_timeout", "repository_mismatch", "run_budget_exceeded", "session_identity_mismatch", "session_identity_missing", "session_provenance_invalid", "spawn_failed", "stack_unhealthy", "timeout", "unknown_failure", "unknown_port", "unknown_stack"] },
+          "code": { "type": "string", "enum": ["adapter_contract_invalid", "bad_health_config", "bad_json", "bad_port", "branch_mismatch", "cancelled", "cmd_failed", "head_mismatch", "health_bad_status", "health_unreachable", "invalid_receipt", "launcher_version_mismatch", "local_binary_missing", "missing_binary", "missing_port", "missing_prompt", "missing_stack", "missing_surface", "model_reported_error", "model_stopped", "none", "not_configured", "port_not_listening", "primary_execution_profile_mismatch", "process_exit", "provider_authentication", "provider_http_5xx", "provider_network", "provider_overloaded", "provider_quota", "provider_rate_limit", "reported_timeout", "repository_mismatch", "run_budget_exceeded", "session_identity_mismatch", "session_identity_missing", "session_provenance_invalid", "spawn_failed", "stack_unhealthy", "surface_still_running", "surface_unhealthy", "timeout", "unexpected_fields", "unknown_failure", "unknown_port", "unknown_stack", "unknown_surface"] },
           "evidence": { "type": "string" },
           "summary": { "type": "string", "maxLength": 80 }
         }
@@ -1264,6 +1314,74 @@
         "properties": {
           "error": { "type": "string" },
           "code": { "type": "string" },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
+        }
+      },
+      "SurfaceRequest": {
+        "type": "object",
+        "required": ["stack", "surface"],
+        "additionalProperties": false,
+        "properties": {
+          "stack": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
+          "surface": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" }
+        }
+      },
+      "SurfaceServiceState": {
+        "type": "object",
+        "required": ["name", "service", "state", "health", "exit_code"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": ["string", "null"], "maxLength": 256 },
+          "service": { "type": ["string", "null"], "maxLength": 128 },
+          "state": { "type": ["string", "null"], "maxLength": 128 },
+          "health": { "type": ["string", "null"], "maxLength": 128 },
+          "exit_code": { "type": ["integer", "string", "null"] }
+        }
+      },
+      "SurfaceHealth": {
+        "type": "object",
+        "required": ["name", "ok", "status", "diagnostic"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "maxLength": 128 },
+          "ok": { "type": "boolean" },
+          "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
+        }
+      },
+      "SurfacePort": {
+        "type": "object",
+        "required": ["port", "listening", "diagnostic"],
+        "additionalProperties": false,
+        "properties": {
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "listening": { "type": "boolean" },
+          "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
+        }
+      },
+      "SurfaceReceipt": {
+        "type": "object",
+        "required": ["ok", "receipt_version", "action", "stack", "surface", "services", "dependencies", "healthy", "running_services", "service_states", "health", "ports", "compose_ok", "diagnostic"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean" },
+          "receipt_version": { "type": "string", "const": "surface-lifecycle-v1" },
+          "action": { "type": "string", "enum": ["status", "up", "stop"] },
+          "stack": { "type": "string", "maxLength": 64 },
+          "surface": { "type": "string", "maxLength": 64 },
+          "services": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 128 } },
+          "dependencies": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 128 } },
+          "healthy": { "type": "boolean" },
+          "running_services": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 128 } },
+          "service_states": { "type": "array", "maxItems": 64, "items": { "$ref": "#/components/schemas/SurfaceServiceState" } },
+          "health": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SurfaceHealth" } },
+          "ports": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SurfacePort" } },
+          "compose_ok": { "type": "boolean" },
+          "attempts": { "type": "integer", "minimum": 0, "maximum": 1201 },
+          "stopped": { "type": "boolean" },
+          "volumes_preserved": { "type": "boolean" },
+          "error": { "type": "string", "maxLength": 160 },
+          "code": { "type": "string", "maxLength": 64 },
           "diagnostic": { "$ref": "#/components/schemas/Diagnostic" }
         }
       },
