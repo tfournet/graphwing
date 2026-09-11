@@ -27186,25 +27186,47 @@ class GraphEdgeHandleVocabularyTests(unittest.TestCase):
         self.assertEqual(ok["right"], {"kind": "binary", "operator": "and", "left": by["closed"], "right": by["reason_allowed"]})
 
     def test_run_control_graphs_never_compare_objects_with_equality(self):
-        # The engine cannot compare maps: live run 12386f9a's reconcile child
-        # died with "comparing uncomparable type map[string]interface {}" on
-        # receipt.route == outstanding_reservation.route. Compare fields.
-        #
-        # Scoped to run-control-*.json only, this lint was blind to
-        # pr-drive.json: that graph carries the same run-control
-        # objectBuilder legs (rc_continuity and its siblings) but its
-        # filename does not match the glob, so an object-equality regression
-        # there would ship undetected. It has none today (checked below over
-        # every graph, not just the run-control-* ones), so widening the
-        # scan is a pure coverage fix, not a graph change.
-        object_tails = {"route", "envelope", "handoff", "reservation", "launch_descriptor", "receipt",
-                        "progress", "usage", "candidate_route", "current_route", "next_envelope"}
+        # Live Go evaluates object equality by comparing interface values and
+        # panics on maps. This caught run-control run 12386f9a but missed the
+        # same class in routing-policy run d2d1a240. Compare closed scalars or
+        # transforms.hash hex values instead.
+        object_tails = {
+            "route", "envelope", "handoff", "reservation", "launch_descriptor", "receipt",
+            "progress", "usage", "candidate_route", "current_route", "next_envelope",
+        }
+        routing_object_tails = {
+            "data", "route_evidence", "route_execution_profile", "writer_execution_profile",
+            "primary_evidence", "fallback_evidence", "fresh_primary_evidence", "primary_route",
+            "fallback_route", "route_input", "session_identity", "active_route",
+        }
         def offenders(expr, where, out):
             if isinstance(expr, dict):
                 if expr.get("kind") == "binary" and expr.get("operator") in ("==", "!="):
                     sides = (expr.get("left", {}), expr.get("right", {}))
-                    if all(s.get("kind") == "getField" and s["path"].rsplit(".", 1)[-1] in object_tails for s in sides):
-                        out.append((where, sides[0]["path"], sides[1]["path"]))
+                    get_field_tails = tuple(
+                        side.get("path", "").rsplit(".", 1)[-1]
+                        if side.get("kind") == "getField" else None
+                        for side in sides
+                    )
+                    fields_match = any(
+                        all(
+                            side.get("kind") == "getField" and tail in tails
+                            for side, tail in zip(sides, get_field_tails)
+                        )
+                        for tails in (object_tails, routing_object_tails)
+                    )
+                    field_matches_object = any(
+                        sides[index].get("kind") == "getField"
+                        and get_field_tails[index] in routing_object_tails
+                        and sides[1 - index].get("kind") == "object"
+                        for index in (0, 1)
+                    )
+                    if fields_match or field_matches_object:
+                        out.append((
+                            where,
+                            sides[0].get("path", sides[0].get("kind")),
+                            sides[1].get("path", sides[1].get("kind")),
+                        ))
                 for value in expr.values():
                     offenders(value, where, out)
             elif isinstance(expr, list):
@@ -32937,6 +32959,88 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
         })
         return runner, runner.context["CTX"]["routing_policy_output"]
 
+    def test_writer_success_fallback_and_later_recovery_preserve_persist_readback_contract(self):
+        store = RunControlDatastoreFixture()
+        inputs = {
+            "class": "mechanical", "work_kind": "go_coding", "size": "M",
+            "ac_count": 0, "seams": 0, "routing_run_id": "run-186-persist",
+            "invocation_run_id": "run-186-first",
+        }
+        _, primary = self._run_policy(store, inputs)
+        primary_success = self._evidence(
+            primary, "9" * 32, "ok", "2026-09-08T15:00:00Z",
+            "2026-09-08T15:00:02Z",
+        )
+        writer_sync, writer_route = self._run_policy(
+            store, {**inputs, "route_evidence": primary_success},
+        )
+        self.assertEqual(
+            (writer_route["recovery_decision"], writer_route["compatibility_behavior"]),
+            ("normal", "normal-v1"),
+        )
+        self.assertTrue({
+            "current_route_evidence_verify", "route_state_upsert",
+            "route_state_readback_hash", "route_state_readback_valid",
+        } <= set(writer_sync.executed))
+        self.assertEqual(
+            writer_sync.context["CTX"]["route_state_readback_hash"]["value"],
+            writer_sync.context["CTX"]["route_state_expected_hash"]["value"],
+        )
+
+        primary_failure = self._evidence(
+            primary, "a" * 32, "error", "2026-09-08T15:01:00Z",
+            "2026-09-08T15:01:02Z", failure_code="provider_network",
+        )
+        _, fallback = self._run_policy(
+            store, {**inputs, "agent_evidence": primary_failure},
+        )
+        self.assertEqual(
+            (fallback["recovery_decision"], fallback["compatibility_behavior"]),
+            ("initial_fallback", "availability-fallback-v1"),
+        )
+        fallback_success = self._evidence(
+            fallback, "c" * 32, "ok", "2026-09-08T15:01:03Z",
+            "2026-09-08T15:01:05Z",
+        )
+        fallback_sync, persisted_fallback = self._run_policy(
+            store, {**inputs, "route_evidence": fallback_success},
+        )
+        self.assertEqual(
+            (persisted_fallback["recovery_decision"],
+             persisted_fallback["compatibility_behavior"]),
+            ("fallback_retained", "availability-fallback-v1"),
+        )
+        self.assertTrue({
+            "current_route_evidence_verify", "route_state_upsert",
+            "route_state_readback_hash", "route_state_readback_valid",
+        } <= set(fallback_sync.executed))
+        self.assertEqual(
+            fallback_sync.context["CTX"]["route_state_readback_hash"]["value"],
+            fallback_sync.context["CTX"]["route_state_expected_hash"]["value"],
+        )
+        record = store.records[(
+            "graphwing_routing_state_v1", "graphwing-routing-v1:run-186-persist",
+        )]["data"]
+        self.assertEqual(record["primary_evidence"], primary_failure)
+        self.assertEqual(record["fallback_evidence"], fallback_success)
+        self.assertEqual(record["decision"], "fallback_retained")
+
+        _, retained = self._run_policy(store, inputs)
+        self.assertEqual(
+            (retained["recovery_decision"], retained["compatibility_behavior"]),
+            ("fallback_retained", "availability-fallback-v1"),
+        )
+        fresh_primary = self._evidence(
+            primary, "b" * 32, "ok", "2026-09-08T15:02:00Z",
+            "2026-09-08T15:02:02Z",
+        )
+        self._run_policy(store, {**inputs, "route_evidence": fresh_primary})
+        _, recovered = self._run_policy(store, inputs)
+        self.assertEqual(
+            (recovered["recovery_decision"], recovered["compatibility_behavior"]),
+            ("primary_recovered", "normal-v1"),
+        )
+
     def test_missing_binary_recovery_selects_primary_only_after_current_capability_is_verified(self):
         _, _, _, state = self._state_fixture(failure_code="missing_binary")
         unavailable, retained = self._choice(state, "unavailable")
@@ -33048,7 +33152,11 @@ class DurableRoutingRecoveryTests(unittest.TestCase):
                          "action.datastore.records.get")
         self.assertEqual(nodes["route_state_expected_hash"]["type"], "transforms.hash")
         self.assertEqual(nodes["route_state_readback_hash"]["type"], "transforms.hash")
-        for node_id in ("route_state_expected_hash", "route_state_readback_hash"):
+        hash_node_ids = {
+            node["id"] for node in graph["spec"]["nodes"]
+            if node["type"] == "transforms.hash"
+        }
+        for node_id in hash_node_ids:
             self.assertNotIn("TASKS." + node_id, json.dumps(graph))
         rules = {
             rule["path"]
