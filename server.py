@@ -10222,6 +10222,39 @@ def parse_receipt_text(text: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_agent_receipt_text(text: str, job: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = parse_receipt_text(text)
+    if parsed is not None:
+        return parsed
+    workspace = job.get("codeoff_workspace")
+    if not (
+        isinstance(workspace, dict)
+        and workspace.get("slot") in ("author-1", "author-2")
+        and isinstance(text, str)
+        and len(text) <= _PROVIDER_OUTPUT_MAX_CHARS
+    ):
+        return None
+    try:
+        completed = strict_json_object(text.strip())
+    except ValueError:
+        return None
+    files = completed.get("files")
+    verification = completed.get("verification")
+    if not (
+        set(completed) == {"status", "files", "verification"}
+        and completed.get("status") == "completed"
+        and isinstance(files, list) and len(files) <= CODEOFF_MAX_FILES
+        and all(isinstance(path, str) and 0 < len(path) <= 4096 for path in files)
+        and isinstance(verification, str) and 0 < len(verification) <= COMPACT_MAX_CHARS
+        and "\n" not in verification and "\r" not in verification
+    ):
+        return None
+    return {
+        "status": "ok", "sha": None, "pr_url": None,
+        "summary": verification,
+    }
+
+
 def structured_provider_failure(text: str) -> str | None:
     """Return an allowlisted provider code from adapter-owned JSON, never prose."""
     if not isinstance(text, str) or len(text) > _PROVIDER_OUTPUT_MAX_CHARS:
@@ -10927,7 +10960,7 @@ def run_grok_acp(
                 raise RuntimeError("Grok ACP prompt did not end_turn")
             final_message = "".join(chunks)
             path.joinpath("last-message.txt").write_text(final_message)
-            parsed = parse_receipt_text(final_message)
+            parsed = parse_agent_receipt_text(final_message, job)
             if not (
                 isinstance(parsed, dict)
                 and set(parsed) == {"status", "sha", "pr_url", "summary"}
@@ -11274,7 +11307,7 @@ def run_agent_job(job_id: str) -> None:
         protocol_error = None
     stdout = read_bounded_output(job_dir(job_id) / "stdout.log")
     final_message = read_bounded_output(job_dir(job_id) / "last-message.txt")
-    parsed = parse_receipt_text(final_message) or parse_receipt_text(stdout)
+    parsed = parse_agent_receipt_text(final_message, job) or parse_agent_receipt_text(stdout, job)
     session_id = session_id or parse_native_session_id(stdout, str(job.get("launcher") or ""))
     session_error: str | None = None
     session_evidence: str | None = None

@@ -2239,6 +2239,36 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(parsed["status"], "ok")
         self.assertEqual(parsed["sha"], "abc")
 
+    def test_codeoff_author_completed_receipt_maps_to_ok(self):
+        last_message = (
+            '{"status":"completed","files":["NOTES.md"],'
+            '"verification":"exactly one line: ok"}'
+        )
+        parsed = server.parse_agent_receipt_text(last_message, {
+            "codeoff_workspace": {"experiment_id": "experiment-0001", "slot": "author-1"},
+        })
+        self.assertEqual(parsed, {
+            "status": "ok", "sha": None, "pr_url": None,
+            "summary": "exactly one line: ok",
+        })
+
+    def test_completed_receipt_is_codeoff_author_only_and_closed(self):
+        last_message = json.dumps({
+            "status": "completed", "files": ["NOTES.md"],
+            "verification": "exactly one line: ok",
+        })
+        for job in ({}, {"codeoff_workspace": {
+            "experiment_id": "experiment-0001", "slot": "judge-1",
+        }}):
+            with self.subTest(job=job):
+                self.assertIsNone(server.parse_agent_receipt_text(last_message, job))
+        self.assertIsNone(server.parse_agent_receipt_text(json.dumps({
+            "status": "completed", "files": ["NOTES.md"],
+            "verification": "exactly one line: ok", "arbitrary": True,
+        }), {"codeoff_workspace": {
+            "experiment_id": "experiment-0001", "slot": "author-1",
+        }}))
+
     def test_parse_codex_jsonl_receipt_and_session(self):
         text = "\n".join([
             '{"type":"thread.started","thread_id":"codex-123"}',
