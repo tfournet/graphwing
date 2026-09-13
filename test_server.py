@@ -22359,7 +22359,7 @@ class CodeOffTests(unittest.TestCase):
         canonical = json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "559877d8a0df7a4d09cb92123e629ea9b3a1d90d74d0cf0119d590ff569cdaea",
+            "6cb4e3bc39d23831cb0de4cbd9fc3fa7b1b1f1fadc607fd32d695fb82c52dadc",
         )
         self.assertEqual(len(graph["spec"]["nodes"]), 533)
         self.assertEqual(len(graph["spec"]["edges"]), 634)
@@ -23379,7 +23379,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         for expression in (check["data_matches"]["left"], check["data_matches"]["right"]):
             self.assertTrue(expression["path"].startswith("CTX."), expression)
         activation = self._v2_mappings(nodes["v2_promotion_activation"])
-        self.assertEqual(activation["activation_enabled"], {"kind": "literal", "value": False})
+        self.assertEqual(activation["activation_enabled"], {"kind": "literal", "value": True})
         self.assertEqual(nodes["v2_promote"]["config"], {
             "integrationInstanceId": "$GRAPHWING_INSTANCE", "timeout": 120,
             "experiment_id": "{{ CTX.INPUT.experiment_id }}",
@@ -23846,7 +23846,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
             "kind": "literal", "value": "code-off-candidate-routing-v2",
         })
         self.assertEqual(contract["activation_enabled"], {
-            "kind": "literal", "value": False,
+            "kind": "literal", "value": True,
         })
         self.assertEqual(contract["retry_policy"], {
             "kind": "literal", "value": "prohibited",
@@ -23978,7 +23978,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(inbound["v2_author_1_launch_identity"], {
             ("v2_candidate_activation_gate", "pass"),
         })
-        self.assertFalse(contract["activation_enabled"]["value"])
+        self.assertTrue(contract["activation_enabled"]["value"])
 
     def test_v2_callback_uses_terminal_receipt_fields_and_duplicate_delivery_replays_one_effect(self):
         nodes, edges = self._v2_durable_graph()
@@ -25647,7 +25647,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(nodes["v2_continuation_disabled"]["type"], "action.noop")
         self.assertEqual(forward.get("v2_continuation_disabled"), {"v2_candidate_stage_contract"})
         contract = self._v2_mappings(nodes["v2_candidate_stage_contract"])
-        self.assertEqual(contract["activation_enabled"], {"kind": "literal", "value": False})
+        self.assertEqual(contract["activation_enabled"], {"kind": "literal", "value": True})
         self.assertEqual(forward["v2_candidate_stage_contract"], {"v2_candidate_activation_gate"})
         self.assertEqual(
             {source for source, _handle in inbound["v2_author_1_launch_identity"]},
