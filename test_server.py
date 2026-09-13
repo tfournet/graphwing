@@ -24402,7 +24402,7 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
         self.assertNotIn("seed", initialize["config"])
 
         author = payload["slots"]["author-1"]
-        with mock.patch.object(server, "enqueue_agent", side_effect=AssertionError("v2 author launched")):
+        with mock.patch.object(server, "enqueue_agent") as enqueue:
             launch_status, launch = server.dispatch(
                 "POST", "/v1/agent/run", {}, True, json.dumps({
                     "codeoff_workspace": {"experiment_id": "policy-v2-experiment", "slot": "author-1"},
@@ -24412,7 +24412,9 @@ class CodeOffPolicyMigrationTests(unittest.TestCase):
                     "run_budget_seconds": self._policy()["budgets"]["author_seconds"],
                 }).encode(),
             )[:2]
-        self.assertEqual((launch_status, launch["code"]), (409, "codeoff_v2_not_activated"))
+        self.assertEqual(launch_status, 202, launch)
+        self.assertNotEqual(launch.get("code"), "codeoff_v2_not_activated")
+        enqueue.assert_called_once()
 
     def test_v2_replay_returns_the_same_commitment_and_slots_but_changed_policy_local_loss_or_expiry_cannot_redraw_or_launch(self):
         body = self._body("policy-v2-replay")

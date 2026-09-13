@@ -15908,11 +15908,6 @@ def _resolve_codeoff_agent(raw: Any) -> tuple[dict[str, Any] | None, dict[str, A
         return None, err
     assert root and manifest and state
     is_v2 = manifest.get("protocol_version") == CODEOFF_V2_PROTOCOL_VERSION
-    if is_v2 and slot.startswith("author-"):
-        return None, {
-            "error": "code-off v2 author launch remains disabled until workflow cutover",
-            "code": "codeoff_v2_not_activated",
-        }
     identity_err = codeoff_manifest_identity_error(manifest)
     if identity_err:
         return None, identity_err
@@ -15996,7 +15991,6 @@ def agent_run(
         if codeoff_err:
             return 409 if codeoff_err.get("code") in (
                 "experiment_finalized", "bad_experiment_stage", "codeoff_identity_unpinned",
-                "codeoff_v2_not_activated",
             ) else 400, codeoff_err
         assert codeoff is not None
         prompt_bytes = codeoff["prompt"]
